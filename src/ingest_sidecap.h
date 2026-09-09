@@ -1742,6 +1742,10 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
             { // enclosing class/module → id= addressability, per-class overload sets, editCheckImplicitReceiver
                 d.scope = rubyEnclosingScopeOf( nameNode, src );   // (test/rubyscopecheck.sh)
             }
+            else if( le.lang == Lang::Dart )
+            {
+                d.scope = dartEnclosingScopeOf( nameNode, src );
+            }
             defs.push_back( std::move( d ) );
             if( kind == SymKind::Class || kind == SymKind::Struct || kind == SymKind::Interface )
             {

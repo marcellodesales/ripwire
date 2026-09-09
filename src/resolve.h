@@ -154,7 +154,7 @@ inline std::string lexicalNormalize( std::string_view path )
 // The import dialect a file's imports resolve in, keyed off its extension. C-family covers the quote
 // `#include`; Other (Swift/Java/C#/PHP/Markdown/…) never precise-resolves (deferred / no path in import).
 // Bash/Ruby/Lua/Elixir joined at kParserVer 81 — see their Step-As below.
-enum class IncludeLang : std::uint8_t { CFamily, Python, Ts, Rust, Go, Bash, Ruby, Lua, Elixir, Other };
+enum class IncludeLang : std::uint8_t { CFamily, Python, Ts, Rust, Go, Bash, Ruby, Lua, Elixir, Dart, Other };
 
 // extension → dialect, a declarative constexpr table (NOT a scattered if-chain). Extension includes the
 // leading dot; the classifier lowercases nothing (source extensions are lowercase by convention here).
@@ -180,6 +180,7 @@ inline IncludeLang includeLangOf( std::string_view path ) noexcept
         { ".rb",  IncludeLang::Ruby },
         { ".lua", IncludeLang::Lua },
         { ".ex",  IncludeLang::Elixir },  { ".exs", IncludeLang::Elixir },
+        { ".dart", IncludeLang::Dart },
         // B6.2: `.cs` has NO entry here — it falls through to IncludeLang::Other below, DEFERRED like
         // Java (also absent) and Swift/Go-single-root: a C# namespace does not map 1:1 onto a file (one
         // namespace spans many files, one file can hold several namespaces), so there is no sound
@@ -1302,6 +1303,550 @@ inline HashMap<std::string, std::uint32_t> buildElixirModuleIndex( const IngestR
     return modules;
 }
 
+struct DartPackageRoot
+{
+    std::string name;
+    std::string libBase;   // root-relative, or labeled root-relative in a workspace
+};
+
+inline void dartSkipJsonWs( const std::string& bytes, std::size_t& i ) noexcept
+{
+    while( i < bytes.size() && ( bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\r' || bytes[i] == '\n' ) )
+    {
+        ++i;
+    }
+}
+
+inline bool dartParseJsonString( const std::string& bytes, std::size_t& i, std::string& out )
+{
+    if( i >= bytes.size() || bytes[i] != '"' )
+    {
+        return false;
+    }
+    out.clear();
+    ++i;
+    while( i < bytes.size() )
+    {
+        const char c = bytes[i++];
+        if( c == '"' )
+        {
+            return true;
+        }
+        if( c != '\\' )
+        {
+            out.push_back( c );
+            continue;
+        }
+        if( i >= bytes.size() )
+        {
+            return false;
+        }
+        const char esc = bytes[i++];
+        switch( esc )
+        {
+            case '"': case '\\': case '/': out.push_back( esc ); break;
+            case 'b': out.push_back( '\b' ); break;
+            case 'f': out.push_back( '\f' ); break;
+            case 'n': out.push_back( '\n' ); break;
+            case 'r': out.push_back( '\r' ); break;
+            case 't': out.push_back( '\t' ); break;
+            case 'u':
+                if( i + 4 > bytes.size() )
+                {
+                    return false;
+                }
+                i += 4;
+                out.push_back( '?' );
+                break;
+            default: return false;
+        }
+    }
+    return false;
+}
+
+inline bool dartSkipJsonValue( const std::string& bytes, std::size_t& i )
+{
+    dartSkipJsonWs( bytes, i );
+    if( i >= bytes.size() )
+    {
+        return false;
+    }
+    if( bytes[i] == '"' )
+    {
+        std::string scratch;
+        return dartParseJsonString( bytes, i, scratch );
+    }
+    if( bytes[i] == '{' )
+    {
+        ++i;
+        dartSkipJsonWs( bytes, i );
+        if( i < bytes.size() && bytes[i] == '}' )
+        {
+            ++i;
+            return true;
+        }
+        while( i < bytes.size() )
+        {
+            std::string key;
+            if( !dartParseJsonString( bytes, i, key ) )
+            {
+                return false;
+            }
+            dartSkipJsonWs( bytes, i );
+            if( i >= bytes.size() || bytes[i] != ':' )
+            {
+                return false;
+            }
+            ++i;
+            if( !dartSkipJsonValue( bytes, i ) )
+            {
+                return false;
+            }
+            dartSkipJsonWs( bytes, i );
+            if( i < bytes.size() && bytes[i] == ',' )
+            {
+                ++i;
+                dartSkipJsonWs( bytes, i );
+                continue;
+            }
+            if( i < bytes.size() && bytes[i] == '}' )
+            {
+                ++i;
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+    if( bytes[i] == '[' )
+    {
+        ++i;
+        dartSkipJsonWs( bytes, i );
+        if( i < bytes.size() && bytes[i] == ']' )
+        {
+            ++i;
+            return true;
+        }
+        while( i < bytes.size() )
+        {
+            if( !dartSkipJsonValue( bytes, i ) )
+            {
+                return false;
+            }
+            dartSkipJsonWs( bytes, i );
+            if( i < bytes.size() && bytes[i] == ',' )
+            {
+                ++i;
+                dartSkipJsonWs( bytes, i );
+                continue;
+            }
+            if( i < bytes.size() && bytes[i] == ']' )
+            {
+                ++i;
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+    const std::size_t start = i;
+    while( i < bytes.size() && bytes[i] != ',' && bytes[i] != '}' && bytes[i] != ']' && bytes[i] != ' '
+           && bytes[i] != '\t' && bytes[i] != '\r' && bytes[i] != '\n' )
+    {
+        ++i;
+    }
+    return i > start;
+}
+
+inline std::string dartConfigUriToPath( std::string_view uri )
+{
+    if( uri.empty() )
+    {
+        return {};
+    }
+    if( uri.starts_with( "file://" ) )
+    {
+        return std::string( uri.substr( 7 ) );
+    }
+    if( uri.starts_with( "file:" ) )
+    {
+        return std::string( uri.substr( 5 ) );
+    }
+    if( uri.find( ':' ) != std::string_view::npos )
+    {
+        return {};
+    }
+    return std::string( uri );
+}
+
+inline void appendDartPackageRoot( std::vector<DartPackageRoot>& packages, std::string_view configDirRel,
+                                   const std::string& name, std::string_view rootUri, std::string_view packageUri,
+                                   std::string_view packageUriRoot )
+{
+    if( name.empty() )
+    {
+        return;
+    }
+    const std::string baseRoot = dartConfigUriToPath( rootUri );
+    std::string       relBase  = dartConfigUriToPath( packageUriRoot );
+    if( relBase.empty() )
+    {
+        const std::string pkg = dartConfigUriToPath( packageUri );
+        if( pkg.empty() )
+        {
+            return;
+        }
+        relBase = baseRoot.empty() ? pkg : lexicalNormalize( baseRoot + "/" + pkg );
+    }
+    std::string joined;
+    if( !configDirRel.empty() )
+    {
+        joined.append( configDirRel );
+        joined.push_back( '/' );
+    }
+    joined.append( relBase );
+    const std::string libBase = lexicalNormalize( joined );
+    if( libBase.empty() )
+    {
+        return;
+    }
+    packages.push_back( { name, libBase } );
+}
+
+inline void parseDartPackageConfig( const std::string& bytes, std::string_view configDirRel, std::vector<DartPackageRoot>& packages )
+{
+    std::size_t i = 0;
+    dartSkipJsonWs( bytes, i );
+    if( i >= bytes.size() || bytes[i] != '{' )
+    {
+        return;
+    }
+    ++i;
+    while( i < bytes.size() )
+    {
+        dartSkipJsonWs( bytes, i );
+        if( i < bytes.size() && bytes[i] == '}' )
+        {
+            return;
+        }
+        std::string key;
+        if( !dartParseJsonString( bytes, i, key ) )
+        {
+            return;
+        }
+        dartSkipJsonWs( bytes, i );
+        if( i >= bytes.size() || bytes[i] != ':' )
+        {
+            return;
+        }
+        ++i;
+        dartSkipJsonWs( bytes, i );
+        if( key != "packages" )
+        {
+            if( !dartSkipJsonValue( bytes, i ) )
+            {
+                return;
+            }
+        }
+        else
+        {
+            if( i >= bytes.size() || bytes[i] != '[' )
+            {
+                return;
+            }
+            ++i;
+            while( i < bytes.size() )
+            {
+                dartSkipJsonWs( bytes, i );
+                if( i < bytes.size() && bytes[i] == ']' )
+                {
+                    ++i;
+                    break;
+                }
+                if( i >= bytes.size() || bytes[i] != '{' )
+                {
+                    return;
+                }
+                ++i;
+                std::string name, rootUri, packageUri, packageUriRoot;
+                while( i < bytes.size() )
+                {
+                    dartSkipJsonWs( bytes, i );
+                    if( i < bytes.size() && bytes[i] == '}' )
+                    {
+                        ++i;
+                        appendDartPackageRoot( packages, configDirRel, name, rootUri, packageUri, packageUriRoot );
+                        break;
+                    }
+                    std::string pkgKey, value;
+                    if( !dartParseJsonString( bytes, i, pkgKey ) )
+                    {
+                        return;
+                    }
+                    dartSkipJsonWs( bytes, i );
+                    if( i >= bytes.size() || bytes[i] != ':' )
+                    {
+                        return;
+                    }
+                    ++i;
+                    dartSkipJsonWs( bytes, i );
+                    if( i < bytes.size() && bytes[i] == '"' && dartParseJsonString( bytes, i, value ) )
+                    {
+                        if( pkgKey == "name" )               { name = std::move( value ); }
+                        else if( pkgKey == "rootUri" )       { rootUri = std::move( value ); }
+                        else if( pkgKey == "packageUri" )    { packageUri = std::move( value ); }
+                        else if( pkgKey == "packageUriRoot" ){ packageUriRoot = std::move( value ); }
+                    }
+                    else if( !dartSkipJsonValue( bytes, i ) )
+                    {
+                        return;
+                    }
+                    dartSkipJsonWs( bytes, i );
+                    if( i < bytes.size() && bytes[i] == ',' )
+                    {
+                        ++i;
+                        continue;
+                    }
+                    if( i < bytes.size() && bytes[i] == '}' )
+                    {
+                        ++i;
+                        appendDartPackageRoot( packages, configDirRel, name, rootUri, packageUri, packageUriRoot );
+                        break;
+                    }
+                    return;
+                }
+                dartSkipJsonWs( bytes, i );
+                if( i < bytes.size() && bytes[i] == ',' )
+                {
+                    ++i;
+                    continue;
+                }
+                if( i < bytes.size() && bytes[i] == ']' )
+                {
+                    ++i;
+                    break;
+                }
+                return;
+            }
+        }
+        dartSkipJsonWs( bytes, i );
+        if( i < bytes.size() && bytes[i] == ',' )
+        {
+            ++i;
+            continue;
+        }
+        if( i < bytes.size() && bytes[i] == '}' )
+        {
+            return;
+        }
+    }
+}
+
+inline std::string dartRelWithinRoot( const IngestResult& ing, std::uint32_t fileId )
+{
+    if( fileId >= ing.files.size() )
+    {
+        return {};
+    }
+    if( ing.fileRoot.empty() || ing.rootLabels.empty() )
+    {
+        return ing.files[ fileId ];
+    }
+    const std::uint32_t rootId = ing.fileRoot[ fileId ];
+    if( rootId >= ing.rootLabels.size() )
+    {
+        return {};
+    }
+    const std::string_view label = ing.rootLabels[ rootId ];
+    std::string_view       rel   = ing.files[ fileId ];
+    if( rel.size() >= label.size() && rel.compare( 0, label.size(), label ) == 0 )
+    {
+        rel.remove_prefix( label.size() );
+        if( !rel.empty() && rel.front() == '/' )
+        {
+            rel.remove_prefix( 1 );
+        }
+    }
+    return std::string( rel );
+}
+
+inline std::string parsePubspecName( const std::string& bytes )
+{
+    std::size_t i = 0;
+    while( i < bytes.size() )
+    {
+        std::size_t e = bytes.find( '\n', i );
+        if( e == std::string::npos )
+        {
+            e = bytes.size();
+        }
+        std::string_view line( bytes.data() + i, e - i );
+        i = e + 1;
+        std::string_view t = trimWs( line );
+        const bool       indented = !line.empty() && ( line.front() == ' ' || line.front() == '\t' );
+        if( t.empty() || t.front() == '#' || indented )
+        {
+            continue;
+        }
+        if( t.substr( 0, 5 ) != "name:" )
+        {
+            continue;
+        }
+        t = trimWs( t.substr( 5 ) );
+        if( t.empty() )
+        {
+            return {};
+        }
+        if( ( t.front() == '\'' || t.front() == '"' ) && t.size() >= 2 && t.back() == t.front() )
+        {
+            t = t.substr( 1, t.size() - 2 );
+        }
+        std::size_t end = 0;
+        while( end < t.size() && ( ( t[end] >= 'a' && t[end] <= 'z' ) || ( t[end] >= '0' && t[end] <= '9' ) || t[end] == '_' ) )
+        {
+            ++end;
+        }
+        if( end == 0 )
+        {
+            return {};
+        }
+        const std::string_view tail = trimWs( t.substr( end ) );
+        if( !tail.empty() && tail.front() != '#' )
+        {
+            return {};
+        }
+        return std::string( t.substr( 0, end ) );
+    }
+    return {};
+}
+
+inline std::vector<DartPackageRoot> buildDartPackageRoots( const IngestResult& ing )
+{
+    std::vector<DartPackageRoot> packages;
+    const std::uint32_t          F = std::uint32_t( ing.files.size() );
+    bool                         anyDartDirective = false;
+    for( const Include& inc : ing.includes )
+    {
+        if( inc.fileId < F && includeLangOf( ing.files[ inc.fileId ] ) == IncludeLang::Dart )
+        {
+            anyDartDirective = true;
+            break;
+        }
+    }
+    if( !anyDartDirective || ing.rootReals.empty() )
+    {
+        return packages;
+    }
+
+    const bool isWorkspace = !ing.fileRoot.empty() && !ing.rootLabels.empty();
+    for( std::uint32_t rootId = 0; rootId < ing.rootReals.size(); ++rootId )
+    {
+        const std::string config = readConfigBytes( ing.rootReals[ rootId ] + "/.dart_tool/package_config.json" );
+        if( config.empty() )
+        {
+            continue;
+        }
+        std::string configDirRel;
+        if( isWorkspace )
+        {
+            configDirRel = ing.rootLabels[ rootId ] + "/.dart_tool";
+        }
+        else
+        {
+            configDirRel = ".dart_tool";
+        }
+        parseDartPackageConfig( config, configDirRel, packages );
+    }
+    for( std::uint32_t f = 0; f < F; ++f )
+    {
+        const std::string_view path = ing.files[ f ];
+        if( path != "pubspec.yaml" && ( path.size() < 13 || path.substr( path.size() - 13 ) != "/pubspec.yaml" ) )
+        {
+            continue;
+        }
+        const std::uint32_t rootId = ( isWorkspace && f < ing.fileRoot.size() ) ? ing.fileRoot[ f ] : 0u;
+        if( rootId >= ing.rootReals.size() )
+        {
+            continue;
+        }
+        const std::string rel = dartRelWithinRoot( ing, f );
+        if( rel.empty() )
+        {
+            continue;
+        }
+        const std::string bytes = readConfigBytes( ing.rootReals[ rootId ] + "/" + rel );
+        const std::string name  = parsePubspecName( bytes );
+        if( name.empty() )
+        {
+            continue;
+        }
+        const std::string pkgDir = rel == "pubspec.yaml" ? std::string{} : rel.substr( 0, rel.size() - 13 );
+        std::string       libBase;
+        if( isWorkspace )
+        {
+            libBase = ing.rootLabels[ rootId ];
+            libBase.push_back( '/' );
+        }
+        if( !pkgDir.empty() )
+        {
+            libBase += pkgDir;
+            libBase.push_back( '/' );
+        }
+        libBase += "lib";
+        packages.push_back( { name, lexicalNormalize( libBase ) } );
+    }
+    std::sort( packages.begin(), packages.end(), []( const DartPackageRoot& a, const DartPackageRoot& b )
+               { return a.name != b.name ? a.name < b.name : a.libBase < b.libBase; } );
+    packages.erase( std::unique( packages.begin(), packages.end(), []( const DartPackageRoot& a, const DartPackageRoot& b )
+                                 { return a.name == b.name && a.libBase == b.libBase; } ),
+                    packages.end() );
+    return packages;
+}
+
+inline std::uint32_t resolveDartImport( std::string_view includerPath, std::string_view target,
+                                        const HashMap<std::string, std::uint32_t>& fileIndex,
+                                        const std::vector<DartPackageRoot>* packages,
+                                        const WsIncludeCtx* ws = nullptr, std::uint32_t includerFileId = kNoFile )
+{
+    if( target.empty() || target.front() == '/' || target.starts_with( "dart:" ) )
+    {
+        return kNoFile;
+    }
+    if( target.starts_with( "package:" ) )
+    {
+        if( packages == nullptr )
+        {
+            return kNoFile;
+        }
+        std::string_view spec = target.substr( 8 );
+        const std::size_t sl  = spec.find( '/' );
+        if( sl == std::string_view::npos || sl == 0 || sl + 1 >= spec.size() )
+        {
+            return kNoFile;
+        }
+        const std::string_view pkg  = spec.substr( 0, sl );
+        const std::string_view rest = spec.substr( sl + 1 );
+        UniqueProbe            probe;
+        for( const DartPackageRoot& root : *packages )
+        {
+            if( root.name != pkg )
+            {
+                continue;
+            }
+            const std::string base = lexicalNormalize( root.libBase );
+            const std::string cand = lexicalNormalize( base + "/" + std::string( rest ) );
+            if( cand.empty() || cand.size() <= base.size() || cand.compare( 0, base.size(), base ) != 0 || cand[ base.size() ] != '/' )
+            {
+                continue;
+            }
+            const auto it = fileIndex.find( cand );
+            probe.consider( it == fileIndex.end() ? kNoFile : it->second );
+        }
+        return probe.result();
+    }
+    return joinNormalizeLookup( includerDir( includerPath ), target, fileIndex, ws, includerFileId );
+}
+
 // ─── Ruby constant index (parser version 82) ─────────────────────────────────────────────────────────────
 // The Ruby twin of the Elixir defmodule index, for the spellings a Rails codebase actually depends through:
 // `class X < Base`, `include M` / `extend M` / `prepend M`, and the path-less `autoload :Name` — captured
@@ -1573,13 +2118,14 @@ inline std::pair<std::uint32_t, std::uint32_t> resolveRubyConstant( const RubyCo
 // fallback, NEVER a guess).
 //   * C-family quote `"x.h"` (isAngle==false): resolve relative-to-includer, collapse `.`/`..`, exact hit.
 //   * C-family angle `<x.h>` (isAngle==true): external without a build system ⇒ kNoFile (never matched).
-//   * Python / TS / Rust / Bash / Ruby / Lua / Elixir: their per-language Step-A above (unique-or-degrade).
+//   * Python / TS / Rust / Bash / Ruby / Lua / Elixir / Dart: their per-language Step-A above (unique-or-degrade).
 //   * Go / Swift / Other: DEFERRED / no path ⇒ kNoFile (contributes nothing — honest).
 inline std::uint32_t resolvePreciseInclude( std::string_view includerPath, std::string_view target, bool isAngle,
                                             const HashMap<std::string, std::uint32_t>& fileIndex,
                                             std::string_view crateRootDir = {}, bool hasCrateRoot = false,
                                             const WsIncludeCtx* ws = nullptr, std::uint32_t includerFileId = kNoFile,
-                                            const HashMap<std::string, std::uint32_t>* moduleIndex = nullptr )
+                                            const HashMap<std::string, std::uint32_t>* moduleIndex = nullptr,
+                                            const std::vector<DartPackageRoot>* dartPackages = nullptr )
 {
     if( target.empty() )
     {
@@ -1648,6 +2194,7 @@ inline std::uint32_t resolvePreciseInclude( std::string_view includerPath, std::
         case IncludeLang::Ruby:   return resolveRubyRequire( includerPath, target, fileIndex, ws, includerFileId );
         case IncludeLang::Lua:    return resolveLuaRequire(  includerPath, target, fileIndex, ws, includerFileId );
         case IncludeLang::Elixir: return resolveElixirModule( target, moduleIndex );
+        case IncludeLang::Dart:   return resolveDartImport( includerPath, target, fileIndex, dartPackages, ws, includerFileId );
         case IncludeLang::Other:  return kNoFile;        // Swift (no path in import) → deferred
     }
     return kNoFile;
@@ -1790,6 +2337,8 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
 
     const HashMap<std::string, std::uint32_t> elixirModules = buildElixirModuleIndex( ing );
     const HashMap<std::string, std::uint32_t>* moduleIndex = elixirModules.empty() ? nullptr : &elixirModules;
+    const std::vector<DartPackageRoot>         dartPackages = buildDartPackageRoots( ing );
+    const std::vector<DartPackageRoot>*        packageRoots = dartPackages.empty() ? nullptr : &dartPackages;
     const RubyConstantIndex                   rubyConsts    = buildRubyConstantIndex( ing );   // parser version 82; empty unless a symbolic directive exists
     HashMap<std::string, std::pair<std::uint32_t, std::uint32_t>> rubyMemo;
 
@@ -1841,7 +2390,7 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
             hasCrd = hasCrateByRoot[ r ] != 0;
         }
         const std::uint32_t to = resolvePreciseInclude( ing.files[ inc.fileId ], inc.target, inc.isAngle,
-                                                         fileIndex, crd, hasCrd, ws, inc.fileId, moduleIndex );
+                                                         fileIndex, crd, hasCrd, ws, inc.fileId, moduleIndex, packageRoots );
         if( to == kNoFile || to == inc.fileId )
         {
             continue; // unresolved or self-include → contributes nothing

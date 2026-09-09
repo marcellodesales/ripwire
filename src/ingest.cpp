@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>             // std::getenv — RIPWIRE_CACHE_STATS drift observable
 #include <cstring>
+#include <limits.h>            // PATH_MAX — single-root realpath for config-backed import resolution
 #include <sys/stat.h>          // A4-P7: stat() for the (size,mtime) warm-run shortcut
 #include <fcntl.h>             // v15: ::open( O_RDONLY ) — the cache blob's own read descriptor (ingest_cache.h)
 #include <unistd.h>            // getpid — unique per-process cache temp name; ::pread — the offset-table record reads
@@ -156,6 +157,7 @@ extern "C"
     const TSLanguage* tree_sitter_php( void );
     const TSLanguage* tree_sitter_lua( void );
     const TSLanguage* tree_sitter_elixir( void );
+    const TSLanguage* tree_sitter_dart( void );
 }
 
 // ── the ingest-family sections (2026-08-29 split; ingest() phases followed 2026-08-30) ──────────────
@@ -180,6 +182,7 @@ extern "C"
 #include "ingest_names.h"
 #include "ingest_binds.h"
 #include "ingest_elixir.h"
+#include "ingest_dart.h"
 #include "ingest_sidecap.h"
 #include "ingest_prewarm.h"
 #include "ingest_parsepool.h"
@@ -225,6 +228,10 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
     {
         DEGRADED_PATH_ALERT( "ingest: null root directory — empty result" );
         return result;
+    }
+    {
+        char resolved[ PATH_MAX ];
+        result.rootReals.push_back( ::realpath( rootDir, resolved ) != nullptr ? std::string{ resolved } : std::string{ rootDir } );
     }
 
     // a zero/absurd ceiling would silently crawl nothing — clamp to the default (degrade, never trap).

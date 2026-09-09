@@ -242,6 +242,7 @@ set(_ripwire_query_names
   c
   cpp
   csharp
+  dart
   elixir
   go
   java
@@ -435,6 +436,12 @@ add_ts_grammar(markdown https://github.com/tree-sitter-grammars/tree-sitter-mark
 # LANGUAGE_VERSION]=[13,15] for core v0.26.9. Ships a scanner.c (raw/interpolated string literals)
 # which the macro picks up.
 add_ts_grammar(csharp https://github.com/tree-sitter/tree-sitter-c-sharp.git     cac6d5fb595f5811a076336682d5d595ac1c9e85)  # v0.23.5
+# Dart (.dart): nielsenko/tree-sitter-dart. Evaluated against pinned real corpora before vendoring:
+# dart-lang/pub @ 3c752254847aa09b28df821f3074283cc52a2ebd and flutter/packages @
+# 956ba9e272db9b04b90b3f27ba189e8fb4627975 both parsed 100% (537/537, 3894/3894), and this grammar
+# outperformed the alternate UserNobody14/tree-sitter-dart on the larger sdk stress corpus too. Ships a
+# scanner.c for template strings, block comments and metadata parens.
+add_ts_grammar(dart   https://github.com/nielsenko/tree-sitter-dart.git          b57d734c84f510bbd524097902cab671e4dbfca9)  # main @ 2026-09-09, MIT
 # C (.c): the official tree-sitter org grammar (structs/unions/enums/typedefs/function definitions +
 # object-like & function-like #define macros + calls). v0.24.1 -> ABI 15, in [MIN_COMPATIBLE,
 # LANGUAGE_VERSION]=[13,15] for core v0.26.9 (same ABI as csharp above). No external scanner (pure
@@ -522,6 +529,7 @@ set(RIPWIRE_TS_OBJECTS
   $<TARGET_OBJECTS:ts_toml>
   $<TARGET_OBJECTS:ts_yaml>
   $<TARGET_OBJECTS:ts_csharp>
+  $<TARGET_OBJECTS:ts_dart>
   $<TARGET_OBJECTS:ts_c>
   $<TARGET_OBJECTS:ts_cuda>
   $<TARGET_OBJECTS:ts_markdown>
@@ -714,7 +722,7 @@ endif()
 set(RIPWIRE_GRAMMAR_TARGETS
   ts_cpp ts_python ts_go ts_rust ts_tsts ts_tstsx ts_swift ts_objc
   ts_javascript ts_bash ts_java ts_ruby ts_json ts_toml ts_yaml ts_csharp ts_c ts_cuda ts_markdown
-  ts_php ts_lua ts_elixir)
+  ts_php ts_lua ts_elixir ts_dart)
 set(RIPWIRE_RUNTIME_COMPILE_TARGETS ripwire_probe ripwire tree-sitter ${RIPWIRE_GRAMMAR_TARGETS})
 set(RIPWIRE_RUNTIME_LINK_TARGETS ripwire_probe ripwire)
 # The C++ subset of the compile list — the only targets that include a C++ standard library at all, and so
@@ -950,6 +958,7 @@ if(RIPWIRE_FUZZ)
   add_ripwire_fuzzer(toml       tree_sitter_toml       toml)
   add_ripwire_fuzzer(yaml       tree_sitter_yaml       yaml)
   add_ripwire_fuzzer(csharp     tree_sitter_c_sharp    csharp)
+  add_ripwire_fuzzer(dart       tree_sitter_dart       dart)
   add_ripwire_fuzzer(c          tree_sitter_c          c)
   add_ripwire_fuzzer(php        tree_sitter_php        php)
   add_ripwire_fuzzer(elixir     tree_sitter_elixir     elixir)

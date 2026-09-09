@@ -1,0 +1,20 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "sample_pkg",
+      "rootUri": "../",
+      "packageUri": "lib/"
+    },
+    {
+      "name": "support_pkg",
+      "rootUri": "../packages/support/",
+      "packageUri": "lib/"
+    },
+    {
+      "name": "config_only",
+      "rootUri": "../packages/config_only/",
+      "packageUri": "lib/"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+class FuzzProbe {
+  const FuzzProbe.named();
+  static int get value => 1;
+  int run() => helper<int>(value);
+}
+
+T helper<T>(T value) => value;

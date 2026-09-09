@@ -812,6 +812,8 @@ inline std::string preprocImportTarget( TSNode n, std::string_view src, bool& is
 // Elixir call's `arguments` child is one shape and it already has one reader, and a second private copy
 // here is exactly the duplication --quality-delta flags. Same TU, same anonymous namespace.
 TSNode elixirArguments( TSNode node ) noexcept;
+std::string dartDirectiveTarget( TSNode node, std::string_view src );
+std::vector<std::string> dartConditionalTargets( TSNode node, std::string_view src );
 
 // The literal text a shell word/string argument names, or empty when the argument is not a literal at
 // all. `word` is an unquoted argument (`source ./lib.sh`), `string`/`raw_string` a quoted one; a
@@ -1380,6 +1382,11 @@ inline constexpr std::array<std::string_view, 6> kElixirImportContainers = {
     "call", "do_block", "stab_clause", "body", "arguments", "keywords"
 };
 
+// DART. `import`/`export` directives sit under an `import_or_export` wrapper whose child names the real
+// directive (`library_import` / `library_export`), so the walk needs exactly that one container to stand on
+// the URI-bearing node. `part` and `part of` are root children directly and need no container entry.
+inline constexpr std::array<std::string_view, 1> kDartImportContainers = { "import_or_export" };
+
 // The FUNCTION-BODY node kinds — read off real parses, not predicted. Entering ANY one of these means
 // everything inside it is written INSIDE a function's body, so a require()/import() found there only runs
 // when and if that function runs: a real dependency (kParserVer 72's whole point — the importer tier must
@@ -1470,7 +1477,7 @@ inline constexpr std::array<std::string_view, 34> kJsImportContainers = {
 // language has is DATA, and a language absent from the table simply has none.
 struct LangImportContainers { Lang lang; std::span<const std::string_view> nodes; };
 
-inline constexpr std::array<LangImportContainers, 8> kImportContainersByLang = { {
+inline constexpr std::array<LangImportContainers, 9> kImportContainersByLang = { {
     { Lang::Python,     kPythonImportContainers },
     { Lang::Rust,       kRustImportContainers   },
     { Lang::CSharp,     kCsharpImportContainers },
@@ -1478,7 +1485,8 @@ inline constexpr std::array<LangImportContainers, 8> kImportContainersByLang = {
     { Lang::JavaScript, kJsImportContainers     },
     { Lang::Bash,       kBashImportContainers   },
     { Lang::Lua,        kLuaImportContainers    },
-    { Lang::Elixir,     kElixirImportContainers }
+    { Lang::Elixir,     kElixirImportContainers },
+    { Lang::Dart,       kDartImportContainers   }
 } };
 
 inline bool isImportContainer( Lang lang, const char* type ) noexcept
@@ -1619,6 +1627,12 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
         // call_expression branch above. The `MyApp.{A, B}` group form returns empty here and is emitted
         // by captureIncludes through elixirAliasGroup, one Include per member.
         target = elixirDirectiveTarget( n, src );
+    }
+    else if( lang == Lang::Dart
+             && ( std::strcmp( t, "library_import" ) == 0 || std::strcmp( t, "library_export" ) == 0
+                  || std::strcmp( t, "part_directive" ) == 0 || std::strcmp( t, "part_of_directive" ) == 0 ) )
+    {
+        target = dartDirectiveTarget( n, src );
     }
     else if( std::strcmp( t, "use_declaration" ) == 0 )                  // Rust `use crate::a::b;`
     {
@@ -1945,6 +1959,20 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
             for( std::string& member : elixirAliasGroup( n, src ) )
             {
                 emitDirective( std::move( member ), false );
+            }
+        }
+        if( lang == Lang::Dart && ( std::strcmp( t, "library_import" ) == 0 || std::strcmp( t, "library_export" ) == 0 ) )
+        {
+            // Dart conditional imports/exports (`import "stub.dart" if (...) "io.dart";`) name several
+            // possible files. With no build environment in evidence the honest posture matches preprocessor
+            // branches: union over the stated URIs, each shown as its own Include row, and precise resolution
+            // still applies unique-or-degrade per target.
+            for( std::string& member : dartConditionalTargets( n, src ) )
+            {
+                if( member != target )
+                {
+                    emitDirective( std::move( member ), false );
+                }
             }
         }
     }
