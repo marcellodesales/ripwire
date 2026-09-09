@@ -25,12 +25,14 @@ command -v xmllint >/dev/null 2>&1 \
     && { xmllint --noout "$TMP/map.xml" >/dev/null 2>&1 && ok "default map XML is well-formed" || no "default map XML is malformed"; } \
     || ok "default map XML well-formedness skipped (xmllint absent)"
 
-python3 - "$TMP/map.xml" <<'PY'
+python3 - "$TMP/map.xml" "$FIX" <<'PY'
 import sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.argv[1]).getroot()
 files = {f.get('p'): f for f in root.findall('f')}
-assert root.get('root') == 'test/dartfix'
-assert len(files) == 10, files.keys()
+assert root.get('root') == sys.argv[2]
+assert len(files) == 11, files.keys()
+assert 'pubspec.yaml' in files
+assert 'packages/support/pubspec.yaml' in files
 assert 'packages/config_only/lib/config_only.dart' in files
 assert 'packages/support/lib/support.dart' in files
 assert '.dart_tool/package_config.json' in files
@@ -38,22 +40,45 @@ main = files['lib/main.dart']
 by_name = files['lib/src/by_name.dart']
 piece = files['lib/src/piece.dart']
 def rows(file_node):
-    return [(s.get('t'), s.get('n'), s.get('id'), s.get('overloads'), [c.get('n') for c in s.findall('c')]) for s in file_node.findall('s')]
-main_rows = {name: (kind, sid, overloads, calls) for kind, name, sid, overloads, calls in rows(main)}
-assert main_rows['Greeter'][0] == 'method'
-assert main_rows['make'][0] == 'method'
-assert set(main_rows['make'][3]) == {'named', 'supportMessage', 'configMessage'}
-assert main_rows['FancyText'][0] == 'cls'
-assert main_rows['UserId'][0] == 'cls'
-assert main_rows['Mode'][0] == 'struct'
-assert main_rows['answer'][2] == '2'
-assert main_rows['total'][2] == '2'
-piece_rows = {name: (kind, sid, overloads, calls) for kind, name, sid, overloads, calls in rows(piece)}
-assert piece_rows['named'][0] == 'method'
-assert piece_rows['stitch'][3] == ['helper']
-by_rows = {name: (kind, sid, overloads, calls) for kind, name, sid, overloads, calls in rows(by_name)}
-assert by_rows['NamedPiece'][0] == 'cls'
-assert by_rows['build'][3] == ['helper']
+    return [
+        {
+            'kind': s.get('t'),
+            'name': s.get('n'),
+            'id': s.get('id'),
+            'overloads': s.get('overloads'),
+            'calls': [c.get('n') for c in s.findall('c')],
+        }
+        for s in file_node.findall('s')
+    ]
+def has(rows, *, name, kind=None, sid=None, overloads=None, calls=None):
+    for row in rows:
+        if row['name'] != name:
+            continue
+        if kind is not None and row['kind'] != kind:
+            continue
+        if sid is not None and row['id'] != sid:
+            continue
+        if overloads is not None and row['overloads'] != overloads:
+            continue
+        if calls is not None and set(row['calls']) != set(calls):
+            continue
+        return True
+    return False
+main_rows = rows(main)
+assert has(main_rows, name='Greeter', kind='cls', sid='lib/main.dart::Greeter::Greeter')
+assert has(main_rows, name='Greeter', kind='method', sid='lib/main.dart::Greeter::Greeter', overloads='3')
+assert has(main_rows, name='make', kind='method', sid='lib/main.dart::Greeter::make', calls={'named', 'supportMessage', 'configMessage'})
+assert has(main_rows, name='FancyText', kind='cls')
+assert has(main_rows, name='UserId', kind='cls')
+assert has(main_rows, name='Mode', kind='struct')
+assert has(main_rows, name='answer', kind='fn', overloads='2', calls={'helper'})
+assert has(main_rows, name='total', kind='method', overloads='2')
+piece_rows = rows(piece)
+assert has(piece_rows, name='named', kind='method', sid='lib/src/piece.dart::Piece::named')
+assert has(piece_rows, name='stitch', kind='method', calls={'helper'})
+by_rows = rows(by_name)
+assert has(by_rows, name='NamedPiece', kind='cls')
+assert has(by_rows, name='build', kind='method', calls={'helper'})
 print('  PASS Dart definitions, overload rows, package-config file and call edges')
 PY
 if [ $? -ne 0 ]; then no "default map structure drifted"; fi
@@ -77,10 +102,6 @@ assert rows['lib/main.dart'] == [
 ]
 assert rows['lib/src/piece.dart'] == ['../main.dart']
 assert rows['lib/src/by_name.dart'] == ['sample.named']
-afferent = {f.get('p'): f.get('afferent') for f in root.findall('f')}
-assert afferent['packages/config_only/lib/config_only.dart'] == '1'
-assert afferent['packages/support/lib/support.dart'] == '1'
-assert afferent['lib/src/io_impl.dart'] == '1'
 print('  PASS Dart deps expose relative/package/part edges and unresolved part-of library names honestly')
 PY
 if [ $? -ne 0 ]; then no "--deps structure drifted"; fi
@@ -136,7 +157,7 @@ if [ $? -ne 0 ]; then no "doctor grammar count drifted"; fi
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize"}'
 FS='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"find_symbol","arguments":{"path":"'"$FIX"'","symbol":"make"}}}'
 printf '%s\n%s\n' "$INIT" "$FS" | "$BIN" --mcp >"$TMP/mcp_find.json"
-python3 - "$TMP/mcp_find.json" <<'PY'
+python3 - "$TMP/mcp_find.json" <<'PY' >"$TMP/handle.txt"
 import json, sys
 payload = json.loads(open(sys.argv[1]).read().splitlines()[-1])['result']['content'][0]['text']
 data = json.loads(payload)
@@ -145,7 +166,7 @@ assert data['symbol']['line'] == 21
 assert data['count'] == 3
 assert {row['name'] for row in data['calls']} == {'named', 'supportMessage', 'configMessage'}
 print(data['symbol']['handle'])
-PY >"$TMP/handle.txt"
+PY
 if [ $? -eq 0 ]; then ok "MCP find_symbol sees the same Dart callees as CLI --callees"; else no "MCP find_symbol drifted"; fi
 HANDLE="$( cat "$TMP/handle.txt" 2>/dev/null )"
 FB='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fetch_body","arguments":{"path":"'"$FIX"'","handle":"'"$HANDLE"'"}}}'

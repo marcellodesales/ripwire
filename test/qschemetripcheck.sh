@@ -34,6 +34,12 @@ SRC="$ROOT/src/quality.h"
 ING="$ROOT/src/ingest_cache.h"   # extraction-identity constants moved here (2026-08-29 ingest.cpp section split); the hashed CONCAT label keeps its historical spelling so the pin holds
 PIN="$ROOT/test/qschemetrip.hash"
 # RE-PIN LOG (the pin is a bare hash, so its justification has to live here).
+# 2026-09-09, DART (test/dartcheck.sh): kParserVer 84 -> 85 and kIngestParserVerMirror -> 85 for the
+#   vendored nielsenko/tree-sitter-dart grammar, Dart definition/call/doc extraction, and Dart
+#   import/export/part facts resolved through the corpus's own pubspec/package_config metadata.
+#   Record shapes and Snapshot-side semantics are unchanged, so kCacheVersion stays 18 and
+#   kQSnapCacheScheme stays 8. Because Lang is serialized and append-only, a concurrent Kotlin branch
+#   must rebase and append after Dart rather than keeping any provisional fork-local enum slot/value.
 # 2026-09-07, ES DEFAULT IMPORTS (test/lib/jsdefaultimport.sh): kParserVer and its quality mirror
 #   move 81 -> 82 for default import/export facts. Record layouts and Snapshot-side functions are
 #   unchanged: kCacheVersion stays 16 and kQSnapCacheScheme stays 8.

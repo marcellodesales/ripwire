@@ -203,7 +203,19 @@ constexpr std::uint32_t kCacheVersion = 18;           // 18: #62 — call refs i
                                                       //    (Py `pkg.mod`, TS `./x`, Rust `crate::a::b`/`mod:x`) —
                                                       //    a target FORMAT change → old caches must be rejected.
                                                       // 4: Include gained a `bool isAngle` (quote/angle) field
-constexpr std::uint32_t kParserVer    = 84;           // bump on any grammar/.scm/extraction change
+constexpr std::uint32_t kParserVer    = 85;           // bump on any grammar/.scm/extraction change
+                                                      // 85 = 2026-09-09 (test/dartcheck.sh): Dart joins the
+                                                      //    indexed-language set with the vendored
+                                                      //    nielsenko/tree-sitter-dart grammar
+                                                      //    (b57d734c84f510bbd524097902cab671e4dbfca9),
+                                                      //    definition/call captures, doc-comment sidecar,
+                                                      //    and import/export/part edges resolved
+                                                      //    conservatively through the corpus's own
+                                                      //    pubspec.yaml / .dart_tool/package_config.json
+                                                      //    metadata. Flutter/runtime semantics and
+                                                      //    `dart:` SDK/library-name `part of` targets
+                                                      //    remain disclosed floors. Record shape
+                                                      //    unchanged (format 18).
                                                       // 84 = 2026-09-08 (test/rubyrecvcheck.sh): a Ruby constant
                                                       //    RECEIVER (`User.find`, `App::Mailer.deliver`) is a
                                                       //    symbolic directive, one per (file, innermost open,

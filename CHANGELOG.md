@@ -15,6 +15,42 @@ not published here — see `docs/EVALS.md` for the instruments behind the headli
 
 ## [Unreleased]
 
+### Added — Dart, as a first-class indexed language (parser version 85)
+
+Dart joins the vendored grammar set in a dedicated language-only round: `.dart` files now index classes,
+mixins, enums, extensions, extension types, typedefs, functions, methods, getters/setters and constructors
+(including named/factory forms), with byte/line spans, canonical ids and doc-comment sidecar capture.
+Relative imports, `package:` imports, `export`, `part`, `part of`, and conditional Dart directives surface in
+the dependency view, and `package:` targets resolve **only** through the corpus's own `pubspec.yaml` and
+`.dart_tool/package_config.json` metadata — never by a guessed package-name→path convention. CLI and MCP
+lookup/body/navigation surfaces now accept and label Dart, and the HTML/report tables carry the new language.
+
+**Grammar selection was measured before vendoring.** Two MIT grammars were evaluated on pinned corpora:
+
+| grammar | pin | corpus | files | parsed cleanly | rate |
+| --- | --- | --- | ---: | ---: | ---: |
+| `nielsenko/tree-sitter-dart` | `b57d734c84f510bbd524097902cab671e4dbfca9` | `dart-lang/pub` @ `3c752254847aa09b28df821f3074283cc52a2ebd` | 537 | 537 | 100.0% |
+| `nielsenko/tree-sitter-dart` | `b57d734c84f510bbd524097902cab671e4dbfca9` | `flutter/packages` @ `956ba9e272db9b04b90b3f27ba189e8fb4627975` | 3894 | 3894 | 100.0% |
+| `nielsenko/tree-sitter-dart` | `b57d734c84f510bbd524097902cab671e4dbfca9` | `dart-lang/sdk` @ `8915af6c20edfd9d3a6e5f0f3b6155259d361bb4` | 25535 | 24220 | 94.85% |
+| `UserNobody14/tree-sitter-dart` | `be07cf7118d3dba06236a3f19541685a68209934` | `dart-lang/pub` @ `3c752254847aa09b28df821f3074283cc52a2ebd` | 537 | 537 | 100.0% |
+| `UserNobody14/tree-sitter-dart` | `be07cf7118d3dba06236a3f19541685a68209934` | `flutter/packages` @ `956ba9e272db9b04b90b3f27ba189e8fb4627975` | 3894 | 3894 | 100.0% |
+| `UserNobody14/tree-sitter-dart` | `be07cf7118d3dba06236a3f19541685a68209934` | `dart-lang/sdk` @ `8915af6c20edfd9d3a6e5f0f3b6155259d361bb4` | 25535 | 24012 | 94.03% |
+
+The selected grammar was therefore `nielsenko/tree-sitter-dart`, vendored byte-for-byte with its MIT
+license. The `sdk/` run is a stress corpus rather than a release-quality application corpus — it contains
+parser tests and deliberately adversarial syntax — so its sub-100% rate is disclosed as a limit, not hidden.
+
+**Floors stated by the product, not comments:** `dart:` SDK imports remain shown but unresolved; `part of
+some.library.name` is preserved as a target string unless the corpus supplies unique file evidence for that
+library name; conditional imports/exports surface every stated URI rather than guessing the active runtime
+branch; Flutter widget/runtime/platform-channel semantics are deliberately out of scope for this PR and left
+for the later framework round.
+
+Parser version 84 → 85 with the quality mirror in the same commit. Because `Lang` is serialized and append-only,
+the concurrent Kotlin branch must rebase onto this tip and append after Dart rather than reusing the same enum
+slot or parser-version value. No sibling Kotlin PR was discoverable from this checkout when the Dart round landed,
+so the merge-order warning lives here and in the code comments instead of pointing at a branch that may not exist.
+
 ### Added — a Ruby constant receiver is a dependency (parser version 83)
 
 Round two of the Ruby constant work. Parser version 82 gave the declarative spellings — `class X < Base`,

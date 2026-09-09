@@ -44,7 +44,7 @@ claim cannot quietly drift. The row-by-row ledger is
 </details>
 
 **Languages:** Rust · C++ · Objective-C/C++ · C · Metal · CUDA · Python · Go · Swift · TypeScript ·
-JavaScript · Java · Ruby · PHP · Lua · Elixir · Bash · C# · JSON · TOML · YAML · Markdown — see
+JavaScript · Java · Ruby · PHP · Lua · Elixir · Bash · C# · Dart · JSON · TOML · YAML · Markdown — see
 [language support and limits](#languages).
 
 ### No API key. No embeddings. No index server. No daemon.
@@ -1798,9 +1798,9 @@ wrong, and it has. These are the results that say so, all in-tree, all published
 ### In the tests
 
 <details>
-<summary><b>562 gate scripts</b>, five contracts no unit test can hold, and the house rule: write the gate before the code it measures</summary>
+<summary><b>563 gate scripts</b>, five contracts no unit test can hold, and the house rule: write the gate before the code it measures</summary>
 
-`test/regression.sh` names **562 gate scripts** and is the authoritative list;
+`test/regression.sh` names **563 gate scripts** and is the authoritative list;
 `python3 test/pargates.py . ./build/ripwire -j 6` runs the same set in parallel. On top of them sit the
 contracts that do not fit a unit test: two runs byte-identical, warm output identical to cold, output
 that pipes clean through `xmllint --noout`, a sanitizer build with `-fno-sanitize-recover=all`, and a
@@ -1988,7 +1988,7 @@ are one contributor's corpus away from being measurably better, and we cannot se
 ## Languages
 
 <details>
-<summary><b>22</b> vendored grammars, and what each parser does and does not see — CUDA launch edges, PHP dynamic dispatch, Lua metatables</summary>
+<summary><b>23</b> vendored grammars, and what each parser does and does not see — CUDA launch edges, Dart `part of` floors, PHP dynamic dispatch, Lua metatables</summary>
 
 C, C++, Objective-C / Objective-C++, **Metal** (Metal Shading Language, `.metal` — indexed with the
 C++ grammar, since MSL is a C++14 dialect, so a dual-compile header's symbols resolve from both the
@@ -2017,7 +2017,14 @@ Want another language? The pipeline is language-agnostic past the parse: a new l
 vendored tree-sitter grammar, its query file, and entries in the declarative
 `extension → { grammar, queries }` table (the "declarative constexpr tables" rule in
 [`CONTRIBUTING.md`](CONTRIBUTING.md)). Some grammars also need capture filters: Elixir, for example,
-represents definitions as ordinary calls. Open an issue naming the grammar and the repo you'd run it on.
+represents definitions as ordinary calls. **Dart** (`.dart` — classes, mixins, extensions, extension
+types, enums, typedefs, fields/getters/setters, constructors including named/factory forms, and
+function/method doc comments; relative, `package:`, `import`, `export`, `part` and conditional-directive
+targets are captured, with `package:` narrowed only through the corpus's own `pubspec.yaml` and
+`.dart_tool/package_config.json` metadata). `dart:` SDK imports and `part of some.library.name` remain
+shown but unresolved unless the corpus provides unique file evidence, and Flutter widget/runtime
+relationships are out of scope for this language-only round. Open an issue naming the grammar and the repo
+you'd run it on.
 
 Notebooks, HTML and CSV are indexed as *documents* for `--recall` and the doc↔code edges behind
 `--mentions`; Office and PDF join them through an optional bridge. Markdown graduated from that
