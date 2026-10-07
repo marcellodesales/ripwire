@@ -62,6 +62,7 @@ is why the sizes are what they are — `parser.c` is one big static table, not h
 | `deps/ruby` | tree-sitter-ruby (v0.23.1) | Rob Rix | MIT | `71bd32fb7607035768799732addba884a37a6210` | https://github.com/tree-sitter/tree-sitter-ruby | 15 MB |
 | `deps/bash` | tree-sitter-bash (v0.23.3) | Max Brunsfeld | MIT | `487734f87fd87118028a65a4599352fa99c9cde8` | https://github.com/tree-sitter/tree-sitter-bash | 10 MB |
 | `deps/csharp` | tree-sitter-c-sharp (v0.23.5) | Max Brunsfeld, Damien Guard, Amaan Qureshi and contributors | MIT | `cac6d5fb595f5811a076336682d5d595ac1c9e85` | https://github.com/tree-sitter/tree-sitter-c-sharp | 28 MB |
+| `deps/dart` | tree-sitter-dart | Nikolay Remizov and contributors | MIT | `b57d734c84f510bbd524097902cab671e4dbfca9` | https://github.com/nielsenko/tree-sitter-dart | 2.6 MB |
 | `deps/json` | tree-sitter-json (v0.24.8) | Max Brunsfeld | MIT | `ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24` | https://github.com/tree-sitter/tree-sitter-json | 56 KB |
 | `deps/toml` | tree-sitter-toml (v0.7.0) | Ika (ikatyang) | MIT | `64b56832c2cffe41758f28e05c756a3a98d16f41` | https://github.com/tree-sitter-grammars/tree-sitter-toml | 164 KB |
 | `deps/yaml` | tree-sitter-yaml (v0.7.2) | Ika (ikatyang) | MIT | `7708026449bed86239b1cd5bce6e3c34dbca6415` | https://github.com/tree-sitter-grammars/tree-sitter-yaml | 1.3 MB |
