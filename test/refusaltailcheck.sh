@@ -29,10 +29,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -102,7 +103,7 @@ OUT="$( "$BIN" "$R" --edit-plan="$R/plan.json" --dry-run --no-cache 2>&1 1>/dev/
 printf '%s' "$OUT" | grep -qF 'replace_symbol_body' \
   && ok "C the unknown-op refusal names the supported ops" \
   || no "C the unknown-op refusal names no supported set: $OUT"
-HELPF="$TMP/help.txt"; "$BIN" --help >"$HELPF" 2>/dev/null
+HELPF="$TMP/help.txt"; "$BIN" --help=all >"$HELPF" 2>/dev/null
 grep -qF 'replace_symbol_body' "$HELPF" \
   && ok "C --help lists the edit-plan op vocabulary" \
   || no "C --help still documents {op,target,file?,payload} without naming the op values"

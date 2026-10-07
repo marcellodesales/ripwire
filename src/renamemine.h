@@ -1,4 +1,8 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // renamemine.h — §9.5 CALIBRATION: judge the naming-* lint rules against the repo's OWN rename history.
 //
@@ -18,7 +22,7 @@
 // Developers rename for many reasons that have nothing to do with name QUALITY: a project rebrand, a module
 // move, an API version bump, a type change, a merge resolution, an extract-function that happens to reuse a
 // nearby spelling. Measured on ripwire's own history the single largest rename family is a whole-project
-// rebrand (ctxpack → ripwire, 1686 supporting lines), which carries no information about naming quality at
+// rebrand (a private pre-release name → ripwire, 1686 supporting lines), which carries no information about naming quality at
 // all. So:
 //   * the numbers below are a PRECISION PROXY, never precision;
 //   * every emitted report states the sample size, and the gate SKIPS rather than passes when the sample is
@@ -78,10 +82,12 @@
 #include "quality.h"            // gitRepoHasHistory
 #include "gitstamp.h"           // atAttr — at="<sha>[+dirty]" root anchor (M10: --naming-calibration read git and carried no anchor)
 #include "serialize.h"          // escapeXml
-#include "infra/Diagnostics.h"  // VERIFY / DEGRADED_PATH_ALERT
+#include "infra/Diagnostics.h"  // ASSUME / DISCLOSE
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>       // std::declval — the rule-mask width static_assert reads firedRuleMask's return type
+#include <limits>       // std::numeric_limits — the mask-width static_assert: an index shifted into a mask must fit it
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -120,6 +126,24 @@ struct RenameHarvest
     bool                         ok         = false;
     bool                         truncated  = false;  // a walk bound was hit ⇒ candidates= is a FLOOR
     bool                         nonGitRoot = false;
+    // The DISCLOSE sink for the walk's degrades: no answer reads probed="0", a partial one truncated="1".
+    enum class DisclosureWhy : std::uint8_t
+    {
+        WalkNotStarted,
+        NoCommits,
+        WalkBounded,
+        WalkExitedNonZero,
+    };
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        switch( why )
+        {
+            case DisclosureWhy::WalkNotStarted:
+            case DisclosureWhy::NoCommits:         ok = false; break;
+            case DisclosureWhy::WalkBounded:
+            case DisclosureWhy::WalkExitedNonZero: truncated = true; break;
+        }
+    }
 };
 
 // ── line tokenizing: identifiers, and the text between them ──────────────────────────────────────────────
@@ -294,7 +318,7 @@ inline RenameHarvest mineRenamePairs( const std::string& root )
         return harvest;
     }
 
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                           + " log --no-merges --no-color --no-ext-diff --no-textconv --no-renames"
                             " --format='%x01%H' -p -U0 2>/dev/null";
 
@@ -346,33 +370,32 @@ inline RenameHarvest mineRenamePairs( const std::string& root )
 
     if( !walk.started )
     {
-        DEGRADED_PATH_ALERT( "renamemine: git log failed to start — the calibration corpus is empty, which the report states rather than scoring zero" );
+        DISCLOSE( harvest, RenameHarvest::DisclosureWhy::WalkNotStarted,
+                  "renamemine: git log failed to start — the calibration corpus is empty, which the report states rather than scoring zero" );
         return harvest;
     }
     if( walk.truncated )
     {
-        harvest.truncated = true;
-        DEGRADED_PATH_ALERT( "renamemine: the history walk hit its bound — candidates= is a floor, not a total" );
+        DISCLOSE( harvest, RenameHarvest::DisclosureWhy::WalkBounded, "renamemine: the history walk hit its bound — candidates= is a floor, not a total" );
     }
     // The dangerous failure, guarded the way gitoracle guards it: the caller has established that HEAD
     // resolves, so ZERO commit headers means git failed (stderr is swallowed, popen still succeeds). An empty
     // candidate set with ok=true reads as "this repo has no renames", which is a claim, not an observation.
     if( harvest.commitsWalked == 0 )
     {
-        DEGRADED_PATH_ALERT( "renamemine: git log produced no commits despite a resolvable HEAD — reporting no answer rather than 'no renames'" );
+        DISCLOSE( harvest, RenameHarvest::DisclosureWhy::NoCommits, "renamemine: git log produced no commits despite a resolvable HEAD — reporting no answer rather than 'no renames'" );
         return harvest;
     }
     if( walk.status != 0 )
     {
-        harvest.truncated = true;
-        DEGRADED_PATH_ALERT( "renamemine: git log exited non-zero mid-walk — the partial answer is kept and marked truncated" );
+        DISCLOSE( harvest, RenameHarvest::DisclosureWhy::WalkExitedNonZero, "renamemine: git log exited non-zero mid-walk — the partial answer is kept and marked truncated" );
     }
 
     harvest.candidates.reserve( votes.size() );
     for( const auto& vote : votes )
     {
         const std::size_t sep = vote.first.find( '\x01' );
-        VERIFY( sep != std::string::npos );
+        ASSUME( sep != std::string::npos );
         harvest.candidates.push_back( { vote.first.substr( 0, sep ), vote.first.substr( sep + 1 ), vote.second } );
     }
     // The hash map's iteration order is not a contract; the emitted order is. Sort before anyone can see it.
@@ -486,6 +509,8 @@ inline std::uint32_t firedRuleMask( const Symbol& s, std::string_view sig )
     }
     return mask;
 }
+static_assert( kRuleCount <= std::numeric_limits<decltype( firedRuleMask( std::declval<const Symbol&>(), std::string_view() ) )>::digits,
+               "firedRuleMask holds one bit per naming rule — widen it before kRuleCount outgrows it" );
 
 // Read one file whole, memoized. A signature is a byte range in a file, and an unreadable file must degrade
 // to "no signature" — both role-vs-return-type rules then stay silent — rather than to a guess. The read
@@ -502,10 +527,7 @@ struct FileBytesCache
         if( !loaded[fileId] )
         {
             loaded[fileId] = 1;
-            if( !docparse::detail::readWholeFile( diskPath( ing, fileId ), bytes[fileId] ) )
-            {
-                bytes[fileId].clear();
-            }
+            bytes[fileId] = docparse::detail::readWholeFile( diskPath( ing, fileId ) ).value_or( std::string() );   // unreadable ⇒ empty
         }
         return bytes[fileId];
     }
@@ -614,7 +636,7 @@ inline CalibrationReport scoreRenamePairs( const IngestResult& ing, RenameHarves
         }
         const RenameCandidate& candidate = harvest.candidates[pairIndex];
         const Symbol*          newSymbol = eligibleNamed( candidate.newName );
-        VERIFY( newSymbol != nullptr );
+        ASSUME( newSymbol != nullptr );
 
         Symbol oldSymbol = *newSymbol;
         oldSymbol.name   = candidate.oldName;
@@ -724,13 +746,13 @@ inline int writeNamingCalibrationReport( const IngestResult& ing, const std::str
     const std::string atStamp = gitstamp::atAttr( root );
     if( !report.harvest.ok )
     {
-        std::printf( "<naming-calibration probed=\"0\" r=\"%s\"%s/>",
+        rw::emitTo( stdout, "<naming-calibration probed=\"0\" r=\"{}\"{}/>",
                      report.harvest.nonGitRoot ? "not-a-git-repo" : "probe-failed", atStamp.c_str() );
         return 0;
     }
 
-    std::printf( "<naming-calibration probed=\"1\" pairs=\"%zu\" candidates=\"%zu\" commits=\"%u\" hunks=\"%llu\" wide_hunks=\"%llu\""
-                 " drop_old_alive=\"%llu\" drop_new_absent=\"%llu\" drop_ambiguous=\"%llu\" drop_old_skipped=\"%llu\"%s%s>",
+    rw::emitTo( stdout, "<naming-calibration probed=\"1\" pairs=\"{}\" candidates=\"{}\" commits=\"{}\" hunks=\"{}\" wide_hunks=\"{}\""
+                 " drop_old_alive=\"{}\" drop_new_absent=\"{}\" drop_ambiguous=\"{}\" drop_old_skipped=\"{}\"{}{}>",
                  report.pairs.size(), report.harvest.candidates.size(), report.harvest.commitsWalked,
                  (unsigned long long)report.harvest.hunksScanned, (unsigned long long)report.harvest.hunksTooWide,
                  (unsigned long long)report.droppedOldStillHere, (unsigned long long)report.droppedNewNotAtHead,
@@ -741,16 +763,16 @@ inline int writeNamingCalibrationReport( const IngestResult& ing, const std::str
     {
         if( !score.scored )
         {
-            std::printf( "<r n=\"%s\" scope=\"group-rule\"/>", score.rule );
+            rw::emitTo( stdout, "<r n=\"{}\" scope=\"group-rule\"/>", score.rule );
             continue;
         }
         const std::uint32_t fired = score.oldFires + score.newFires;
-        std::printf( "<r n=\"%s\" old=\"%u\" new=\"%u\" fired=\"%u\"", score.rule, score.oldFires, score.newFires, fired );
+        rw::emitTo( stdout, "<r n=\"{}\" old=\"{}\" new=\"{}\" fired=\"{}\"", score.rule, score.oldFires, score.newFires, fired );
         if( fired != 0 )
         {
-            std::printf( " proxy=\"%.3f\"", double( score.oldFires ) / double( fired ) );
+            rw::emitTo( stdout, " proxy=\"{:.3f}\"", double( score.oldFires ) / double( fired ) );
         }
-        std::printf( "/>" );
+        rw::emitRaw( stdout, "/>" );
     }
 
     // TWO scratch buffers, not one reused twice in the same call: escapeXml returns a VIEW into its `out`,
@@ -763,20 +785,20 @@ inline int writeNamingCalibrationReport( const IngestResult& ing, const std::str
         const std::string oldName( escapeXml( pair.oldName, escOld ) );
         const std::string newName( escapeXml( pair.newName, escNew ) );
         const std::string path( escapeXml( ing.files[pair.fileId], escPath ) );
-        std::printf( "<p o=\"%s\" n=\"%s\" sup=\"%u\" at=\"%s:%u\"", oldName.c_str(), newName.c_str(), pair.support, path.c_str(), pair.line );
+        rw::emitTo( stdout, "<p o=\"{}\" n=\"{}\" sup=\"{}\" at=\"{}:{}\"", oldName.c_str(), newName.c_str(), pair.support, path.c_str(), pair.line );
         const std::string oldFires = detail::ruleListOf( pair.oldMask );
         const std::string newFires = detail::ruleListOf( pair.newMask );
         if( !oldFires.empty() )
         {
-            std::printf( " old_fires=\"%s\"", oldFires.c_str() );
+            rw::emitTo( stdout, " old_fires=\"{}\"", oldFires.c_str() );
         }
         if( !newFires.empty() )
         {
-            std::printf( " new_fires=\"%s\"", newFires.c_str() );
+            rw::emitTo( stdout, " new_fires=\"{}\"", newFires.c_str() );
         }
-        std::printf( "/>" );
+        rw::emitRaw( stdout, "/>" );
     }
-    std::printf( "</naming-calibration>" );
+    rw::emitRaw( stdout, "</naming-calibration>" );
     return 0;
 }
 

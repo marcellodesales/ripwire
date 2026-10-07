@@ -17,10 +17,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 HOOK="$ROOT/hooks/ripwire-nudge.sh"
 INSTALL="$ROOT/skills/install.sh"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -f "$HOOK" ] || { echo "no $HOOK"; exit 2; }
@@ -128,7 +129,7 @@ GREP_JSON='{"session_id":"grepcase","cwd":"'"$REPO"'","tool_name":"Grep","tool_i
 OUT1="$( printf '%s' "$GREP_JSON" | env RIPWIRE_METER_LOG="$L1" PATH="$WITH_RIPWIRE" TMPDIR="$T1" bash "$HOOK" )"; RC1=$?
 echo "-- Grep case output --"; echo "[$OUT1]"; echo "(exit=$RC1)"
 
-[ "$RC1" -eq 0 ] && ok "Grep case: exit 0" || no "Grep case: exit was $RC1"
+if [ "$RC1" -eq 0 ]; then ok "Grep case: exit 0"; else no "Grep case: exit was $RC1"; fi
 [ -z "$OUT1" ] && ok "Grep case: SILENT — the retired base tier says nothing" \
     || no "Grep case: the retired base tier emitted ${#OUT1} byte(s): [$OUT1]"
 [ "$( meterrowget "$L1" 1 nudge )" = "retired" ] && [ "$( meterrowget "$L1" 1 nudged )" = "0" ] \
@@ -138,8 +139,8 @@ echo "-- Grep case output --"; echo "[$OUT1]"; echo "(exit=$RC1)"
 # ── (2) Grep case, second invocation same session: inside the cooldown ────────────────────────────
 OUT1B="$( printf '%s' "$GREP_JSON" | env RIPWIRE_METER_LOG="$L1" PATH="$WITH_RIPWIRE" TMPDIR="$T1" bash "$HOOK" )"; RC1B=$?
 echo "-- Grep case, 2nd invocation (dedup) --"; echo "[$OUT1B]"; echo "(exit=$RC1B)"
-[ "$RC1B" -eq 0 ] && ok "Grep dedup: exit 0" || no "Grep dedup: exit was $RC1B"
-[ -z "$OUT1B" ] && ok "Grep dedup: silent on 2nd call" || no "Grep dedup: 2nd call was not silent: $OUT1B"
+if [ "$RC1B" -eq 0 ]; then ok "Grep dedup: exit 0"; else no "Grep dedup: exit was $RC1B"; fi
+if [ -z "$OUT1B" ]; then ok "Grep dedup: silent on 2nd call"; else no "Grep dedup: 2nd call was not silent: $OUT1B"; fi
 [ "$( meterrowget "$L1" 2 nudge )" = "dedup" ] \
     && ok "Grep dedup: the cooldown is still recorded on the row (nudge=dedup)" \
     || no "Grep dedup: row 2 nudge=[$( meterrowget "$L1" 2 nudge )], expected dedup"
@@ -152,8 +153,8 @@ L3="$TMP/t3.jsonl"
 OUT3="$( printf '%s' "$BASHGREP_JSON" | env RIPWIRE_METER_LOG="$L3" PATH="$WITH_RIPWIRE" TMPDIR="$T3" bash "$HOOK" )"; RC3=$?
 echo "-- Bash-grep case output --"; echo "[$OUT3]"; echo "(exit=$RC3)"
 
-[ "$RC3" -eq 0 ] && ok "Bash-grep case: exit 0" || no "Bash-grep case: exit was $RC3"
-[ -z "$OUT3" ] && ok "Bash-grep case: silent" || no "Bash-grep case: emitted [$OUT3]"
+if [ "$RC3" -eq 0 ]; then ok "Bash-grep case: exit 0"; else no "Bash-grep case: exit was $RC3"; fi
+if [ -z "$OUT3" ]; then ok "Bash-grep case: silent"; else no "Bash-grep case: emitted [$OUT3]"; fi
 [ "$( meterrowget "$L3" 1 class )" = "grep" ] && [ "$( meterrowget "$L3" 1 nudge )" = "retired" ] \
     && ok "Bash-grep case: counted as grep, delivery moment recorded (nudge=retired)" \
     || no "Bash-grep case: row = class=[$( meterrowget "$L3" 1 class )] nudge=[$( meterrowget "$L3" 1 nudge )]"
@@ -203,8 +204,8 @@ T3F="$TMP/t3f"; mkdir -p "$T3F"; L3F="$TMP/t3f.jsonl"
 READ_JSON='{"session_id":"readcase","cwd":"'"$REPO"'","tool_name":"Read","tool_input":{"file_path":"src/foo.cpp"}}'
 OUT3F="$( printf '%s' "$READ_JSON" | env RIPWIRE_METER_LOG="$L3F" PATH="$WITH_RIPWIRE" TMPDIR="$T3F" bash "$HOOK" )"; RC3F=$?
 echo "-- Read case output --"; echo "[$OUT3F]"; echo "(exit=$RC3F)"
-[ "$RC3F" -eq 0 ] && ok "Read case: exit 0" || no "Read case: exit was $RC3F"
-[ -z "$OUT3F" ] && ok "Read case: silent" || no "Read case: emitted [$OUT3F]"
+if [ "$RC3F" -eq 0 ]; then ok "Read case: exit 0"; else no "Read case: exit was $RC3F"; fi
+if [ -z "$OUT3F" ]; then ok "Read case: silent"; else no "Read case: emitted [$OUT3F]"; fi
 [ "$( meterrowget "$L3F" 1 class )" = "read" ] && [ "$( meterrowget "$L3F" 1 nudge )" = "retired" ] \
     && ok "Read case: counted as read, delivery moment recorded (nudge=retired)" \
     || no "Read case: row = class=[$( meterrowget "$L3F" 1 class )] nudge=[$( meterrowget "$L3F" 1 nudge )]"
@@ -257,7 +258,7 @@ if [ -x "$REALBIN" ]; then
     SS_JSON='{"session_id":"sscase","cwd":"'"$REPO"'","source":"startup"}'
     OUT3I="$( printf '%s' "$SS_JSON" | PATH="$WITH_REAL" TMPDIR="$T3I" bash "$HOOK" --session-start )"; RC3I=$?
     echo "-- SessionStart case (first 3 lines) --"; printf '%s' "$OUT3I" | head -c 300; echo; echo "(exit=$RC3I)"
-    [ "$RC3I" -eq 0 ] && ok "SessionStart: exit 0" || no "SessionStart: exit was $RC3I"
+    if [ "$RC3I" -eq 0 ]; then ok "SessionStart: exit 0"; else no "SessionStart: exit was $RC3I"; fi
     printf '%s' "$OUT3I" | is_valid_json && ok "SessionStart: valid JSON on stdout" \
         || no "SessionStart: stdout is not valid JSON"
     printf '%s' "$OUT3I" | grep -q '"hookEventName"[[:space:]]*:[[:space:]]*"SessionStart"' \
@@ -276,6 +277,43 @@ if [ -x "$REALBIN" ]; then
     OUT3I3="$( printf '%s' "$SS_NONGIT" | PATH="$WITH_REAL" TMPDIR="$T3I3" bash "$HOOK" --session-start )"; RC3I3=$?
     [ "$RC3I3" -eq 0 ] && [ -z "$OUT3I3" ] && ok "SessionStart in non-git dir: silent" \
         || no "SessionStart in non-git dir: exit=$RC3I3 out=[$OUT3I3]"
+    # ── (3i2) routehookcheck O11's shape (1cd00d4d), applied to THIS hook: `git rev-parse
+    # --is-inside-work-tree` prints `false` WITH exit status 0 in a bare repository and inside a work
+    # tree's own .git directory. The route hooks were fixed to read the ANSWER, not only the exit
+    # status; the session-start primer at hooks/ripwire-nudge.sh:~1163 still read only the status, so a
+    # session started there still ran `ripwire wrap claude` and could emit the primer. RED on the
+    # status-only guard: both cwds below would print the wrap blurb (or at least fail to stay silent).
+    T3I4B="$TMP/t3i4bare"; mkdir -p "$T3I4B"
+    SS_BARE_GIT="$TMP/t3i4bare.git"; git init -q --bare "$SS_BARE_GIT"
+    SS_BARE_JSON='{"session_id":"ssbare","cwd":"'"$SS_BARE_GIT"'","source":"startup"}'
+    OUT3I4="$( printf '%s' "$SS_BARE_JSON" | PATH="$WITH_REAL" TMPDIR="$T3I4B" bash "$HOOK" --session-start )"; RC3I4=$?
+    [ "$RC3I4" -eq 0 ] && [ -z "$OUT3I4" ] && ok "SessionStart in a bare repository: silent (rev-parse prints false there)" \
+        || no "SessionStart in a bare repository: exit=$RC3I4 out=[$OUT3I4]"
+    T3I4D="$TMP/t3i4dotgit"; mkdir -p "$T3I4D"
+    SS_DOTGIT_JSON='{"session_id":"ssdotgit","cwd":"'"$REPO/.git"'","source":"startup"}'
+    OUT3I4D="$( printf '%s' "$SS_DOTGIT_JSON" | PATH="$WITH_REAL" TMPDIR="$T3I4D" bash "$HOOK" --session-start )"; RC3I4D=$?
+    [ "$RC3I4D" -eq 0 ] && [ -z "$OUT3I4D" ] && ok "SessionStart in a work tree's own .git dir: silent (rev-parse prints false there)" \
+        || no "SessionStart in a work tree's own .git dir: exit=$RC3I4D out=[$OUT3I4D]"
+    # ── (3i3) train20-cr C3: routehookcheck O11's inherited-GIT_DIR shape, applied to THIS hook. With GIT_DIR
+    # exported (alone, or with GIT_WORK_TREE naming an ancestor of cwd), `git -C "$dir" rev-parse
+    # --is-inside-work-tree` answers for THAT repository and prints `true` in a non-git cwd, so the primer
+    # fired there. RED on the hook without the reset the two route hooks already had.
+    for ss_case in "GIT_DIR" "GIT_DIR and an ancestor GIT_WORK_TREE"; do
+        ss_env=( "GIT_DIR=$REPO/.git" )
+        [ "$ss_case" = "GIT_DIR" ] || ss_env+=( "GIT_WORK_TREE=$TMP" )
+        T3I5="$TMP/t3i5.${#ss_env[@]}"; mkdir -p "$T3I5"
+        SS_ENV_JSON='{"session_id":"ssgitenv'"${#ss_env[@]}"'","cwd":"'"$NONREPO"'","source":"startup"}'
+        OUT3I5="$( printf '%s' "$SS_ENV_JSON" | env PATH="$WITH_REAL" TMPDIR="$T3I5" "${ss_env[@]}" bash "$HOOK" --session-start )"; RC3I5=$?
+        [ "$RC3I5" -eq 0 ] && [ -z "$OUT3I5" ] && ok "SessionStart in a non-git dir with an inherited $ss_case: silent" \
+            || no "SessionStart in a non-git dir with an inherited $ss_case: exit=$RC3I5 out=[$( printf '%s' "$OUT3I5" | head -c 160 )]"
+    done
+    # positive control: a real work tree cwd still gets the primer (proves the stub/binary reaches this far)
+    T3I4P="$TMP/t3i4pos"; mkdir -p "$T3I4P"
+    SS_POS_JSON='{"session_id":"sspos","cwd":"'"$REPO"'","source":"startup"}'
+    OUT3I4P="$( printf '%s' "$SS_POS_JSON" | PATH="$WITH_REAL" TMPDIR="$T3I4P" bash "$HOOK" --session-start )"; RC3I4P=$?
+    [ "$RC3I4P" -eq 0 ] && printf '%s' "$OUT3I4P" | grep -q 'Do NOT open a file you have not located first' \
+        && ok "SessionStart positive control: a real work tree still gets the primer" \
+        || no "SessionStart positive control: exit=$RC3I4P out=[$( printf '%s' "$OUT3I4P" | head -c 160 )] — the bare/.git arms above prove nothing"
 else
     echo "  SKIP  SessionStart checks (no real binary at $REALBIN)"
 fi
@@ -284,8 +322,8 @@ fi
 T4="$TMP/t4"; mkdir -p "$T4"
 BASHOTHER_JSON='{"session_id":"othercase","cwd":"'"$REPO"'","tool_name":"Bash","tool_input":{"command":"ls -la"}}'
 OUT4="$( run_hook "$BASHOTHER_JSON" "$WITH_RIPWIRE" "$T4" )"; RC4=$?
-[ "$RC4" -eq 0 ] && ok "Bash non-grep: exit 0" || no "Bash non-grep: exit was $RC4"
-[ -z "$OUT4" ] && ok "Bash non-grep: silent (not a tree-wide search)" || no "Bash non-grep: unexpectedly fired: $OUT4"
+if [ "$RC4" -eq 0 ]; then ok "Bash non-grep: exit 0"; else no "Bash non-grep: exit was $RC4"; fi
+if [ -z "$OUT4" ]; then ok "Bash non-grep: silent (not a tree-wide search)"; else no "Bash non-grep: unexpectedly fired: $OUT4"; fi
 
 # single-file grep (no recursive flag) -> also silent
 T4B="$TMP/t4b"; mkdir -p "$T4B"
@@ -325,7 +363,7 @@ EDIT_JSON='{"session_id":"editcase","cwd":"'"$REPO"'","tool_name":"Edit","tool_i
 START_NS=$(date +%s%N 2>/dev/null || echo 0)
 OUT4C="$( run_hook "$EDIT_JSON" "$WITH_RIPWIRE" "$T4C" )"; RC4C=$?
 END_NS=$(date +%s%N 2>/dev/null || echo 0)
-[ "$RC4C" -eq 0 ] && [ -z "$OUT4C" ] && ok "Other tool (Edit): silent" || no "Other tool (Edit): exit=$RC4C out=[$OUT4C]"
+if [ "$RC4C" -eq 0 ] && [ -z "$OUT4C" ]; then ok "Other tool (Edit): silent"; else no "Other tool (Edit): exit=$RC4C out=[$OUT4C]"; fi
 if [ "$START_NS" != "0" ] && [ "$END_NS" != "0" ]; then
     MS=$(( (END_NS - START_NS) / 1000000 ))
     echo "  (Edit-case wall time: ${MS} ms)"
@@ -335,13 +373,13 @@ fi
 T5="$TMP/t5"; mkdir -p "$T5"
 NONGIT_JSON='{"session_id":"nongitcase","cwd":"'"$NONREPO"'","tool_name":"Grep","tool_input":{"pattern":"needle"}}'
 OUT5="$( run_hook "$NONGIT_JSON" "$WITH_RIPWIRE" "$T5" )"; RC5=$?
-[ "$RC5" -eq 0 ] && [ -z "$OUT5" ] && ok "Non-git dir: silent" || no "Non-git dir: exit=$RC5 out=[$OUT5], expected silent"
+if [ "$RC5" -eq 0 ] && [ -z "$OUT5" ]; then ok "Non-git dir: silent"; else no "Non-git dir: exit=$RC5 out=[$OUT5], expected silent"; fi
 
 # ── (6) Negative: ripwire missing from PATH -> silent even in a git repo ───────────────────────────
 T6="$TMP/t6"; mkdir -p "$T6"
 NOCTX_JSON='{"session_id":"noctxcase","cwd":"'"$REPO"'","tool_name":"Grep","tool_input":{"pattern":"needle"}}'
 OUT6="$( run_hook "$NOCTX_JSON" "$NO_RIPWIRE" "$T6" )"; RC6=$?
-[ "$RC6" -eq 0 ] && [ -z "$OUT6" ] && ok "ripwire missing: silent" || no "ripwire missing: exit=$RC6 out=[$OUT6], expected silent"
+if [ "$RC6" -eq 0 ] && [ -z "$OUT6" ]; then ok "ripwire missing: silent"; else no "ripwire missing: exit=$RC6 out=[$OUT6], expected silent"; fi
 
 # ── (7) Different session ids keep independent cooldown state (per-session, not global) ───────────
 # OR-chain pattern (P4.2) — see the note at case (1). With nothing on stdout, the row is the proof:
@@ -358,8 +396,8 @@ HOOK_HOME="$TMP/hookhome"; mkdir -p "$HOOK_HOME"
 INSTOUT1="$( HOME="$HOOK_HOME" bash "$INSTALL" --hook 2>&1 )"; INSTRC1=$?
 SETTINGS="$HOOK_HOME/.claude/settings.json"
 echo "-- install.sh --hook output --"; echo "$INSTOUT1"
-[ "$INSTRC1" -eq 0 ] && ok "install.sh --hook: exit 0" || no "install.sh --hook: exit was $INSTRC1"
-[ -f "$SETTINGS" ] && ok "install.sh --hook: wrote $SETTINGS" || no "install.sh --hook: $SETTINGS not created"
+if [ "$INSTRC1" -eq 0 ]; then ok "install.sh --hook: exit 0"; else no "install.sh --hook: exit was $INSTRC1"; fi
+if [ -f "$SETTINGS" ]; then ok "install.sh --hook: wrote $SETTINGS"; else no "install.sh --hook: $SETTINGS not created"; fi
 if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ]; then
     jq -e --arg cmd "$HOOK" 'any((.hooks.PreToolUse // [])[]?.hooks[]?; .command == $cmd)' "$SETTINGS" >/dev/null 2>&1 \
         && ok "settings.json references hooks/ripwire-nudge.sh" \
@@ -388,7 +426,7 @@ printf '%s' "$INSTOUT1" | grep -qi 'will add' && ok "install.sh --hook prints wh
 # ── (9) installer idempotency: running --hook twice does not duplicate the entry ───────────────────
 INSTOUT2="$( HOME="$HOOK_HOME" bash "$INSTALL" --hook 2>&1 )"; INSTRC2=$?
 echo "-- install.sh --hook, 2nd run --"; echo "$INSTOUT2"
-[ "$INSTRC2" -eq 0 ] && ok "install.sh --hook (2nd run): exit 0" || no "install.sh --hook (2nd run): exit was $INSTRC2"
+if [ "$INSTRC2" -eq 0 ]; then ok "install.sh --hook (2nd run): exit 0"; else no "install.sh --hook (2nd run): exit was $INSTRC2"; fi
 if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ]; then
     COUNT="$( jq '[(.hooks.PreToolUse // [])[] | select(.hooks[]?.command | test("ripwire-nudge"))] | length' "$SETTINGS" )"
     [ "$COUNT" = "1" ] && ok "install.sh --hook is idempotent (1 PreToolUse entry after 2 runs)" \
@@ -454,7 +492,7 @@ TM1="$TMP/tm1"; mkdir -p "$TM1"
 M1_JSON='{"session_id":"meter1","cwd":"'"$REPO"'","tool_name":"Grep","tool_input":{"pattern":"needle"}}'
 run_meter "" "$M1_JSON" "$TM1" $DEFAULTS >/dev/null 2>&1; RCM1=$?
 echo "-- meter default-path row --"; [ -f "$DEFAULT_LOG" ] && cat "$DEFAULT_LOG"
-[ "$RCM1" -eq 0 ] && ok "M1 meter: hooked call still exits 0" || no "M1 meter: exit was $RCM1"
+if [ "$RCM1" -eq 0 ]; then ok "M1 meter: hooked call still exits 0"; else no "M1 meter: exit was $RCM1"; fi
 [ "$( meterrows "$DEFAULT_LOG" )" = "1" ] \
     && ok "M1 meter: one row lazily created at <meter home>/substitution.jsonl (the default filename)" \
     || no "M1 meter: expected 1 row at $DEFAULT_LOG, got $( meterrows "$DEFAULT_LOG" )"
@@ -909,7 +947,7 @@ SW4="$( sweep_run "$LS1" "$TS1" "$( grepjson sweepgrep delta )" )"
     || no "S3b sweep: row 2 nudge=[$( meterrowget "$LS1" 2 nudge )], expected none"
 [ "$RCS3" -eq 0 ] && [ -z "$SW3" ] && ok "S2 sweep: call 3 is silent (exit 0)" \
     || no "S2 sweep: call 3 exit=$RCS3 out=[$SW3]"
-[ -z "$SW4" ] && ok "S4 sweep: call 4 is silent too" || no "S4 sweep: call 4 emitted: [$SW4]"
+if [ -z "$SW4" ]; then ok "S4 sweep: call 4 is silent too"; else no "S4 sweep: call 4 emitted: [$SW4]"; fi
 
 # ── S5: the escalation MOMENT is on the ROW. Without this the eligibility question — how often was
 #    the sweep threshold even reached — cannot be asked at all, and it is the covariate the next
@@ -1544,6 +1582,16 @@ sweep_run "$LW3" "$TW3" '{"session_id":"tagnonrepo","cwd":"'"$NONREPO"'","tool_n
 [ "$( meterrowget "$LW3" 1 tag )" = "nonrepo" ] \
     && ok "TAG3 tag: outside a repo the tag still falls back to the directory basename" \
     || no "TAG3 tag: non-repo reported tag=[$( meterrowget "$LW3" 1 tag )], expected nonrepo"
+# TAG3b (train20-cr C3, the PreToolUse half): the same non-repo cwd, with the caller exporting GIT_DIR at another
+# repository. `git -C "$dir" rev-parse --show-toplevel --git-common-dir` then answers for THAT repository (the cwd
+# as its top level, $REPO/.git as its common dir), so the row was tagged `repo` and the call counted as in-repo.
+# RED on the hook without meter_set_repo's reset of git's inherited repository-selection variables.
+TW3B="$TMP/ttag3b"; mkdir -p "$TW3B"; LW3B="$TMP/tag3b.jsonl"
+sweep_run "$LW3B" "$TW3B" '{"session_id":"tagnonrepoenv","cwd":"'"$NONREPO"'","tool_name":"Grep","tool_input":{"pattern":"needle"}}' \
+    GIT_DIR="$REPO/.git" >/dev/null 2>&1
+[ "$( meterrowget "$LW3B" 1 tag )" = "nonrepo" ] \
+    && ok "TAG3b tag: a non-repo cwd with an inherited GIT_DIR still tags as its own basename" \
+    || no "TAG3b tag: non-repo cwd with an inherited GIT_DIR reported tag=[$( meterrowget "$LW3B" 1 tag )], expected nonrepo"
 # The SessionStart path derives the tag too, and derived it separately — a fix applied to one and not
 # the other would split a session's own rows across two tags.
 TW4="$TMP/ttag4"; mkdir -p "$TW4"; LW4="$TMP/tag4.jsonl"

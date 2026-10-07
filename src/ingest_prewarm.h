@@ -30,7 +30,44 @@ struct IngestFileScan
     std::vector<long long>        statMtime;
     std::vector<long long>        statCtime;
     std::vector<FileHealth>       health;      // §L1: one slot per fileId, one writer per slot
+    std::vector<std::uint32_t>    nestRefusedBytes;   // the Kotlin nesting guard: the refused file's size, 0 = not refused (one writer per slot)
+    std::vector<std::uint8_t>     extractPartial;     // 1 = the file's facts are PARTIAL (an ExtractShortfall, or a throw mid-file) (one writer per slot)
+    std::vector<std::uint32_t>    extractPartialBytes;   // its size as observed at hash time, 0 = not captured (the row's bytes=)
+
+    // `knownBytes` is the file's size where the caller holds its bytes; otherwise the stat taken at hash time, which is
+    // read HERE, before the save path may forget it for the cache. 0 = neither was captured.
+    void markExtractPartial( std::size_t fileId, std::size_t knownBytes = 0 ) noexcept
+    {
+        extractPartial[ fileId ]      = 1;
+        const long long size          = knownBytes > 0 ? static_cast<long long>( knownBytes ) : statSize[ fileId ];
+        extractPartialBytes[ fileId ] = size > 0 ? static_cast<std::uint32_t>( std::min<long long>( size, UINT32_MAX ) ) : 0u;
+    }
 };
+
+// The DISCLOSE sink for a file whose extraction THREW part-way: the facts gathered before the throw are kept, so the
+// file is marked partial — its --skipped row (why="extract-partial") and a cache record written UNKNOWN say so.
+struct FileExtractThrew
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        WorkerThrew,
+    };
+    IngestFileScan& scan;
+    std::size_t     fileId;
+    void disclose( DisclosureWhy ) noexcept
+    {
+        scan.markExtractPartial( fileId );
+    }
+};
+
+// Record a pass's shortfall on the file's slot (plumbing: the DISCLOSE already happened inside the pass).
+inline void notePartialExtract( IngestFileScan& scan, std::size_t fileId, const ExtractShortfall& shortfall, std::size_t fileBytes ) noexcept
+{
+    if( shortfall.isShort )
+    {
+        scan.markExtractPartial( fileId, fileBytes );
+    }
+}
 
 // size the per-file arrays and classify each file's language — the fileId space is the crawl's sorted list.
 inline IngestFileScan makeFileScan( const std::vector<std::string>& files )
@@ -43,6 +80,9 @@ inline IngestFileScan makeFileScan( const std::vector<std::string>& files )
     scan.statMtime.assign( nfilesEarly, -1 );
     scan.statCtime.assign( nfilesEarly, -1 );
     scan.health.resize( nfilesEarly );
+    scan.nestRefusedBytes.assign( nfilesEarly, 0u );
+    scan.extractPartial.assign( nfilesEarly, 0u );
+    scan.extractPartialBytes.assign( nfilesEarly, 0u );
     {
         PROFILE_SCOPE_DESCRIBE( "ingest: classify file languages" );
         for( std::size_t fileId = 0; fileId < nfilesEarly; ++fileId )
@@ -52,6 +92,168 @@ inline IngestFileScan makeFileScan( const std::vector<std::string>& files )
         }
     }
     return scan;
+}
+
+// One per-file slot array → one --skipped class: serial and in ascending fileId, so the rows are path-sorted like every
+// other drop list; capped at kMaxSkipRowsPerClass, with the exact count kept beside them.
+template<class IsIn, class BytesOf>
+inline void collectSkipClass( const IngestResult& result, std::size_t slotCount, IsIn isIn, BytesOf bytesOf,
+                              std::vector<SkippedFile>& rows, std::uint64_t& count )
+{
+    for( std::size_t fileId = 0; fileId < slotCount && fileId < result.files.size(); ++fileId )
+    {
+        if( !isIn( fileId ) )
+        {
+            continue;
+        }
+        ++count;
+        if( rows.size() < kMaxSkipRowsPerClass )
+        {
+            rows.push_back( SkippedFile{ result.files[ fileId ], bytesOf( fileId ), lowerExtensionOf( result.files[ fileId ] ) } );
+        }
+    }
+}
+
+// The Kotlin nesting guard's refusals, as --skipped rows (why="nest-refused"). Serial and in ascending fileId, so the rows
+// are path-sorted like every other drop list; capped at kMaxSkipRowsPerClass like them, with the exact count kept beside.
+// A refused file never reaches the cache (no facts were extracted), so every run — cold or warm — re-reads it, re-refuses
+// it, and rebuilds this list: the rows cannot go stale.
+inline void collectNestRefusals( const IngestFileScan& scan, IngestResult& result )
+{
+    collectSkipClass( result, scan.nestRefusedBytes.size(), [ & ]( std::size_t f ) { return scan.nestRefusedBytes[ f ] != 0; },
+                      [ & ]( std::size_t f ) { return std::uint64_t( scan.nestRefusedBytes[ f ] ); },
+                      result.crawlSkips.nestRefused, result.crawlSkips.nestRefusedFiles );
+}
+
+// The files whose facts are PARTIAL, as --skipped rows (why="extract-partial"), collectNestRefusals' shape: serial, ascending
+// fileId, capped rows beside an exact count. bytes= is the size observed at hash time (0 when none was captured).
+// NOT written to the cache as whole (forgetNestRefusalsForCache also forgets these), so the rows cannot go stale either.
+inline void collectExtractPartials( const IngestFileScan& scan, IngestResult& result )
+{
+    collectSkipClass( result, scan.extractPartial.size(), [ & ]( std::size_t f ) { return scan.extractPartial[ f ] != 0; },
+                      [ & ]( std::size_t f ) { return std::uint64_t( scan.extractPartialBytes[ f ] ); },
+                      result.crawlSkips.extractPartial, result.crawlSkips.extractPartialFiles );
+}
+
+// A file the nesting guard refused yielded NO facts, so the cache record saveCache writes for every crawled file would
+// read, on the next warm run, as "parsed, nothing there": a stat-gate or hash hit that never reaches the prescan, so the
+// refusal — its stderr note and its --skipped row — vanished from every warm run (kotlincheck §12's warm arm caught it).
+// The record is written as UNKNOWN instead: hash 0 and the stat gate's own -1 "not captured" triple, so the next run
+// re-reads the file, re-refuses it and re-rows it. Called on the save path only, after the pool has joined; nothing
+// reads these slots afterwards. The price is a cache rewrite on each warm run of a tree that holds a refused file.
+inline void forgetNestRefusalsForCache( IngestFileScan& scan ) noexcept
+{
+    for( std::size_t fileId = 0; fileId < scan.nestRefusedBytes.size(); ++fileId )
+    {
+        // a PARTIAL extraction is forgotten the same way: its record would otherwise read, warm, as the whole answer
+        if( scan.nestRefusedBytes[ fileId ] == 0 && ( fileId >= scan.extractPartial.size() || scan.extractPartial[ fileId ] == 0 ) )
+        {
+            continue;
+        }
+        scan.hash[ fileId ]      = 0;
+        scan.statSize[ fileId ]  = -1;
+        scan.statMtime[ fileId ] = -1;
+        scan.statCtime[ fileId ] = -1;
+    }
+}
+
+// #157: generalized from the Kotlin-only guard this struct used to name alone. PROCESS-SURVIVAL /
+// MEMORY-SAFETY load-bearing for all four cases refuseNesting below switches on (see ingest.h for each
+// ceiling's own defect arithmetic). A refusal here is ITEMIZED — its size lands in scan.nestRefusedBytes,
+// which collectNestRefusals turns into --skipped rows — because a refused file takes real content out of
+// the map and the reader must be told which file and why, not just counted into unmeasured=.
+// The DISCLOSE sink for one refusal: recording the refused file's size in its scan slot IS the disclosure —
+// collectNestRefusals turns the slot into the --skipped row (why="nest-refused") and nest_refused=, in every
+// build flavour, whichever LANGUAGE's guard fired.
+struct NestRefusal
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        JsonNesting,
+        YamlNesting,
+        MarkdownBlockNesting,
+        KotlinStringTemplates,
+    };
+    IngestFileScan& scan;
+    std::size_t     fileId;
+    std::uint32_t   bytes;
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        scan.nestRefusedBytes[ fileId ] = bytes;
+    }
+};
+
+// The one call site every corpus-file parse uses (#157), generalized from the Kotlin-only
+// refuseKotlinNesting this replaces. Before it, JSON/YAML/Markdown were three hand-copied `if` blocks
+// with no --skipped row and no warm-cache forgetting, and Kotlin was a fourth, separately-itemized one;
+// the fact that three of the four were forgotten is exactly what a second hand-copied site risks doing
+// again. Deliberately NOT a runtime table of function pointers: `&jsonNestsTooDeep` etc. taken as data
+// left every prescan with ZERO call-graph edges into it (ripwire's own resolver tracks AST call
+// expressions, not values read out of an aggregate — `--callers=jsonNestsTooDeep` measured count="0" on a
+// function four verbs actually call), so quality-delta's own dead-code check gated on FOUR bogus findings
+// against this very diff. A `switch` keeps every prescan a textually direct call, at the cost of the
+// per-case repetition the table used to buy — the DISCLOSE call needed a compile-time-literal `why` at
+// each site regardless (RW_DISCLOSE_SINK_ binds it to a `constexpr` local), so this is one switch doing
+// the job two used to.
+inline bool refuseNesting( const LangEntry& le, std::string_view bytes, const char* path, std::size_t fileId, IngestFileScan& scan )
+{
+    // EXPECTS, not VALIDATE: fileId is not external input here — it is the parse worker's own loop index into
+    // the SAME scan the crawl sized (makeFileScan assigns every per-file array, nestRefusedBytes included, to
+    // exactly files.size() before the pool starts). A violation would be a caller bug, not a hostile corpus.
+    EXPECTS( fileId < scan.nestRefusedBytes.size(), "refuseNesting: fileId must index the scan the crawl already sized" );
+    switch( le.lang )
+    {
+        case Lang::Json:
+        {
+            if( !jsonNestsTooDeep( bytes ) )
+            {
+                return false;
+            }
+            NestRefusal refusal{ scan, fileId, static_cast<std::uint32_t>( std::min<std::size_t>( bytes.size(), UINT32_MAX ) ) };
+            DISCLOSE( refusal, NestRefusal::DisclosureWhy::JsonNesting,
+                      "ingest: a .json file nests brackets/braces past kMaxJsonNestDepth — refused before the parse (--skipped why=nest-refused)" );
+            rw::emitTo( stderr, "[ripwire] {}: json nesting > {} levels — treated as data, not config (skipped)\n", path, kMaxJsonNestDepth );
+            return true;
+        }
+        case Lang::Yaml:
+        {
+            if( !yamlNestsTooDeep( bytes ) )
+            {
+                return false;
+            }
+            NestRefusal refusal{ scan, fileId, static_cast<std::uint32_t>( std::min<std::size_t>( bytes.size(), UINT32_MAX ) ) };
+            DISCLOSE( refusal, NestRefusal::DisclosureWhy::YamlNesting,
+                      "ingest: a .yml/.yaml file nests blocks past kMaxYamlNestDepth — refused before the parse (--skipped why=nest-refused)" );
+            rw::emitTo( stderr, "[ripwire] {}: yaml nesting > {} levels — treated as data, not config (skipped)\n", path, kMaxYamlNestDepth );
+            return true;
+        }
+        case Lang::Markdown:
+        {
+            if( !mdNestsTooDeep( bytes ) )
+            {
+                return false;
+            }
+            NestRefusal refusal{ scan, fileId, static_cast<std::uint32_t>( std::min<std::size_t>( bytes.size(), UINT32_MAX ) ) };
+            DISCLOSE( refusal, NestRefusal::DisclosureWhy::MarkdownBlockNesting,
+                      "ingest: a markdown file nests blockquotes/lists past kMaxMdBlockDepth — refused before the parse (--skipped why=nest-refused)" );
+            rw::emitTo( stderr, "[ripwire] {}: markdown blockquote/list nesting > {} levels — treated as data, not a doc (skipped)\n", path, kMaxMdBlockDepth );
+            return true;
+        }
+        case Lang::Kotlin:
+        {
+            if( !kotlinStringsNestTooDeep( bytes ) )
+            {
+                return false;
+            }
+            NestRefusal refusal{ scan, fileId, static_cast<std::uint32_t>( std::min<std::size_t>( bytes.size(), UINT32_MAX ) ) };
+            DISCLOSE( refusal, NestRefusal::DisclosureWhy::KotlinStringTemplates,
+                      "ingest: a .kt file nests string templates past kMaxKotlinStringNestDepth — refused before the parse (--skipped why=nest-refused)" );
+            rw::emitTo( stderr, "[ripwire] {}: kotlin string-template nesting > {} levels — refused before the parse (skipped)\n", path, kMaxKotlinStringNestDepth );
+            return true;
+        }
+        default:
+            return false;   // no nesting guard applies to this language
+    }
 }
 
 // The compile/ready state the prewarm launch hands to the parse pool's install moment. Non-movable on
@@ -135,7 +337,7 @@ inline void prewarmTagsQueries( const std::vector<std::string>& files, const Has
 
         for( unsigned t = 0; t < nHashThreads; ++t )
         {
-            hashPool.emplace_back( [ & ]()
+            hashPool.emplace_back( [ & ]() noexcept
             {
                 std::string bytes;
                 std::string headerPrefix;
@@ -276,7 +478,9 @@ inline void prewarmTagsQueries( const std::vector<std::string>& files, const Has
                     }
                     catch( ... )
                     {
-                        DEGRADED_PATH_ALERT( "ingest: prewarm hash worker exception on a file — treated as no-miss" );
+                        DISCLOSE( Diagnostics::answerUnchanged,
+                                  "a missed prewarm only defers a grammar's query: a file then left without it discloses extract-partial itself",
+                                  "ingest: prewarm hash worker exception on a file — treated as no-miss" );
                     }
                 }
             } );
@@ -369,7 +573,7 @@ inline void prewarmTagsQueries( const std::vector<std::string>& files, const Has
 
         for( std::size_t i = 0; i < prewarm.toCompile.size(); ++i )
         {
-            prewarm.compilePool.emplace_back( [ &prewarm, i ]() { prewarm.compiledQueries[ i ] = compileQueryStandalone( *prewarm.toCompile[ i ] ); } );
+            prewarm.compilePool.emplace_back( [ &prewarm, i ]() noexcept { prewarm.compiledQueries[ i ] = compileQueryStandalone( *prewarm.toCompile[ i ] ); } );
         }
     }
 }

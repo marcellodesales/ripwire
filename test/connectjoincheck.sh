@@ -48,7 +48,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -76,7 +76,8 @@ mkcorpus(){
 mkcorpus "$TMP/hubfirst" a_hub.cpp z_mid.cpp     # hub sorts FIRST → the lower node id → the pre-fix winner
 mkcorpus "$TMP/midfirst" z_hub.cpp a_mid.cpp     # the mirror: only the file names differ
 
-HUBFIRST="$( "$BIN" "$TMP/hubfirst" --no-cache --connect=left,right 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact and spells <s ...> row shapes inside its comment; (D) counts real rows, so this run asks for the full legend.
+HUBFIRST="$( "$BIN" "$TMP/hubfirst" --no-cache --connect=left,right --legend=full 2>/dev/null )"
 MIDFIRST="$( "$BIN" "$TMP/midfirst" --no-cache --connect=left,right 2>/dev/null )"
 
 steinerOf(){ printf '%s' "$1" | grep -o '<s n="[^"]*"' | sed 's/<s n="//;s/"//' | sort | tr '\n' ' ' | sed 's/ $//'; }
@@ -149,11 +150,11 @@ diff -q "$TMP/d1" "$TMP/d2" >/dev/null && diff -q "$TMP/d2" "$TMP/d3" >/dev/null
     && ok "(G) determinism: 3 runs byte-identical" || no "(G) non-deterministic join choice"
 "$BIN" "$TMP/hubfirst" --connect=left,right >/dev/null 2>&1          # prime the cache
 "$BIN" "$TMP/hubfirst" --connect=left,right >"$TMP/w2" 2>/dev/null
-diff -q "$TMP/d1" "$TMP/w2" >/dev/null && ok "(G) warm == cold (cache-neutral)" || no "(G) warm run differs from cold"
+if diff -q "$TMP/d1" "$TMP/w2" >/dev/null; then ok "(G) warm == cold (cache-neutral)"; else no "(G) warm run differs from cold"; fi
 
 # ── H) G4: well-formed XML ─────────────────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    printf '%s' "$HUBONLY" | xmllint --noout - 2>/dev/null && ok "(H) xml well-formed (xmllint)" || no "(H) xml malformed"
+    if printf '%s' "$HUBONLY" | xmllint --noout - 2>/dev/null; then ok "(H) xml well-formed (xmllint)"; else no "(H) xml malformed"; fi
 else
     ok "(H) xmllint absent — skipped"
 fi

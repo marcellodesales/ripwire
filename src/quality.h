@@ -1,4 +1,8 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // quality.h — --quality-baseline / --quality-delta: the deterministic oracle for a code-quality CONVERGENCE
 // LOOP. Snapshot the current per-symbol cognitive complexity, the duplicate-clone groups, and the dead-symbol
@@ -18,28 +22,30 @@
 #include "model.h"
 #include "ingest.h"             // ingest() — the HEAD-tree snapshot re-ingests the archived commit (computeHeadSnapshot)
 #include "graph.h"
+#include "valuerefindex.h"       // reference-as-value round: a function a table/field/argument holds is not dead (dead kind)
 #include "clones.h"
 #include "cloneidiom.h"         // idiom-class demotion — the closed 3-idiom shape classifier that turns an idiom-COLLISION clone group into a minor row instead of a gating one
-#include "lintrules.h"          // findErrorMasking — the built-in error-masking rule table (GitClear +47% kind)
+#include "lintrules.h"          // findQualityConstructs — the built-in error-masking rule table (GitClear +47% kind) + the placeholder shapes
 #include "arch.h"               // fnv1a64
+#include "pathguard.h"          // CWE-59/367: rw::pathguard::openNoFollowTruncate — writeBaseline truncates, so its open must refuse a link atomically
 #include "gitmine.h"            // shSingleQuote + gitFileCommitCountsInDayWindow — short-horizon-churn window mining
 #include "docparse.h"           // docparse::detail::readWholeFile — THE canonical whole-file byte read (commentcoherence.h names it that); reused rather than re-rolled, see forEachSymbolBody
 #include "filter.h"             // B10.1a: isTestPath — the general test-dir convention behind isTestScriptPath
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — the degrade path when git archive/ingest fails (no-op under NDEBUG; a gate-visible degrade line needs its own fprintf)
+#include "infra/Diagnostics.h"  // DISCLOSE — the degrade path when git archive/ingest fails (no-op under NDEBUG; a gate-visible degrade line needs its own fprintf)
 #include "infra/jsonesc.h"      // L2 — rw::jsonesc::escapeMcp for staleAcksJsonArray's kind= field (the same posture serialize.h's jsonStr uses)
+#include "sourceidentity.h"    // rw::kRipwireSourceIdentity — the producer identity the qsnap/qbody keys and blob header carry
 
 #include "btree.hpp"              // gtl btree_map — sorted like std::map, cache-friendly nodes (house rule: never std::map)
 #include "infra/dynamic_map.hpp"  // S+tree scratch maps — bounded, no per-operation allocation in hot seen-set paths
 
-#include <sys/stat.h>  // ::mkdir — the per-user cache-dir ladder (cacheDirLadder)
-#include <sys/file.h>  // ::flock — F-04: the ack ledger's cross-process write lock (SidecarWriteLock)
-#include <fcntl.h>     // ::open — same
-#include <unistd.h>    // ::getpid — unique HEAD-snapshot temp-dir suffix; ::close/::getuid
+#include "infra/os.h"  // rw::os — mkdir/lstat/chmod/getuid for the per-user cache-dir ladder (cacheDirLadder); open/flock/close for
+                       // F-04, the ack ledger's cross-process write lock (SidecarWriteLock); getpid for the HEAD-snapshot temp-dir suffix
 #include <cerrno>      // EWOULDBLOCK — the LOCK_NB retry predicate
 #include <ctime>       // ::nanosleep — the lock's bounded 10 ms poll
 
 #include <algorithm>
-#include <atomic>       // Phase-M: the tmp-name sequence counter (atomicWriteFile); also the A5 process-once cache-sweep guard
+#include <array>        // OwnBuildBlobTails — one tagged tail per root-keyed family
+#include <atomic>       // the A5 process-once cache-sweep guard
 #include <cctype>       // std::isxdigit/std::isdigit — B10.2d churn-blame porcelain parsing
 #include <chrono>       // A5: the 30-day cache-blob age cutoff (evictOldCacheFamily)
 #include <cstdio>
@@ -54,6 +60,7 @@
 #include <string>
 #include <type_traits>  // std::is_trivially_copyable_v — the qsnap POD put/get static_assert
 #include <utility>
+#include <span>          // mergeBuiltinsWithConfig — a non-owning view over either built-in list
 #include <vector>
 
 namespace rw
@@ -90,6 +97,94 @@ constexpr std::uint32_t   kMinorCcxDelta   = 3;    // complexity: delta < 3 → 
 constexpr std::uint32_t   kMinorLocDelta   = 10;   // verbosity:  delta < 10 LOC → minor
 constexpr std::uint32_t   kMinorParamDelta = 2;    // params:     +1 param → minor; +2 or more → major
 
+// Q-DIAL-3 (2026-09-10) — GROWTH IS A SIGNAL, and the bar alone was not one. `now > was && now > BAR` says
+// nothing about how much this change added: audit lane Q1 measured the median growth of a GATING complexity
+// row at 6% and of a gating verbosity row at 6% (§2d) — +3% on a function that was 1,068 lines before the
+// change gated, while 6 → 55 LOC (9x) and ccx 5 → 13 (+160%) were invisible because neither ends up over the
+// bar. Two thresholds fix both halves, and they apply to complexity and verbosity ONLY (params is the
+// highest-precision kind in the table at 77% and nesting has no measured false positive — neither is moved
+// on a hunch):
+constexpr std::uint32_t   kMaterialGrowthPct = 25;    // over the bar: gate on a bar CROSSING, or on growth >= this. Otherwise the row is real, reported, and sev="minor" — chronic debt the change did not create.
+constexpr std::uint32_t   kSubBarGrowthPct   = 100;   // UNDER the bar: a DOUBLING is worth a minor row rather than silence (synthetics S4b/S8) — never gating, because nothing is over the bar yet.
+// …with a floor so a 3 → 6 line helper is not a finding. Two thirds of the kind's own bar, so the floor moves
+// with the bar it belongs to and there is no third number to keep in sync: ccx 10, loc 40.
+inline constexpr std::uint32_t subBarGrowthFloor( std::uint32_t bar ) noexcept { return ( bar * 2 ) / 3; }
+
+// ─── ACK PROVENANCE / RE-SCORE — the per-symbol numeric kinds' materiality, as ONE declarative table ─────
+//
+// kind → the three constants perSymbolKind already compares (was,now) against. Pulled out as a table
+// (CONTRIBUTING.md §3 "declarative constexpr tables over scattered switch/if") so the LIVE decision
+// (perSymbolKind, below) and the RE-SCORE decision (an ack row's stored `was=`/`now=`, read back off the
+// ledger by rescoreAckRecord — see AckRecord::provenance) are the SAME lookup, not two hand-kept copies
+// that can drift. The two facet-driven kinds (duplication / new-clone-of-reused-helper: decided by the
+// recognized clone idiom, not a bar) and the two presence kinds (dead-code / api-surface tier A: always
+// major, no materiality question) are deliberately absent — findRowByKind over this table returns nullptr.
+struct MaterialityBar
+{
+    std::string_view kind;
+    std::uint32_t    bar;
+    std::uint32_t    minorDelta;
+    bool              growthTiered;
+};
+inline constexpr MaterialityBar kMaterialityBars[] = {
+    { "complexity", kCcxBar,   kMinorCcxDelta,   true  },
+    { "verbosity",  kLocBar,   kMinorLocDelta,   true  },
+    { "nesting",    kNestBar,  0,                false },
+    { "params",     kParamBar, kMinorParamDelta, false },
+};
+
+// The linear scan behind every "kind → its declarative table row" lookup in this file — rescoreNumericMajor's
+// own lookup below and facetAttrName (kFacetAttrs, further down) are both this shape over a different small
+// constexpr table, so this is the one body instead of two. `Row` need only expose a `.kind` field comparable
+// to a string_view; the table is small (at most a handful of kinds) so a linear scan over a sorted-by-nothing
+// array beats any container overhead. No `materialityBarFor` wrapper around it: rescoreNumericMajor is its
+// only caller, and a one-line forwarding wrapper that short is itself clone-bait — measured turning this one
+// in: it duplication-matched three unrelated one-line forwarders elsewhere in the tree the moment it existed
+// as its own named symbol, for no reader benefit over calling findRowByKind at the one call site directly.
+template<class Row>
+inline const Row* findRowByKind( const Row* begin, const Row* end, std::string_view kind ) noexcept
+{
+    const Row* const hit = std::find_if( begin, end, [ kind ]( const Row& r ) { return r.kind == kind; } );
+    return hit != end ? hit : nullptr;
+}
+
+// The growth-vs-bar formula itself, factored out of perSymbolKind so it has exactly one body: the caller
+// already knows `now > was` and `now > bar` (perSymbolKind's own guards), and already has `growthPct` in
+// hand (it needs it for the sub-bar branch too), so this takes both rather than recomputing either.
+inline bool numericRegressionIsMajor( std::uint32_t was, std::uint32_t now, std::uint32_t bar, std::uint32_t minorDelta,
+                                       bool growthTiered, std::uint64_t growthPct ) noexcept
+{
+    const bool crossed = was <= bar;
+    return !growthTiered ? ( minorDelta == 0 || now - was >= minorDelta )
+                          : ( crossed || growthPct >= kMaterialGrowthPct );
+}
+
+// RE-SCORE, mechanical: given a (kind, was, now) triple alone — no re-ingest, no git history — recompute
+// whether this would be a MAJOR (gating-eligible) or minor finding under the kind's bar/minorDelta today.
+// nullopt means "cannot answer from these three values": either `kind` is not one of the four numeric bar
+// kinds (duplication/new-clone-of-reused-helper decide via `facet` — see AckRecord's doc comment — and
+// dead-code/api-surface tier A have no materiality question at all), or now<=was, which is not a regression
+// under any threshold. This is the whole payoff of storing was=/now= on the ack row: the knob sweep this
+// exists for calls it with a DIFFERENT bar/minorDelta than kMaterialityBars carries today.
+inline std::optional<bool> rescoreNumericMajor( std::string_view kind, std::uint32_t was, std::uint32_t now,
+                                                 std::optional<std::uint32_t> barOverride = std::nullopt,
+                                                 std::optional<std::uint32_t> minorDeltaOverride = std::nullopt ) noexcept
+{
+    const MaterialityBar* mb = findRowByKind( std::begin( kMaterialityBars ), std::end( kMaterialityBars ), kind );
+    if( mb == nullptr || now <= was )
+    {
+        return std::nullopt;
+    }
+    const std::uint32_t bar        = barOverride.value_or( mb->bar );
+    const std::uint32_t minorDelta = minorDeltaOverride.value_or( mb->minorDelta );
+    if( now <= bar )
+    {
+        return false;   // under the bar — never MAJOR (may still be a reported sev="minor" row; not this predicate's question)
+    }
+    const std::uint64_t growthPct = ( std::uint64_t( now - was ) * 100 ) / std::max( was, 1u );
+    return numericRegressionIsMajor( was, now, bar, minorDelta, mb->growthTiered, growthPct );
+}
+
 // Signal-to-noise round — the per-finding ACK RATCHET sidecar (`--quality-ack[=REASON]`): each line records one
 // deliberately-accepted finding; --quality-delta suppresses it (honestly, via acked="N") until the finding
 // WORSENS past the acked magnitude, at which point it reappears. Committable, like the baseline sidecar.
@@ -122,7 +217,7 @@ inline std::string acksPath( const std::string& root )     { return rootQualifie
 // reader, no `RIPWIRE_CONFIG` constant). Smallest thing consistent with the two house sidecar
 // conventions already in the tree — `.ripwire_notes` (committed, degrade-don't-throw, absent=inert) and
 // `.ripwire_quality_acks` (root-qualified via rootQualifiedSidecar, never the process CWD): a committed,
-// human-editable key=value text file at the repo root. ONE recognized key today (readRegisterMacrosConfig
+// human-editable key=value text file at the repo root. TWO recognized keys today (readRegisterMacrosConfig
 // below); an unrecognized key is skipped rather than refused, so the file can grow new keys later without
 // a binary that predates them choking on it — notes.h's own forward-compat rule, restated here for a new
 // file rather than invented twice.
@@ -132,14 +227,12 @@ inline std::string configPath( std::string_view root ) { return rootQualifiedSid
 template<class Value>
 using ScratchMap = stree::dyn::dynamic_map<std::uint64_t, Value, 32>;   // uint64 keys on Apple cache lines; use only when a hard capacity bound is obvious
 
-inline bool insertScratchSeen( ScratchMap<std::uint8_t>& seen, std::uint64_t key, const char* capacityMsg )
+// Every caller sizes `seen` at ing.symbols.size() and inserts at most one key per symbol it iterates (traced 2026-09-19:
+// the per-symbol, api, mask and churn passes of quality.h), so the container can never reject a new key.
+inline bool insertScratchSeen( ScratchMap<std::uint8_t>& seen, std::uint64_t key )
 {
     const auto [ it, inserted ] = seen.insert( { key, 1 } );
-    if( it == seen.end() )
-    {
-        DEGRADED_PATH_ALERT( capacityMsg );
-        return false;
-    }
+    ASSUME( it != seen.end(), "a scratch map is sized at the symbol count and takes at most one key per symbol" );
     return inserted;
 }
 
@@ -163,11 +256,13 @@ inline std::string baselineCanonId( const IngestResult& ing, NodeId i, std::stri
 struct Snapshot
 {
     gtl::btree_map<std::uint64_t, std::uint32_t> ccxBySym;    // hash(canonId) → MAX ccx (btree = sorted iteration for the byte-stable sidecar)
-    gtl::btree_map<std::uint64_t, std::uint32_t> locBySym;    // Q1 verbosity  — hash(canonId) → MAX physical LOC (the master variable, §1d)
+    gtl::btree_map<std::uint64_t, std::uint32_t> locBySym;    // Q1 verbosity  — hash(canonId) → MAX CODE lines (Q-DIAL-3: blank and comment-only lines are not debt; see codeLinesInBody). ALSO the r26 ORIGIN oracle, which reads MEMBERSHIP only, so the value change does not touch it.
     gtl::btree_map<std::uint64_t, std::uint32_t> nestBySym;   // Q1 erosion    — hash(canonId) → MAX control-nesting depth
     gtl::btree_map<std::uint64_t, std::uint32_t> paramsBySym; // Q1 erosion    — hash(canonId) → MAX parameter count
     gtl::btree_map<std::uint64_t, std::uint32_t> defsBySym;   // hash(canonId) → COUNT of definitions sharing the id (an overload set's CARDINALITY, deliberately NOT a MAX — see computeSnapshot)
     gtl::btree_map<std::uint64_t, std::uint32_t> maskBySym;   // §D#4 error-masking — hash(canonId) → COUNT of error-masking constructs in the symbol (SUM over overloads, see computeSnapshot)
+    gtl::btree_map<std::uint64_t, std::uint32_t> maskReportBySym; // the REPORT-ONLY part of maskBySym's count: widened handler shapes that do not gate in the symbol's language (kHandlerShapeGates); absent = 0
+    gtl::btree_map<std::uint64_t, std::uint32_t> placeholderBySym; // the placeholder kind — hash(canonId) → COUNT of stub / TODO constructs in the symbol (SUM over overloads, like maskBySym)
     gtl::btree_map<std::uint64_t, std::uint64_t> bodyHashBySym; // §D#4 short-horizon-churn — pathQualifiedKey(path,scope,name) → fnv1a64 of the RAW body bytes (change detection; literal-only edits move NO metric, so metrics can't detect them). Path-qualified since v6: a bare canonId key folded every scope-less same-named symbol ACROSS FILES into one join identity (the W1-S2 cross-file churn misattribution)
     std::vector<std::uint64_t>             cloneGroups; // sorted hash(sorted member canonIds)
     std::vector<std::uint64_t>             dead;        // sorted hash(canonId) of dead-candidate symbols
@@ -183,9 +278,9 @@ struct Snapshot
 inline bool isPublicApi( const IngestResult& ing, NodeId i ) noexcept
 {
     const Symbol& s = ing.symbols[i];
-    if( s.kind == SymKind::Section )
+    if( s.kind == SymKind::Section || s.kind == SymKind::ModuleScope )
     {
-        return false; // markdown heading — not a code contract
+        return false; // markdown heading / a file's module scope — neither is a code contract
     }
     const std::string& p = ing.files[ s.fileId ];
     const auto ends = [ & ]( std::string_view e )
@@ -321,10 +416,16 @@ inline bool isValidMacroToken( std::string_view token ) noexcept
 struct RegisterMacrosConfig
 {
     std::vector<std::string> names;              // valid register_macros=NAME tokens, sorted + deduped
-    std::vector<std::string> unrecognizedKeys;    // distinct non-"register_macros" keys seen, sorted + deduped
+    std::vector<std::string> vendoredPaths;      // Q-DIAL-5: vendored_paths=PATH[, PATH...] tokens, sorted + deduped
+    std::vector<std::string> unrecognizedKeys;    // distinct key seen that is neither of the two above, sorted + deduped
 };
+// NAME NOTE: this type and its reader are spelled for the FIRST key they carried, and they keep those names
+// on purpose — test/qschemetripcheck.sh's manifest keys the determinism guard on the function NAME
+// `readRegisterMacrosConfig`, so renaming it for tidiness would silently retire a guard. It is the
+// .ripwire_config reader; it reads two keys.
 
-// `.ripwire_config`'s ONE recognized key: `register_macros = NAME[, NAME...]`. Grammar: one directive per
+// `.ripwire_config`'s TWO recognized keys: `register_macros = NAME[, NAME...]` and, since 2026-09-10,
+// `vendored_paths = PATH[, PATH...]` (Q-DIAL-5 — code this repo carries but did not write). Grammar: one directive per
 // line, '#' full-line comments, blank lines ignored; a line with no '=' at all carries no key/value shape
 // this file defines anything for, so it is left alone rather than guessed at (same "never throws, never
 // guesses" posture as the malformed-token skip below). A line that DOES have that shape but whose key is
@@ -333,11 +434,45 @@ struct RegisterMacrosConfig
 // accepted. Absent/unreadable/empty file yields two empty lists — INERTNESS CONTRACT: no config file
 // changes nothing about this run's set of exempted names (kBuiltinRegisterMacros still applies), and an
 // unrecognized key is disclosed, never a refusal — a typo in an otherwise-inert config must not fail a run.
+// One directive's VALUE list: comma-separated tokens, each trimmed, each admitted by its key's own rule.
+// Hoisted out of the line loop so that loop stays readable (and under its bars) now that the file carries two
+// keys. A PATH is root-relative with no '..' segment and no leading '/'; anything else is a value this file's
+// grammar defines nothing for and is dropped rather than guessed at, the same posture the macro-token check
+// takes. Never throws, never warns: a malformed VALUE is inert, and only a malformed KEY is disclosed.
+inline void appendConfigValueTokens( std::string_view rest, bool isVendor, RegisterMacrosConfig& out )
+{
+    std::size_t start = 0;
+    while( start <= rest.size() )
+    {
+        const std::size_t comma = rest.find( ',', start );
+        std::string_view  tok( rest.data() + start, ( comma == std::string_view::npos ? rest.size() : comma ) - start );
+        while( !tok.empty() && ( tok.back()  == ' ' || tok.back()  == '\t' ) ) { tok.remove_suffix( 1 ); }
+        while( !tok.empty() && ( tok.front() == ' ' || tok.front() == '\t' ) ) { tok.remove_prefix( 1 ); }
+        if( isVendor )
+        {
+            if( !tok.empty() && tok.front() != '/' && tok.find( ".." ) == std::string_view::npos )
+            {
+                out.vendoredPaths.emplace_back( tok );
+            }
+        }
+        else if( isValidMacroToken( tok ) )
+        {
+            out.names.emplace_back( tok );
+        }
+        if( comma == std::string_view::npos )
+        {
+            break;
+        }
+        start = comma + 1;
+    }
+}
+
 inline RegisterMacrosConfig readRegisterMacrosConfig( std::string_view root )
 {
     RegisterMacrosConfig out;
-    std::string          text;
-    if( !docparse::detail::readWholeFile( configPath( root ), text ) || text.empty() )
+    // readRegularFile: a FIFO at the name hung every --quality-delta, and a directory there aborted on Linux (docparse.h).
+    const std::string    text = docparse::detail::readRegularFile( ".ripwire_config", configPath( root ) ).value_or( std::string() );
+    if( text.empty() )
     {
         return out;   // absent/unreadable/empty — inert, never a refusal
     }
@@ -360,33 +495,20 @@ inline RegisterMacrosConfig readRegisterMacrosConfig( std::string_view root )
         }
         std::string_view key = line.substr( 0, eq );
         while( !key.empty() && ( key.back() == ' ' || key.back() == '\t' ) ) { key.remove_suffix( 1 ); }
-        constexpr std::string_view kKey = "register_macros";
-        if( key != kKey )
+        constexpr std::string_view kKey       = "register_macros";
+        constexpr std::string_view kVendorKey = "vendored_paths";   // Q-DIAL-5
+        const bool                 isVendor   = key == kVendorKey;
+        if( key != kKey && !isVendor )
         {
             out.unrecognizedKeys.emplace_back( key );   // F-13: disclosed, not skipped
             continue;
         }
-        std::string_view rest = line.substr( eq + 1 );
-        std::size_t      start = 0;
-        while( start <= rest.size() )
-        {
-            const std::size_t comma = rest.find( ',', start );
-            std::string_view  tok( rest.data() + start, ( comma == std::string_view::npos ? rest.size() : comma ) - start );
-            while( !tok.empty() && ( tok.back() == ' ' || tok.back() == '\t' ) ) { tok.remove_suffix( 1 ); }
-            while( !tok.empty() && ( tok.front() == ' ' || tok.front() == '\t' ) ) { tok.remove_prefix( 1 ); }
-            if( isValidMacroToken( tok ) )
-            {
-                out.names.emplace_back( tok );
-            }
-            if( comma == std::string_view::npos )
-            {
-                break;
-            }
-            start = comma + 1;
-        }
+        appendConfigValueTokens( line.substr( eq + 1 ), isVendor, out );
     }
     std::sort( out.names.begin(), out.names.end() );
     out.names.erase( std::unique( out.names.begin(), out.names.end() ), out.names.end() );
+    std::sort( out.vendoredPaths.begin(), out.vendoredPaths.end() );
+    out.vendoredPaths.erase( std::unique( out.vendoredPaths.begin(), out.vendoredPaths.end() ), out.vendoredPaths.end() );
     std::sort( out.unrecognizedKeys.begin(), out.unrecognizedKeys.end() );
     out.unrecognizedKeys.erase( std::unique( out.unrecognizedKeys.begin(), out.unrecognizedKeys.end() ), out.unrecognizedKeys.end() );
     return out;
@@ -394,16 +516,75 @@ inline RegisterMacrosConfig readRegisterMacrosConfig( std::string_view root )
 
 // The combined, sorted, deduped registered-macro name list for ONE run: the built-ins above plus whatever
 // .ripwire_config's register_macros= adds. Sorted so nothing downstream needs its own re-sort.
+// The ONE shape both .ripwire_config consumers need: this tool's built-in list, plus whatever the repo's own
+// config adds, sorted and deduped so nothing downstream re-sorts. Factored the moment the second consumer
+// existed — `--quality-delta` reported vendoredPathPrefixes as a 114-token clone of this function the first
+// time it was written out longhand, which is the kind's whole job.
+inline std::vector<std::string> mergeBuiltinsWithConfig( std::span<const std::string_view> builtins,
+                                                         std::vector<std::string> fromConfig )
+{
+    std::vector<std::string> out;
+    out.reserve( builtins.size() + fromConfig.size() );
+    for( std::string_view b : builtins )
+    {
+        out.emplace_back( b );
+    }
+    for( std::string& extra : fromConfig )
+    {
+        out.push_back( std::move( extra ) );
+    }
+    std::sort( out.begin(), out.end() );
+    out.erase( std::unique( out.begin(), out.end() ), out.end() );
+    return out;
+}
+
 inline std::vector<std::string> registeredMacroNames( std::string_view root )
 {
-    std::vector<std::string> names( kBuiltinRegisterMacros.begin(), kBuiltinRegisterMacros.end() );
-    for( std::string& extra : readRegisterMacrosConfig( root ).names )
+    return mergeBuiltinsWithConfig( kBuiltinRegisterMacros, readRegisterMacrosConfig( root ).names );
+}
+
+// Q-DIAL-5 (2026-09-10) — VENDORED PATHS: code this repo CARRIES but did not WRITE. No such notion existed
+// anywhere in this file, and the clone kinds paid for it: one commit (08416403, the timsort landing) produced
+// 9 duplication rows, 8 of 8 dead-code:new-symbol acks and 37 api-surface acks against an upstream body whose
+// shape is not this repo's to fix. The ledger says so in its own words, 11 times.
+//
+// Built-in conventions plus whatever `.ripwire_config`'s vendored_paths= adds. The built-ins are the four
+// directory names the ecosystem agrees on; a vendored file that lives somewhere else (this repo's own
+// src/infra/timsort.hpp) is exactly what the config key is for, because no convention can guess it.
+// HONEST SCOPE, measured while writing the gate for this: the CRAWLER already drops third_party/, vendor/
+// and node_modules/, so those three names are here for completeness rather than effect — `external/` is the
+// only built-in the indexer actually reaches, and everything else vendored is reached through the config key.
+inline constexpr std::array<std::string_view, 4> kBuiltinVendoredPrefixes = { "third_party/", "vendor/", "node_modules/", "external/" };
+
+inline std::vector<std::string> vendoredPathPrefixes( std::string_view root )
+{
+    return mergeBuiltinsWithConfig( kBuiltinVendoredPrefixes, readRegisterMacrosConfig( root ).vendoredPaths );
+}
+
+// `rel` is ROOT-RELATIVE (the relForHash spelling every sidecar key uses). A prefix ending in '/' names a
+// DIRECTORY and matches everything under it; one that does not is a whole path and must match exactly, so
+// `vendored_paths = src/infra/timsort.hpp` cannot silently swallow src/infra/timsort_extra.hpp.
+inline bool isVendoredPath( std::string_view rel, const std::vector<std::string>& prefixes ) noexcept
+{
+    for( const std::string& p : prefixes )
     {
-        names.push_back( std::move( extra ) );
+        if( p.empty() )
+        {
+            continue;
+        }
+        if( p.back() == '/' )
+        {
+            if( rel.size() >= p.size() && rel.compare( 0, p.size(), p ) == 0 )
+            {
+                return true;
+            }
+        }
+        else if( rel == p )
+        {
+            return true;
+        }
     }
-    std::sort( names.begin(), names.end() );
-    names.erase( std::unique( names.begin(), names.end() ), names.end() );
-    return names;
+    return false;
 }
 
 // A registered macro's own call syntax, read starting at the CALLEE's own signature start byte (`region`
@@ -455,12 +636,28 @@ inline bool startsWithRegisteredMacro( std::string_view region, const std::vecto
 // mark a symbol live) with only the fromSymbol test inverted. NAME-level matching, not per-target resolution
 // — the same heuristic level as the resolver's bare-name spray, and a collision errs in the safe direction
 // (false-live, never false-dead). Sorted + deduped for binary_search; deterministic (reference order is).
+//
+// ISSUE #60 — "FILE SCOPE" IS NOW A SYMBOL, AND THIS SET MUST STILL SEE IT. ingest_model.h
+// mintModuleScopeOwners gives a top-level call an owner, so `fromSymbol == kNoNode` alone stopped selecting
+// anything on a code corpus and this evidence source silently went EMPTY. What that costs is not
+// hypothetical: a file-scope call the resolver DECLINES (tier 3 — several same-named defs, none in the
+// caller's file or directory) mints no in-edge either, so its callee had no evidence left at all and
+// --quality-delta gated dead-code on an untouched, genuinely-called function (measured: +154 dead keys on
+// vue-core, +98 on django, +64 here). The mint only ever ADDS a caller, so this predicate widens to match:
+// a reference owned BY a module-scope owner is exactly the file-scope reference it used to be. kNoNode is
+// kept beside it — a non-call reference outside every definition still has no owner (emitReferences takes
+// findOwnedDef for those roles), and a corpus the mint never ran over must read the same as before.
 inline std::vector<std::uint64_t> topLevelCalleeNameHashes( const IngestResult& ing )
 {
+    const auto atFileScope = [ & ]( const Reference& r ) noexcept
+    {
+        return r.fromSymbol == kNoNode
+            || ( r.fromSymbol < ing.symbols.size() && ing.symbols[ r.fromSymbol ].kind == SymKind::ModuleScope );
+    };
     std::vector<std::uint64_t> hashes;
     for( const Reference& r : ing.references )
     {
-        if( r.fromSymbol != kNoNode || r.isInherit || r.isDocLink || r.isCompose
+        if( !atFileScope( r ) || r.isInherit || r.isDocLink || r.isCompose
             || ( r.role != RefRole::Call && r.role != RefRole::Macro ) )
         {
             continue;
@@ -472,8 +669,70 @@ inline std::vector<std::uint64_t> topLevelCalleeNameHashes( const IngestResult& 
     return hashes;
 }
 
+// Q-DIAL-2 (2026-09-10) — THE SYMBOLS A LANGUAGE INVOKES, for which "zero in-edges in a name-based call
+// graph" is evidence of nothing at all. This is what the dead kind's blanket header exclusion was a PROXY
+// for, stated directly, and it is measurable in both directions: all ten dead-code rows the verb produced
+// across 40 replayed commits were exactly these shapes (audit Q1 §2e W1), and the header rule that hid them
+// also hid 96.8% of this repo's own source from the kind (Q1 §3, synthetic S6 — the sole caller of a header
+// function deleted, silently missed).
+//
+// Each clause names a call site the parser cannot see as a named CALL:
+//   * a TYPE (class/struct/interface) is never invoked at all — its in-edge count is not a liveness signal;
+//   * `main` is invoked by the runtime;
+//   * `operator...` is invoked by the OPERATOR'S SYNTAX (`a + b`, `p[i]`, `new T`, `f( x )` on a functor);
+//   * a leading `~` is a C++ destructor — the language runs it at scope exit;
+//   * name == the innermost scope segment is a CONSTRUCTOR in every language that spells one that way
+//     (C++, Java, C#, PHP-in-part), built by object creation rather than by a call to that name;
+//   * a Python-style dunder (`__enter__`, `__repr__`, `__init__`) is invoked by a protocol, never by name;
+//   * a METHOD named init/deinit/constructor is Swift's / JavaScript's spelling of the same constructor
+//     protocol. Scoped to Method deliberately: a free function called `init` is an ordinary function, and
+//     excluding it would be the header rule's over-reach in a smaller costume.
+// FLOOR, stated: this is a NAME-level rule, exactly like the resolver's own bare-name matching, and it errs
+// toward false-LIVE (a symbol wrongly considered invoked is silently not reported) rather than false-dead,
+// which is the direction a deletion candidate must err in.
+inline bool languageInvokedSymbol( const Symbol& s ) noexcept
+{
+    if( s.kind == SymKind::Class || s.kind == SymKind::Struct || s.kind == SymKind::Interface )
+    {
+        return true; // a type is declared, never called
+    }
+    if( s.name == "main" )
+    {
+        return true; // the runtime's entry point
+    }
+    if( s.name.rfind( "operator", 0 ) == 0 )
+    {
+        return true; // invoked by the operator's own syntax
+    }
+    if( !s.name.empty() && s.name.front() == '~' )
+    {
+        return true; // C++ destructor
+    }
+    if( s.name.size() > 4 && s.name.rfind( "__", 0 ) == 0
+        && s.name.compare( s.name.size() - 2, 2, "__" ) == 0 )
+    {
+        return true; // Python dunder — invoked by a protocol
+    }
+    if( s.kind == SymKind::Method && ( s.name == "init" || s.name == "deinit" || s.name == "constructor" ) )
+    {
+        return true; // Swift init/deinit, JavaScript constructor
+    }
+    if( !s.scope.empty() )
+    {
+        const std::size_t     sep  = s.scope.rfind( "::" );
+        const std::string_view tail = sep == std::string::npos ? std::string_view( s.scope )
+                                                               : std::string_view( s.scope ).substr( sep + 2 );
+        if( !tail.empty() && tail == s.name )
+        {
+            return true; // constructor: the member that shares its type's name
+        }
+    }
+    return false;
+}
+
 // A "dead deletion-candidate": has a body, no caller in the indexed tree, not invoked from file scope, not
-// header-exported, not a test fixture, not produced by a registered self-registering macro. A SIMPLE,
+// invoked by the LANGUAGE itself (languageInvokedSymbol, above), not a test fixture, not produced by a
+// registered self-registering macro. A SIMPLE,
 // internally-consistent heuristic — the delta only needs baseline↔current consistency, not parity with the
 // fuller --dead-code verb. `topLevelCallees` is the sorted set topLevelCalleeNameHashes builds and
 // `registeredMacroIds` the sorted set registeredMacroSymbolIds builds (below, past forEachSymbolBody) —
@@ -484,6 +743,7 @@ inline std::vector<std::uint64_t> topLevelCalleeNameHashes( const IngestResult& 
 inline bool isDeadCandidate( const IngestResult& ing, const Graph& g, NodeId i,
                              const std::vector<std::uint64_t>& topLevelCallees,
                              const std::vector<NodeId>& registeredMacroIds,
+                             const std::vector<NodeId>& pythonDispatchIds,
                              bool* exemptedByRegisterMacro = nullptr ) noexcept
 {
     if( exemptedByRegisterMacro )
@@ -491,9 +751,9 @@ inline bool isDeadCandidate( const IngestResult& ing, const Graph& g, NodeId i,
         *exemptedByRegisterMacro = false;
     }
     const Symbol& s = ing.symbols[i];
-    if( s.kind == SymKind::Section )
+    if( s.kind == SymKind::Section || s.kind == SymKind::ModuleScope )
     {
-        return false; // markdown heading
+        return false; // markdown heading / a file's module scope (no body of its own)
     }
     if( s.sigEndByte >= s.endByte )
     {
@@ -508,13 +768,15 @@ inline bool isDeadCandidate( const IngestResult& ing, const Graph& g, NodeId i,
     {
         return false; // W1-S2: invoked from file scope (a top-level script statement) — a use the CSR drops
     }
-    const std::string& p = ing.files[ s.fileId ];
-    const auto ends = [ & ]( std::string_view e )
-    { return p.size() >= e.size() && p.compare( p.size() - e.size(), e.size(), e ) == 0; };
-    if( ends( ".h" ) || ends( ".hpp" ) || ends( ".hh" ) || ends( ".hxx" ) )
+    if( std::binary_search( pythonDispatchIds.begin(), pythonDispatchIds.end(), i ) )
     {
-        return false; // header-exported by convention
+        return false; // a Python self/cls call can dispatch to this override through an indexed base
     }
+    if( languageInvokedSymbol( s ) )
+    {
+        return false; // Q-DIAL-2: the LANGUAGE calls it — see languageInvokedSymbol (this replaced a blanket header exclusion)
+    }
+    const std::string_view p = rootRelPath( ing, s.fileId );   // #228: a directory above the root never decides this
     if( isFixturePath( p ) )
     {
         return false; // fixtures are dead by design (noise rules)
@@ -533,6 +795,27 @@ inline bool isDeadCandidate( const IngestResult& ing, const Graph& g, NodeId i,
     }
     return true;
 }
+
+// The dead-code kind's one exemption beyond isDeadCandidate: a call the builtin-method name gate DECLINED could have
+// meant this definition (graph.h BuiltinMethodGate, Graph::gateDeclinedTarget), so it is not provably uncalled — which
+// is what it was before the gate, when that call bound to it by name. Both dead-set readers (the snapshot and the
+// delta) apply it after isDeadCandidate, so a symbol it exempts is exactly one that would otherwise be dead, and the
+// delta counts those as declined-call-excluded=.
+inline bool declinedCallMayReach( const Graph& g, NodeId i ) noexcept
+{
+    return i < g.gateDeclinedTarget.size() && g.gateDeclinedTarget[ i ] != 0;
+}
+
+// ONE clone group of the CURRENT tree, reduced to the two facts an ack row can be healed from: the
+// member-set hash that IS the ack identity for both clone kinds, and the idiom verdict that decides their
+// severity. computeDelta already computes both for every group it scans (exactIdioms/type3Idioms), so
+// exporting them costs a copy rather than a second clone pass — see its cloneIdiomsOut parameter, and
+// backfillCloneAckProvenance, the one consumer.
+struct CloneIdiomFact
+{
+    std::uint64_t hash = 0;
+    std::string   idiom;   // cloneIdiomName( vd.idiom ) — the same string Regression::facet carries
+};
 
 // hash a clone group by its SORTED member canonical ids — so "this set of functions is duplicated" is the
 // group's stable identity (adding a 3rd copy changes the set ⇒ a new group ⇒ reported as new duplication).
@@ -572,20 +855,66 @@ inline std::uint64_t pathQualifiedKey( std::string_view relPath, std::string_vie
     return fnv1a64( idText );
 }
 
-// §D#4 error-masking — attribute each error-masking hit (findErrorMasking) to its ENCLOSING symbol by byte-span
-// containment, then COUNT hits per baseline canonId. A symbol contains a hit iff the hit's start byte lies in
-// the symbol's full def span [sigStartByte, endByte) in the same file. Overloads sharing a canonId SUM (the
-// count is a magnitude, not a max — two overloads each masking once = 2 masks under that id, and the delta then
-// fires when the total grows). Deterministic: findErrorMasking is deterministic and the fold is a pure sum.
+// THE SAME KEY, taken from a Symbol — and the ONE place a language's keying rule lives. Elixir indexes a
+// callable as `name/N` (parser version 95): run/1 and run/2 are two ENTITIES, so canonicalId keeps the arity,
+// but they are one piece of SOURCE under this key — exactly as C++ overloads of `f` already share one — so
+// an arity edit is a params movement on one identity (--edit-check: contract-change, params_was/params_now;
+// --quality-delta: a params row), never a dead old symbol beside a brand-new one, which is what the
+// arity-carrying key reported (PR #81 review item 4, test/elixirnamearitycheck.sh arm C). Every language
+// but Elixir keys by the name as indexed. Every call site keys through this overload: a raw
+// (path, scope, name) call beside it would be a second rule that has to be ARGUED equal to this one.
+// kQSnapCacheScheme v11 is this fold — a v10 blob's Elixir keys hash a different byte string.
+inline std::uint64_t pathQualifiedKey( std::string_view relPath, const Symbol& s )
+{
+    return pathQualifiedKey( relPath, s.scope, s.lang == Lang::Elixir ? elixirBaseName( s.name ) : std::string_view( s.name ) );
+}
+
+// §D#4 error-masking and placeholder — attribute each hit (findQualityConstructs) to its ENCLOSING symbol by
+// byte-span containment, then COUNT hits per baseline canonId. A symbol contains a hit iff the hit's start byte
+// lies in the symbol's full def span [sigStartByte, endByte) in the same file. Overloads sharing a canonId SUM
+// (the count is a magnitude, not a max — two overloads each masking once = 2 masks under that id, and the delta
+// then fires when the total grows). Deterministic: findQualityConstructs is deterministic and the fold is a
+// pure sum.
 //
 // Attribution is O(hits · symbols-per-file) via a per-file symbol index; a hit inside no def (file-scope) is
-// dropped (no owning symbol → nothing to attribute a regression to). Byte-span containment mirrors how ingest
-// attributes References to their enclosing definition, so the same-file, same-span discipline is consistent.
-inline gtl::btree_map<std::uint64_t, std::uint32_t> errorMaskCountsBySym( const IngestResult& ing, std::string_view root )
+// dropped (no owning symbol → nothing to attribute a regression to — for a file-level TODO comment that is a
+// stated floor of the placeholder kind). Byte-span containment mirrors how ingest attributes References to
+// their enclosing definition, so the same-file, same-span discipline is consistent.
+struct ConstructCounts
 {
-    gtl::btree_map<std::uint64_t, std::uint32_t> counts;
-    const std::vector<ErrorMaskHit> hits = findErrorMasking( ing );
-    if( hits.empty() )
+    gtl::btree_map<std::uint64_t, std::uint32_t> mask;         // every error-masking hit (→ Snapshot::maskBySym)
+    gtl::btree_map<std::uint64_t, std::uint32_t> maskReport;   // the REPORT-ONLY subset of `mask` (→ maskReportBySym): widened shapes whose (shape, language) is not in kHandlerShapeGates
+    gtl::btree_map<std::uint64_t, std::uint32_t> placeholder;  // stub / TODO hits (→ Snapshot::placeholderBySym)
+};
+
+// The innermost def whose span holds `startByte` in file `fileId`, or kNoNode. Smallest enclosing def wins
+// (a nested lambda/method inside a method), so a count lands on the innermost owning symbol.
+inline NodeId enclosingDefOf( const IngestResult& ing, const SymbolsByFile& byFile, std::uint32_t fileId, std::uint32_t startByte )
+{
+    if( fileId >= byFile.size() )
+    {
+        return kNoNode;
+    }
+    NodeId        owner   = kNoNode;
+    std::uint32_t bestLen = UINT32_MAX;
+    for( NodeId i : byFile[ fileId ] )
+    {
+        const Symbol& s = ing.symbols[i];
+        if( startByte >= s.sigStartByte && startByte < s.endByte && s.endByte - s.sigStartByte < bestLen )
+        {
+            bestLen = s.endByte - s.sigStartByte;
+            owner   = i;
+        }
+    }
+    ENSURES( owner == kNoNode || owner < ing.symbols.size(), "an owner is a def id taken from byFile, which indexes ing.symbols" );
+    return owner;
+}
+
+inline ConstructCounts constructCountsBySym( const IngestResult& ing, std::string_view root )
+{
+    ConstructCounts            counts;
+    const QualityConstructHits hits = findQualityConstructs( ing );
+    if( hits.mask.empty() && hits.placeholder.empty() )
     {
         return counts;
     }
@@ -593,34 +922,32 @@ inline gtl::btree_map<std::uint64_t, std::uint32_t> errorMaskCountsBySym( const 
     // per-file symbol id list (only real-body defs can enclose a masking block). `symbols[i].id == i`, so
     // the shared bucket-and-sort's `s.id` is the same value the hand-written loop pushed as `i`.
     const SymbolsByFile byFile = symbolsByFileInIdOrder( ing, []( const Symbol& s ) { return s.endByte > s.sigStartByte; } );
-    for( const ErrorMaskHit& h : hits )
+    // pathQualifiedKey, via the SAME rule maskBySym is stored under (see qualityKey). These counts are compared
+    // against that map key-for-key, so a scheme that differs by one byte silently reports every construct as new.
+    const auto keyOf = [ & ]( NodeId owner ) { return pathQualifiedKey( relForHash( ing.files[ing.symbols[owner].fileId], root ), ing.symbols[owner] ); };
+    for( const ErrorMaskHit& h : hits.mask )
     {
-        if( h.fileId >= byFile.size() )
+        const NodeId owner = enclosingDefOf( ing, byFile, h.fileId, h.startByte );
+        if( owner == kNoNode )
         {
             continue;
         }
-        // smallest enclosing def wins (a nested lambda/method inside a method) — pick the tightest [start,end)
-        // that contains the hit so the count lands on the innermost owning symbol. Linear per file is fine.
-        NodeId        owner   = kNoNode;
-        std::uint32_t bestLen = UINT32_MAX;
-        for( NodeId i : byFile[ h.fileId ] )
+        const std::uint64_t key = keyOf( owner );
+        ++counts.mask[ key ];
+        if( !errorMaskHitGates( h.id, ing.symbols[owner].lang ) )
         {
-            const Symbol& s = ing.symbols[i];
-            if( h.startByte >= s.sigStartByte && h.startByte < s.endByte )
-            {
-                const std::uint32_t len = s.endByte - s.sigStartByte;
-                if( len < bestLen ) { bestLen = len; owner = i; }
-            }
-        }
-        if( owner != kNoNode )
-        {
-            // pathQualifiedKey, via the SAME rule maskBySym is stored under (see qualityKey). These counts are
-            // compared against that map key-for-key, so a scheme that differs by one byte silently reports every
-            // masking construct as new.
-            ++counts[ pathQualifiedKey( relForHash( ing.files[ing.symbols[owner].fileId], root ),
-                                        ing.symbols[owner].scope, ing.symbols[owner].name ) ];
+            ++counts.maskReport[ key ];
         }
     }
+    for( const ErrorMaskHit& h : hits.placeholder )
+    {
+        const NodeId owner = enclosingDefOf( ing, byFile, h.fileId, h.startByte );
+        if( owner != kNoNode )
+        {
+            ++counts.placeholder[ keyOf( owner ) ];
+        }
+    }
+    ENSURES( counts.maskReport.size() <= counts.mask.size(), "every report-only hit was also counted in the total, under the same key" );
     return counts;
 }
 
@@ -654,7 +981,7 @@ inline gtl::btree_map<std::uint64_t, std::uint32_t> errorMaskCountsBySym( const 
 inline std::uint64_t qualityKey( const IngestResult& ing, NodeId i, std::string_view root )
 {
     const Symbol& s = ing.symbols[i];
-    return pathQualifiedKey( relForHash( ing.files[ s.fileId ], root ), s.scope, s.name );
+    return pathQualifiedKey( relForHash( ing.files[ s.fileId ], root ), s );   // the Symbol overload: the one keying rule per language
 }
 
 // §D#4 short-horizon-churn — a per-identity hash of the symbols' RAW body bytes, for CHANGE detection that
@@ -680,16 +1007,16 @@ inline std::uint64_t qualityKey( const IngestResult& ing, NodeId i, std::string_
 template<class Fn>
 inline void forEachSymbolBody( const IngestResult& ing, Fn&& visit )
 {
-    // per-file def ids with a real body (see errorMaskCountsBySym above on `symbols[i].id == i`).
+    // per-file def ids with a real body (see constructCountsBySym above on `symbols[i].id == i`).
     const SymbolsByFile byFile = symbolsByFileInIdOrder( ing, []( const Symbol& s ) { return s.endByte > s.sigStartByte; } );
-    std::string         bytes;
     for( std::uint32_t f = 0; f < ing.files.size(); ++f )
     {
         if( byFile[f].empty() )
         {
             continue;
         }
-        if( !docparse::detail::readWholeFile( ing.files[f], bytes ) || bytes.empty() )
+        const std::string bytes = docparse::detail::readWholeFile( ing.files[f] ).value_or( std::string() );
+        if( bytes.empty() )
         {
             continue;   // unreadable or empty — contributes nothing, silently: a partial read is evidence of nothing
         }
@@ -704,6 +1031,376 @@ inline void forEachSymbolBody( const IngestResult& ing, Fn&& visit )
         }
     }
 }
+
+// Direct Python class members only; module-level and nested functions have no class owner.
+inline std::vector<NodeId> pythonMethodOwners( const IngestResult& ing )
+{
+    const bool hasClasses = std::any_of( ing.symbols.begin(), ing.symbols.end(), []( const Symbol& s )
+    {
+        return s.lang == Lang::Python && s.kind == SymKind::Class;
+    } );
+    if( !hasClasses )
+    {
+        return {};
+    }
+    std::vector<NodeId> owner( ing.symbols.size(), kNoNode );
+    SymbolsByFile byFile = symbolsByFileInIdOrder( ing, []( const Symbol& s )
+    {
+        return s.lang == Lang::Python && ( s.kind == SymKind::Class || s.kind == SymKind::Function || s.kind == SymKind::Method );
+    } );
+    std::vector<NodeId> parents;
+    for( auto& ids : byFile )
+    {
+        std::sort( ids.begin(), ids.end(), [ & ]( NodeId a, NodeId b )
+        {
+            const Symbol& x = ing.symbols[a];
+            const Symbol& y = ing.symbols[b];
+            if( x.sigStartByte != y.sigStartByte ) { return x.sigStartByte < y.sigStartByte; }
+            if( x.endByte != y.endByte ) { return x.endByte > y.endByte; }
+            return a < b;
+        } );
+        parents.clear();
+        for( NodeId id : ids )
+        {
+            const Symbol& s = ing.symbols[id];
+            while( !parents.empty() && ( ing.symbols[parents.back()].sigStartByte >= s.sigStartByte
+                                         || ing.symbols[parents.back()].endByte < s.endByte ) )
+            {
+                parents.pop_back();
+            }
+            if( s.kind != SymKind::Class && !parents.empty() && ing.symbols[parents.back()].kind == SymKind::Class )
+            {
+                owner[id] = parents.back();
+            }
+            parents.push_back( id );
+        }
+    }
+    return owner;
+}
+
+// Python VarDecl bindings are parameter names in source order (emitBindings); the first one
+// identifies the conventional receiver. Reuse those AST facts, including commented/typed parameters.
+// A non-receiver first parameter is marked 3 so a later parameter named cls cannot replace it.
+inline std::vector<std::uint8_t> pythonReceiverParameters( const IngestResult& ing )
+{
+    std::vector<std::uint8_t> receiver( ing.symbols.size(), 0 );
+    for( const Binding& b : ing.bindings )
+    {
+        if( b.fromSymbol >= receiver.size() || ing.symbols[b.fromSymbol].lang != Lang::Python
+            || b.kind != LocalBindKind::VarDecl || b.spanStart != 0 || b.spanEnd != 0 || receiver[b.fromSymbol] != 0 )
+        {
+            continue;
+        }
+        receiver[b.fromSymbol] = b.var == "self" ? 1 : b.var == "cls" ? 2 : 3;
+    }
+    return receiver;
+}
+
+// Deduplicate receiver-call evidence before walking inheritance; repeated call sites have the same
+// possible targets. Views borrow the ingested reference names for this one snapshot computation.
+inline std::vector<std::pair<NodeId, std::string_view>> pythonDispatchRequests( const IngestResult& ing,
+    std::span<const NodeId> owner, std::span<const std::uint8_t> receiver )
+{
+    std::vector<std::pair<NodeId, std::string_view>> requests;
+    for( const Reference& r : ing.references )
+    {
+        if( r.lang != Lang::Python || r.role != RefRole::Call || r.fromSymbol >= owner.size()
+            || owner[r.fromSymbol] == kNoNode || !r.qualifier.empty()
+            || !( ( r.recv == RecvKind::ThisObj && receiver[r.fromSymbol] == 1 )
+                  || ( r.recv == RecvKind::NamedVar && r.recvVar == "cls" && receiver[r.fromSymbol] == 2 ) ) )
+        {
+            continue;
+        }
+        requests.emplace_back( owner[r.fromSymbol], r.calleeName );
+    }
+    std::sort( requests.begin(), requests.end(), []( const auto& a, const auto& b )
+    {
+        return a.first != b.first ? a.first < b.first : rw::sortutil::svLess( a.second, b.second );
+    } );
+    requests.erase( std::unique( requests.begin(), requests.end() ), requests.end() );
+    return requests;
+}
+
+// Include the class itself and follow implementors DOWNWARD only. A walk up then down would admit
+// sibling classes the receiver cannot be. The graph already filters inheritance by language/root.
+inline std::vector<NodeId> pythonDispatchClasses( const Graph& g, NodeId base )
+{
+    std::vector<NodeId> classes{ base };
+    HashMap<NodeId, bool> visited;
+    visited.reserve( 32 );
+    visited.emplace( base, true );
+    for( std::size_t n = 0; n < classes.size(); ++n )
+    {
+        const NodeId id = classes[n];
+        if( id >= g.implementors.size() )
+        {
+            continue;
+        }
+        for( NodeId child : g.implementors[id] )
+        {
+            if( visited.emplace( child, true ).second )
+            {
+                classes.push_back( child ); // cycles and diamonds visit a class only once
+            }
+        }
+    }
+    return classes;
+}
+
+// Python self/cls dispatch can reach a subclass override even when the call graph pins the base
+// definition. Keep possible targets out of the deletion-candidate set; do not invent call edges.
+// Evidence is bounded to an enclosing class, a receiver parameter, and the indexed inheritance graph.
+// This is conservative liveness, not a model of Python's MRO, descriptors, or monkey-patching.
+inline std::vector<NodeId> pythonDispatchedMethodIds( const IngestResult& ing, const Graph& g )
+{
+    const std::vector<NodeId> owner = pythonMethodOwners( ing );
+    if( owner.empty() )
+    {
+        return {};
+    }
+    HashMap<NodeId, std::vector<NodeId>> methods;
+    methods.reserve( 32 );
+    for( NodeId i = 0; i < owner.size(); ++i )
+    {
+        if( owner[i] != kNoNode && ing.symbols[i].sigEndByte < ing.symbols[i].endByte )
+        {
+            methods[ owner[i] ].push_back( i );
+        }
+    }
+    const std::vector<std::uint8_t> receiver = pythonReceiverParameters( ing );
+    std::vector<NodeId> result;
+    for( const auto& [ base, name ] : pythonDispatchRequests( ing, owner, receiver ) )
+    {
+        for( NodeId id : pythonDispatchClasses( g, base ) )
+        {
+            const auto it = methods.find( id );
+            if( it == methods.end() )
+            {
+                continue;
+            }
+            for( NodeId method : it->second )
+            {
+                if( ing.symbols[method].name == name )
+                {
+                    result.push_back( method );
+                }
+            }
+        }
+    }
+    std::sort( result.begin(), result.end() );
+    result.erase( std::unique( result.begin(), result.end() ), result.end() );
+    return result;
+}
+
+// Q-DIAL-3 (2026-09-10) — THE VERBOSITY KIND'S METRIC: CODE lines, not physical lines.
+//
+// `Symbol::loc` is the def's physical line span, and the verbosity kind judged it directly. That makes blank
+// lines and comments debt: audit lane Q1 added 60 PURE BLANK lines inside an 18-LOC body and got
+// `verbosity was="18" now="78"`, gating, exit 2 — and the same for 60 pure COMMENT lines, in a repo whose own
+// CONTRIBUTING.md requires the reasoning to be written down. It is not hypothetical either: landed commit
+// 7d5dd201 ("comment(caps): update three stale cap justifications") added 7 comment lines and 1 code line and
+// produced two verbosity regression rows. Measured composition of what the kind judges, over 60 rows:
+// 72.8% code, 23.3% comment, 3.9% blank.
+//
+// A LINE HEURISTIC, NOT A LEXER, and the floor is stated rather than implied: a line counts as code unless it
+// is blank or its first non-space characters open a comment. So a trailing comment after code counts as code
+// (correct), a comment marker inside a string literal makes that line read as a comment (wrong, and rare), and
+// a multi-line raw string full of blank lines reads as blank (wrong, and rarer). The alternative is a second
+// tokenization pass per symbol on every --quality-delta, for a metric whose whole job is to say "this body is
+// big". Both sides of every comparison run the identical rule, which is the property the delta actually needs.
+//
+// Markers by language family, from the symbol's own `lang`: `//` plus `/* … */` for the C family and its
+// descendants, `#` for the shell/Python/Ruby/Elixir/config family (in the C family `#` opens a PREPROCESSOR
+// directive, which is code — that is why this is per-language and not one union set), `--` for Lua. Markdown
+// and JSON have no comment syntax, so every non-blank line there is content.
+inline bool langUsesHashComment( Lang l ) noexcept
+{
+    return l == Lang::Python || l == Lang::Bash || l == Lang::Ruby || l == Lang::Elixir
+        || l == Lang::Toml   || l == Lang::Yaml || l == Lang::GDScript;
+}
+
+inline std::uint32_t codeLinesInBody( std::string_view body, Lang lang ) noexcept
+{
+    const bool hash   = langUsesHashComment( lang );
+    const bool cLike  = !hash && lang != Lang::Markdown && lang != Lang::Json && lang != Lang::Lua;
+    const bool lua    = lang == Lang::Lua;
+    std::uint32_t  code    = 0;
+    bool           inBlock = false;
+    std::size_t    at      = 0;
+    while( at <= body.size() )
+    {
+        const std::size_t nl   = body.find( '\n', at );
+        std::string_view  line = body.substr( at, ( nl == std::string_view::npos ? body.size() : nl ) - at );
+        at = ( nl == std::string_view::npos ) ? body.size() + 1 : nl + 1;
+        while( !line.empty() && ( line.front() == ' ' || line.front() == '\t' || line.front() == '\r' ) )
+        {
+            line.remove_prefix( 1 );
+        }
+        while( !line.empty() && ( line.back() == ' ' || line.back() == '\t' || line.back() == '\r' ) )
+        {
+            line.remove_suffix( 1 );
+        }
+        if( inBlock )
+        {
+            const std::size_t close = line.find( "*/" );
+            if( close == std::string_view::npos )
+            {
+                continue;   // still inside the block comment
+            }
+            inBlock = false;
+            line.remove_prefix( close + 2 );
+            while( !line.empty() && ( line.front() == ' ' || line.front() == '\t' ) )
+            {
+                line.remove_prefix( 1 );
+            }
+        }
+        if( line.empty() )
+        {
+            continue;   // blank
+        }
+        if( cLike && line.rfind( "//", 0 ) == 0 )
+        {
+            continue;
+        }
+        if( hash && line.front() == '#' )
+        {
+            continue;
+        }
+        if( lua && line.rfind( "--", 0 ) == 0 )
+        {
+            continue;
+        }
+        if( cLike && line.rfind( "/*", 0 ) == 0 )
+        {
+            inBlock = line.find( "*/", 2 ) == std::string_view::npos;
+            if( !inBlock )
+            {
+                const std::size_t close = line.find( "*/", 2 );
+                std::string_view  rest  = line.substr( close + 2 );
+                while( !rest.empty() && ( rest.front() == ' ' || rest.front() == '\t' ) )
+                {
+                    rest.remove_prefix( 1 );
+                }
+                if( rest.empty() )
+                {
+                    continue;   // `/* … */` alone on the line
+                }
+            }
+            else
+            {
+                continue;
+            }
+        }
+        ++code;
+    }
+    return code;
+}
+
+// The per-NODE code-line count for THIS tree, read off each symbol's own body bytes in ONE pass over the
+// files (forEachSymbolBody). A symbol with no readable body — a declaration, a prototype, an unreadable file —
+// keeps its physical `loc`: that span IS its signature, there is nothing to discount, and a silent 0 there
+// would read as "this symbol shrank to nothing" on the next delta.
+inline std::vector<std::uint32_t> codeLocByNode( const IngestResult& ing )
+{
+    std::vector<std::uint32_t> out( ing.symbols.size(), 0 );
+    for( NodeId i = 0; i < ing.symbols.size(); ++i )
+    {
+        out[i] = ing.symbols[i].loc;
+    }
+    forEachSymbolBody( ing, [ & ]( NodeId i, const Symbol& s, std::string_view body )
+    {
+        if( s.kind == SymKind::Section || s.kind == SymKind::ModuleScope )
+        {
+            return;   // a markdown SECTION is prose: there is no code/comment line to separate, and counting
+                      // its non-blank lines as "code" makes an in-place doc rewrite that swaps 5 blank lines
+                      // for 5 sentences read as +5 verbosity. Measured on the ref-pair replay before this
+                      // clause: 03ec6f14 (a docs correction) went from a clean report to three minor rows.
+                      // Sections keep the physical span they always had — the churn kind exempts them for the
+                      // same reason ("doc sections churn by design").
+        }
+        out[i] = codeLinesInBody( body, s.lang );
+    } );
+    return out;
+}
+
+// Q-DIAL-4 (2026-09-10) — DOES THE LAST DECLARED PARAMETER CARRY A DEFAULT?
+//
+// 113 of the 132 `api-surface` acks in this repo's own committed ledger (85.6%) say the same sentence: "one
+// trailing DEFAULTED parameter, every existing caller compiles unchanged". A kind whose acks are 86% one
+// shape is describing that shape, so the shape is read off the signature and reported sev="minor" instead of
+// being acked one row at a time. It is still a row — the contract DID change, and a defaulted parameter is
+// how most contract rot starts.
+//
+// A BRACE-DEPTH SCAN, NOT A PARSER, and the floor is stated: the signature's first '(' opens the parameter
+// list, its matching ')' closes it, the last comma at depth 0 starts the final parameter, and an '=' in that
+// final parameter is a default. Depth counts ( ) [ ] { } and, for C++ templates, < > — which is where the
+// heuristic can be fooled (`a < b` inside a default expression, an `operator<`), and where being fooled costs
+// exactly one severity tier on one row. Languages that spell defaults the same way (Python, TypeScript, PHP,
+// Ruby, C#, Swift) are covered by the same scan for free; a language that does not spell them at all simply
+// never matches.
+inline bool trailingParamHasDefault( std::string_view signature ) noexcept
+{
+    const std::size_t open = signature.find( '(' );
+    if( open == std::string_view::npos )
+    {
+        return false;
+    }
+    int         depth      = 0;
+    int         angle      = 0;
+    std::size_t lastComma  = std::string_view::npos;
+    std::size_t close      = std::string_view::npos;
+    for( std::size_t i = open; i < signature.size(); ++i )
+    {
+        const char c = signature[i];
+        if( c == '(' || c == '[' || c == '{' ) { ++depth; }
+        else if( c == ')' || c == ']' || c == '}' )
+        {
+            --depth;
+            if( depth == 0 ) { close = i; break; }
+        }
+        else if( c == '<' ) { ++angle; }
+        else if( c == '>' && angle > 0 ) { --angle; }
+        else if( c == ',' && depth == 1 && angle == 0 ) { lastComma = i; }
+    }
+    if( close == std::string_view::npos || close <= open + 1 )
+    {
+        return false;   // unclosed, or an empty parameter list
+    }
+    const std::size_t     from = ( lastComma == std::string_view::npos ) ? open + 1 : lastComma + 1;
+    const std::string_view last = signature.substr( from, close - from );
+    for( std::size_t i = 0; i < last.size(); ++i )
+    {
+        if( last[i] != '=' )
+        {
+            continue;
+        }
+        const bool cmp = ( i + 1 < last.size() && last[ i + 1 ] == '=' )
+                      || ( i > 0 && ( last[ i - 1 ] == '=' || last[ i - 1 ] == '!' || last[ i - 1 ] == '<' || last[ i - 1 ] == '>' ) );
+        if( !cmp )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The per-NODE answer for THIS tree, read off each symbol's own signature bytes in the same one-pass shape
+// codeLocByNode uses. forEachSymbolBody hands back [sigStartByte, endByte), and the signature is its prefix.
+inline std::vector<std::uint8_t> trailingDefaultByNode( const IngestResult& ing )
+{
+    std::vector<std::uint8_t> out( ing.symbols.size(), 0 );
+    forEachSymbolBody( ing, [ & ]( NodeId i, const Symbol& s, std::string_view body )
+    {
+        const std::size_t sigLen = s.sigEndByte > s.sigStartByte ? std::size_t( s.sigEndByte - s.sigStartByte ) : 0;
+        if( sigLen == 0 || sigLen > body.size() )
+        {
+            return;
+        }
+        out[i] = trailingParamHasDefault( body.substr( 0, sigLen ) ) ? 1 : 0;
+    } );
+    return out;
+}
+
 
 // P2.2 — every symbol in THIS tree whose own signature text is a registered-macro call (built ONCE per
 // computeSnapshot/computeDelta run, exactly like topLevelCallees above), reading each file's bytes once via
@@ -777,7 +1474,7 @@ inline gtl::btree_map<std::uint64_t, std::uint64_t> bodyHashesBySym( const Inges
     forEachSymbolBody( ing,
                        [ & ]( NodeId, const Symbol& s, std::string_view body )
                        {
-                           const std::uint64_t key = pathQualifiedKey( relForHash( ing.files[ s.fileId ], root ), s.scope, s.name );
+                           const std::uint64_t key = pathQualifiedKey( relForHash( ing.files[ s.fileId ], root ), s );
                            perId[ key ].push_back( fnv1a64( body ) );
                        } );
     gtl::btree_map<std::uint64_t, std::uint64_t> out;
@@ -785,7 +1482,7 @@ inline gtl::btree_map<std::uint64_t, std::uint64_t> bodyHashesBySym( const Inges
     {
         std::sort( hs.begin(), hs.end() );                                    // order-independent overload fold
         std::string joined;
-        for( std::uint64_t h : hs ) { char b[ 17 ]; std::snprintf( b, sizeof( b ), "%016llx", static_cast<unsigned long long>( h ) ); joined += b; }
+        for( std::uint64_t h : hs ) { char b[ 17 ]; rw::formatTo( b, sizeof( b ), "{:016x}", static_cast<unsigned long long>( h ) ); joined += b; }
         out[ key ] = fnv1a64( joined );
     }
     return out;
@@ -938,7 +1635,7 @@ inline ContentIdIndex contentIdsBySym( const IngestResult& ing, const Graph& g, 
                            const std::uint64_t cid      = scrubbedBodyHash( body, s.name );
                            const bool          hasCanon = ( i < g.canonId.size() && !g.canonId[i].empty() );
                            out.symbolsPerCid[ cid ] += 1;              // per SYMBOL — the uniqueness question
-                           const std::uint64_t pqKey = pathQualifiedKey( rel, s.scope, s.name );
+                           const std::uint64_t pqKey = pathQualifiedKey( rel, s );
                            if( hasCanon )
                            {
                                // The canonId-space key is still INDEXED (an ack written by a pre-2026-08-25
@@ -965,6 +1662,29 @@ inline ContentIdIndex contentIdsBySym( const IngestResult& ing, const Graph& g, 
 // /tmp/ripwire-<uid>, always mode 0700. Keeping our artifacts one level below TMPDIR is a performance
 // boundary as well as a security one: cache hygiene must never enumerate an unbounded shared TMPDIR full of
 // unrelated agent-session files. Returns the dir with NO trailing slash. Deterministic per (user, env).
+//
+// #326 (structural follow-up): the value RETURNED here is what EVERY consumer in the tree builds cache paths
+// from — resolveCacheBlobPath (the choke point nearly every blob path routes through), evictOldCacheFamily/
+// sweepStaleCacheBlobsOnce, slicediff.h/editpreview.h's temp parse roots, crossref.h's blob-batch listing,
+// ingest_docpass.h's doc-bridge cache, and main.cpp's remote-clone cache all take this string and either hand
+// it straight to os:: calls (already correctly rebased internally, no bug there) or to something OUTSIDE the
+// os:: layer — std::filesystem, a bare std::fopen — that is not. `--doctor`'s cache-dir check used to be the
+// one LOCAL fix (rebasing only its own copy of this string before use); rebasing HERE instead makes every one
+// of those consumers correct by construction, with none of them needing to know this ever mattered. os::
+// mkdir/lstat/chmod below still verify the PRE-rebase spelling (harmless either way — rebased_path is a no-op
+// on an already-native path, since NativePath's own dispatch only fires on a leading "/tmp" or "/dev/null"),
+// so the verification logic is unchanged; only the RETURN value is now the spelling every downstream reader
+// needs. Identity on POSIX (rebased_path is `return path;` there), and identity on Windows for the two
+// TMPDIR/XDG_CACHE_HOME tiers too UNLESS the value they hold is itself "/tmp"-shaped (a plausible real case:
+// Git Bash sets TMPDIR=/tmp) — rebasing unconditionally, regardless of which tier produced the string, is
+// what makes that case correct too, rather than special-casing only the hardcoded third tier.
+//
+// #334, THE WINDOWS LAST RUNG, RULED AND KEPT: the third tier's "/tmp" rebases to GetTempPathW, whose documented order
+// is TMP, TEMP, USERPROFILE, then the Windows directory. So with TMPDIR, TEMP and TMP all unset the cache lands in the
+// profile root (%USERPROFILE%\ripwire-<uid>), not %LOCALAPPDATA%. That is kept: it is what every Win32 program calls
+// "temp" in that environment, it is per-user, --doctor's cache-dir row discloses it, and a Windows-only
+// %LOCALAPPDATA%\ripwire rung would break this ladder's one-shape-everywhere rule for an environment Windows itself
+// never produces (it sets TEMP and TMP per user). README's Windows section says where the cache goes.
 inline std::string cacheDirLadder()
 {
     std::string d;
@@ -984,21 +1704,25 @@ inline std::string cacheDirLadder()
     }
     else
     {
-        d = "/tmp/ripwire-" + std::to_string( static_cast<unsigned long long>( ::getuid() ) );
+        d = "/tmp/ripwire-" + std::to_string( static_cast<unsigned long long>( os::getuid() ) );
     }
 
-    const int mkdirRc = ::mkdir( d.c_str(), 0700 );
-    struct stat st {};
-    if( mkdirRc == 0 || ( ::lstat( d.c_str(), &st ) == 0 && S_ISDIR( st.st_mode ) && st.st_uid == ::getuid() ) )
+    const int mkdirRc = os::mkdir( d.c_str(), 0700 );
+    os::stat_t st {};
+    if( mkdirRc == 0 || ( os::lstat( d.c_str(), &st ) == 0 && S_ISDIR( st.st_mode ) && st.st_uid == os::getuid() ) )
     {
-        if( ::chmod( d.c_str(), 0700 ) == 0
-            && ::lstat( d.c_str(), &st ) == 0 && S_ISDIR( st.st_mode ) && st.st_uid == ::getuid()
+        if( os::chmod( d.c_str(), 0700 ) == 0
+            && os::lstat( d.c_str(), &st ) == 0 && S_ISDIR( st.st_mode ) && st.st_uid == os::getuid()
             && ( st.st_mode & 0777 ) == 0700 )
         {
-            return d;
+            return os::rebased_path( d.c_str() );
         }
     }
-    return "/dev/null/ripwire-cache-unavailable";   // unsafe/unusable candidate: make cache I/O fail closed
+    // unsafe/unusable candidate: make cache I/O fail closed. Rebased too, for the same reason — Windows'
+    // rebaseDevNull spelling ("|unusable|...", a byte no Win32 filename may hold) is what actually makes it
+    // unopenable there; the raw "/dev/null/..." spelling is only fail-closed by accident (drive-relative,
+    // usually absent) the way the bug this file exists for relied on.
+    return os::rebased_path( "/dev/null/ripwire-cache-unavailable" );
 }
 
 // popen a shell command and return its trimmed stdout ("" on any failure — never crashes). THE one copy of
@@ -1007,12 +1731,19 @@ inline std::string cacheDirLadder()
 // still spell quality::popenTrimmed, which this using-declaration resolves. Not a wrapper: one definition.
 using rw::popenTrimmed;
 
+// isBareCommitSha (THE object-name gate) and gitResolveCommitSha (THE commit resolver) live in gitmine.h too —
+// moved down 2026-09-10 when resolveSinceScope needed them, so --since hands git a resolved sha instead of the
+// caller's string. gitIsAncestor / materializeCommitTree below and crossref.h still spell them quality::…,
+// which these using-declarations resolve. One definition each.
+using rw::isBareCommitSha;
+using rw::gitResolveCommitSha;
+
 // Run one short git query against `root` and return its whitespace-trimmed output (expected single-line), or
 // "" on any failure. The shared shape behind gitHeadSha / gitWindowRefSha — `tail` is everything after
 // `git -C <root>` INCLUDING redirects (so a caller can pipe, e.g. "rev-list HEAD 2>/dev/null | tail -1").
 inline std::string gitOneLine( const std::string& root, const std::string& tail )
 {
-    return popenTrimmed( "git -c core.quotepath=false -C " + shSingleQuote( root ) + " " + tail );
+    return popenTrimmed( gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root ) + " " + tail );
 }
 
 // ─── R1 IDENTITY: the GIT-RECORDED RENAME MAP ──────────────────────────────────────────────────────────
@@ -1140,7 +1871,7 @@ inline RenameMap gitRenameMap( const std::string& root, const std::string& span 
         }
     };
 
-    const std::string pinned = "git -c core.quotepath=false -c diff.renames=true -C " + shSingleQuote( root ) + " ";
+    const std::string pinned = gitCmd( " -c core.quotepath=false -c diff.renames=true -C " ) + shSingleQuote( root ) + " ";
     if( span.empty() )
     {
         // Uncommitted first (a staged `git mv` is the single moment an agent is most likely to run this),
@@ -1186,7 +1917,7 @@ inline std::string gitHeadSha( const std::string& root )
 // dashes at 4 and 7) — the caller degrades to a fixed epoch date. Read-only: `git log` never mutates the repo.
 inline std::string gitCommitterDateIso( const std::string& root )
 {
-    const std::string out = gitOneLine( root, "log -1 --format=%cs HEAD 2>/dev/null" );
+    std::string out = gitOneLine( root, "log -1 --format=%cs HEAD 2>/dev/null" );   // not const: a const local cannot be moved out on return
     if( out.size() != 10 || out[4] != '-' || out[7] != '-' )
     {
         return {};
@@ -1205,54 +1936,6 @@ inline std::string gitCommitterDateIso( const std::string& root )
 // the CLI while the MCP arm honestly reported zero); `selectBaseline` now decides staleness by STRICT sha
 // equality and never calls this. The remaining caller is `binstale.h`'s "is the built binary older than the
 // sources?" check, which is a genuine reachability question — do not delete this.
-// ─── r27 (Lane C routing) — the OBJECT-NAME gate on every token that reaches a git argv ────────────────
-//
-// `shSingleQuote` stops SHELL injection, but the token still arrives as its own argv ENTRY, and git reads a
-// leading `-` as an OPTION. Lane C's P0.1 defect is the proof this matters: `--pr-context=--output=FILE`
-// reached `git diff` as an option and TRUNCATED a file outside the repo, exit 0. The durable defense is not
-// quoting — it is refusing anything that is not a bare object name.
-//
-// A commit sha is 40 (SHA-1) or 64 (SHA-256) lowercase hex and NOTHING else: it cannot begin with `-`, cannot
-// contain a path separator, and cannot spell an option. Checking that SHAPE is a complete defense on its own
-// and needs no subprocess, so it is applied at both ends — at the trust boundary where an untrusted value is
-// READ (readBaselineHeadSha, whose input is a COMMITTED, therefore clone-attacker-influenceable sidecar) and
-// again at the SINK, here, because a future caller will not remember the boundary.
-//
-// KNOWN DUPLICATE, flagged by our own --quality-delta and left deliberately: `crossref::isBlobSha`
-// (crossref.h) is the same predicate for git BLOB shas. It cannot be reused from here — crossref.h INCLUDES
-// quality.h, so the dependency only runs one way. The consolidation is a one-line change in crossref.h
-// (`isBlobSha` delegating to this), which is outside this lane's file boundary; it is written up in the lane
-// report rather than done silently across a file this lane does not own.
-inline bool isBareCommitSha( std::string_view s ) noexcept
-{
-    if( s.size() != 40 && s.size() != 64 )
-    {
-        return false;
-    }
-    for( char c : s )
-    {
-        if( !std::isxdigit( static_cast<unsigned char>( c ) ) )
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Resolve `ref` to a concrete commit sha, or "" if it does not resolve to one. Belt AND braces: the ref is
-// refused outright if it could be read as an option, and the ANSWER must itself be a bare object name — a
-// `rev-parse` that echoes something else (a path, an error, a multi-line answer) is not trusted. Callers that
-// hand a token to git should hand THIS result, never the caller's own string.
-inline std::string gitResolveCommitSha( const std::string& root, const std::string& ref )
-{
-    if( ref.empty() || ref[0] == '-' )
-    {
-        return {};
-    }
-    const std::string out = gitOneLine( root, "rev-parse --verify --quiet " + shSingleQuote( ref + "^{commit}" ) + " 2>/dev/null" );
-    return isBareCommitSha( out ) ? out : std::string{};
-}
-
 inline bool gitIsAncestor( const std::string& root, const std::string& ancestor, const std::string& descendant )
 {
     if( ancestor.empty() || descendant.empty() )
@@ -1264,13 +1947,13 @@ inline bool gitIsAncestor( const std::string& root, const std::string& ancestor,
     // than the P0.1 data-loss bug — the shape is identical. Refuse anything that is not a bare object name.
     if( !isBareCommitSha( ancestor ) || !isBareCommitSha( descendant ) )
     {
-        DEGRADED_PATH_ALERT( "quality: refusing a non-sha revision token on the merge-base path" );
+        DISCLOSE( "quality: refusing a non-sha revision token on the merge-base path" );
         return false;                                          // degrade: "not reachable" → the caller self-heals the pin
     }
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                           + " merge-base --is-ancestor " + shSingleQuote( ancestor ) + " " + shSingleQuote( descendant )
                           + " >/dev/null 2>&1";
-    return std::system( cmd.c_str() ) == 0;
+    return os::system( cmd.c_str() ) == 0;
 }
 
 // Signal-to-noise round — the CHURN-WINDOW reference commit: the newest commit STRICTLY OLDER than the
@@ -1295,7 +1978,7 @@ inline std::string gitWindowRefSha( const std::string& root, std::uint32_t days 
     // newest commit at-or-before the window floor (rev-list --min-age filters on committer time ≤ the bound;
     // cutoff−1 keeps a commit landing exactly ON the floor inside the window, matching gitmine's inclusive floor).
     const std::int64_t cutoff = headEpoch - std::int64_t( days ) * 86400;
-    const std::string  preWindow = gitOneLine( root, "rev-list --max-count=1 --min-age=" + std::to_string( cutoff - 1 ) + " HEAD 2>/dev/null" );
+    std::string        preWindow = gitOneLine( root, "rev-list --max-count=1 --min-age=" + std::to_string( cutoff - 1 ) + " HEAD 2>/dev/null" );   // not const: moved out on return
     if( !preWindow.empty() )
     {
         return preWindow;
@@ -1309,9 +1992,9 @@ inline std::string gitWindowRefSha( const std::string& root, std::uint32_t days 
 // exists, but a --since window matched zero commits". popen failure degrades to false.
 inline bool gitRepoHasHistory( const std::string& root )
 {
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                           + " rev-parse --verify --quiet HEAD 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return false;
@@ -1325,9 +2008,42 @@ inline bool gitRepoHasHistory( const std::string& root )
             gotHead = true;
         }
     }
-    const int rc = pclose( pipe );
+    const int rc = os::pclose( pipe );
     return rc == 0 && gotHead;
 }
+
+// ─── SHALLOW-HISTORY HONESTY (0.6.6 command sweep) ──────────────────────────────────────────────────────
+// A `--depth=N` clone (actions/checkout's default) holds only the newest N commits. Every history verb then
+// answers from that stub, and the sweep found them saying things that are false about the REPOSITORY:
+// "a root commit" for a commit whose parent was simply not fetched, "git unavailable" for a git repo with a
+// short history, `window="all-history"` over one commit, bf="1" from one squashed commit. The at= stamp's
+// `+shallow` suffix was the only disclosure. These three are the ONE probe and the ONE sentence every such
+// verb now shares (gitstamp::isShallow and the shallow="1" root attribute read the same probe).
+//
+// Not memoized: the MCP server is long-lived, and a `git fetch --unshallow` mid-session must be seen.
+inline bool gitIsShallow( const std::string& root )
+{
+    return gitOneLine( root, "rev-parse --is-shallow-repository 2>/dev/null" ) == "true";
+}
+
+// Is `sha` a shallow BOUNDARY — a commit whose object records a parent the clone never fetched? The raw
+// commit object still carries its `parent` lines when the parent is missing (the shallow file grafts them
+// away from rev-parse/rev-list, not from the object), so this tells a boundary from a TRUE root commit in
+// a shallow clone whose depth happens to reach the root. `sha` must be a resolved commit name (the caller's
+// gitResolveCommitSha output); anything else answers false.
+inline bool gitIsShallowBoundary( const std::string& root, const std::string& sha )
+{
+    if( !isBareCommitSha( sha ) || !gitIsShallow( root ) )
+    {
+        return false;
+    }
+    return !gitOneLine( root, "cat-file commit " + sha + " 2>/dev/null | sed -n '/^parent /{p;q;}'" ).empty();
+}
+
+// The one way to say how to get the missing history, so no two verbs name it differently.
+// (Worded so no string literal here OPENS with a git command: githardencheck (L) reads such a literal as an
+// executed git invocation spelled outside rw::gitCmd(); this one is advice to a reader, never run.)
+inline constexpr std::string_view kShallowDeepenHint = "deepen it with git fetch --deepen=N, or git fetch --unshallow";
 
 // A4-P1 — the HEAD-snapshot ingest cache. The HEAD tree is IMMUTABLE for a given HEAD sha, so its cold ingest
 // (~12.5 s on the 1498-file corpus) is perfectly cacheable: we hand the archived-tree ingest an incremental
@@ -1353,19 +2069,83 @@ inline bool gitRepoHasHistory( const std::string& root )
 // header already self-validates). Folded into the filename key so an old-scheme file is simply never named.
 constexpr std::uint32_t kHeadSnapCacheScheme = 1;
 
-// The 16-hex repo key: fnv1a64 of realpath(root) (matching defaultCachePath) so two spellings of one repo
-// share one warm cache AND one eviction group. A null realpath (missing path) degrades to the verbatim
-// spelling — still correct, at worst one extra cold miss. Used by both the filename and the eviction glob.
-inline std::string headSnapRepoHex( const std::string& root )
+// ─── THE ROOT KEY — one canonical spelling, for every cache family ────────────────────────────────────
+//
+// The 16-hex field every cache blob's filename carries, identifying the ROOT the blob belongs to:
+// `ripwire-<rootKey>-{lean,rich}-c<format>p<parser>.bin` (main.cpp::defaultCachePath),
+// `ripwire-mcp-<rootKey>-c<format>p<parser>.cache` (mcpindex.h::mcpCachePath) and `ripwire-<family>-<rootKey>-<exclHex>-<shaHex>.bin`
+// (shaKeyedCachePath below: qheadsnap, qsnap, qbody, qhist, qms, qchurn, stier). It is what makes
+// "which root does this blob belong to?" answerable from the NAME alone — see cacheBlobRootKey and the
+// byte-budget pin in evictBySizeBudget, which is only ever as wide as the set of blobs that spell the
+// key the SAME way.
+//
+// AND TWO SPELLINGS SHIPPED. Both builders hashed realpath(root) with FNV-1a, but with DIFFERENT offset
+// bases: `defaultCachePath` (and `mcpCachePath`) seeded 1469598103934665603 — seventeen digits, a
+// TRUNCATED FNV-1a-64 basis — while this function seeded arch.h's `fnv1a64`, i.e. the real
+// 14695981039346656037. Same material, two keys, on every root, always. Measured on llvm-project:
+// lean/rich carried 4280d3ca01d82374 while qchurn carried 6b73c58ba5897c7a; reproduced on a four-file
+// fixture as `ripwire-844a155665d606eb-{lean,rich}.bin` beside `ripwire-qchurn-526f2ad625b9f069--….bin`.
+// The consequence is exactly the gap P1-1 stated: the pin covered lean+rich and left every git-metadata
+// family evictable by the very root that had just written it.
+//
+// WHY THE SURVIVING BASIS IS THE TRUNCATED ONE, AND WHY IT MUST NOT BE "FIXED". A key change orphans
+// every blob spelled the old way. Adopting `fnv1a64`'s basis would have renamed the MAIN PARSE CACHE —
+// 1.76 GB of it on llvm-project alone (rich 1.19 GB + lean 0.57 GB), a full cold re-parse for every root
+// on the machine. Adopting defaultCachePath's renames only the git-metadata families, which are
+// kilobytes and rebuild from one `git log` walk. The constant is an IDENTITY, not a digest: FNV-1a's
+// avalanche comes from the prime multiply, and any odd seed gives the same distribution over these
+// inputs, so nothing is weaker — only the naming compatibility differs, and it differs by three orders
+// of magnitude. Changing `kCacheRootKeySeed` to the textbook basis would silently throw away every warm
+// parse cache in existence; test/evictioncheck.sh (k) is what makes such a change visible, but it will
+// go GREEN on a uniform wrong seed, so this paragraph is the guard.
+//
+// NORMALIZED, so the key follows the TREE and not its spelling: `realpath` collapses symlinks, `.`/`..`,
+// `//` and a trailing '/'. When realpath fails — the path does not exist, so there is nothing to cache
+// under it anyway — the same folding is done LEXICALLY (resolve.h's `lexicalNormalize`, the house's
+// segment-stack folder) so that at least the trailing-slash and `.`/`..` cases still agree; an unsound
+// `..` escape yields "" there and degrades to the verbatim spelling, still correct, at worst one extra
+// cold miss. Gate: test/evictioncheck.sh (k) one root ⇒ one key across every family, (l) a trailing
+// slash and a symlinked spelling add no new key.
+//
+// NO SCHEME BUMP, AND THE REASON IS THE HOUSE RULE ITSELF, NOT AN OMISSION. `kQChurnCacheScheme`,
+// `kQSnapCacheScheme` and `kHeadSnapCacheScheme` exist so that a blob whose CONTENT MEANING changed
+// becomes a clean miss rather than a wrong answer served from cache (see kQChurnCacheScheme's own comment:
+// scheme 2 was a merge-blind stream). Nothing about any blob's content changes here — only the root FIELD
+// of its NAME. Every pre-existing blob is therefore already never NAMED again, which is precisely the
+// effect a bump buys, reached by the key rather than by a version. Bumping on top would assert a content
+// change that did not happen, and would additionally invalidate the blobs that are about to be re-minted
+// under the unified key anyway. The old-spelling blobs are ordinary orphans: the "ripwire-" family sweep
+// still matches them by prefix, so the 30-day age pass deletes them on schedule — verified by seeding one
+// backdated `ripwire-qchurn-<old-key>-…bin` and watching a later run remove it. That pass is silent for
+// every blob it takes (it has no disclosure line at all — see evictBySizeBudget's note on why only the
+// byte-budget pass speaks), so an orphan is treated exactly as any other aged-out blob, with no special
+// case in either direction.
+inline constexpr std::uint64_t kCacheRootKeySeed = 1469598103934665603ull;
+
+inline std::string cacheRootKeyHex( const std::string& root )
 {
-    char* rp = ::realpath( root.c_str(), nullptr );
-    const std::string absRoot = rp ? std::string( rp ) : root;
-    if( rp )
+    char*       rp = os::realpath( root.c_str(), nullptr );
+    std::string absRoot;
+    if( rp != nullptr )
     {
+        absRoot = rp;
         std::free( rp );
     }
+    else
+    {
+        absRoot = lexicalNormalize( root );
+        if( absRoot.empty() )
+        {
+            absRoot = root;   // a `..` that escapes above its own base — unsound to fold, hash it verbatim
+        }
+    }
+    std::uint64_t h = kCacheRootKeySeed;
+    for( const char c : absRoot )
+    {
+        h = rw::hashutil::fnv1aAbsorb( h, c );
+    }
     char hex[ 20 ];
-    std::snprintf( hex, sizeof( hex ), "%016llx", static_cast<unsigned long long>( fnv1a64( absRoot ) ) );
+    rw::formatTo( hex, sizeof( hex ), "{:016x}", static_cast<unsigned long long>( h ) );
     return std::string( hex );
 }
 
@@ -1395,10 +2175,139 @@ inline std::string headSnapRepoHex( const std::string& root )
 // suite the moment the two disagree, and `test/qschemetripcheck.sh` (which previously hashed only quality.h
 // functions and never looked at ingest.cpp — precisely why this shipped) now hashes the ingest-side constant
 // lines too. Bumping kParserVer without updating these two lines is a hard gate failure, not a silent miss.
-// FOLLOW-UP for whoever owns ingest.{h,cpp}: promote the two constants into ingest.h and turn the gate into a
-// `static_assert` — this lane's file boundary forbade editing those files.
-constexpr std::uint32_t kIngestCacheVersionMirror   = 18;   // MUST equal ingest.cpp's kCacheVersion (gated)
-constexpr std::uint32_t kIngestParserVerMirror    = 85;   // MUST equal ingest.cpp's kParserVer   (gated)
+// The FOLLOW-UP this note asked for is done the other way round: ingest_cache.h holds
+// `static_assert( quality::kIngestParserVerMirror == kParserVer && … )`, so a missed mirror now fails the build. It does
+// not include this header; it relies on ingest.cpp including quality.h (line 13) before ingest_cache.h, and a reorder
+// that broke that fails the build on the undeclared name rather than passing.
+constexpr std::uint32_t kIngestCacheVersionMirror   = 28;   // MUST equal ingest.cpp's kCacheVersion (gated); 28 = FE-A ref memberCall/memberRoot, 27 = corrected fnScope values, 26 = function-local def scope span (25 = #157 + #150)
+constexpr std::uint32_t kIngestParserVerMirror    = 143;  // MUST equal ingest.cpp's kParserVer   (gated)
+                                                          // 141 = 2026-10-04 (train 25: above FE-A's 134/135 and refval-edges' 140, see kParserVer
+                                                          //   note; kIngestCacheVersionMirror 28 from FE-A, kQSnapCacheScheme 17 from refval-edges)
+                                                          // 140 = lane refval-edges (reference-as-value rows; see kParserVer note)
+                                                          // 135 = 2026-10-03 (lane FE-A fix round, see kParserVer note)
+                                                          // 134 = 2026-10-03 (lane FE-A, see kParserVer note; 133 is train 24's)
+                                                          // 133 = 2026-10-02 (train 24: above the merged lanes' 130 and 131 extraction
+                                                          //   changes and train 23's 132, see kParserVer note; kIngestCacheVersionMirror stays 27)
+                                                          // 132 = 2026-10-02 (train 23: cache-key hygiene above every branch
+                                                          //   build's number, see kParserVer note; kIngestCacheVersionMirror stays 27)
+                                                          // 129 = 2026-09-30 (train 22: #338 + #325 after fn-literal's 128, see kParserVer
+                                                          //   note; kIngestCacheVersionMirror stays 27)
+                                                          // 128 = 2026-09-29 (fn-literal-bodies, see kParserVer note)
+                                                          // 125 = 2026-09-27 (#338, RSpec described_class, see kParserVer note;
+                                                          //   kIngestCacheVersionMirror stays 25)
+                                                          // 122 = 2026-09-25 (#320/#67, Astro frontmatter, see kParserVer note;
+                                                          //   kIngestCacheVersionMirror stays 25)
+                                                          // 121 = 2026-09-24 (#310, Ruby attr DSL, see kParserVer note)
+                                                          // 120 = 2026-09-23 (#150): RawRef::qualifierRootsStd +
+                                                          //   RawDef::scopeRootsStd, folded together with a
+                                                          //   same-lane F1/F2 correctness fix (2026-09-24) that
+                                                          //   briefly used 121 before collapsing back into this
+                                                          //   120 — 121 never reached main or a release, and
+                                                          //   caches are per-worktree — see ingest_cache.h's own
+                                                          //   kParserVer/kCacheVersion history for the full note.
+                                                          // 119 = 2026-09-20 (T13/fix3): queries/java + queries/kotlin
+                                                          //    tags.scm import captures moved @reference.call ->
+                                                          //    @reference.import (RefRole::Import) — an import is a
+                                                          //    dependency edge, not a call-graph edge.
+                                                          // 118 = 2026-09-19 (CodeRabbit follow-up, thread 4053600599:
+                                                          //    isJsxIntrinsicTagIdentifier now tests ASCII-lowercase
+                                                          //    directly, so `_Widget`/`$Widget` are components, not
+                                                          //    intrinsic tags; see src/ingest_cache.h)
+                                                          // 117 = 2026-09-19 (train 7, both members: extract-partial
+                                                          //    re-extraction; #285 JSX element calls + the .tsx query; see src/ingest_cache.h)
+                                                          // 116 = 2026-09-18 (issue #287 round 2:
+                                                          //    capturePythonRebindShadowDecls' rebind
+                                                          //    veto evidence; see src/ingest_cache.h)
+                                                          // 115 = 2026-09-18 (issue #287: RawBind::importedName
+                                                          //    marks a Python Import bind "module" vs a
+                                                          //    from-import member; see src/ingest_cache.h)
+                                                          // 114 = 2026-09-17 (reference-returning definitions, test/narrowcheck.sh
+                                                          //    arms 61-63): a definition returning `T&`/`T&&` records its
+                                                          //    parameters; an attributed declarator its VarDecl. The
+                                                          //    full note sits beside ingest_cache.h's declaration.
+                                                          // 113 = 2026-09-17 (smart-pointer members, PR #282): a std smart
+                                                          //    pointer member records its pointee, a call records `->`;
+                                                          //    the ref record grows a u8 (cache version 24 above).
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 112 = 2026-09-17 (type aliases, PR #280): a typedef / using alias
+                                                          //    of a named class records its target for the base walk.
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 111 = 2026-09-17 (block-scope direct-initialized locals,
+                                                          //    test/narrowcheck.sh arms 52-60). See ingest_cache.h's kParserVer note.
+                                                          // 110 = 2026-09-17 (Java catch/enhanced-for/resource shadows, #235
+                                                          //    follow-up). See ingest_cache.h's kParserVer note.
+                                                          // 109 = 2026-09-17 (Ruby constant receivers, PR #267): a constant or
+                                                          //    scope_resolution receiver is NamedVar with its final segment.
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 108 = 2026-09-17 (GDScript, PR #233): a new grammar, tags.scm and
+                                                          //    `.gd` crawl row. See ingest_cache.h's kParserVer note.
+                                                          // 107 = 2026-09-17 (Java Type::method, issue #74, PR #235): its two
+                                                          //    steps below (declared 97, 98) land as one on integration/train-3.
+                                                          //    PR step 98, 2026-09-15 (Java Type::method review):
+                                                          //    Java shadow binds carry lexical spans and inferred
+                                                          //    lambda parameters are captured. See ingest_cache.h.
+                                                          //    PR step 97, 2026-09-15 (Java Type::method candidates):
+                                                          //    method_reference member capture plus indexed-class +
+                                                          //    no-shadow resolver gating. #216 spent 96, so this
+                                                          //    RE-BUMPS. See ingest_cache.h's kParserVer note.
+                                                          // 106 = 2026-09-17 (assignment types, PR #278): a C++ assignment's bind
+                                                          //    record carries isFromAssignment (cache version 23).
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 105 = 2026-09-17 (A4, found-items 2026-09-17): `.hxx`
+                                                          //    gained a kLangTable row (src/ingest_crawl.h), so a
+                                                          //    tree that spells its headers `.hxx` now yields NEW
+                                                          //    files/symbols/edges a pre-bump cache never saw.
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 104 = 2026-09-17 (template arguments in a receiver's type): a
+                                                          //    declaration records its type's last name through the
+                                                          //    grammar's fields. See ingest_cache.h's kParserVer note.
+                                                          // 103 = 2026-09-17 (TS/JS signed numeric literal receivers, train 1b
+                                                          //    #277). See ingest_cache.h's kParserVer note.
+                                                          // 102 = 2026-09-17 (C++ template scopes, test/cpptmplscopecheck.sh,
+                                                          //    PR #256). See ingest_cache.h's kParserVer note.
+                                                          // 101 = 2026-09-17 (member template calls, test/cppqualcheck.sh
+                                                          //    §12, PR #243): `r.f<T>()` / `x.template f<T>()` mint call
+                                                          //    references; the `template` disambiguator leaves names and
+                                                          //    qualifiers. See ingest_cache.h's kParserVer note.
+                                                          // 100 = 2026-09-17 (TS/JS literal receivers, issue #163, PR #244): RecvKind
+                                                          //    Lit* appended; extraction identity moves, cache format does not.
+                                                          // 99 = 2026-09-16 (std-typed member fields): a field's compose
+                                                          //    record carries its written namespace as its qualifier.
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 98 = 2026-09-16 (std-qualified receivers): a C++ assignment's
+                                                          //    constructor records its qualified text too.
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 97 = 2026-09-16 (parameter receivers): a declaration's qualified
+                                                          //    written type rides its Type/ParamType RawBind (importedName).
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 96 = 2026-09-13 (internal linkage, test/decltodefcheck.sh arm B2):
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 95 = 2026-09-12 (Elixir module/name/arity resolution, PR #81):
+                                                          //    RE-BUMPED from the branch's 87 over #139's 93 and #172's 94.
+                                                          //    See ingest_cache.h's kParserVer note.
+                                                          // 94 = 2026-09-11 (#62/#72 follow-up): the decided-dead `#if 0`
+                                                          //    filter now covers every --uses role, the Include record, and
+                                                          //    DEFINITIONS — the extracted set shrinks on any C-family tree
+                                                          //    with a literal `#if 0`/`#if 1`. See ingest_cache.h's
+                                                          //    kParserVer note. Renumbered 93 -> 94 on the merge with
+                                                          //    main 558a2e03, where #139 had spent 93.
+                                                          // 93 = 2026-09-11 (Ruby argument + rescue constants): a
+                                                          //    constant argument of a call/super/yield and a rescue
+                                                          //    class are directives. See ingest_cache.h's note.
+                                                          // 92 = 2026-09-11 (yaml unsigned-char, PR #140): the yaml scanner's
+                                                          //    status type. SCN_FAIL (-1) returned through plain `char` came
+                                                          //    back as 255 wherever `char` is unsigned (aarch64 Linux, the
+                                                          //    linux-arm64 release asset), parsing a malformed %-escape in a
+                                                          //    tag differently from every signed-`char` build. See
+                                                          //    ingest_cache.h's kParserVer note.
+                                                          // 91 = 2026-09-11 (Kotlin, PR #126): a twenty-fourth grammar, its
+                                                          //    extraction arms, two scanner patches that change a parse, and the
+                                                          //    string-nesting refusal. See ingest_cache.h's kParserVer note.
+                                                          // 90 = 2026-09-11 (member-macro re-parse): a C-family file
+                                                          //    whose first parse holds error bytes may be extracted from
+                                                          //    a re-parse with its member macro invocations blanked.
+                                                          // 89 = 2026-09-11 (extent honesty): each def carries the
+                                                          //    `recovered` extraction bit. See ingest_cache.h's note.
                                                           // 78 = 2026-09-07 (Elixir): a twenty-second grammar and its
                                                           //    definition/call filters.
                                                           // 79 = 2026-09-07 (ES import facts): named import aliases and
@@ -1546,6 +2455,41 @@ inline std::string extractionIdentityTag()
     return "x" + std::to_string( kIngestCacheVersionMirror ) + "." + std::to_string( kIngestParserVerMirror );
 }
 
+// ─── the PRODUCER IDENTITY — which build computed a cached Snapshot ─────────────────────────────────────
+//
+// THE BUG THIS CLOSES. A qsnap blob's dead set is a function of CALL RESOLUTION, not only of extraction:
+// isDeadCandidate reads g.inEdges, and pythonDispatchedMethodIds reads the graph. The key above holds the
+// extraction identity, and a resolution change moves none of it — by rule, since a resolver runs over cached
+// ingest facts (d39554dd's std::-qualified call guard said so in its own message: "no graph or edge blob is
+// cached"). So two builds that resolve differently, sharing one cache dir on one repo HEAD, served each other's
+// dead set. Measured on main a55b118e with that guard switched off in a second build, over a two-file fixture:
+// a cold run reports regressions="0"; the same run after the unguarded build warmed the cache reports a GATING
+// dead-code row on an untouched symbol and exits 2. The other order HIDES a real gating regression (exit 2
+// cold, exit 0 warm). test/qsnapproducercheck.sh pins both directions.
+//
+// WHY DERIVED, NOT A kResolverVer TO BUMP. A constant holds only while every lane remembers it, and this cache's
+// record says how that goes: B10.1a's isDeadCandidate exemption (retired late, at v3) and 28c7d32's kParserVer
+// bump (P0.2) each changed what a blob means without the bump that would have retired it, and none of the twelve
+// scheme versions below cites a resolution change — d39554dd weighed the caches and still missed this one. The
+// identity is instead the SHA-256 of every file under src/ and queries/ (cmake/source_identity.cmake, computed on
+// every build), so ANY change to what a Snapshot means — resolution, the dead predicate, clone identity, a key
+// rule the qschemetrip manifest does not list — names a new blob without anyone deciding to. The price is that an
+// edit which changes no meaning renames the blob too: one cold HEAD snapshot after a rebuild that touched a source
+// file. The ingest blob underneath (qheadsnap) stays on the extraction identity alone, because it holds
+// extraction facts only, so that cold snapshot re-reads a warm ingest.
+//
+// Folded into the qsnap and qbody filename keys (qsnapExclHex, qbodyExclHex) and carried in the shared blob
+// header, the same two guards P0.2 gave the extraction identity: never NAMED again, and REFUSED if reached.
+inline std::string_view producerIdentity() noexcept
+{
+    return std::string_view( rw::kRipwireSourceIdentity );
+}
+
+inline std::uint64_t producerIdentityHash() noexcept
+{
+    return fnv1a64( producerIdentity() );
+}
+
 // The 16-hex EXCLUDES-config key: fnv1a64 of the exact exclude set + the family's scheme tag + the extraction
 // identity + the file-size ceiling. This is the SECOND filename field so eviction groups per (repo, config) —
 // different --exclude sets are independent cache families that never evict one another (mirrors the
@@ -1569,7 +2513,7 @@ inline std::string exclConfigHex( const std::vector<std::string>& excludes, cons
     keyMat.push_back( '\x1f' );
     keyMat += std::to_string( maxFileBytes );          // P0.2: the file-size ceiling changes the extracted SET
     char hex[ 20 ];
-    std::snprintf( hex, sizeof( hex ), "%016llx", static_cast<unsigned long long>( fnv1a64( keyMat ) ) );
+    rw::formatTo( hex, sizeof( hex ), "{:016x}", static_cast<unsigned long long>( fnv1a64( keyMat ) ) );
     return std::string( hex );
 }
 
@@ -1596,14 +2540,14 @@ inline std::string headSnapExclHex( const std::vector<std::string>& excludes, st
 inline std::string blobShardHex( std::string_view filename )
 {
     char hex[ 3 ];
-    std::snprintf( hex, sizeof( hex ), "%02x", static_cast<unsigned>( fnv1a64( filename ) & 0xff ) );
+    rw::formatTo( hex, sizeof( hex ), "{:02x}", static_cast<unsigned>( fnv1a64( filename ) & 0xff ) );
     return std::string( hex );
 }
 
 inline std::string resolveCacheBlobPath( const std::string& dir, const std::string& filename )
 {
     namespace fs = std::filesystem;
-    const std::string flatPath = dir + "/" + filename;
+    std::string       flatPath = dir + "/" + filename;   // not const: moved out on either early return
     std::error_code   existsEc;
     if( fs::exists( fs::path( flatPath ), existsEc ) && !existsEc )
     {
@@ -1629,7 +2573,7 @@ inline std::string shaKeyedCachePath( const char* family, const std::string& rep
 {
     const std::uint64_t shaKey = fnv1a64( sha );
     char tail[ 96 ];
-    std::snprintf( tail, sizeof( tail ), "ripwire-%s-%s-%s-%016llx.bin",
+    rw::formatTo( tail, sizeof( tail ), "ripwire-{}-{}-{}-{:016x}.bin",
                    family, repoHex.c_str(), exclHex.c_str(), static_cast<unsigned long long>( shaKey ) );
     return resolveCacheBlobPath( cacheDirLadder(), tail );
 }
@@ -1637,6 +2581,392 @@ inline std::string shaKeyedCachePath( const char* family, const std::string& rep
 inline std::string headSnapCachePath( const std::string& repoHex, const std::string& exclHex, const std::string& headSha )
 {
     return shaKeyedCachePath( "qheadsnap", repoHex, exclHex, headSha );
+}
+
+// ─── THE BUILD TAG — which ingest format a root-keyed blob holds, spelled in its NAME ─────────────────────────
+//
+// #334 (follow-up). Both root-keyed families were keyed by root and verb class only, so two builds of different
+// formats — an installed release and a local build, or two installed versions — that alternate on one tree
+// refused and rewrote each other's blob on EVERY run (`format-version — not used`, reparsed=N reused=0, one path).
+// The auto names now carry the pair that decides whether a blob is readable at all, (kCacheVersion, the class's
+// parserVer): `ripwire-<rootKey>-lean-c<format>p<parser>.bin`, `ripwire-<rootKey>-rich-c<format>p<parser>.bin` and
+// `ripwire-mcp-<rootKey>-c<format>p<parser>.cache`, the rich/MCP parser number being the lean one + 1. Two builds of one format still share a blob (a rebuild of the same
+// tree must not go cold); two formats never meet at one path.
+//
+// THE TAG IS NEVER 16 HEX: `c<digits>p<digits>` always holds a 'p', so cacheBlobRootKey's "first 16-hex field"
+// rule below still reads the root key and nothing else, in every shape. Only [a-z0-9.-] appear, so the name
+// stays valid on NTFS. An explicit `--cache=PATH` is NOT tagged: that file is the user's, named by them, and is
+// often a committed `--index-out` artifact a CI job consumes by its exact name.
+//
+// The mirror pair lives in this header (see kIngestParserVerMirror); ingest_cache.h static_asserts that
+// `ingestParserVerFor` agrees with its own parserVerFor for both classes, so the tag cannot drift from the
+// header stamp the blob carries.
+inline constexpr std::uint32_t ingestParserVerFor( bool captureValueUses ) noexcept
+{
+    return kIngestParserVerMirror + ( captureValueUses ? 1u : 0u );
+}
+
+// The families whose whole key IS the root — the main parse cache's two verb classes (main.cpp::defaultCachePath)
+// and the MCP index (mcpindex.h::mcpCachePath, always the rich class) — as ONE table: the builder and the eviction
+// pin below read the same rows, so "is this blob this build's?" cannot disagree with "what does this build write?".
+enum class RootBlobFamily : std::uint8_t
+{
+    Lean,
+    Rich,
+    Mcp,
+    Count
+};
+
+struct RootBlobShape
+{
+    std::string_view prefix;       // before the 16-hex root key
+    std::string_view classField;   // between the key and the build tag ("" for the MCP index)
+    std::string_view ext;
+    bool             rich;         // which parserVer the tag names
+};
+
+inline constexpr RootBlobShape kRootBlobShapes[] = {
+    { "ripwire-",     "-lean", ".bin",   false },
+    { "ripwire-",     "-rich", ".bin",   true  },
+    { "ripwire-mcp-", "",      ".cache", true  },
+};
+static_assert( std::size( kRootBlobShapes ) == static_cast<std::size_t>( RootBlobFamily::Count ), "one shape per root-keyed family" );
+
+// Everything after the root key, build tag included: `-lean-c<format>p<parser>.bin`, `-rich-c<format>p<parser+1>.bin`,
+// `-c<format>p<parser+1>.cache`.
+inline std::string rootBlobTail( const RootBlobShape& shape )
+{
+    return std::format( "{}-c{}p{}{}", shape.classField, kIngestCacheVersionMirror, ingestParserVerFor( shape.rich ), shape.ext );
+}
+
+// The builder for every root-keyed family. They sat in different translation units and each open-coded the same
+// three lines around its own copy of the hash, which is exactly how the two root spellings drifted apart in the
+// first place; one body means a future family joins by adding a row rather than by re-deriving a key.
+inline std::string rootKeyedCachePath( const std::string& root, RootBlobFamily family )
+{
+    EXPECTS( family < RootBlobFamily::Count );
+    const RootBlobShape& shape = kRootBlobShapes[ static_cast<std::size_t>( family ) ];
+    const std::string    after = rootBlobTail( shape );
+    // Bounded: the longest prefix is "ripwire-mcp-" (12), the key is 16 hex, and the longest tail is
+    // "-rich-c<u32>p<u32>.bin" (32 at ten digits a side) — 60 of the 63 usable bytes.
+    EXPECTS( shape.prefix.size() + 16 + after.size() < 64, "a root-keyed cache name is a fixed-width prefix, key and build-tagged tail" );
+    char tail[ 64 ];
+    rw::formatTo( tail, sizeof( tail ), "{}{}{}", shape.prefix, cacheRootKeyHex( root ), after );
+    return resolveCacheBlobPath( cacheDirLadder(), tail );
+}
+
+// This build's tagged tails, one per family, built once per sweep rather than once per blob.
+using OwnBuildBlobTails = std::array<std::string, static_cast<std::size_t>( RootBlobFamily::Count )>;
+
+inline OwnBuildBlobTails ownBuildBlobTails()
+{
+    static_assert( std::tuple_size_v<OwnBuildBlobTails> == 3, "one tail per kRootBlobShapes row, in row order" );
+    return OwnBuildBlobTails{ rootBlobTail( kRootBlobShapes[ 0 ] ), rootBlobTail( kRootBlobShapes[ 1 ] ), rootBlobTail( kRootBlobShapes[ 2 ] ) };
+}
+
+// `c<digits>p<digits>` — the tag shape, and nothing else.
+inline bool isCacheBuildTagField( std::string_view field ) noexcept
+{
+    const std::size_t p = field.find( 'p' );
+    if( field.size() < 4 || field.front() != 'c' || p == std::string_view::npos || p < 2 || p + 1 >= field.size() )
+    {
+        return false;
+    }
+    const auto allDigits = []( std::string_view s ) noexcept
+    {
+        return std::all_of( s.begin(), s.end(), []( const char c ) noexcept { return c >= '0' && c <= '9'; } );
+    };
+    return allDigits( field.substr( 1, p - 1 ) ) && allDigits( field.substr( p + 1 ) );
+}
+
+// A root-keyed blob ANOTHER build wrote, read off its name alone:
+//   * a build tag that is not one of this build's tails (another kCacheVersion or parserVer), or
+//   * a pre-tag name — `ripwire-<16hex>-lean.bin`, `ripwire-<16hex>-rich.bin`, `ripwire-mcp-<16hex>.cache` —
+//     which from this change on only an older release writes.
+// Every other name (qheadsnap/qsnap/qbody/qchurn/…, whose keys already fold the extraction identity) answers
+// false and keeps exactly the pin it had.
+// A name THIS build writes for one of its root-keyed families (any root).
+inline bool isThisBuildRootBlobName( std::string_view name, const OwnBuildBlobTails& own ) noexcept
+{
+    for( std::size_t f = 0; f < own.size(); ++f )
+    {
+        if( name.starts_with( kRootBlobShapes[ f ].prefix ) && name.ends_with( own[ f ] ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool isOtherBuildRootBlob( std::string_view name, const OwnBuildBlobTails& own ) noexcept
+{
+    if( !name.starts_with( "ripwire-" ) || isThisBuildRootBlobName( name, own ) )
+    {
+        return false;
+    }
+    const bool             isMcp = name.starts_with( "ripwire-mcp-" );
+    const std::size_t      dot   = name.rfind( '.' );
+    const std::string_view stem  = name.substr( 0, dot );
+    const std::string_view ext   = dot == std::string_view::npos ? std::string_view{} : name.substr( dot );
+    const std::size_t      dash  = stem.rfind( '-' );
+    const std::string_view last  = dash == std::string_view::npos ? stem : stem.substr( dash + 1 );
+    if( isCacheBuildTagField( last ) )
+    {
+        return true;   // tagged, and not with this build's tag
+    }
+    // the pre-tag shapes, matched exactly: "ripwire-" (8) + 16 hex + "-lean"/"-rich" (5) + ".bin", or "ripwire-mcp-" (12) + 16 hex + ".cache"
+    const bool legacyClass = ext == ".bin" && stem.size() == 8 + 16 + 5 && ( stem.ends_with( "-lean" ) || stem.ends_with( "-rich" ) );
+    const bool legacyMcp   = isMcp && ext == ".cache" && stem.size() == 12 + 16;
+    return legacyClass || legacyMcp;
+}
+
+// P1-1 (2026-09-10 full audit) — THE PIN KEY. Every cache blob's filename carries the SAME 16-hex root
+// field, and since the follow-up round it really is the same one: `defaultCachePath` writes
+// `ripwire-<rootKey>-{lean,rich}-<tag>.bin`, `mcpCachePath` writes `ripwire-mcp-<rootKey>-<tag>.cache` and
+// `shaKeyedCachePath` writes `ripwire-<family>-<rootKey>-<exclHex>-<shaHex>.bin`, all three through the ONE
+// canonical `cacheRootKeyHex` above — so ONE root's every family (lean, rich, mcp, qheadsnap, qsnap, qbody,
+// qhist, qms, qchurn, stier) spells the same key in the same place. That makes "which root does this blob
+// belong to?" answerable from the NAME alone, with no plumbing: the byte-budget sweep reads the key off the
+// very blob it is about to write (`keepPath`) and pins its siblings.
+//
+// The rule is positional-free on purpose: return the FIRST '-'-delimited field that is exactly 16 hex
+// digits. No family tag is 16 characters of hex ("qheadsnap", "qsnap", "qbody", "qhist", "qms", "qchurn",
+// "stier", "mcp"), and no build tag is either (`c<format>p<parser>` always holds a 'p'), so the first such field is the root
+// key in every filename shape, and a foreign or legacy blob that carries no such field yields "" — which pins
+// nothing and evicts exactly as it did before.
+//
+// TWO FAMILIES ARE EXCEPTIONS, and they are NAMED rather than guessed at — their 16-hex field is a real
+// key, just not a key over a ROOT:
+//   * `ripwire-docmd-<hash>.bin`  (ingest_docpass.h) is CONTENT-addressed: fnv1a64 of the DOCUMENT'S
+//     BYTES, so one PDF extracted under two checkouts is cached once.
+//   * `ripwire-stier-<hash>-…`    (ingest_astquery.h::spanTierMemoPath) is FILE-addressed: it passes a
+//     per-file disk path to cacheRootKeyHex, one memo per source file above a 32 KiB floor. An llvm --for
+//     leaves ~30 of them beside the three root-keyed blobs, each with its own key.
+// Reading either as a root key would be a wrong answer about OWNERSHIP — it names a document or a file,
+// not the tree the blob belongs to — and at 1-in-2^64 could pin a blob to an unrelated root. Both are
+// excluded here rather than renamed: their names are correct for what they identify, and renaming would
+// orphan the most expensive thing in this directory to rebuild (a docmd blob costs a markitdown popen and
+// a Python start, seconds per file). They yield "" and are treated as unowned, which is what they are —
+// the byte-budget sweep may take them, and that is the right policy for a per-file memo whose recompute
+// cost is one file, not one tree.
+//
+// KEEP THE LIST HONEST: test/evictioncheck.sh arm (k) mirrors these prefixes in shell and FAILS if the two
+// lists disagree, so a family added later with a non-root 16-hex field is a gate failure rather than a
+// blob quietly pinned to a stranger.
+inline constexpr std::string_view kNonRootKeyedBlobPrefixes[] = { "ripwire-docmd-", "ripwire-stier-" };
+
+inline bool isNonRootKeyedBlob( std::string_view blobName ) noexcept
+{
+    return std::any_of( std::begin( kNonRootKeyedBlobPrefixes ), std::end( kNonRootKeyedBlobPrefixes ),
+                        [ blobName ]( const std::string_view prefix ) noexcept { return blobName.starts_with( prefix ); } );
+}
+
+inline std::string cacheBlobRootKey( std::string_view blobName ) noexcept
+{
+    const auto isHex16 = []( std::string_view f ) noexcept
+    {
+        if( f.size() != 16 )
+        {
+            return false;
+        }
+        for( const char c : f )
+        {
+            if( !std::isxdigit( static_cast<unsigned char>( c ) ) )
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if( isNonRootKeyedBlob( blobName ) )
+    {
+        return std::string{};   // content- or file-addressed, root-independent by design — see above
+    }
+
+    // A field ends at the next '-' OR at the '.' that opens the suffix. The dash-only scan this replaces
+    // could not read `ripwire-mcp-<rootKey>.cache` (mcpindex.h::mcpCachePath): its last field came out as
+    // `<rootKey>.cache`, 22 bytes, not hex16, so the function returned an EMPTY key for the one family
+    // whose name is nothing but a root key. The consequence is in evictBySizeBudget — an empty key pins
+    // nothing, so the byte-budget sweep would evict the MCP index blob of the very root it was serving
+    // while pinning that root's lean and rich blobs, and the MCP server paid a full re-parse for it.
+    // (CodeRabbit #127 / 3985249706. test/evictioncheck.sh's shell mirror `blobrootkey` already stripped
+    // `\.(bin|cache)$` before splitting, so the gate's reading and the binary's had silently diverged —
+    // arm (k) never primed an MCP blob, which is why nothing caught it.)
+    std::size_t at = 0;
+    while( at < blobName.size() )
+    {
+        const std::size_t      sep   = blobName.find_first_of( "-.", at );
+        const std::string_view field = blobName.substr( at, sep == std::string_view::npos ? std::string_view::npos : sep - at );
+        if( isHex16( field ) )
+        {
+            return std::string( field );
+        }
+        if( sep == std::string_view::npos )
+        {
+            break;
+        }
+        at = sep + 1;
+    }
+    return std::string{};
+}
+
+// One matching cache artifact as the sweep sees it: what it costs, how old it is, where it is. Hoisted out
+// of evictOldCacheFamily's body so the byte-budget pass below can be its own function rather than a third
+// in-line pass inside an already-long one.
+struct CacheBlobStat
+{
+    std::filesystem::file_time_type mtime;
+    std::uintmax_t                  byteSize;
+    std::string                     path;
+};
+
+// The byte-budget pass's eviction ORDER (evictBySizeBudget below): each blob's tier, read off its name ONCE — a
+// comparator that re-derived it would parse every name O(n log n) times — then sorted by tier, oldest first within a
+// tier. Tier 0: another root's blob, or one no root owns. Tier 1: another ripwire build's blob of the root being
+// written (isOtherBuildRootBlob). Tier 2 (kEvictTierPinned): this build's blobs of that root, and keepPath itself.
+inline constexpr std::uint8_t kEvictTierPinned = 2;
+
+struct RankedBlob
+{
+    std::uint8_t tier;
+    std::size_t  blobIndex;   // into the vector that was ranked
+};
+
+inline std::uint8_t evictionTier( const std::string& blobPath, const std::string& keepPath, const std::string& pinRootKey,
+                                  const OwnBuildBlobTails& ownTails )
+{
+    if( blobPath == keepPath )
+    {
+        return kEvictTierPinned;
+    }
+    const std::string name = std::filesystem::path( blobPath ).filename().string();
+    if( pinRootKey.empty() || cacheBlobRootKey( name ) != pinRootKey )
+    {
+        return 0;
+    }
+    return isOtherBuildRootBlob( name, ownTails ) ? std::uint8_t( 1 ) : kEvictTierPinned;
+}
+
+inline std::vector<RankedBlob> rankBlobsForEviction( const std::vector<CacheBlobStat>& blobs, const std::string& keepPath )
+{
+    const std::string       pinRootKey = cacheBlobRootKey( std::filesystem::path( keepPath ).filename().string() );
+    const OwnBuildBlobTails ownTails   = ownBuildBlobTails();
+    std::vector<RankedBlob> order;
+    order.reserve( blobs.size() );
+    for( std::size_t i = 0; i < blobs.size(); ++i )
+    {
+        order.push_back( RankedBlob{ evictionTier( blobs[ i ].path, keepPath, pinRootKey, ownTails ), i } );
+    }
+    std::sort( order.begin(), order.end(), [ &blobs ]( const RankedBlob& a, const RankedBlob& b )
+               { return a.tier != b.tier ? a.tier < b.tier : blobs[ a.blobIndex ].mtime < blobs[ b.blobIndex ].mtime; } );
+    ENSURES( order.size() == blobs.size(), "every blob is ranked exactly once" );
+    return order;
+}
+
+// P1-1 (2026-09-10 full audit) — THE BYTE-BUDGET PASS: delete until the family is under a LOW-WATER mark of
+// 7/8 budget, in THREE TIERS, oldest-first within each: (0) other roots' blobs and unowned ones, (1) another
+// ripwire build's blobs of the root being written, (2) never — this build's blobs of that root and `keepPath`.
+// Returns the blobs that survived. `mine` arrives unsorted.
+//
+// THE LOW-WATER MARK is F6's live-cache finding (B7.4, 2026-07-14): trimming to exactly the budget left the
+// dir hovering AT the ceiling, so every subsequent process re-crossed it on its first write and paid
+// deletion work on every save — sweeping to low water buys ~12% burst headroom and makes the common
+// next-process sweep a scan-only no-op.
+//
+// WHOSE BLOB GOES FIRST. Oldest-first alone is wrong at scale, and it was measured wrong: one llvm-project
+// root needs 1.76 GB for its OWN two families (rich 1.19 GB + lean 0.57 GB) against a 2 GB budget, so a
+// second corpus — or one --edit-check HEAD snapshot (0.52 GB) — made the sweep delete the SIBLING FAMILY OF
+// THE ROOT THE USER IS WORKING IN, the one thing they are certain to need next. Identical argv, same
+// session, same binary: `--grep` 20 s → 206 s, `--for` 19 s → 268 s, and SELF-SUSTAINING, because each cold
+// run's own save then evicts the other family again. `keepPath` alone never covered it: the blob being
+// written is precisely the family we are NOT about to need. src/main.cpp:181-189 already records the same
+// mechanism as a registered negative for a different key change ("the cache directory's 2 GiB cap evicts the
+// blob a running gate is about to reuse"). The BUDGET IS NOT LOWERED (owner rule
+// `quality-first-caps-are-blowup-guards`) — the ORDER is what changes, and the pin costs no state and no
+// stat: the root key is read off `keepPath`, i.e. whoever is writing IS the most-recently-used root.
+//
+// WHY ONLY THIS PASS IS PINNED. The age pass stays unpinned deliberately: a blob nobody has touched in 30
+// days is stale by that policy's own definition and losing it costs ONE cold parse, not a ping-pong —
+// whereas a blob evicted here is, by construction, one this very root just used.
+//
+// DISCLOSURE, and the reason P1-1 stayed invisible: all four measured 250 s runs wrote 0 bytes to stderr.
+// Conditional by construction — a sweep that frees nothing and is not over budget on its pinned set alone
+// says nothing at all, so no ordinary run, and no gate that compares stderr, grows a line. Plain emits,
+// NEVER DISCLOSE: NDEBUG compiles that out, and a Release binary is exactly where a 10x
+// slowdown needs to be visible.
+//
+// ANOTHER BUILD'S BLOBS OF THIS ROOT ARE TIER 1, NEITHER PINNED NOR FIRST (#334 follow-up). Since the auto names
+// carry the build tag, one root can hold a blob per build that ran on it (isOtherBuildRootBlob above).
+//   * Pinning them would make every upgrade leave the previous version's blobs pinned for the 30 days the age pass
+//     waits — on llvm-project 1.76 GB of them against a 2 GiB budget, the self-sustaining "kept anyway" state this
+//     pass exists to avoid.
+//   * Taking them oldest-first WITH other roots' blobs (the first cut of this change) evicted blobs still in use:
+//     a live MCP server of another build indexing this root, or the other build's class when two builds alternate,
+//     while evicting another root alone would have been enough. Measured by review: the server's next rebuild went
+//     from reparsed=1 to reparsed=5 of 5 files.
+// So they go only after every other root's blob is gone and the dir is still over the low-water mark. The cost that
+// remains: where one root's blobs from two builds do not fit the budget together (llvm-project, 1.76 GB per build),
+// the other build's blobs of it are evicted and that build re-parses on its next run — the pre-tag cost, paid now
+// only in that regime, and after every other root's blob was spent first.
+// The same tier also holds the version upgraded FROM: on the first save after an upgrade its blobs of this root outrank
+// every other root's, current-format ones included, so near the budget one upgrade can cost every other root a cold run.
+// Name and mtime cannot tell that version from a live one: a "superseded by this build's newer blob of the class" rule
+// fixes the upgrade case but brings the alternation thrash back (both measured by review).
+inline std::vector<CacheBlobStat> evictBySizeBudget( std::vector<CacheBlobStat>& mine, const std::string& dir,
+                                                     const std::string& keepPath, std::uintmax_t maxTotalBytes )
+{
+    namespace fs = std::filesystem;
+    EXPECTS( maxTotalBytes > 0, "a zero budget means 'no size pass' and evictOldCacheFamily never calls this pass with it" );
+
+    std::uintmax_t totalBytes = 0;
+    for( const CacheBlobStat& b : mine )
+    {
+        totalBytes += b.byteSize;
+    }
+    if( totalBytes <= maxTotalBytes )
+    {
+        return std::move( mine );
+    }
+
+    const std::uintmax_t          lowWaterBytes = maxTotalBytes - maxTotalBytes / 8;
+    const std::vector<RankedBlob> order         = rankBlobsForEviction( mine, keepPath );
+
+    std::vector<CacheBlobStat> kept;
+    kept.reserve( mine.size() );
+    std::size_t    evictedCount = 0;
+    std::uintmax_t pinnedBytes  = 0;
+    for( const RankedBlob& r : order )
+    {
+        ASSUME( r.blobIndex < mine.size(), "rankBlobsForEviction returns one entry per index of mine" );
+        const CacheBlobStat& b = mine[ r.blobIndex ];
+        if( r.tier == kEvictTierPinned )
+        {
+            pinnedBytes += b.byteSize;
+        }
+        else if( totalBytes > lowWaterBytes )
+        {
+            std::error_code de;
+            fs::remove( fs::path( b.path ), de );
+            totalBytes -= b.byteSize;
+            ++evictedCount;
+            continue;
+        }
+        kept.push_back( b );
+    }
+
+    constexpr std::uintmax_t kMiB = 1024ull * 1024;
+    if( evictedCount > 0 )
+    {
+        rw::emitTo( stderr, "ripwire: cache {}: over its {} MiB budget — evicted {} blob(s) of other roots or other ripwire builds (this build's blobs for this root are kept)\n",
+                      dir.c_str(), maxTotalBytes / kMiB, evictedCount );
+    }
+    if( totalBytes > maxTotalBytes )
+    {
+        rw::emitTo( stderr, "ripwire: cache {}: this build's blobs for this root are {} MiB, past the {} MiB budget — kept anyway (evicting one costs a full re-parse)\n",
+                      dir.c_str(), pinnedBytes / kMiB, maxTotalBytes / kMiB );
+    }
+    return kept;
 }
 
 // Hygiene: within one (repo, excludes) FAMILY, keep at most `keep` HEAD-snapshot cache files (newest by mtime);
@@ -1663,14 +2993,17 @@ inline std::string headSnapCachePath( const std::string& repoHex, const std::str
 // subdirectories, "00".."ff") — so a family's blobs are found and evicted correctly regardless of which
 // layout wrote them, and a mid-migration mix of both is swept as one set. The 256 shard names are an EXACT,
 // bounded set (never an open-ended recursive walk of a shared $TMPDIR that may hold unrelated large trees).
+//
+// P1-1: the byte-budget pass additionally PINS the root `keepPath` belongs to (see evictBySizeBudget). That
+// needs no new parameter and no plumbing — the pin key is a function of `keepPath`, which every call site
+// already passes — and it cannot reach the keep-N call sites below, which run with maxTotalBytes == 0.
 inline void evictOldCacheFamily( const std::string& dir, const std::string& prefix,
                                  const std::string& keepPath, std::size_t keep,
                                  double maxAgeDays = 0.0, std::uintmax_t maxTotalBytes = 0 )
 {
     namespace fs = std::filesystem;
 
-    struct Blob { fs::file_time_type mtime; std::uintmax_t byteSize; std::string path; };
-    std::vector<Blob> mine;
+    std::vector<CacheBlobStat> mine;
     const auto matches = [ & ]( const std::string& name )
     {
         if( name.size() < prefix.size() || name.compare( 0, prefix.size(), prefix ) != 0 )
@@ -1710,7 +3043,7 @@ inline void evictOldCacheFamily( const std::string& dir, const std::string& pref
             }
             std::error_code se;
             const auto sz = sit->file_size( se );
-            mine.push_back( Blob{ mt, se ? std::uintmax_t( 0 ) : sz, sit->path().string() } );   // size-stat failure degrades to 0 (age/count passes still see the file)
+            mine.push_back( CacheBlobStat{ mt, se ? std::uintmax_t( 0 ) : sz, sit->path().string() } );   // size-stat failure degrades to 0 (age/count passes still see the file)
         }
     };
 
@@ -1751,7 +3084,7 @@ inline void evictOldCacheFamily( const std::string& dir, const std::string& pref
         }
         std::error_code se;
         const auto sz = it->file_size( se );
-        mine.push_back( Blob{ mt, se ? std::uintmax_t( 0 ) : sz, it->path().string() } );   // size-stat failure degrades to 0 (age/count passes still see the file)
+        mine.push_back( CacheBlobStat{ mt, se ? std::uintmax_t( 0 ) : sz, it->path().string() } );   // size-stat failure degrades to 0 (age/count passes still see the file)
     }
     for( const fs::path& sd : shardDirs )
     {
@@ -1763,9 +3096,9 @@ inline void evictOldCacheFamily( const std::string& dir, const std::string& pref
     {
         const auto ageBudget = std::chrono::duration_cast<fs::file_time_type::duration>( std::chrono::duration<double, std::ratio<86400>>( maxAgeDays ) );
         const auto cutoff = fs::file_time_type::clock::now() - ageBudget;
-        std::vector<Blob> kept;
+        std::vector<CacheBlobStat> kept;
         kept.reserve( mine.size() );
-        for( const Blob& b : mine )
+        for( const CacheBlobStat& b : mine )
         {
             if( b.mtime < cutoff && b.path != keepPath )
             {
@@ -1778,43 +3111,17 @@ inline void evictOldCacheFamily( const std::string& dir, const std::string& pref
         mine.swap( kept );
     }
 
-    // size pass: if the family is still over budget, delete oldest-first until under a LOW-WATER mark of
-    // 7/8 budget (disabled when maxTotalBytes == 0). The hysteresis is F6's live-cache finding (B7.4,
-    // 2026-07-14): trimming to exactly the budget left the dir hovering AT the ceiling, so every subsequent
-    // process re-crossed it on its first write and paid deletion work on every save — sweep-to-low-water
-    // buys ~12% burst headroom and makes the common next-process sweep a scan-only no-op.
+    // size pass — the byte budget, its eviction order and its disclosure all live in evictBySizeBudget
+    // above (disabled when maxTotalBytes == 0, which is every keep-N call site below).
     if( maxTotalBytes > 0 )
     {
-        const std::uintmax_t lowWaterBytes = maxTotalBytes - maxTotalBytes / 8;
-        std::uintmax_t totalBytes = 0;
-        for( const Blob& b : mine )
-        {
-            totalBytes += b.byteSize;
-        }
-        if( totalBytes > maxTotalBytes )
-        {
-            std::sort( mine.begin(), mine.end(), []( const Blob& a, const Blob& b ){ return a.mtime < b.mtime; } );   // oldest first
-            std::vector<Blob> kept;
-            kept.reserve( mine.size() );
-            for( const Blob& b : mine )
-            {
-                if( totalBytes > lowWaterBytes && b.path != keepPath )
-                {
-                    std::error_code de;
-                    fs::remove( fs::path( b.path ), de );
-                    totalBytes -= b.byteSize;
-                    continue;
-                }
-                kept.push_back( b );
-            }
-            mine.swap( kept );
-        }
+        mine = evictBySizeBudget( mine, dir, keepPath, maxTotalBytes );
     }
 
     // count pass (the original behavior): keep only the `keep` newest, delete the rest (disabled via keep == max()).
     if( keep != std::numeric_limits<std::size_t>::max() && mine.size() > keep )
     {
-        std::sort( mine.begin(), mine.end(), []( const Blob& a, const Blob& b ){ return a.mtime > b.mtime; } );   // newest first
+        std::sort( mine.begin(), mine.end(), []( const CacheBlobStat& a, const CacheBlobStat& b ){ return a.mtime > b.mtime; } );   // newest first
         for( std::size_t i = keep; i < mine.size(); ++i )
         {
             if( mine[i].path == keepPath )
@@ -1886,16 +3193,16 @@ inline void sweepStaleEditLocks( const std::string& dir )
 {
     for( const std::string& path : staleEditLockPaths( dir ) )
     {
-        const int fd = ::open( path.c_str(), O_RDWR );
+        const int fd = os::open( path.c_str(), O_RDWR );
         if( fd < 0 )
         {
             continue;
         }
-        if( ::flock( fd, LOCK_EX | LOCK_NB ) == 0 )
+        if( os::flock( fd, LOCK_EX | LOCK_NB ) == 0 )
         {
-            ::unlink( path.c_str() );   // unheld and old: reclaim; a later editor recreates it on demand
+            os::unlink( path.c_str() );   // unheld and old: reclaim; a later editor recreates it on demand
         }
-        ::close( fd );
+        os::close( fd );
     }
 }
 
@@ -1927,8 +3234,10 @@ inline void evictOldHeadSnapCaches( const std::string& dir, const std::string& r
 // working-tree side legitimately still pays its own clone pass + ingest (it changes between runs).
 //
 // NEVER-STALE, on the same two independent guards the ingest cache uses:
-//  1) FILENAME key = (realpath repo-root, HEAD sha, excludes, a qsnap scheme tag) — a different HEAD / repo /
-//     --exclude set / scheme names a different file → the wrong Snapshot can never be loaded.
+//  1) FILENAME key = (realpath repo-root, HEAD sha, excludes, a qsnap scheme tag, the extraction identity, the
+//     producer identity) — a different HEAD / repo / --exclude set / scheme / BUILD names a different file → the
+//     wrong Snapshot can never be loaded. The producer identity (v14) is what keeps two builds that resolve
+//     calls differently apart; see producerIdentity.
 //  2) Blob self-validation: a magic + scheme-version header, an embedded fnv1a64(headSha) that must match the
 //     live HEAD, and an fnv1a64 content checksum trailer over the whole body. Any mismatch/truncation → the blob
 //     is rejected and the full compute runs (which then rewrites a correct blob) — a stale/foreign blob can
@@ -1959,6 +3268,11 @@ inline void evictOldHeadSnapCaches( const std::string& dir, const std::string& r
 // instructions: did the *semantics* of what a cached Snapshot represents change? → bump kQSnapCacheScheme AND
 // re-pin the hash in the same diff. Refactor-only (no behavior change)? → just re-pin. Keep this manifest
 // SMALL and edit it here (nowhere else) if the semantic surface grows:
+//   pythonMethodOwners        (quality.h) — enclosing-class evidence
+//   pythonReceiverParameters  (quality.h) — conventional first receiver parameter
+//   pythonDispatchRequests    (quality.h) — eligible receiver-call evidence
+//   pythonDispatchClasses     (quality.h) — downward-only inheritance reachability
+//   pythonDispatchedMethodIds  (quality.h) — Python inherited receiver-call evidence for the dead set
 //   isDeadCandidate            (quality.h) — the dead-set predicate itself
 //   isFixturePath              (quality.h) — a fixture-path exemption isDeadCandidate calls into
 //   isTestScriptPath           (quality.h) — the test-script exemption isDeadCandidate calls into (the exact
@@ -2018,15 +3332,62 @@ inline void evictOldHeadSnapCaches( const std::string& dir, const std::string& r
 // Benchmark BENCHMARK bodies reported as newly-dead the moment an agent added a test). No extraction
 // change — the underlying symbols were always indexed; only the dead-SET predicate narrowed — so
 // kParserVer/the mirrors deliberately did NOT move. Bumped 7 -> 8 to retire every blob written before it.
-constexpr std::uint32_t kQSnapCacheScheme = 8;
+// v9 (Q-DIAL-2, 2026-09-10) — `isDeadCandidate`'s header exclusion was REPLACED by languageInvokedSymbol,
+// so the dead SET both grew (every header symbol with no caller is now eligible) and shrank (constructors,
+// destructors, operators, bare types and main are out). Same shape as v6/v8 in the opposite direction, and
+// the direction is what makes the bump load-bearing rather than hygienic: a v8 blob's dead set was computed
+// while 96.8% of this repo's source was invisible to the predicate, so served to this binary every
+// newly-eligible dead symbol would read as ABSENT from the baseline dead set and be reported as freshly
+// dead — a whole tree of phantom regressions on the first run after an upgrade. No extraction change (the
+// symbols were always indexed; only the dead-SET predicate moved), so kParserVer and its mirrors deliberately
+// did NOT move. Bumped 8 -> 9 to retire every blob written before it.
+// v10 (Q-DIAL-3, 2026-09-10) — locBySym's VALUES are CODE lines now, not the physical span. Keys unchanged,
+// which is exactly what makes a stale blob dangerous rather than obvious: a v9 blob deserializes cleanly and
+// every symbol reads as having SHRUNK (its recorded physical loc exceeds the current code count), so the
+// verbosity kind reports NOTHING and says nothing about why. Bumped 9 -> 10.
+// v11 (PR #81 review item 4, 2026-09-12) — pathQualifiedKey( relPath, Symbol ) folds an Elixir `name/N` arity
+// OUT of the key: run/1 and run/2 are one piece of source, as C++ overloads of `f` are, so an arity edit is a
+// params movement on one identity instead of a dead symbol beside a new one. The v6/v7 shape again (the keys
+// hash a different byte string), confined to one language: a v10 blob's Elixir entries are absent from every
+// lookup this binary makes, so each Elixir symbol would read as new. Extraction is unchanged (parser version
+// 95 stays), so kParserVer and its mirror deliberately did NOT move. Bumped 10 -> 11.
+// v12 — Python inherited self/cls dispatch excludes possible overrides from the dead set on both sides.
+// v13 (#228, root-spelling invariance) — the HEAD side always ingests at an absolute temp root, and until this
+// round that spelling decided answers: Python's root-relative import probe was inert there (the name ladder bound
+// a same-directory def instead), and isFixturePath / isTestScriptPath read the directories ABOVE the temp root.
+// Both now read model.h::rootRelPath, so the dead set and every call edge a v12 blob was computed from can differ
+// for an UNCHANGED sha — and served to this binary, the pre-fix Snapshot is exactly the phantom row #228 reported
+// (test/rootspellingcheck.sh arm 5 watched it served: exit 2 on an unchanged four-file tree). No extraction
+// change: parser version and its mirror stay. Bumped 12 -> 13.
+// v14 (2026-09-16) — the blob header gained the PRODUCER IDENTITY after the extraction identity, and
+// qsnapExclHex folds it: a HEADER SHAPE change, so bumped by the v4 rule. The defect it closes is one this
+// rule could not have caught: a dead set is a function of call resolution, no version in the key moved with
+// resolution, and so two builds that resolve differently served each other's dead set (see producerIdentity).
+// Since v14 a bump is no longer what keeps two builds' blobs apart — any source change renames every blob — so
+// a semantics change that lands without one leaves this history incomplete, not a wrong answer across builds.
+// v15 (2026-09-26, lane/builtin-bind-065) — isDeadCandidate no longer counts a definition dead when a call the
+// builtin-method name gate DECLINED could have meant it (graph.h BuiltinMethodGate, Graph::gateDeclinedTarget):
+// the dead SET moved, as in v9/v12. The producer identity already keeps this build's blobs apart from older ones;
+// bumped 14 -> 15 so the history above stays complete. No extraction change: kParserVer 122 and its mirror stay.
+// v16 (2026-09-27, the masking/placeholder round) — the blob gained two per-symbol count maps after
+// maskBySym (maskReportBySym, placeholderBySym), and maskBySym itself now counts the widened handler shapes
+// (log-only, rethrow-only): a BLOB SHAPE change and a change to what a cached Snapshot's mask counts mean.
+// A v15 blob is short two maps and its mask counts are low, so served here it would read every widened shape
+// as newly added. Bumped by the v4/v5 rule.
+// v17 (lane/refval-edges, reference-as-value round) — the dead set no longer holds a function a table, field or
+// argument holds as a VALUE (valuerefindex.h ValueRefIndex::isValueReferenced, checked after every other exemption,
+// counted as value-ref-excluded= like --dead-code): the dead SET moved, as in v9/v12/v15. kParserVer moved with
+// the extraction (the Value/Through rows) and its mirror moved with it. Bumped 16 -> 17.
+constexpr std::uint32_t kQSnapCacheScheme = 17;
 constexpr char          kQSnapMagic[4]    = { 'Q', 'S', 'N', 'P' };
 
 // The qsnap EXCLUDES-config key folds the qsnap SCHEME (independent of the ingest cache's kHeadSnapCacheScheme)
 // so a qsnap-format bump renames every file → old-scheme blobs are simply never named again. It also folds the
 // extraction identity + maxFileBytes (see exclConfigHex).
+// v14: and the PRODUCER identity, because a Snapshot's dead set depends on call resolution (producerIdentity).
 inline std::string qsnapExclHex( const std::vector<std::string>& excludes, std::size_t maxFileBytes = kDefaultMaxFileBytes )
 {
-    return exclConfigHex( excludes, "qsnap" + std::to_string( kQSnapCacheScheme ), maxFileBytes );
+    return exclConfigHex( excludes, "qsnap" + std::to_string( kQSnapCacheScheme ) + '\x1f' + std::string( producerIdentity() ), maxFileBytes );
 }
 
 // a distinct "qsnap" family prefix so the ingest and Snapshot families never collide and evict independently.
@@ -2053,11 +3414,15 @@ inline void evictOldQSnapCaches( const std::string& dir, const std::string& repo
 // v3 (W1-S2): bodyHashBySym keys became pathQualifiedKey (see kQSnapCacheScheme v6). The blob header's
 // scheme check would already reject a v2 blob — but as CORRUPT (alert + stderr), not a clean miss; bumping
 // the family renames every file so old blobs are simply never named again.
-constexpr std::uint32_t kQBodyCacheScheme = 3;
+// v4 (2026-09-16): the shared blob header gained the producer identity (kQSnapCacheScheme v14), so this family
+// retires with it, as it did at v2. Its facts are extraction-only, yet the key folds the producer identity too:
+// deserializeSnapshot refuses a foreign producer for BOTH families, and a key without it would turn every
+// rebuild's first read into a "corrupt" alert instead of a clean miss.
+constexpr std::uint32_t kQBodyCacheScheme = 4;
 
 inline std::string qbodyExclHex( const std::vector<std::string>& excludes, std::size_t maxFileBytes = kDefaultMaxFileBytes )
 {
-    return exclConfigHex( excludes, "qbody" + std::to_string( kQBodyCacheScheme ), maxFileBytes );
+    return exclConfigHex( excludes, "qbody" + std::to_string( kQBodyCacheScheme ) + '\x1f' + std::string( producerIdentity() ), maxFileBytes );
 }
 
 inline std::string qbodyCachePath( const std::string& repoHex, const std::string& exclHex, const std::string& refSha )
@@ -2065,11 +3430,15 @@ inline std::string qbodyCachePath( const std::string& repoHex, const std::string
     return shaKeyedCachePath( "qbody", repoHex, exclHex, refSha );
 }
 
-// append one trivially-copyable POD to the blob buffer (native layout; see the determinism note above).
+// append one POD to the blob buffer (native layout; see the determinism note above). CONSTRAINED, not merely asserted
+// trivially copyable: a trivially copyable struct can still carry padding bytes, whose values are indeterminate, and a
+// float has more than one byte spelling of one value (-0.0 beside 0.0, many NaNs). Either would write a blob whose
+// bytes differ between two runs over the same facts. Every call site passes a fixed-width integer, and the constraint
+// keeps it that way: has_unique_object_representations is false for any type with padding or a floating-point member.
 template<class T>
+    requires std::has_unique_object_representations_v<T>
 inline void qsnapPut( std::string& buf, const T& v )
 {
-    static_assert( std::is_trivially_copyable_v<T>, "qsnap serializes PODs only" );
     buf.append( reinterpret_cast<const char*>( &v ), sizeof( T ) );
 }
 
@@ -2086,12 +3455,30 @@ inline bool qsnapGet( const char*& p, const char* end, T& out )
     return true;
 }
 
-// Serialize a Snapshot to a self-validating blob: [magic][scheme][cacheVer][parserVer][fnv(headSha)] then each
+// A record COUNT read out of a blob is the blob's claim, not a fact: bound it by the bytes that remain BEFORE
+// anything is sized from it. `minRecordBytes` is the smallest encoding one record can have, so a count that
+// passes cannot reserve more records than the blob could possibly hold. Without it a checksum-valid blob
+// whose count reads 0xFFFFFFFF reached `reserve` — 32 GiB for a u64 vector — and on a host that will not
+// overcommit that is std::bad_alloc, which nothing on the CLI path catches: SIGABRT on every run until the
+// blob was evicted. The twin of loadCache's countFits (ingest_cache.h), for the qsnap-format readers.
+inline bool qsnapCountFits( const char* p, const char* end, std::uint32_t count, std::size_t minRecordBytes ) noexcept
+{
+    if( count <= static_cast<std::size_t>( end - p ) / minRecordBytes )
+    {
+        return true;
+    }
+    DISCLOSE( Diagnostics::answerUnchanged, "the rejected blob is recomputed from the tree: same answer, slower",
+              "quality: a cache blob's record count exceeds its remaining bytes — blob rejected" );
+    return false;
+}
+
+// Serialize a Snapshot to a self-validating blob: [magic][scheme][cacheVer][parserVer][producer][fnv(headSha)] then each
 // of the 9 fields as a uint32 count followed by its flat records (btree maps in sorted key order, vectors
 // as-is), then an fnv1a64 checksum over all preceding bytes. Byte-stable for a fixed Snapshot.
 // P0.2 (r27): cacheVer/parserVer are the EXTRACTION IDENTITY every field below is a function of — see the note
 // at kIngestCacheVersionMirror. They are in the filename key too; carrying them here as well means a blob
 // reached by any other route (hand-copied, collided) is REJECTED rather than believed.
+// v14: `producer` is fnv1a64 of the producer identity — the build that computed the dead set (producerIdentity).
 inline std::string serializeSnapshot( const Snapshot& s, const std::string& headSha )
 {
     std::string buf;
@@ -2099,6 +3486,7 @@ inline std::string serializeSnapshot( const Snapshot& s, const std::string& head
     qsnapPut( buf, kQSnapCacheScheme );
     qsnapPut( buf, kIngestCacheVersionMirror );
     qsnapPut( buf, kIngestParserVerMirror );
+    qsnapPut( buf, producerIdentityHash() );
     qsnapPut( buf, fnv1a64( headSha ) );
 
     const auto putValMap = [ & ]( const gtl::btree_map<std::uint64_t, std::uint32_t>& m )
@@ -2114,6 +3502,8 @@ inline std::string serializeSnapshot( const Snapshot& s, const std::string& head
     putValMap( s.paramsBySym );
     putValMap( s.defsBySym );
     putValMap( s.maskBySym );
+    putValMap( s.maskReportBySym );
+    putValMap( s.placeholderBySym );
     putHashMap( s.bodyHashBySym );
     putVec( s.cloneGroups );
     putVec( s.dead );
@@ -2129,9 +3519,9 @@ inline std::string serializeSnapshot( const Snapshot& s, const std::string& head
 // miss. Vectors are re-sorted so computeDelta's binary_search invariant holds regardless of on-disk order.
 inline bool deserializeSnapshot( const std::string& blob, const std::string& headSha, Snapshot& out )
 {
-    if( blob.size() < 4 + 3 * sizeof( std::uint32_t ) + sizeof( std::uint64_t ) + sizeof( std::uint64_t ) )
+    if( blob.size() < 4 + 3 * sizeof( std::uint32_t ) + 3 * sizeof( std::uint64_t ) )
     {
-        return false;                                          // smaller than magic+scheme+cacheVer+parserVer+sha+trailer
+        return false;                                          // smaller than magic+scheme+cacheVer+parserVer+producer+sha+trailer
     }
     const char*       data    = blob.data();
     const std::size_t bodyLen = blob.size() - sizeof( std::uint64_t );   // trailer = last 8 bytes
@@ -2164,6 +3554,15 @@ inline bool deserializeSnapshot( const std::string& blob, const std::string& hea
         return false;
     }
     if( !qsnapGet( p, end, blobParserVer ) || blobParserVer != kIngestParserVerMirror )
+    {
+        return false;
+    }
+
+    // v14 — the PRODUCER guard. The dead set is a function of call resolution as well as extraction, so a blob
+    // another build computed describes a different graph; the key already never names one, this refuses one
+    // reached any other way (see producerIdentity).
+    std::uint64_t blobProducer = 0;
+    if( !qsnapGet( p, end, blobProducer ) || blobProducer != producerIdentityHash() )
     {
         return false;
     }
@@ -2215,9 +3614,9 @@ inline bool deserializeSnapshot( const std::string& blob, const std::string& hea
     const auto getVec = [ & ]( std::vector<std::uint64_t>& v ) -> bool
     {
         std::uint32_t n = 0;
-        if( !qsnapGet( p, end, n ) )
+        if( !qsnapGet( p, end, n ) || !qsnapCountFits( p, end, n, sizeof( std::uint64_t ) ) )
         {
-            return false;
+            return false;   // a corrupt blob: the caller's "cache corrupt — recomputing" path
         }
         v.reserve( n );
         for( std::uint32_t i = 0; i < n; ++i )
@@ -2232,7 +3631,7 @@ inline bool deserializeSnapshot( const std::string& blob, const std::string& hea
         return true;
     };
 
-    if( !getValMap( s.ccxBySym ) || !getValMap( s.locBySym ) || !getValMap( s.nestBySym ) || !getValMap( s.paramsBySym ) || !getValMap( s.defsBySym ) || !getValMap( s.maskBySym ) || !getHashMap( s.bodyHashBySym ) || !getVec( s.cloneGroups ) || !getVec( s.dead ) || !getVec( s.publicApi ) )
+    if( !getValMap( s.ccxBySym ) || !getValMap( s.locBySym ) || !getValMap( s.nestBySym ) || !getValMap( s.paramsBySym ) || !getValMap( s.defsBySym ) || !getValMap( s.maskBySym ) || !getValMap( s.maskReportBySym ) || !getValMap( s.placeholderBySym ) || !getHashMap( s.bodyHashBySym ) || !getVec( s.cloneGroups ) || !getVec( s.dead ) || !getVec( s.publicApi ) )
     {
         return false;
     }
@@ -2244,38 +3643,38 @@ inline bool deserializeSnapshot( const std::string& blob, const std::string& hea
     return true;
 }
 
-// Read a qsnap blob whole. Returns 1 = readable non-empty file (out filled), 0 = absent/empty/unreadable/not-a-regular-file (a
-// CLEAN miss — no alert). A present-but-invalid blob still returns 1 here; deserializeSnapshot then rejects it,
+// Read a qsnap blob whole: its bytes for a readable non-empty file, nullopt for absent/empty/unreadable/not-a-regular-file
+// (a CLEAN miss — no alert). A present-but-invalid blob is still returned here; deserializeSnapshot then rejects it,
 // and the caller alerts. Binary-safe (no getline/text translation).
-inline int readQSnapBlob( const std::string& path, std::string& out )
+inline std::optional<std::string> readQSnapBlob( const std::string& path )
 {
     // L1 (Linux runtime probe): opening a DIRECTORY succeeds on Linux/glibc and fails on macOS, so a
     // non-regular file at a cache-blob path is a platform-split hazard rather than a clean miss — it cost
     // ingest.cpp's loadCache an abort (see isRegularFileAt there). A qsnap blob is always a REGULAR file
     // (atomicWriteFile renames one into place); every other shape is a miss on every platform, which is
-    // exactly what this function's 0 already means, so it stays silent and the caller recomputes.
+    // exactly what this function's nullopt already means, so it stays silent and the caller recomputes.
     {
-        struct stat probe;
-        if( ::stat( path.c_str(), &probe ) != 0 || !S_ISREG( probe.st_mode ) )
+        os::stat_t probe;
+        if( os::stat( path.c_str(), &probe ) != 0 || !S_ISREG( probe.st_mode ) )
         {
-            return 0;
+            return std::nullopt;
         }
     }
 
     std::ifstream f( path, std::ios::binary | std::ios::ate );
     if( !f )
     {
-        return 0;
+        return std::nullopt;
     }
     const std::streamsize sz = f.tellg();
     if( sz <= 0 )
     {
-        return 0;
+        return std::nullopt;
     }
-    out.resize( static_cast<std::size_t>( sz ) );
+    std::string out( static_cast<std::size_t>( sz ), '\0' );
     f.seekg( 0 );
-    if( !f.read( out.data(), sz ) ) { out.clear(); return 0; }
-    return 1;
+    if( !f.read( out.data(), sz ) ) { return std::nullopt; }
+    return out;
 }
 
 // ─── Phase-M concurrency seam ───────────────────────────────────────────────────────────────────────
@@ -2310,22 +3709,18 @@ inline std::mutex& headSnapshotIngestMutex()
 // and degrade rules to drift, which is the clone kind --quality-delta gates on.
 inline bool atomicWriteFile( const std::string& path, const std::string& blob )
 {
-    static std::atomic<std::uint64_t> seq{ 0 };
-    const std::string tmp = path + ".tmp." + std::to_string( ::getpid() )
-                          + "." + std::to_string( seq.fetch_add( 1, std::memory_order_relaxed ) );
+    // Round 5 (rw::pathguard): the temp is created EXCLUSIVELY and WITHOUT following a link, under an
+    // unpredictable name beside the target, refusing an existing entry at that name. The RAII holder removes
+    // the temp on any failure
+    // path below; commit() renames it into place. The name keeps its `.tmp.` infix (a *.tmp.* residue glob
+    // still matches) and 0666 preserves the ofstream default mode; the kernel applies the umask exactly as
+    // the stream did. The fd-based write replaces the ofstream, which cannot express O_EXCL.
+    rw::pathguard::ExclTempFile temp = rw::pathguard::createExclTempFile( path + ".tmp.", "", 0666 );
+    if( !temp.ok() || !temp.write( blob ) )
     {
-        std::ofstream of( tmp, std::ios::binary | std::ios::trunc );
-        if( !of )
-        {
-            return false;
-        }
-        of.write( blob.data(), static_cast<std::streamsize>( blob.size() ) );
-        of.flush();
-        if( !of ) { std::error_code e; std::filesystem::remove( std::filesystem::path( tmp ), e ); return false; }
+        return false;   // temp removed by the holder's destructor
     }
-    if( std::rename( tmp.c_str(), path.c_str() ) != 0 )
-    { std::error_code e; std::filesystem::remove( std::filesystem::path( tmp ), e ); return false; }
-    return true;
+    return temp.commit( path );
 }
 
 // ─── shared plumbing for the two archived-tree consumers (HEAD snapshot / churn window-ref) ─────────────
@@ -2334,12 +3729,12 @@ inline bool atomicWriteFile( const std::string& path, const std::string& blob )
 // -1 = present but corrupt/mismatched (caller decides whether to alert). Never throws.
 inline int probeSnapshotBlob( const std::string& path, const std::string& sha, Snapshot& out )
 {
-    std::string blob;
-    if( readQSnapBlob( path, blob ) != 1 )
+    const std::optional<std::string> blob = readQSnapBlob( path );
+    if( !blob )
     {
         return 0;
     }
-    return deserializeSnapshot( blob, sha, out ) ? 1 : -1;
+    return deserializeSnapshot( *blob, sha, out ) ? 1 : -1;
 }
 
 // RAII owner of a materialized commit tree — keep alive while reading file bytes through its ingest result.
@@ -2350,11 +3745,74 @@ struct TmpTreeGuard
 };
 
 // Materialize `committish`'s committed tree into a fresh pid-suffixed temp dir under the hardened cache
-// ladder (per-user; never the repo) via `git archive | tar -x`. Returns the temp root, or "" on any failure
-// (degrade-alerted; a half-made dir is cleaned up here — on success the CALLER owns cleanup via TmpTreeGuard).
-inline std::string materializeCommitTree( const std::string& root, const std::string& committish, const char* tag )
+// ladder (per-user; never the repo) via `git archive` followed by `tar -x`. Returns the temp root, or "" on
+// any failure (degrade-alerted; a half-made dir is cleaned up here — on success the CALLER owns cleanup via
+// TmpTreeGuard).
+// What materializeCommitTree hands back: the temp root, or EMPTY — the one field every caller reads as "no tree". It is
+// the DISCLOSE sink for the four ways the tree is not made; each caller then refuses, or marks its own answer.
+//
+// ARCHIVE AND EXTRACT ARE TWO SEPARATE COMMANDS, EACH CHECKED ON ITS OWN EXIT STATUS — not one shell pipeline
+// (mergescout.h's own commitTreeIsEmpty comment first named the ambiguity this closes). `git archive … | tar -x …`
+// piped straight through reports the PIPELINE's exit status as `tar`'s alone (no `pipefail`): that reads 0
+// whether the tar stream had zero entries because the tree is genuinely empty OR because `git archive` failed
+// upstream and piped nothing downstream at all — `tar -x` on an empty stream is not itself an error. Writing the
+// archive to a file first, then extracting that file as its own command, makes ArchiveFailed mean what it says:
+// git's own exit status, independent of whatever tar does with the result. A caller can then trust that a
+// materialize which returns a non-empty root really READ the tree, so an ingest of that root coming back empty is
+// the tree's own content (no supported files, every path excluded, or a genuinely empty commit), never a masked
+// archive failure — indexCommittish no longer needs a second, indirect signal (the removed commitTreeIsEmpty) to
+// tell the two apart.
+struct MaterializedTree
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        RevisionUnresolved,
+        TempDirUnavailable,
+        ArchiveFailed,
+        ExtractFailed,
+    };
+    std::string root;
+    void disclose( DisclosureWhy ) noexcept
+    {
+        root.clear();
+    }
+};
+
+// The crawl denylist (ingest.h kCrawlSkipDirs / isSkippedCrawlDir) spelled as `git archive` exclude pathspecs, each
+// single-quoted and space-led. A caller that only INGESTS the tree (merge-scout's per-arm index) gains nothing from
+// extracting a subtree the crawl prunes by name anyway, and on this repository that subtree is most of the bytes:
+// third_party/ is 249 MB of a 325 MB archive, so every scouted arm wrote and deleted a quarter-gigabyte it never read
+// (--stray-content --plan: 12 arms, 116 s, timed out a 60 s caller with nothing printed). `glob` magic keeps `*` inside
+// one path component, the leading `**/` matches the root level too, and an exclude-only pathspec list still means
+// "everything else" (git >= 2.13). The one crawl prune a pathspec cannot express — a directory holding CMakeCache.txt —
+// is still extracted and still pruned by the crawl. What the prune CAN change is a tracked SYMLINK: one whose target sits
+// under a pruned directory (`src/v.c -> ../vendor/lib/v.c`) dangles in the pruned tree, and the crawl drops a dangling
+// link silently where the full tree indexed it. So a tree holding any symlink (mode 120000) is never pruned
+// (treeHasNoSymlink); with that guard the ingest result is the one an unpruned archive gives.
+// True only when `rev`'s tree provably holds no symlink: `git ls-tree -r` lists every entry's mode, and none is 120000.
+// An empty listing (an empty tree, or a git too old for --format) is not proof, so it answers false: the plain archive.
+inline bool treeHasNoSymlink( const std::string& root, const std::string& rev )
+{
+    const std::string modes = gitOneLine( root, "ls-tree -r " + shSingleQuote( "--format=%(objectmode)" ) + " " + shSingleQuote( rev ) + " 2>/dev/null" );
+    return !modes.empty() && modes.find( "120000" ) == std::string::npos;
+}
+
+inline std::string crawlSkipDirPathspecs()
+{
+    std::string specs;
+    for( const std::string_view dir : kCrawlSkipDirs )
+    {
+        specs += " " + shSingleQuote( ":(exclude,glob)**/" + std::string( dir ) + "/**" );
+    }
+    specs += " " + shSingleQuote( ":(exclude,glob)**/cmake-build-?*/**" );   // isSkippedCrawlDir: the prefix plus at least one byte
+    specs += " " + shSingleQuote( ":(exclude,glob)**/?*.dSYM/**" );          // isSkippedCrawlDir: a name longer than the suffix
+    return specs;
+}
+
+inline std::string materializeCommitTree( const std::string& root, const std::string& committish, const char* tag, bool pruneCrawlSkipDirs = false )
 {
     namespace fs = std::filesystem;
+    MaterializedTree tree;
 
     // r27 (Lane C routing) — RESOLVE THE REVISION FIRST. `git archive --output=FILE` really does write a file
     // (measured), so this is the P0.1 shape one careless caller away from being the same data-loss bug. Every
@@ -2365,23 +3823,58 @@ inline std::string materializeCommitTree( const std::string& root, const std::st
     // the separator goes AFTER the revision.
     const std::string rev = gitResolveCommitSha( root, committish );
     if( rev.empty() )
-    { DEGRADED_PATH_ALERT( "quality: commit-tree revision does not resolve to a commit — refusing to archive" ); return {}; }
+    {
+        DISCLOSE( tree, MaterializedTree::DisclosureWhy::RevisionUnresolved, "quality: commit-tree revision does not resolve to a commit — refusing to archive" );
+        return tree.root;
+    }
 
     std::error_code ec;
-    const std::string tmpRoot = cacheDirLadder() + "/ripwire-" + tag + "-" + std::to_string( ::getpid() );
+    std::string tmpRoot = cacheDirLadder() + "/ripwire-" + tag + "-" + std::to_string( os::getpid() );   // not const: moved out on return
     fs::remove_all( fs::path( tmpRoot ), ec );                 // stale leftover from a crashed prior run
     if( !fs::create_directories( fs::path( tmpRoot ), ec ) && ec )
-    { DEGRADED_PATH_ALERT( "quality: cannot create commit-tree temp dir" ); return {}; }
-
-    const std::string extract = "git -c core.quotepath=false -C " + shSingleQuote( root )
-                              + " archive --format=tar " + shSingleQuote( rev ) + " -- 2>/dev/null | tar -x -C " + shSingleQuote( tmpRoot ) + " 2>/dev/null";
-    if( std::system( extract.c_str() ) != 0 )
     {
-        DEGRADED_PATH_ALERT( "quality: git archive failed — committed tree unavailable" );
+        DISCLOSE( tree, MaterializedTree::DisclosureWhy::TempDirUnavailable, "quality: cannot create commit-tree temp dir" );
+        return tree.root;
+    }
+
+    // Two SEPARATE commands, each checked on its own exit status (see the struct comment above for why: a
+    // piped `archive | tar -x` masks a failed archive behind tar's own, unrelated, successful exit on an
+    // empty stream). The intermediate .tar is a sibling of tmpRoot under the same cache ladder, named off the
+    // same tag+pid tmpRoot already is (so it inherits the same per-process uniqueness contract §3619 documents
+    // for tmpRoot itself), and is removed here regardless of outcome — it is never part of what the caller's
+    // TmpTreeGuard owns.
+    const std::string archiveFile = tmpRoot + ".tar";
+    const std::string archiveCmd  = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
+                                  + " archive --format=tar --output=" + shSingleQuote( archiveFile ) + " " + shSingleQuote( rev ) + " -- ";
+    // The pruned archive is an optimisation, never a new way to fail: git refuses an exclude-only pathspec over an
+    // EMPTY tree ("pathspec … did not match any files", measured on git 2.50), which is a legal base. Any refusal of
+    // the pruned form falls back to the plain archive, whose exit status then decides as it always did.
+    // A tree with a symlink is archived whole (see crawlSkipDirPathspecs: a link into a pruned subtree would dangle).
+    const bool archivedPruned = pruneCrawlSkipDirs && treeHasNoSymlink( root, rev )
+                             && os::system( ( archiveCmd + crawlSkipDirPathspecs() + " 2>/dev/null" ).c_str() ) == 0;
+    if( !archivedPruned && os::system( ( archiveCmd + " 2>/dev/null" ).c_str() ) != 0 )
+    {
+        DISCLOSE( tree, MaterializedTree::DisclosureWhy::ArchiveFailed, "quality: git archive failed — committed tree unavailable" );
         std::error_code e;
         fs::remove_all( fs::path( tmpRoot ), e );
-        return {};
+        fs::remove( fs::path( archiveFile ), e );
+        return tree.root;
     }
+
+    const std::string extractCmd = "tar -x -f " + shSingleQuote( archiveFile ) + " -C " + shSingleQuote( tmpRoot ) + " 2>/dev/null";
+    const int         extractRc  = os::system( extractCmd.c_str() );
+    std::error_code   rmEc;
+    fs::remove( fs::path( archiveFile ), rmEc );   // never leave the intermediate .tar behind, success or failure
+    if( extractRc != 0 )
+    {
+        DISCLOSE( tree, MaterializedTree::DisclosureWhy::ExtractFailed, "quality: tar extract failed — committed tree unavailable" );
+        std::error_code e;
+        fs::remove_all( fs::path( tmpRoot ), e );
+        return tree.root;
+    }
+    // The intermediate .tar this function wrote is never handed back — `rmEc` above already removed it
+    // (best-effort; a leftover .tar sibling is cache-ladder litter the sweep still reclaims, never something
+    // a caller reads: ingest() below only ever walks `tmpRoot`, a directory, not a `.tar` sibling of it).
     return tmpRoot;
 }
 
@@ -2404,7 +3897,7 @@ enum class RefSpecStatus : std::uint8_t
     NoGit,          // environment: not a repo, or no commit on HEAD — `reason` says which
     BadRange,       // USER error: the three-dot form — `badToken` is the spec verbatim
     BadRev,         // USER error: `badToken` does not resolve to a commit
-    NoParent,       // environment: the REV form landed on a root commit — `reason` says so
+    NoParent,       // environment: the REV form landed on a root commit or a shallow boundary — `reason` says which
 };
 
 struct RefSpec
@@ -2416,6 +3909,18 @@ struct RefSpec
     std::string   badToken;                    // BadRev/BadRange only: the offending token, verbatim
     std::string   reason;                      // NoGit/NoParent only: the environment sentence
 };
+
+// The NoParent sentence: a shallow clone's boundary commit is named as one (its parent exists upstream and was not
+// fetched), a true root commit keeps the sentence it always had.
+inline std::string noParentReason( const std::string& root, const std::string& sha )
+{
+    if( gitIsShallowBoundary( root, sha ) )
+    {
+        return "shallow clone: that commit's parent was not fetched, so there is no earlier tree here to be a delta against "
+               "(it is the shallow boundary, not a root commit; " + std::string( kShallowDeepenHint ) + ")";
+    }
+    return "that commit has no parent — a root commit has no earlier tree to be a delta against";
+}
 
 inline RefSpec resolveRefSpec( const std::string& root, std::string_view spec )
 {
@@ -2470,12 +3975,14 @@ inline RefSpec resolveRefSpec( const std::string& root, std::string_view spec )
         return r;
     }
     // The per-commit form: the commit against its FIRST parent. A root commit has none — an environment fact,
-    // not a typo, so it degrades with a stated reason rather than refusing.
+    // not a typo, so it degrades with a stated reason rather than refusing. 0.6.6: so does a shallow clone's
+    // BOUNDARY commit, whose parent exists but was never fetched; calling that "a root commit" was false
+    // (--quality-delta=HEAD and --dmm=HEAD on every depth-1 clone), so the reason names which one it is.
     r.baseSha = gitResolveCommitSha( root, r.targetSha + "^" );
     if( r.baseSha.empty() )
     {
         r.status = RefSpecStatus::NoParent;
-        r.reason = "that commit has no parent — a root commit has no earlier tree to be a delta against";
+        r.reason = noParentReason( root, r.targetSha );
     }
     return r;
 }
@@ -2496,7 +4003,8 @@ inline RefSpec resolveRefSpec( const std::string& root, std::string_view spec )
 // Degrade (never throw): non-git root, no HEAD (unborn / detached with no committed tree), git unavailable, or
 // a failed archive/extract/ingest → returns {snapshot, false}. rootPath is shell-escaped (shSingleQuote) and
 // quotepath=false — no injection, deterministic path handling.
-inline Snapshot computeSnapshot( const IngestResult& ing, const Graph& g, std::string_view root );   // fwd — defined below; computeHeadSnapshot reuses it
+inline Snapshot computeSnapshot( const IngestResult& ing, const Graph& g, std::string_view root,
+                                 const std::vector<char>* fileInBaseline = nullptr );   // fwd — defined below; computeHeadSnapshot reuses it
 // `excludes` MUST mirror the working-tree side's cfg.excludes (A4-F5): the HEAD snapshot is compared key-for-key
 // against the working tree, and any in-edge-derived kind (dead-code, api-surface) diverges if one side honors
 // --exclude and the other does not — e.g. a helper called only from tests/ is dead on a --exclude=tests working
@@ -2518,7 +4026,7 @@ inline std::pair<Snapshot, bool> computeHeadSnapshot( const std::string& root, c
     // Cache keys, computed ONCE and shared by both the Snapshot cache (this step) and the ingest cache (step 3).
     const std::string headSha   = gitHeadSha( root );        // non-empty: gitRepoHasHistory passed above
     const bool        useCache  = !headSha.empty();
-    const std::string repoHex   = useCache ? headSnapRepoHex( root )     : std::string{};
+    const std::string repoHex   = useCache ? cacheRootKeyHex( root )     : std::string{};
     const std::string exclHex   = useCache ? headSnapExclHex( excludes, maxFileBytes ) : std::string{};   // ingest-cache family
     const std::string qExclHex  = useCache ? qsnapExclHex( excludes, maxFileBytes )    : std::string{};   // Snapshot-cache family
     const std::string qsnapPath = useCache ? qsnapCachePath( repoHex, qExclHex, headSha ) : std::string{};
@@ -2538,9 +4046,9 @@ inline std::pair<Snapshot, bool> computeHeadSnapshot( const std::string& root, c
         if( hit == -1 )
         {
             // the fprintf is the visible line in ALL build types (test/qsnapcachecheck.sh (e) gates on it);
-            // DEGRADED_PATH_ALERT compiles out under NDEBUG.
-            std::fprintf( stderr, "ripwire: quality: HEAD Snapshot cache corrupt — recomputing\n" );
-            DEGRADED_PATH_ALERT( "quality: HEAD Snapshot cache corrupt — recomputing" );
+            // DISCLOSE compiles out under NDEBUG.
+            rw::emitRaw( stderr, "ripwire: quality: HEAD Snapshot cache corrupt — recomputing\n" );
+            DISCLOSE( Diagnostics::answerUnchanged, "the corrupt cache is recomputed from the tree: same answer, slower", "quality: HEAD Snapshot cache corrupt — recomputing" );
         }
     }
 
@@ -2587,7 +4095,14 @@ inline std::pair<Snapshot, bool> computeHeadSnapshot( const std::string& root, c
         evictOldHeadSnapCaches( cacheDirLadder(), repoHex, exclHex, cachePath, 2 );
     }
     if( headIng.symbols.empty() && headIng.files.empty() )
-    { DEGRADED_PATH_ALERT( "quality: HEAD tree ingested empty — falling back to run --quality-baseline first" ); return { Snapshot{}, false }; }
+    { DISCLOSE( "quality: HEAD tree ingested empty — falling back to run --quality-baseline first" ); return { Snapshot{}, false }; }
+    // #350: a HEAD tree the memory guard cut is never scored and never persisted as the qsnap — a partial floor would
+    // be served as complete by every later run. The no-snapshot path leaves the stop UNANSWERED, so the CLI backstop
+    // exits 5 with its line and the MCP envelope carries _memory_stop (memguard.h).
+    if( headIng.memoryStop.isSet() )
+    {
+        return { Snapshot{}, false };
+    }
     const Graph headG = buildGraph( headIng, nullptr );
 
     // root = tmpRoot so keys are root-relative and match the working-tree side key-for-key (S2).
@@ -2643,7 +4158,7 @@ struct RefTree
 inline bool loadRefTree( const std::string& repoRoot, const std::string& sha, const std::vector<std::string>& excludes,
                          std::size_t maxFileBytes, const char* tag, TmpTreeGuard& guard, RefTree& out )
 {
-    VERIFY( tag != nullptr && *tag != '\0' );
+    ASSUME( tag != nullptr && *tag != '\0' );
     const std::string tmpRoot = materializeCommitTree( repoRoot, sha, tag );
     if( tmpRoot.empty() )
     {
@@ -2654,7 +4169,7 @@ inline bool loadRefTree( const std::string& repoRoot, const std::string& sha, co
     std::string cachePath;
     if( sha == gitHeadSha( repoRoot ) )
     {
-        cachePath = headSnapCachePath( headSnapRepoHex( repoRoot ), headSnapExclHex( excludes, maxFileBytes ), sha );
+        cachePath = headSnapCachePath( cacheRootKeyHex( repoRoot ), headSnapExclHex( excludes, maxFileBytes ), sha );
     }
 
     {
@@ -2666,7 +4181,8 @@ inline bool loadRefTree( const std::string& repoRoot, const std::string& sha, co
     }
     if( out.ing.symbols.empty() && out.ing.files.empty() )
     {
-        DEGRADED_PATH_ALERT( "quality: a materialized commit tree ingested empty" );
+        DISCLOSE( Diagnostics::answerRefused, "the only caller, --quality-delta=A..B, refuses with the sha named; nothing is scored",
+                  "quality: a materialized commit tree ingested empty" );
         return false;
     }
     out.g    = buildGraph( out.ing, nullptr );
@@ -2696,7 +4212,7 @@ computeWindowRefBodyHashes( const std::string& root, std::uint32_t days,
         return { {}, false };
     }
 
-    const std::string repoHex   = headSnapRepoHex( root );
+    const std::string repoHex   = cacheRootKeyHex( root );
     const std::string exclHex   = headSnapExclHex( excludes, maxFileBytes );   // ingest-cache family (shared with qheadsnap)
     const std::string qbExclHex = qbodyExclHex( excludes, maxFileBytes );
     const std::string qbodyPath = qbodyCachePath( repoHex, qbExclHex, refSha );
@@ -2712,8 +4228,8 @@ computeWindowRefBodyHashes( const std::string& root, std::uint32_t days,
         }
         if( hit == -1 )
         {
-            std::fprintf( stderr, "ripwire: quality: window-ref body cache corrupt — recomputing\n" );
-            DEGRADED_PATH_ALERT( "quality: window-ref body cache corrupt — recomputing" );
+            rw::emitRaw( stderr, "ripwire: quality: window-ref body cache corrupt — recomputing\n" );
+            DISCLOSE( Diagnostics::answerUnchanged, "the corrupt cache is recomputed from the tree: same answer, slower", "quality: window-ref body cache corrupt — recomputing" );
         }
     }
 
@@ -2742,7 +4258,11 @@ computeWindowRefBodyHashes( const std::string& root, std::uint32_t days,
     IngestResult refIng = ingest( tmpRoot.c_str(), excludes, std::string_view( ingestCachePath ), maxFileBytes );
     evictOldHeadSnapCaches( cacheDirLadder(), repoHex, exclHex, ingestCachePath, 2 );
     if( refIng.symbols.empty() && refIng.files.empty() )
-    { DEGRADED_PATH_ALERT( "quality: churn-window ref tree ingested empty — churn evidence unavailable" ); return { {}, false }; }
+    { DISCLOSE( "quality: churn-window ref tree ingested empty — churn evidence unavailable" ); return { {}, false }; }
+    if( refIng.memoryStop.isSet() )   // #350: a cut ref tree is never persisted as the qbody (see computeHeadSnapshot)
+    {
+        return { {}, false };
+    }
 
     Snapshot bodyOnly;
     bodyOnly.bodyHashBySym = bodyHashesBySym( refIng, tmpRoot );   // pathQualifiedKey on EVERY side of the churn join (baseline, this ref, working tree, per-node lookup) — a one-sided keying change makes every symbol read as rewritten   // root = tmpRoot → root-relative keys (S2)
@@ -2842,8 +4362,12 @@ inline bool deserializeRawCommitStream( const std::string& blob, const std::stri
         return false;
     }
 
+    // Every commit record is at least its epoch plus its path count, and every path at least its length prefix;
+    // both counts are measured against the bytes left before either sizes a reserve (qsnapCountFits).
+    constexpr std::size_t kMinCommitRecordBytes = sizeof( RawCommitStream::Commit::epoch ) + sizeof( std::uint32_t );
+    constexpr std::size_t kMinPathRecordBytes   = sizeof( std::uint32_t );
     std::uint32_t nCommits = 0;
-    if( !qsnapGet( p, end, nCommits ) )
+    if( !qsnapGet( p, end, nCommits ) || !qsnapCountFits( p, end, nCommits, kMinCommitRecordBytes ) )
     {
         return false;
     }
@@ -2857,7 +4381,7 @@ inline bool deserializeRawCommitStream( const std::string& blob, const std::stri
             return false;
         }
         std::uint32_t nPaths = 0;
-        if( !qsnapGet( p, end, nPaths ) )
+        if( !qsnapGet( p, end, nPaths ) || !qsnapCountFits( p, end, nPaths, kMinPathRecordBytes ) )
         {
             return false;
         }
@@ -2907,7 +4431,7 @@ inline std::vector<std::vector<std::uint32_t>> gitCoChangeAndChurnCached(
         return resolveCommitStream( gitLogNameOnlyRaw( root, coSince ), ing, maxFiles, churnCutoff, outChurn, onlyRoot );
     }
 
-    const std::string repoHex  = headSnapRepoHex( root );
+    const std::string repoHex  = cacheRootKeyHex( root );
     const std::string boundary = gitWindowBoundarySha( root, coSince );   // cheap — no --name-only
     std::string       keyMat   = headSha;
     keyMat.push_back( '\x1f' ); keyMat += coSince;
@@ -2915,9 +4439,9 @@ inline std::vector<std::vector<std::uint32_t>> gitCoChangeAndChurnCached(
     keyMat += "qchurn" + std::to_string( kQChurnCacheScheme );
     const std::string cachePath = shaKeyedCachePath( "qchurn", repoHex, std::string{}, keyMat );
 
-    RawCommitStream raw;
-    std::string      blob;
-    if( readQSnapBlob( cachePath, blob ) == 1 && deserializeRawCommitStream( blob, keyMat, raw ) )
+    RawCommitStream                  raw;
+    const std::optional<std::string> blob = readQSnapBlob( cachePath );
+    if( blob && deserializeRawCommitStream( *blob, keyMat, raw ) )
     {
         return resolveCommitStream( raw, ing, maxFiles, churnCutoff, outChurn, onlyRoot );   // warm hit — no walk
     }
@@ -2931,25 +4455,116 @@ inline std::vector<std::vector<std::uint32_t>> gitCoChangeAndChurnCached(
 // `root` = the ingest root exactly as invoked (cfg.rootPath). It is folded into every baseline key via
 // baselineCanonId so the written sidecar is root-spelling-independent (S2). g.canonId is still consulted only
 // as the "has a canonical id" presence gate — the HASHED key is the root-relative baselineCanonId, never g's.
-inline Snapshot computeSnapshot( const IngestResult& ing, const Graph& g, std::string_view root = {} )
+// ── computeSnapshot's BASELINE-MEMBERSHIP filter, in three named pieces ──────────────────────────────────
+//
+// `fileInBaseline`, when non-null, is a per-fileId flag: 0 means "this file is NOT part of the baseline the
+// snapshot stands for". The IDENTITY BASIS (computeHeadBasis, below) is its only caller — it builds the HEAD
+// baseline out of the WORKING TREE's own ingest and has to leave out the files HEAD does not track, so their
+// symbols stay ABSENT at baseline and keep reading as new. It is a MEMBERSHIP filter, never a metric change:
+// a file that is in the baseline contributes exactly the records it always did, computed from exactly the same
+// graph. A null filter is the pre-#228 behaviour, branch for branch, which is what lets computeHeadSnapshot
+// keep writing a cached Snapshot that means exactly what it always meant (see test/qschemetripcheck.sh).
+//
+// Out-of-range fileIds read as IN-baseline: a short or absent vector can then only ever widen the baseline,
+// never narrow it, so a plumbing mistake cannot invent a regression.
+inline bool fileIsInBaseline( const std::vector<char>* fileInBaseline, std::uint32_t fileId ) noexcept
+{
+    return fileInBaseline == nullptr || fileId >= fileInBaseline->size() || ( *fileInBaseline )[ fileId ] != 0;
+}
+
+// A clone group is a SET identity (see cloneGroupHash), so a member the baseline does not contain makes the
+// whole set something the baseline never held: the group is left out rather than re-hashed without it.
+inline bool cloneGroupIsInBaseline( const CloneGroup& cg, const IngestResult& ing, const std::vector<char>* fileInBaseline ) noexcept
+{
+    for( NodeId m : cg.members )
+    {
+        if( m < ing.symbols.size() && !fileIsInBaseline( fileInBaseline, ing.symbols[m].fileId ) )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// constructCountsBySym and bodyHashesBySym walk EVERY symbol, so the membership filter reaches their results
+// here, on their keys. The key space is path-qualified (qualityKey), so a key belongs to exactly ONE file:
+// dropping a non-baseline file's key can never take a baseline file's record with it.
+inline void dropNonBaselineKeys( Snapshot& snap, const IngestResult& ing, std::string_view root,
+                                 const std::vector<char>* fileInBaseline )
+{
+    if( fileInBaseline == nullptr )
+    {
+        return;
+    }
+    std::vector<std::uint64_t> dropKeys;
+    for( NodeId i = 0; i < ing.symbols.size(); ++i )
+    {
+        if( !fileIsInBaseline( fileInBaseline, ing.symbols[i].fileId ) )
+        {
+            dropKeys.push_back( qualityKey( ing, i, root ) );
+        }
+    }
+    std::sort( dropKeys.begin(), dropKeys.end() );
+    const auto dropped = [ & ]( std::uint64_t k ) noexcept
+    { return std::binary_search( dropKeys.begin(), dropKeys.end(), k ); };
+    for( gtl::btree_map<std::uint64_t, std::uint32_t>* m : { &snap.maskBySym, &snap.maskReportBySym, &snap.placeholderBySym } )
+    {
+        for( auto it = m->begin(); it != m->end(); )
+        {
+            it = dropped( it->first ) ? m->erase( it ) : std::next( it );
+        }
+    }
+    for( auto it = snap.bodyHashBySym.begin(); it != snap.bodyHashBySym.end(); )
+    {
+        it = dropped( it->first ) ? snap.bodyHashBySym.erase( it ) : std::next( it );
+    }
+}
+
+// The duplication baseline = both exact (Type-1/2) AND gapped (Type-3) groups, folded into one set. A Type-3
+// pair hashes by its sorted member canonIds exactly like an exact group, so introducing a NEW near-clone
+// changes the set and the delta flags it. Both passes are deterministic, so the set is stable.
+inline std::vector<std::uint64_t> baselineCloneGroupHashes( const IngestResult& ing, std::string_view root,
+                                                            const std::vector<char>* fileInBaseline )
+{
+    std::vector<std::uint64_t> out;
+    for( const CloneGroup& cg : findClones( ing, int( kMinCloneTokens ) ) )
+    {
+        if( cloneGroupIsInBaseline( cg, ing, fileInBaseline ) ) { out.push_back( cloneGroupHash( cg, ing, root ) ); }
+    }
+    for( const CloneGroup& cg : findClonesType3( ing, int( kMinCloneTokens ) ) )
+    {
+        if( cloneGroupIsInBaseline( cg, ing, fileInBaseline ) ) { out.push_back( cloneGroupHash( cg, ing, root ) ); }
+    }
+    return out;
+}
+
+inline Snapshot computeSnapshot( const IngestResult& ing, const Graph& g, std::string_view root,
+                                 const std::vector<char>* fileInBaseline )
 {
     Snapshot snap;
+    const std::vector<std::uint32_t> codeLoc         = codeLocByNode( ing );                     // Q-DIAL-3: the verbosity kind's metric is CODE lines
     const std::vector<std::uint64_t> topLevelCallees = topLevelCalleeNameHashes( ing );          // W1-S2: dead-kind evidence, built once
     const std::vector<std::string>   macroNames      = registeredMacroNames( root );             // P2.2: built-ins + .ripwire_config
     const std::vector<NodeId>        macroIds        = registeredMacroSymbolIds( ing, macroNames );
+    const std::vector<NodeId>        pythonDispatch  = pythonDispatchedMethodIds( ing, g );
+    const ValueRefIndex              valueRefs( ing );                                           // a value-held function is not dead
     for( NodeId i = 0; i < ing.symbols.size(); ++i )
     {
         if( i >= g.canonId.size() || g.canonId[i].empty() )
         {
             continue;
         }
+        const Symbol& s = ing.symbols[i];
+        if( !fileIsInBaseline( fileInBaseline, s.fileId ) )
+        {
+            continue;   // IDENTITY BASIS: not a baseline file — every record below would be a phantom
+        }
         const std::uint64_t key = qualityKey( ing, i, root );   // path-qualified ALWAYS — see qualityKey
-        const Symbol&       s   = ing.symbols[i];
         // overloads share a canonical id (scope+name) → keep the MAX of each per-symbol metric per id, not
         // last-writer-wins; otherwise a low-metric overload written last makes every later delta report a
         // phantom regression forever (THE trap). Every new per-symbol kind mirrors this MAX exactly.
         { std::uint32_t& slot = snap.ccxBySym[ key ];    slot = std::max( slot, s.ccx ); }
-        { std::uint32_t& slot = snap.locBySym[ key ];    slot = std::max( slot, s.loc ); }
+        { std::uint32_t& slot = snap.locBySym[ key ];    slot = std::max( slot, codeLoc[i] ); }   // Q-DIAL-3: CODE lines, not the physical span
         { std::uint32_t& slot = snap.nestBySym[ key ];   slot = std::max( slot, std::uint32_t( s.maxNest ) ); }
         { std::uint32_t& slot = snap.paramsBySym[ key ]; slot = std::max( slot, std::uint32_t( s.params ) ); }
         // THE ONE KIND THAT IS NOT A MAX, and the reason is the MAX itself. Every metric above collapses the
@@ -2959,7 +4574,8 @@ inline Snapshot computeSnapshot( const IngestResult& ing, const Graph& g, std::s
         // (editcheck.h). A COUNT is overload-collision-proof for the opposite reason a MAX is: it is the one
         // number a collision cannot hide. (maskBySym is the other non-MAX kind; it sums for its own reason.)
         { std::uint32_t& slot = snap.defsBySym[ key ];    slot += 1; }
-        if( isDeadCandidate( ing, g, i, topLevelCallees, macroIds ) )
+        if( isDeadCandidate( ing, g, i, topLevelCallees, macroIds, pythonDispatch ) && !declinedCallMayReach( g, i )
+            && !valueRefs.isValueReferenced( i ) )
         {
             snap.dead.push_back( key );
         }
@@ -2968,30 +4584,316 @@ inline Snapshot computeSnapshot( const IngestResult& ing, const Graph& g, std::s
             snap.publicApi.push_back( key );
         }
     }
-    // duplication baseline = both exact (Type-1/2) AND gapped (Type-3) groups, folded into one set. A
-    // Type-3 pair hashes by its sorted member canonIds exactly like an exact group, so introducing a NEW
-    // near-clone changes the set ⇒ the delta flags it. Both passes are deterministic → the set is stable.
-    for( const CloneGroup& cg : findClones( ing, int( kMinCloneTokens ) ) )
-    {
-        snap.cloneGroups.push_back( cloneGroupHash( cg, ing, root ) );
-    }
-    for( const CloneGroup& cg : findClonesType3( ing, int( kMinCloneTokens ) ) )
-    {
-        snap.cloneGroups.push_back( cloneGroupHash( cg, ing, root ) );
-    }
+    snap.cloneGroups = baselineCloneGroupHashes( ing, root, fileInBaseline );
 
-    // §D#4 error-masking baseline: per-canonId count of error-masking constructs (the SUM the delta compares).
-    snap.maskBySym = errorMaskCountsBySym( ing, root );
+    // §D#4 error-masking + placeholder baseline: per-canonId counts (the SUMs the delta compares), from one pass.
+    {
+        ConstructCounts counts = constructCountsBySym( ing, root );
+        snap.maskBySym         = std::move( counts.mask );
+        snap.maskReportBySym   = std::move( counts.maskReport );
+        snap.placeholderBySym  = std::move( counts.placeholder );
+    }
 
     // §D#4 short-horizon-churn baseline: per-canonId RAW-body hash so the delta detects a rewrite that moved no
     // metric (a literal-only edit). Compared, never bar-checked — presence-or-difference IS the rewrite signal.
     snap.bodyHashBySym = bodyHashesBySym( ing, root );
+
+    dropNonBaselineKeys( snap, ing, root, fileInBaseline );   // IDENTITY BASIS membership, on the two key-built maps
 
     std::sort( snap.dead.begin(),        snap.dead.end() );
     std::sort( snap.cloneGroups.begin(), snap.cloneGroups.end() );
     std::sort( snap.publicApi.begin(),   snap.publicApi.end() );
     snap.publicApi.erase( std::unique( snap.publicApi.begin(), snap.publicApi.end() ), snap.publicApi.end() );  // overloads collapse to one canonId
     return snap;
+}
+
+// ─── THE IDENTITY BASIS — a no-op diff is empty BY CONSTRUCTION, not by luck (issue #228, part 1) ────────
+//
+// THE DEFECT. `--quality-delta`'s auto-baseline builds the HEAD side by `git archive HEAD` into a temp dir and
+// re-ingesting it (computeHeadSnapshot). That tree is NOT "the working tree with my changes undone" — it is a
+// DIFFERENT POPULATION, and a dead-code verdict is a property of the whole population, not of the symbol's own
+// file. So a file that exists on one side only moves a verdict on a symbol in a file both sides share. Measured
+// on a nine-file fixture whose working tree is identical to HEAD (this binary, before the fix):
+//
+//   shape                                            rows   exit   why the populations differ
+//   untracked file defining a same-named function     1     2      the archive cannot hold an untracked file
+//   an untracked nested git repo                      2     2      same, times every file under it
+//   a tracked file marked `export-ignore`             1     2      `git archive` applies export attributes
+//   sparse checkout hiding a tracked caller           2     2      the crawl cannot see it; the archive holds it
+//   `git update-index --skip-worktree` on a caller    1     2      the index says clean; the bytes are not
+//
+// That is the reporter's shape exactly: a Django monolith with untracked directories, `git status` clean of
+// modifications, 58 gating `preexisting-worse` dead-code rows, exit 2. A pre-commit hook that fires on an
+// unchanged tree is unusable, and the escape hatch is blocked too (`--quality-baseline` refuses to pin over a
+// tree that "already holds N gating findings"). NOT the cause, measured: a shallow clone (it reads 0 on its
+// own — the reporter's `+shallow` is a bystander), the caches (cold, warm and `--no-cache` runs were
+// byte-identical), and resolver tie-breaks (d9ad3e84 fixed the root-spelling half already).
+//
+// THE FIX. When the working tree's TRACKED files are identical to HEAD, stop materializing a second tree: the
+// working tree IS HEAD, so the baseline is the working tree's own snapshot, taken from the ingest and graph
+// the delta side is about to be computed from. The comparison is then a snapshot against ITSELF, and
+// computeDelta cannot find a regression in it — no metric can differ from itself, no key can be absent from a
+// map that contains every key, no clone group can be new. Empty by construction, and it costs a `git diff
+// --quiet` instead of an archive, a tar and a full re-ingest.
+//
+// WHAT THE BASELINE LEAVES OUT, and why it is not a fudge. Files the working tree holds that HEAD does not
+// TRACK — untracked files, an untracked nested repo, a checked-out submodule's contents — are still ingested
+// and still in the graph (they are part of the tree the user is asking about), but they are NOT in the
+// baseline: baselineFileMaskAtHead marks them, computeSnapshot's membership filter leaves their symbols out,
+// and they keep reading as NEW exactly as they do against an archived HEAD today. So the new-file debt the
+// verb has always reported is unchanged; only the PHANTOM rows on tracked symbols go away. The honest
+// statement of the basis is "HEAD's tracked content, read in this working tree, alongside the files you have
+// not added yet" — which is what a user comparing a clean tree actually means, and it is said on stderr
+// whenever the count is non-zero.
+//
+// WHY IT DOES NOT TOUCH THE CACHES. This path never probes and never writes the `qsnap`/`qheadsnap` blobs: it
+// has no archived tree to key them to. computeHeadSnapshot is untouched, so a blob written by any binary still
+// means exactly what it meant. That is also why this change needs no kQSnapCacheScheme bump.
+//
+// WHAT IT DOES NOT COVER, stated so the next reader does not mistake the scope: a tree that DOES carry tracked
+// modifications still takes the archive path, so a population divergence can still move a verdict there (the
+// reporter's second observation — 28 rows in unrelated files for a one-file commit — is that case). Making the
+// archive path's population equal by construction is the follow-on, and the starter kit
+// (prompts/help-wanted/quality-delta-unchanged-tree-zero.md) is where its per-class decisions live.
+
+// THE FAST PRE-CHECK, and ONLY that. `git diff --quiet HEAD -- .` answers staged and unstaged changes,
+// additions and deletions of tracked paths, in one exit code with no output to parse — but it is SPECIFIED to
+// be blind to two index bits, and being blind is the whole point of them:
+//
+//   * `git update-index --skip-worktree PATH`      — "the file on disk is not the file I committed; do not look"
+//   * `git update-index --assume-unchanged PATH`   — "trust the stat cache; do not read the bytes"
+//
+// A tracked file carrying either one can hold a REAL change — an edit that deletes a function's only caller,
+// or the file's outright DELETION — and `git diff` still exits 0. Trusting that exit code alone as "the working tree IS HEAD" turned a
+// genuine gating dead-code regression into `gating="0"` exit 0, silently: a false NEGATIVE, which is a worse
+// answer than the false positive the identity basis exists to remove. So this function is the cheap FIRST of
+// two conditions, and `indexHidesTrackedContent` below is the second; `computeHeadBasis` requires both.
+//
+// The `-- .` pathspec scopes the question to the crawl root when the root is a SUBDIRECTORY of the repository,
+// so an edit elsewhere in the repo cannot take the basis away from a root that never crawls it. Untracked
+// files are deliberately NOT a difference here — they are handled by the baseline mask below. Any git failure
+// (not a repo, unborn HEAD, git absent) reads as "not identical" and falls back to the archived baseline.
+inline bool workingTreeMatchesHead( const std::string& root )
+{
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root ) + " diff --quiet HEAD -- . >/dev/null 2>&1";
+    return os::system( cmd.c_str() ) == 0;
+}
+
+// Split one `sep`-separated git listing (NUL for a -z form, '\n' for a line one) into SORTED root-relative
+// views over it, dropping `prefix`
+// (the crawl root's position inside the repository) from each. The views alias `listing`, which therefore has
+// to outlive them — the one caller keeps it in scope for exactly that reason. A trailing newline is trimmed
+// because popenTrimmed re-joins its reads on '\n' and a -z listing carries none inside.
+inline std::vector<std::string_view> splitNulPaths( const std::string& listing, const std::string& prefix, char sep = '\0' )
+{
+    std::vector<std::string_view> out;
+    for( std::size_t start = 0; start < listing.size(); )
+    {
+        const std::size_t nul = listing.find( sep, start );
+        const std::size_t end = ( nul == std::string::npos ) ? listing.size() : nul;
+        std::string_view  p( listing.data() + start, end - start );
+        while( !p.empty() && ( p.back() == '\n' || p.back() == '\r' ) ) { p.remove_suffix( 1 ); }
+        if( !prefix.empty() && p.size() > prefix.size() && p.compare( 0, prefix.size(), prefix ) == 0 ) { p.remove_prefix( prefix.size() ); }
+        if( !p.empty() ) { out.push_back( p ); }
+        start = end + 1;
+    }
+    // rw::sortutil::svLess, not the default comparator: a string_view's operator< goes through
+    // char_traits::compare, whose libstdc++ implementation subtracts two size_t lengths and trips
+    // -fsanitize=integer on the Linux G1 leg the moment two compared views differ in length. Same total
+    // order, so nothing about the resulting sequence changes — and the binary_search over this exact
+    // vector in baselineFileMaskAtHead below MUST pass the same comparator, or the search is looking in
+    // an order the sort did not produce. test/portablebuildcheck.sh arm #6b holds both halves.
+    std::sort( out.begin(), out.end(), rw::sortutil::svLess );
+    return out;
+}
+
+// THE SECOND CONDITION: does any tracked path carry an index bit that hides it from the check above?
+//
+// `git ls-files -v` is the one command that reports the two bits git's own diff will never mention: an `S`
+// tag is skip-worktree, a LOWERCASE tag is assume-unchanged. A path carrying either can differ from HEAD in
+// ANY way — edited, or deleted outright — with `git status` and `git diff` both silent. So the answer here is
+// as blunt as it can be: **any flagged path at all, present or absent, means no identity basis.**
+//
+// IT TOOK THREE REVIEWS TO GET HERE, AND THE HISTORY IS THE ARGUMENT. Round 1 refused only when the flagged
+// path was still ON DISK; that was defeated by `rm`-ing it, because the bit hides a deletion exactly as it
+// hides an edit. Round 2 kept an exception for cone-mode sparse checkout — where git sets the same bit and
+// legitimately removes the file — by deciding for itself which paths the cone includes; that was defeated by
+// a file sitting in an ANCESTOR of a listed directory, which real cone mode materializes and this file's copy
+// of the rule did not know about. Each fix was defeated the first time it was attacked, in the same shape:
+// a real regression invisible, `head_basis="identity"` asserted over it, `--quality-baseline` pinning it.
+//
+// THE LESSON IS THE ONE THIS FILE ALREADY WROTE DOWN FOR THE NON-CONE CASE, then broke for the cone one:
+// re-implementing git's matcher to decide a correctness question is a second, unargued copy of git's rules,
+// and a partial copy is worse than none because it reads as complete. `git sparse-checkout check-rules` would
+// be authoritative, but it lands in git 2.42 and this tool still degrades gracefully on 2.31 (see
+// docs/SUBSTITUTION_METER.md), so on much of the supported range it would refuse anyway — the same outcome
+// as this rule, reached with a version gate, a temp file and a subprocess. So the exception is GONE, and with
+// it sparseConeDirs and sparseConeIncludes. There is nothing left here to model wrongly.
+//
+// WHAT A SPARSE-CHECKOUT USER GETS, stated plainly because it is a real cost and not a neutral one: the
+// archived-HEAD comparison, which is NOT sparse-aware — `git archive HEAD` materializes the excluded files —
+// so a cone-excluded caller can still read as vanished and gate. That is the SAME population divergence this
+// lane removes for untracked content, left in place for this one shape, and it is the pre-existing behaviour
+// on main rather than anything this lane introduces. It belongs to slice 2 of
+// prompts/help-wanted/quality-delta-unchanged-tree-zero.md, where making the archived side's population equal
+// by construction is the actual fix. `head_basis="archived-index-hidden"` on the root is how a user finds out
+// that this is the branch they are on, instead of guessing from silence.
+//
+// COST: one `git ls-files -v` on every identity attempt — one child, the same order as the crawl itself.
+inline bool isBlindIndexTag( char tag ) noexcept
+{
+    return tag == 'S' || ( tag >= 'a' && tag <= 'z' );   // skip-worktree; lowercase = assume-unchanged
+}
+
+// true = refuse the identity basis. A git failure returns true — "assume it hides something" — so an
+// unreadable index can only ever COST the identity basis, never grant it.
+inline bool indexHidesTrackedContent( const std::string& root )
+{
+    const std::string listing = gitOneLine( root, "ls-files -v -z -- . 2>/dev/null" );
+    if( listing.empty() )
+    {
+        return !gitOneLine( root, "ls-files -z -- . 2>/dev/null" ).empty();   // empty because nothing is tracked, or because git failed?
+    }
+    const std::vector<std::string_view> entries = splitNulPaths( listing, std::string{} );   // "<tag> <path>" — no prefix to strip
+    return std::any_of( entries.begin(), entries.end(), []( std::string_view e ) noexcept
+                        { return e.size() >= 3 && e[1] == ' ' && isBlindIndexTag( e[0] ); } );
+}
+
+// Per-fileId flags for computeSnapshot: 1 = this crawled file is TRACKED AT HEAD and therefore part of the
+// baseline, 0 = it is not. `outNotAtHead` receives the count of crawled files HEAD does not track — the number
+// the stderr disclosure reports. Returns false when git could not answer at all, in which case the caller MUST
+// fall back to the archived baseline: an empty answer here is indistinguishable from "HEAD tracks nothing",
+// and acting on it would report every symbol in the tree as new.
+inline bool baselineFileMaskAtHead( const std::string& root, const IngestResult& ing, std::string_view rootPath,
+                                    std::vector<char>& outMask, std::size_t& outNotAtHead )
+{
+    EXPECTS( outMask.empty(), "the mask is built here, never appended to a caller's" );
+
+    // -z: NUL-separated, so a path containing a newline or a quote arrives as its own bytes rather than as
+    // git's C-quoted rendering (core.quotepath=false alone does not stop ls-tree quoting those).
+    const std::string listing = gitOneLine( root, "ls-tree -r --name-only -z HEAD -- . 2>/dev/null" );
+    if( listing.empty() )
+    {
+        return false;   // no answer — NOT "HEAD is empty". The caller degrades to the archived baseline.
+    }
+    // A subdirectory root: ls-tree answers in REPOSITORY-relative paths while every ingest path is
+    // ROOT-relative, so the repo prefix comes off before the two are compared.
+    const std::vector<std::string_view> tracked = splitNulPaths( listing, gitOneLine( root, "rev-parse --show-prefix 2>/dev/null" ) );
+
+    outMask.assign( ing.files.size(), 0 );
+    outNotAtHead = 0;
+    for( std::size_t f = 0; f < ing.files.size(); ++f )
+    {
+        // relForHash is the SAME root-relative spelling every quality key is built from (qualityKey), so a
+        // file's membership here and its key there cannot drift apart.
+        const std::string_view rel = relForHash( ing.files[f], rootPath );
+        // The SAME comparator splitNulPaths sorted `tracked` with. A search under a different order than
+        // the sort produced is a silent wrong answer — here it would drop a tracked file out of the
+        // baseline mask and make its symbols read as new. Both are svLess; neither may change alone.
+        if( std::binary_search( tracked.begin(), tracked.end(), rel, rw::sortutil::svLess ) )
+        {
+            outMask[f] = 1;
+        }
+        else
+        {
+            ++outNotAtHead;
+        }
+    }
+    ENSURES( outMask.size() == ing.files.size(), "one flag per crawled file — computeSnapshot indexes it by fileId" );
+    return true;
+}
+
+// The HEAD baseline for a WORKING-TREE comparison, through ONE seam. Every surface that compares a working
+// tree with HEAD calls this — the CLI `--quality-delta`, the CLI `--quality-baseline` dirty-pin verdict and
+// the MCP `quality_delta` verb — so the three cannot answer the same tree differently in the same second,
+// which is the §B6 M5 / R3 lesson this file already carries twice.
+//
+// TWO CALLERS OF computeHeadSnapshot DELIBERATELY STAY ON IT, and the reason is stated so the next reader
+// cannot mistake it for an oversight: `--edit-check` (editcheck.h) asks a per-symbol contract question whose
+// answer on an unchanged tree is `status="unchanged"` either way — measured on the untracked-file shape,
+// identical on both bases — and its warm path is budgeted on the qsnap hit the identity basis does not take;
+// and the MCP qsnap PREFETCH worker (mcpindex.h) exists precisely to warm that archived blob and has no
+// working-tree ingest to build an identity basis from.
+// `basis` is the value of head_basis= on the root, or nullptr when the attribute is ABSENT. Three states, and
+// the absent one is deliberately the ordinary case so a normal run pays nothing:
+//   "identity"                — the baseline is this working tree's own snapshot (see above)
+//   "archived-index-hidden"   — the identity basis was REFUSED because a tracked path carries skip-worktree or
+//                               assume-unchanged, so the archived HEAD tree answered. A user whose fast path
+//                               vanished can read WHY off the answer instead of guessing from silence, and it
+//                               is the one refusal reason they can act on (clear the bit, or accept that a
+//                               sparse checkout's population differs from HEAD's).
+//   nullptr                   — the archived HEAD tree answered for the ordinary reason: the tree carries
+//                               tracked modifications, which is what every git-HEAD marker has always meant.
+struct HeadBasis
+{
+    Snapshot    snapshot;
+    bool        ok        = false;   // false: no HEAD tree to compare against at all (non-git, unborn, no tree)
+    bool        identity  = false;   // true: the baseline is this working tree's own snapshot (see above)
+    const char* basis     = nullptr; // static storage; head_basis= value, or nullptr when the attribute is absent
+    std::size_t notAtHead = 0;       // crawled files HEAD does not track (identity basis only); 0 = none
+};
+
+inline HeadBasis computeHeadBasis( const std::string& root, const IngestResult& ing, const Graph& g,
+                                   std::string_view rootPath, std::size_t maxFileBytes = kDefaultMaxFileBytes,
+                                   const std::vector<std::string>& excludes = {} )
+{
+    HeadBasis out;
+    // THREE conditions, cheapest first, and all three are required. The third — indexHidesTrackedContent — is
+    // not a refinement of the second: `git diff` is SPECIFIED to answer "clean" for a skip-worktree or
+    // assume-unchanged path, so without it a real change in such a file is compared against a baseline that
+    // already contains it, and vanishes. See the two functions' own comments.
+    const bool hasHistory = gitRepoHasHistory( root );
+    if( hasHistory && workingTreeMatchesHead( root ) )
+    {
+        if( indexHidesTrackedContent( root ) )
+        {
+            // The one refusal a user can act on, so it is named ON THE ANSWER rather than left to silence.
+            out.basis = "archived-index-hidden";
+        }
+        else
+        {
+            std::vector<char> mask;
+            if( baselineFileMaskAtHead( root, ing, rootPath, mask, out.notAtHead ) )
+            {
+                out.identity = true;
+                out.ok       = true;
+                out.basis    = "identity";
+                out.snapshot = computeSnapshot( ing, g, rootPath, out.notAtHead != 0 ? &mask : nullptr );
+                ENSURES( out.notAtHead <= ing.files.size(), "the not-at-HEAD count is a subset of the crawled files it was counted over" );
+                return out;
+            }
+            DISCLOSE( Diagnostics::answerUnchanged, "the archived HEAD baseline still answers, just without the identity guarantee",
+                      "quality: cannot list HEAD's tracked paths — falling back to the archived HEAD baseline" );
+        }
+    }
+    auto [ snap, ok ] = computeHeadSnapshot( root, nullptr, maxFileBytes, excludes );
+    out.snapshot      = std::move( snap );
+    out.ok            = ok;
+    return out;
+}
+
+// THE ONE PLACE THE QUALITY BASELINE SIDECAR IS OPENED, and the whole of its CWE-59/CWE-367 story.
+//
+// `path` is a fixed name inside a crawled repository and the write TRUNCATES, so a link planted at it turns
+// the tool's own write into an arbitrary-file overwrite. The refusal is the OPEN itself — O_NOFOLLOW, one
+// syscall, nothing between deciding and creating for a replacement to land in. The first fix asked lstat and
+// then opened anyway, which is check-then-open; see src/pathguard.h.
+//
+// It is a named seam rather than four lines inside writeBaseline for a reason a reviewer should be able to
+// check: acquiring a safe descriptor and serializing a snapshot are two jobs, and the security-relevant one
+// should be readable without scrolling through ten record loops. The two alerts are the two failure kinds
+// this site has always had, unchanged, and they stay macros HERE so each keeps its own file/line.
+inline int openBaselineSidecar( const std::string& path )
+{
+    auto [ fd, openErr ] = rw::pathguard::openNoFollowTruncate( "the quality baseline sidecar", path );
+    if( fd < 0 )
+    {
+        if( openErr == ELOOP ) { DISCLOSE( Diagnostics::answerRefused, "the baseline write fails on every surface: pathguard names the refused link, and the CLI exits non-zero",
+                                           "quality: refusing to write the baseline sidecar through a symlink" ); }
+        else                   { DISCLOSE( Diagnostics::answerRefused, "the baseline write fails on every surface: pathguard names the OS reason, and the CLI exits non-zero",
+                                           "quality: cannot write baseline file" ); }
+    }
+    return fd;
 }
 
 // `absorbedGating` (H11, capture-audit 2026-09-04) is the number of GATING findings this tree already held
@@ -3002,8 +4904,14 @@ inline Snapshot computeSnapshot( const IngestResult& ing, const Graph& g, std::s
 inline bool writeBaseline( const Snapshot& s, const std::string& path, std::string_view headSha = {},
                            std::size_t absorbedGating = 0 )
 {
-    std::ofstream f( path, std::ios::trunc );
-    if( !f ) { DEGRADED_PATH_ALERT( "quality: cannot write baseline file" ); return false; }
+    const int fd = openBaselineSidecar( path );
+    if( fd < 0 )
+    {
+        return false;
+    }
+    // The record stream is assembled in memory and handed to the descriptor in one write. The bytes below
+    // are unchanged, line for line — only their destination moved off a stream that cannot say O_NOFOLLOW.
+    std::ostringstream f;
     // v2 adds the Q1 kinds (loc/nest/params/api). Format is line-oriented + kind-tagged, so a v1 baseline (no
     // loc/nest/params/api lines) reads fine here — readBaseline skips unknown kinds and treats absent kinds as
     // empty; a v2 baseline read by an OLD binary likewise skips lines it doesn't know. Re-baseline after an
@@ -3016,7 +4924,21 @@ inline bool writeBaseline( const Snapshot& s, const std::string& path, std::stri
     // v4 (2026-08-25): every per-symbol key is pathQualifiedKey, not fnv1a64(baselineCanonId). readBaseline
     // REFUSES v3 and older rather than reading it — see there for why a silent read would be the dishonest
     // option here.
-    f << "# ripwire quality baseline v4 — regenerate with --quality-baseline; do not hand-edit\n";
+    // v5 (Q-DIAL-3, 2026-09-10): the `loc` record's VALUE changed meaning — CODE lines, not the physical span
+    // (codeLinesInBody). The key space is untouched, so a v4 sidecar would read perfectly and be WRONG in one
+    // direction only: its loc values are larger, every symbol reads as having SHRUNK, and the verbosity kind
+    // silently reports nothing at all. A kind that quietly stops firing is the worst of the three outcomes, so
+    // this is a version refusal like v4's, not a graceful skip.
+    // v6 (2026-09-16): the `producer` record below. Its absence is not a graceful skip either: a v5 sidecar can
+    // only have been written by a build that predates the stamp, so it is foreign to every build that reads the
+    // record, and an OLD binary reading a v6 sidecar refuses it rather than skipping the stamp it cannot check.
+    f << "# ripwire quality baseline v6 — regenerate with --quality-baseline; do not hand-edit\n";
+    // PRODUCER STAMP: the identity of the build that computed this snapshot (producerIdentity). The `dead`
+    // records are a function of CALL RESOLUTION, which the head stamp below says nothing about, so at one HEAD
+    // a floor pinned by one build and a working tree judged by another disagreed about which symbols had
+    // callers: a gating dead-code row on an untouched symbol, or a real one hidden. selectBaseline honors the
+    // sidecar only for the build this names (test/qbaselineproducercheck.sh).
+    f << "producer " << producerIdentity() << '\n';
     // STALENESS STAMP: the HEAD commit the baseline was pinned at. --quality-delta compares this to the
     // current HEAD and, if they differ (a baseline left by an abandoned/parallel session, or from before a
     // commit), IGNORES the sidecar and falls back to the git-HEAD auto-baseline instead of reporting a wall
@@ -3053,6 +4975,14 @@ inline bool writeBaseline( const Snapshot& s, const std::string& path, std::stri
     {
         f << "mask " << std::hex << h << std::dec << ' ' << v << '\n'; // §D#4 error-masking count
     }
+    for( const auto& [h, v] : s.maskReportBySym )
+    {
+        f << "maskr " << std::hex << h << std::dec << ' ' << v << '\n'; // the report-only part of that count
+    }
+    for( const auto& [h, v] : s.placeholderBySym )
+    {
+        f << "stub " << std::hex << h << std::dec << ' ' << v << '\n'; // the placeholder count
+    }
     for( const auto& [h, v] : s.defsBySym )
     {
         f << "defs " << std::hex << h << std::dec << ' ' << v << '\n'; // overload-set CARDINALITY (a count, not a max)
@@ -3073,7 +5003,9 @@ inline bool writeBaseline( const Snapshot& s, const std::string& path, std::stri
     {
         f << "api " << std::hex << h << std::dec << '\n';
     }
-    return true;
+    // Was an unconditional `return true`: a stream that failed to flush still reported a written baseline.
+    // The descriptor answers for the bytes, so a full disk is now a failure the caller can report.
+    return rw::pathguard::writeAllAndClose( fd, f.str() );
 }
 
 // Returns true only when `path` is a file that actually LOOKS like a baseline. r27 SUSPICION-A, second half:
@@ -3092,9 +5024,12 @@ inline bool writeBaseline( const Snapshot& s, const std::string& path, std::stri
 // the honest degrade — an unrecognizable baseline makes the caller fall back to git HEAD, and that fallback is
 // already named on every report through `baseline=`. The sidecar is generated and gitignored, so the whole
 // cost of refusing is one `--quality-baseline` re-pin.
+//
+// v6 moved the accepted version for the producer stamp (see writeBaseline), and the refusal carries it: a v5
+// sidecar has no stamp to check, and the build that wrote it cannot be this one.
 inline bool baselineHeaderIsForeign( const std::string& line ) noexcept
 {
-    return line.rfind( "# ripwire quality baseline v", 0 ) == 0 && line.find( " v4 " ) == std::string::npos;
+    return line.rfind( "# ripwire quality baseline v", 0 ) == 0 && line.find( " v6 " ) == std::string::npos;
 }
 
 // 2026-09-06 stranger audit: the sidecar readers dropped what they could not parse with no trace a Release
@@ -3104,23 +5039,75 @@ inline bool baselineHeaderIsForeign( const std::string& line ) noexcept
 struct BaselineReadStats
 {
     bool        present        = false;   // the file opened
+    bool        symlinkRefused = false;   // a SYMLINK sits at the name: refused unopened (pathguard.h round 3), so `present` stays false
     bool        unrecognizable = false;   // opened, but no line of the format's structure in it
+    bool        olderFormat    = false;   // opened, and its header names another format version: refused unread
     bool        preQ1          = false;   // structure, but no per-symbol loc records: origin cannot be classified
     std::size_t badLines       = 0;       // lines of a known kind whose payload did not parse — skipped
+    std::string producer;                 // the `producer` record: 64 lowercase hex, or "" when absent or malformed
+    // The DISCLOSE sink for the read's degrades: each sets the field selectBaseline turns into the root's baseline=
+    // marker or baseline_bad_lines=, so a refused, empty or partly unparsed sidecar is never read as a clean one.
+    enum class DisclosureWhy : std::uint8_t
+    {
+        SymlinkRefused,   // a link at the name, refused unopened
+        MalformedLine,    // a known record kind whose payload did not parse (skipped)
+        Unrecognizable,   // opened, but no line of the format's structure
+    };
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        switch( why )
+        {
+            case DisclosureWhy::SymlinkRefused: symlinkRefused = true; break;
+            case DisclosureWhy::MalformedLine:  ++badLines; break;
+            case DisclosureWhy::Unrecognizable: unrecognizable = true; break;
+        }
+    }
 };
+
+// The v6 `producer` record's payload, into `stats.producer` when it is identity-shaped (64 lowercase hex). Only the
+// SHAPE is judged here — whether it names THIS build is selectBaseline's question. The file is committed DATA, so a
+// payload of any other shape is a bad line and leaves `producer` empty, which no build's identity equals; the first
+// well-formed record wins, as the head stamp's does.
+inline void readProducerRecord( std::istream& is, BaselineReadStats& stats )
+{
+    std::string value;
+    is >> value;
+    const auto isLowerHexDigit = []( char c ) { return ( c >= '0' && c <= '9' ) || ( c >= 'a' && c <= 'f' ); };
+    if( value.size() != 64 || !std::all_of( value.begin(), value.end(), isLowerHexDigit ) )
+    {
+        DISCLOSE( stats, BaselineReadStats::DisclosureWhy::MalformedLine, "quality: malformed baseline producer line skipped" );
+        return;
+    }
+    if( stats.producer.empty() )
+    {
+        stats.producer = std::move( value );
+    }
+}
+
+// THE ONE PLACE THE BASELINE SIDECAR IS READ — shared by readBaseline, readBaselineHeadSha and
+// readBaselineAbsorbed, and openBaselineSidecar's other half with the same answer to a link: O_NOFOLLOW, refused
+// in the open itself. A link here used to be followed on the way in, so the link chose which file was honored as
+// the floor. Why an in-tree link is refused too is round 3 of src/pathguard.h.
+inline rw::pathguard::NoFollowRead readBaselineSidecar( const std::string& path, BaselineReadStats& stats )
+{
+    rw::pathguard::NoFollowRead sidecar = rw::pathguard::openNoFollowRead( "the quality baseline sidecar", path );
+    if( sidecar.refused ) { DISCLOSE( stats, BaselineReadStats::DisclosureWhy::SymlinkRefused, "quality: refusing to read the baseline sidecar through a symlink" ); }
+    return sidecar;
+}
 
 inline bool readBaseline( const std::string& path, Snapshot& out, BaselineReadStats& stats )
 {
     stats = BaselineReadStats{};
-    std::ifstream f( path );
-    if( !f )
+    // "no sidecar" and "a sidecar refused unopened" are different answers: the seam's sink records the refusal
+    rw::pathguard::NoFollowRead sidecar = readBaselineSidecar( path, stats );
+    if( !sidecar.opened )
     {
         return false;
     }
     stats.present = true;
     std::size_t recognizedLineCount = 0;
     std::string line;
-    while( std::getline( f, line ) )
+    while( sidecar.readLine( line ) )
     {
         if( line.empty() )
         {
@@ -3129,9 +5116,13 @@ inline bool readBaseline( const std::string& path, Snapshot& out, BaselineReadSt
         if( baselineHeaderIsForeign( line ) )   // pre-pathQualifiedKey sidecar — refused, see above
         {
             // The refusal is a USER-FACING disclosure, so it must survive NDEBUG: behind only a
-            // DEGRADED_PATH_ALERT a Release binary refuses SILENTLY and the caller reads "no baseline
+            // DISCLOSE a Release binary refuses SILENTLY and the caller reads "no baseline
             // found" — a refusal that hides its reason misleads exactly like the misread it prevents.
-            std::fprintf( stderr, "ripwire: quality: baseline sidecar predates the pathQualifiedKey scheme — refused, re-pin with --quality-baseline\n" );
+            rw::emitRaw( stderr, "ripwire: quality: baseline sidecar predates this binary's baseline format — refused, re-pin with --quality-baseline\n" );
+            // ...and the caller's marker has to say a sidecar is THERE. Without this flag the refusal read as
+            // Absent, so the CLI reported baseline="git-HEAD" ("no sidecar existed") and printed "no <file>"
+            // one line under the refusal that named it. Since v6 every pre-stamp sidecar lands here.
+            stats.olderFormat = true;
             out = Snapshot{};
             return false;
         }
@@ -3142,68 +5133,80 @@ inline bool readBaseline( const std::string& path, Snapshot& out, BaselineReadSt
         // per-symbol MAX metrics: "<kind> <hexhash> <value>". A malformed line degrades + skips (never the
         // silent hash-0 insert). An UNKNOWN kind (e.g. a future record read by this binary) is skipped
         // gracefully so forward/backward baseline versions never crash.
-        const auto readValMap = [ & ]( gtl::btree_map<std::uint64_t, std::uint32_t>& m, const char* what )
+        const auto readValMap = [ & ]( gtl::btree_map<std::uint64_t, std::uint32_t>& m )
         { std::uint64_t h = 0; std::uint32_t v = 0; is >> std::hex >> h >> std::dec >> v;
-          if( is.fail() ) { DEGRADED_PATH_ALERT( what ); ++stats.badLines; return; } m[h] = v; };
-        const auto readSet = [ & ]( std::vector<std::uint64_t>& v, const char* what )
+          if( is.fail() ) { DISCLOSE( stats, BaselineReadStats::DisclosureWhy::MalformedLine ); return; } m[h] = v; };
+        const auto readSet = [ & ]( std::vector<std::uint64_t>& v )
         { std::uint64_t h = 0; is >> std::hex >> h;
-          if( is.fail() ) { DEGRADED_PATH_ALERT( what ); ++stats.badLines; return; } v.push_back( h ); };
+          if( is.fail() ) { DISCLOSE( stats, BaselineReadStats::DisclosureWhy::MalformedLine ); return; } v.push_back( h ); };
         // "<kind> <hexkey> <hexval>" — both 64-bit hex (the raw-body-hash map). Malformed → degrade + skip.
-        const auto readHashMap = [ & ]( gtl::btree_map<std::uint64_t, std::uint64_t>& m, const char* what )
+        const auto readHashMap = [ & ]( gtl::btree_map<std::uint64_t, std::uint64_t>& m )
         { std::uint64_t h = 0, v = 0; is >> std::hex >> h >> v;
-          if( is.fail() ) { DEGRADED_PATH_ALERT( what ); ++stats.badLines; return; } m[h] = v; };
+          if( is.fail() ) { DISCLOSE( stats, BaselineReadStats::DisclosureWhy::MalformedLine ); return; } m[h] = v; };
 
-        if( kind == "ccx" || kind == "loc" || kind == "nest" || kind == "params" || kind == "mask" || kind == "body" || kind == "clone" || kind == "dead" || kind == "api" || kind == "head" || kind == "defs" )
+        if( kind == "ccx" || kind == "loc" || kind == "nest" || kind == "params" || kind == "mask" || kind == "maskr" || kind == "stub" || kind == "body" || kind == "clone" || kind == "dead" || kind == "api" || kind == "head" || kind == "defs"
+         || kind == "producer" )
         {
             ++recognizedLineCount;                                    // structure seen — this file IS a baseline
         }
 
         if( kind == "ccx" )
         {
-            readValMap( out.ccxBySym, "quality: malformed baseline ccx line skipped" );
+            readValMap( out.ccxBySym );
         }
         else if( kind == "loc" )
         {
-            readValMap( out.locBySym, "quality: malformed baseline loc line skipped" );
+            readValMap( out.locBySym );
         }
         else if( kind == "nest" )
         {
-            readValMap( out.nestBySym, "quality: malformed baseline nest line skipped" );
+            readValMap( out.nestBySym );
         }
         else if( kind == "params" )
         {
-            readValMap( out.paramsBySym, "quality: malformed baseline params line skipped" );
+            readValMap( out.paramsBySym );
         }
         else if( kind == "mask" )
         {
-            readValMap( out.maskBySym, "quality: malformed baseline mask line skipped" );
+            readValMap( out.maskBySym );
+        }
+        else if( kind == "maskr" )
+        {
+            readValMap( out.maskReportBySym );
+        }
+        else if( kind == "stub" )
+        {
+            readValMap( out.placeholderBySym );
         }
         else if( kind == "defs" )
         {
-            readValMap( out.defsBySym, "quality: malformed baseline defs line skipped" );
+            readValMap( out.defsBySym );
         }
         else if( kind == "bodyq" )   // v3 tag — a v2 `body` line is bare-canonId-keyed (a different key space) and falls through to the unknown-kind skip
         {
-            readHashMap( out.bodyHashBySym, "quality: malformed baseline bodyq line skipped" );
+            readHashMap( out.bodyHashBySym );
         }
         else if( kind == "clone" )
         {
-            readSet( out.cloneGroups, "quality: malformed baseline clone line skipped" );
+            readSet( out.cloneGroups );
         }
         else if( kind == "dead" )
         {
-            readSet( out.dead, "quality: malformed baseline dead line skipped" );
+            readSet( out.dead );
         }
         else if( kind == "api" )
         {
-            readSet( out.publicApi, "quality: malformed baseline api line skipped" );
+            readSet( out.publicApi );
+        }
+        else if( kind == "producer" )
+        {
+            readProducerRecord( is, stats );
         }
         // else: unknown kind (older/newer format) → skip silently, do not crash.
     }
     if( recognizedLineCount == 0 )
     {
-        DEGRADED_PATH_ALERT( "quality: baseline file is empty/unrecognizable — treating it as absent" );
-        stats.unrecognizable = true;
+        DISCLOSE( stats, BaselineReadStats::DisclosureWhy::Unrecognizable, "quality: baseline file is empty/unrecognizable — treating it as absent" );
         out = Snapshot{};
         return false;
     }
@@ -3211,7 +5214,8 @@ inline bool readBaseline( const std::string& path, Snapshot& out, BaselineReadSt
     // (computeDelta would gate every one and name phantom findings). Refuse it the way the foreign-header
     // sidecar above is refused: loudly, with the re-pin, instead of comparing against a floor it cannot read.
     const bool whollyEmpty = out.locBySym.empty() && out.ccxBySym.empty() && out.nestBySym.empty() && out.paramsBySym.empty()
-                          && out.maskBySym.empty() && out.bodyHashBySym.empty() && out.cloneGroups.empty() && out.dead.empty() && out.publicApi.empty();
+                          && out.maskBySym.empty() && out.placeholderBySym.empty() && out.bodyHashBySym.empty() && out.cloneGroups.empty() && out.dead.empty()
+                          && out.publicApi.empty();
     if( out.locBySym.empty() && !whollyEmpty )
     {
         stats.preQ1 = true;
@@ -3239,13 +5243,14 @@ inline bool readBaseline( const std::string& path, Snapshot& out, BaselineReadSt
 // obeyed. `writeBaseline` only ever writes `gitHeadSha`'s output, so no legitimate sidecar is affected.
 inline std::string readBaselineHeadSha( const std::string& path )
 {
-    std::ifstream f( path );
-    if( !f )
+    BaselineReadStats           unread;   // no channel here: readBaseline's own read records the refusal the report prints
+    rw::pathguard::NoFollowRead sidecar = readBaselineSidecar( path, unread );
+    if( !sidecar.opened )
     {
         return {};
     }
     std::string line;
-    while( std::getline( f, line ) )
+    while( sidecar.readLine( line ) )
     {
         if( line.rfind( "head ", 0 ) == 0 )
         {
@@ -3258,7 +5263,7 @@ inline std::string readBaselineHeadSha( const std::string& path )
             {
                 return sha;
             }
-            DEGRADED_PATH_ALERT( "quality: baseline head stamp is not a bare commit sha — ignoring the pin" );
+            DISCLOSE( "quality: baseline head stamp is not a bare commit sha — ignoring the pin" );
             return {};
         }
     }
@@ -3273,13 +5278,14 @@ inline std::string readBaselineHeadSha( const std::string& path )
 // one the report has something to say about.
 inline std::size_t readBaselineAbsorbed( const std::string& path )
 {
-    std::ifstream f( path );
-    if( !f )
+    BaselineReadStats           unread;   // no channel here: readBaseline's own read records the refusal the report prints
+    rw::pathguard::NoFollowRead sidecar = readBaselineSidecar( path, unread );
+    if( !sidecar.opened )
     {
         return 0;
     }
     std::string line;
-    while( std::getline( f, line ) )
+    while( sidecar.readLine( line ) )
     {
         if( line.rfind( "absorbed ", 0 ) != 0 )
         {
@@ -3326,13 +5332,26 @@ inline std::size_t readBaselineAbsorbed( const std::string& path )
 // Both cases are recorded ONLY in the `baseline=`/`"baseline"` marker — no stderr spam, which is the B10.1b
 // noise fix that survives the ruling intact.
 //
-// NON-GIT ROOTS are unaffected: `gitHeadSha` returns "" and an unstamped sidecar's pin reads "", so ""=="" and
-// the sidecar is honored — the only floor such a tree can have (there is no HEAD to fall back to).
+// NON-GIT ROOTS: `gitHeadSha` returns "" and an unstamped sidecar's pin reads "", so ""=="" and the sidecar is
+// honored — the only floor such a tree can have (there is no HEAD to fall back to) — provided THIS build pinned it.
+//
+// THE PRODUCER RULE (v6, 2026-09-16) — the head stamp's twin, for the other thing a floor depends on. A sidecar's
+// `dead` records are a function of CALL RESOLUTION, so at one HEAD a floor pinned by one build and a working tree
+// judged by another disagreed about which symbols had callers. Measured with two real builds (the std::-qualified
+// call guard on and off) over one fixture: a gating dead-code row on an untouched symbol (exit 2 where the same
+// build reports 0), and in the other direction a real gating regression hidden (exit 0 where the same build
+// reports 2). The qsnap cache had the same defect (producerIdentity); this is the file a user writes on purpose.
+// So the sidecar is honored only when its `producer` record equals this build's identity, and one that does not
+// is FOREIGN. Its policy differs from Stale's on purpose: a stale pin can never describe this HEAD again, while
+// a foreign one is still the right floor for the build that wrote it (a PATH binary and ./build/ripwire in turn),
+// so NEITHER arm deletes it. Demoting the dead-code rows instead of falling back was weighed and rejected: it
+// cannot un-hide a regression whose row never appears, and a different build can compute any kind differently.
 enum class BaselineSource : std::uint8_t
 {
-    Sidecar = 0,      // a readable sidecar pinned at the CURRENT HEAD sha (or a non-git root) — honored as the floor
+    Sidecar = 0,      // a readable sidecar pinned at the CURRENT HEAD sha (or a non-git root) by THIS build — honored as the floor
     Stale   = 1,      // a readable sidecar pinned at ANY other sha — dropped (R3); the caller falls back to git HEAD
     Absent  = 2,      // no readable sidecar (missing, or empty/unrecognizable per readBaseline) — caller falls back
+    Foreign = 3,      // a readable sidecar pinned at the CURRENT HEAD by ANOTHER build (or unstamped) — ignored, never removed; caller falls back
 };
 
 // The seam's answer. `snapshot` carries the pinned floor and is EMPTY unless `source == Sidecar`; `marker` is
@@ -3349,27 +5368,46 @@ struct BaselineSelection
     const char*    marker = "git-HEAD";                        // static storage; safe to hold as a bare pointer
     bool           staleFileRemoved = false;                   // Stale only: the unlink LANDED (file gone from disk)
     bool           sidecarUnreadable = false;                  // a sidecar EXISTS but could not be read (unrecognizable or pre-Q1): ignored, named
+    bool           sidecarSymlinkRefused = false;              // a SYMLINK sits at the name and was refused unopened (pathguard.h round 3): ignored, named
     std::size_t    sidecarBadLines   = 0;                      // honored sidecar: lines skipped as unparseable
 
     bool isSidecarHonored() const noexcept { return source == BaselineSource::Sidecar; }
     bool isSidecarStale()   const noexcept { return source == BaselineSource::Stale; }
+    bool isSidecarForeign() const noexcept { return source == BaselineSource::Foreign; }
     // "the stale pin is STILL sitting there" — true on the read-only arm, and on the CLI arm when the unlink
     // failed. This is the predicate a caller's user-facing wording must branch on (never `removeStaleFile`).
     bool isStaleFileOnDisk() const noexcept { return source == BaselineSource::Stale && !staleFileRemoved; }
 };
 
+// A readable sidecar pinned at the CURRENT HEAD: the floor for the build that pinned it, FOREIGN to every other (the
+// producer rule — see BaselineSource). Asked only once the head matches, because a pin at another sha is stale for
+// EVERY build, and the stale verdict and its self-heal take precedence. A foreign pin is never unlinked, on either arm.
+inline BaselineSelection selectPinnedAtHead( BaselineSelection sel, std::string_view producer )
+{
+    if( producer == producerIdentity() )
+    {
+        sel.source = BaselineSource::Sidecar;
+        sel.marker = "sidecar";
+        return sel;
+    }
+    sel.snapshot = Snapshot{};
+    sel.source   = BaselineSource::Foreign;
+    sel.marker   = "git-HEAD (foreign sidecar ignored)";
+    return sel;
+}
+
 // Read `sidecarPath` and decide whether it is still a valid floor for `root`'s CURRENT HEAD. `removeStaleFile`
 // = the CLI's self-heal policy: a best-effort unlink of a stale sidecar. The unlink can FAIL (read-only parent
 // dir, permissions, a racing sibling run) and the marker then tells the truth about the DISK rather than the
 // intent — "git-HEAD (stale sidecar ignored)", the same honest string the read-only arm uses, because
-// ignored-not-removed is exactly what happened — plus one DEGRADED_PATH_ALERT so the plain build can observe
+// ignored-not-removed is exactly what happened — plus one DISCLOSE so the plain build can observe
 // the degrade. `staleFileRemoved` carries the same fact to the caller, which needs it to word its own fatal
 // message (a "no <file>" message is false while the file is still on disk). `sidecarPath` must already be
 // ROOT-QUALIFIED by the caller (baselinePath) — this function can DELETE it, and a bare relative name would
 // resolve against the process CWD (D1).
 inline BaselineSelection selectBaseline( const std::string& root, const std::string& sidecarPath, bool removeStaleFile )
 {
-    VERIFY( !sidecarPath.empty() );
+    ASSUME( !sidecarPath.empty() );
 
     BaselineSelection sel;
     BaselineReadStats readStats;
@@ -3378,7 +5416,15 @@ inline BaselineSelection selectBaseline( const std::string& root, const std::str
         sel.snapshot = Snapshot{};                             // readBaseline already clears on the unrecognizable path; belt and braces
         sel.source   = BaselineSource::Absent;
         sel.marker   = "git-HEAD";
-        if( readStats.present && ( readStats.unrecognizable || readStats.preQ1 ) )
+        if( readStats.symlinkRefused )
+        {
+            // Round 3 (pathguard.h): a link at the name is refused on read as on write. Never "no sidecar existed"
+            // (the git-HEAD marker) about an entry that is right there, and never "unreadable" about bytes that
+            // were deliberately not opened.
+            sel.sidecarSymlinkRefused = true;
+            sel.marker                = "git-HEAD (symlinked sidecar refused)";
+        }
+        else if( readStats.present && ( readStats.unrecognizable || readStats.olderFormat || readStats.preQ1 ) )
         {
             sel.sidecarUnreadable = true;                      // 2026-09-06: never "no sidecar existed" about a file that is right there
             sel.marker            = "git-HEAD (sidecar unreadable)";
@@ -3393,9 +5439,7 @@ inline BaselineSelection selectBaseline( const std::string& root, const std::str
     const std::string headSha   = gitHeadSha( root );
     if( pinnedSha == headSha )
     {
-        sel.source = BaselineSource::Sidecar;
-        sel.marker = "sidecar";
-        return sel;
+        return selectPinnedAtHead( std::move( sel ), readStats.producer );
     }
 
     // Stale. The DEFAULT marker is the read-only truth ("ignored") and the self-heal upgrades it to "removed"
@@ -3427,11 +5471,13 @@ inline BaselineSelection selectBaseline( const std::string& root, const std::str
         // today — but the alert itself should not assert a fallback that does not exist.
         else if( headSha.empty() )
         {
-            DEGRADED_PATH_ALERT( "quality: could not unlink the stale .ripwire_quality_baseline sidecar — it STAYS on disk and is merely IGNORED this run; this tree has no git HEAD to fall back to either, so this run has no baseline floor at all" );
+            DISCLOSE( Diagnostics::answerRefused, "with no git HEAD either, the run refuses and names the sidecar that stayed on disk",
+                      "quality: could not unlink the stale .ripwire_quality_baseline sidecar — it STAYS on disk and is merely IGNORED this run; this tree has no git HEAD to fall back to either, so this run has no baseline floor at all" );
         }
         else
         {
-            DEGRADED_PATH_ALERT( "quality: could not unlink the stale .ripwire_quality_baseline sidecar — it STAYS on disk and is merely IGNORED this run; the baseline still falls back to git HEAD" );
+            DISCLOSE( Diagnostics::answerUnchanged, "the stale sidecar is ignored either way and the baseline is git HEAD; the marker says ignored, not removed",
+                      "quality: could not unlink the stale .ripwire_quality_baseline sidecar — it STAYS on disk and is merely IGNORED this run; the baseline still falls back to git HEAD" );
         }
     }
     return sel;
@@ -3441,10 +5487,15 @@ inline BaselineSelection selectBaseline( const std::string& root, const std::str
 //
 // The three existing gates (file churn-hot / this diff rewrites the symbol / committed thrash evidence)
 // establish that a symbol IS short-horizon churn. This pass answers a NARROWER question about the CURRENT
-// uncommitted edit specifically: does it MODIFY pre-existing (committed) lines that were themselves last
-// touched inside the churn window (SELF — genuine thrash, keep current severity), or does it only ADD new
-// lines / touch lines that predate the window (AMBIENT — the file is hot, but this particular edit isn't
-// touching hot content) — sev=minor, facet churn="ambient".
+// uncommitted edit specifically: how many COMMITTED commits inside the churn window last wrote the
+// pre-existing lines this edit modifies. One or more ⇒ the edit touches hot content, facet churn="self"; none
+// (the edit only ADDS lines, or touches lines that predate the window) ⇒ churn="ambient".
+//
+// Q-DIAL-1 (2026-09-10) — SEVERITY no longer follows that facet. BOTH facets are informational; what GATES is
+// the count reaching kShortHorizonMinCommits, i.e. "rewritten by >= 2 COMMITTED commits inside the window, the
+// working edit not counted". SELF-gates was measured at 0% precision over twelve landed commits (135 of 171
+// gating rows, audit Q1 §2b/§2d) for a structural reason: on an active branch every symbol you wrote this week
+// and are touching again modifies a line you yourself committed inside the window.
 //
 // Mechanism: `git diff --unified=0 HEAD -- path` gives zero-context unified-diff hunks
 // ("@@ -oldStart[,oldCount] +newStart[,newCount] @@"; git omits a count of 1). A hunk with oldCount==0 is a
@@ -3482,25 +5533,46 @@ inline std::string gitBlameConfigPins( const std::string& root )
     return hasFile ? " -c blame.ignoreRevsFile=" + shSingleQuote( ignoreRevs ) : std::string( " -c blame.ignoreRevsFile=" );
 }
 
-// Blame `root`'s HEAD over `relPath`'s [startLine, startLine+lineCount-1] and report whether ANY line in that
-// range was last committed at or after `windowCutoffEpoch` (the same cutoff basis gitFileCommitCountsInDayWindow
-// and gitWindowRefSha use: HEAD's own committer epoch minus the window, never wall-clock).
-inline bool gitBlameRangeHasWindowCommit( const std::string& root, const std::string& relPath,
-                                          std::uint32_t startLine, std::uint32_t lineCount, std::int64_t windowCutoffEpoch )
+// Blame `root`'s HEAD over `relPath`'s [startLine, startLine+lineCount-1] and APPEND, to `outShas`, the
+// fnv1a64 of every DISTINCT commit that last wrote a line in that range at or after `windowCutoffEpoch` (the
+// same cutoff basis gitFileCommitCountsInDayWindow and gitWindowRefSha use: HEAD's own committer epoch minus
+// the window, never wall-clock).
+//
+// Q-DIAL-1 (2026-09-10) — this used to answer a BOOL ("is any line in this range hot"), which is the SELF vs
+// AMBIENT question and nothing more. The churn kind's GATING question is narrower and needs a count: was this
+// symbol rewritten by >= kShortHorizonMinCommits COMMITTED commits inside the window, not counting the working
+// edit? One in-window commit is a single touch — the branch you are on — and gating on it made 135 of 171
+// gating rows on twelve landed commits the agent's own footprint (audit Q1 §2b/§2d). Blame runs on HEAD, so
+// the uncommitted edit is excluded BY CONSTRUCTION rather than by subtraction.
+//
+// The accumulator is a caller-owned vector rather than a return value because one symbol spans several diff
+// hunks and a commit that wrote lines in two of them must count ONCE; the caller sorts + uniques the union.
+// Ordering: blame output order, which is deterministic for a fixed HEAD + path, and the caller's sort makes
+// the count order-independent anyway. NO short-circuit any more (the bool arm could stop at the first hot
+// line): the whole range is read, which costs the rest of ONE already-spawned blame and no extra subprocess.
+//
+// PORCELAIN SHAPE, and why the sha is tracked separately from the time: `git blame --porcelain` prints a
+// commit's metadata (committer-time among it) only the FIRST time that commit appears; later lines from the
+// same commit carry the bare "<sha> <orig> <final> <n>" header alone. So the header line sets the CURRENT
+// sha and the committer-time line decides whether that sha counts — a repeat header with no metadata needs no
+// second decision, because the sha is already in (or already out of) the set.
+inline void gitBlameRangeWindowCommits( const std::string& root, const std::string& relPath,
+                                        std::uint32_t startLine, std::uint32_t lineCount, std::int64_t windowCutoffEpoch,
+                                        std::vector<std::uint64_t>& outShas )
 {
     if( startLine == 0 || lineCount == 0 )
     {
-        return false;
+        return;
     }
-    const std::string cmd = "git -c core.quotepath=false" + gitBlameConfigPins( root ) + " -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false" ) + gitBlameConfigPins( root ) + " -C " + shSingleQuote( root )
                           + " blame --porcelain -L " + std::to_string( startLine ) + ",+" + std::to_string( lineCount )
                           + " HEAD -- " + shSingleQuote( relPath ) + " 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
-        return false;
+        return;
     }
-    bool hot = false;
+    std::uint64_t curSha = 0;
     char buf[ 512 ];
     while( std::fgets( buf, sizeof( buf ), pipe ) )
     {
@@ -3515,16 +5587,19 @@ inline bool gitBlameRangeHasWindowCommit( const std::string& root, const std::st
             && ( ln.size() == 40 || ln[40] == ' ' );
         if( isHeaderSha )
         {
-            continue; // the sha itself carries no date — wait for its committer-time line
+            curSha = fnv1a64( ln.substr( 0, 40 ) );   // the sha itself carries no date — wait for its committer-time line
+            continue;
         }
         if( ln.rfind( "committer-time ", 0 ) == 0 )
         {
             const std::int64_t t = std::strtoll( std::string( ln.substr( 15 ) ).c_str(), nullptr, 10 );
-            if( t >= windowCutoffEpoch ) { hot = true; break; }     // one hot line is enough — short-circuit
+            if( t >= windowCutoffEpoch && curSha != 0 )
+            {
+                outShas.push_back( curSha );
+            }
         }
     }
-    pclose( pipe );
-    return hot;
+    os::pclose( pipe );
 }
 
 // One zero-context unified-diff hunk, in the two coordinate systems the SELF test needs: the OLD-side range
@@ -3541,7 +5616,7 @@ static_assert( sizeof( DiffHunk ) == 16, "DiffHunk is a 4×u32 POD" );
 
 // P3 (r27) — the RUN-SCOPED hunk memo. `git diff --unified=0 HEAD -- <path>` is a pure function of (HEAD,
 // working tree), both FIXED for the life of one --quality-delta call (the code's own section comment says so),
-// yet churnEditTouchesHotLine spawned it once PER SYMBOL: a subprocess-shim log showed EIGHT byte-identical
+// yet the churn blame pass spawned it once PER SYMBOL: a subprocess-shim log showed EIGHT byte-identical
 // spawns for a single dirty file. Caller owns the storage (house rule — views/handles at seams, no hidden
 // process-global state that a second root or a second MCP request would silently share).
 using DiffHunkMemo = HashMap<std::string, std::vector<DiffHunk>>;
@@ -3563,10 +5638,10 @@ using DiffHunkMemo = HashMap<std::string, std::vector<DiffHunk>>;
 inline std::vector<DiffHunk> gitDiffHunksVsHead( const std::string& root, const std::string& relPath )
 {
     std::vector<DiffHunk> hunks;
-    const std::string cmd = "git -c core.quotepath=false -c diff.algorithm=myers -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false -c diff.algorithm=myers -C " ) + shSingleQuote( root )
                           + " diff --no-ext-diff --unified=0 --no-color HEAD -- " + shSingleQuote( relPath ) + " 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
-    if( !pipe ) { DEGRADED_PATH_ALERT( "quality: churn hunk diff could not be spawned" ); return hunks; }
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
+    if( !pipe ) { DISCLOSE( "quality: churn hunk diff could not be spawned" ); return hunks; }
 
     char buf[ 4096 ];
     while( std::fgets( buf, sizeof( buf ), pipe ) )
@@ -3592,7 +5667,7 @@ inline std::vector<DiffHunk> gitDiffHunksVsHead( const std::string& root, const 
         hunks.push_back( DiffHunk{ std::uint32_t( oldStart ), std::uint32_t( oldCount ),
                                    std::uint32_t( newStart ), std::uint32_t( newCount ) } );
     }
-    pclose( pipe );
+    os::pclose( pipe );
     return hunks;
 }
 
@@ -3608,17 +5683,26 @@ inline const std::vector<DiffHunk>& diffHunksMemoized( DiffHunkMemo& memo, const
     return memo.emplace( relPath, gitDiffHunksVsHead( root, relPath ) ).first->second;
 }
 
-// Does the CURRENT uncommitted edit to `relPath` (vs HEAD) modify any pre-existing line that overlaps the
-// symbol's current [symStart, symStart+symLoc-1] span AND was itself last committed inside the window? See the
-// section comment above for the full mechanism. `symStart`/`symLoc` come straight from the working-tree
-// Symbol (s.line / s.loc). `memo` is the caller-owned per-run hunk cache (P3).
-inline bool churnEditTouchesHotLine( DiffHunkMemo& memo, const std::string& root, const std::string& relPath,
-                                     std::uint32_t symStart, std::uint32_t symLoc, std::int64_t windowCutoffEpoch )
+// HOW MANY DISTINCT in-window COMMITS last wrote the pre-existing lines that the CURRENT uncommitted edit to
+// `relPath` (vs HEAD) modifies inside the symbol's [symStart, symStart+symLoc-1] span. See the section comment
+// above for the full mechanism. `symStart`/`symLoc` come straight from the working-tree Symbol (s.line /
+// s.loc). `memo` is the caller-owned per-run hunk cache (P3).
+//
+// Q-DIAL-1: the two facts the churn kind reads off this ONE number, so they cannot drift apart —
+//   >= 1  the edit touches hot content at all  → churn="self" (informational; it was the GATING rule until
+//         2026-09-10, and it is the agent's own edit window on any active branch);
+//   >= kShortHorizonMinCommits  the lines were rewritten by that many COMMITTED commits inside the window,
+//         the working edit excluded (blame is on HEAD) → this is the rewrite-thrash the kind exists to name,
+//         and the only form of it that gates.
+// 0 (no hunk, no git, no blame) stays AMBIENT, the degrade that never inflates severity on missing evidence.
+inline std::uint32_t churnEditWindowCommitCount( DiffHunkMemo& memo, const std::string& root, const std::string& relPath,
+                                                 std::uint32_t symStart, std::uint32_t symLoc, std::int64_t windowCutoffEpoch )
 {
     if( symStart == 0 )
     {
-        return false;
+        return 0;
     }
+    std::vector<std::uint64_t> shas;
     const std::uint32_t symEnd = symStart + ( symLoc > 0 ? symLoc - 1 : 0 );
 
     for( const DiffHunk& h : diffHunksMemoized( memo, root, relPath ) )
@@ -3651,19 +5735,18 @@ inline bool churnEditTouchesHotLine( DiffHunkMemo& memo, const std::string& root
             continue; // this hunk falls outside the symbol
         }
 
-        if( gitBlameRangeHasWindowCommit( root, relPath, h.oldStart, h.oldCount, windowCutoffEpoch ) )
-        {
-            return true;                                             // one hot line is enough — short-circuit
-        }
+        gitBlameRangeWindowCommits( root, relPath, h.oldStart, h.oldCount, windowCutoffEpoch, shas );
     }
-    return false;
+    std::sort( shas.begin(), shas.end() );
+    shas.erase( std::unique( shas.begin(), shas.end() ), shas.end() );   // a commit spanning two hunks of one symbol counts ONCE
+    return std::uint32_t( shas.size() );
 }
 
 // one reported regression (something the change made WORSE).
 struct Regression
 {
     std::string   kind;   // "complexity" | "duplication" | "dead-code" | "verbosity" | "nesting" | "params" | "api-surface"
-                          //   | "error-masking" | "short-horizon-churn" | "new-clone-of-reused-helper" (§D#4)
+                          //   | "error-masking" | "short-horizon-churn" | "new-clone-of-reused-helper" (§D#4) | "placeholder"
     std::string   sym;    // canonical id (or, for duplication, the space-joined member ids)
     std::uint32_t was = 0;
     std::uint32_t now = 0;
@@ -3702,22 +5785,29 @@ struct Regression
 // quality-delta emitter, its --json twin, and the MCP quality_delta emitter each held the same conditional
 // chain), which is the shape --quality-delta's own duplication kind exists to name; adding the fourth row
 // below is what made keeping three copies indefensible. nullptr = this kind publishes no facet attribute.
-// A declarative table, not a conditional chain (CONTRIBUTING.md §3). Scanned with find_if rather than a
-// hand-rolled loop: the loop spelling is the single most re-derived body in this tree (serialize.h's
-// bytesPerTokenFor, namingconsistency's groupFor, lanes' findClaimByKey, ingest's lookupLang all carry it)
-// and the duplication kind reported this function as a fifth copy of it the moment it was written that way.
+// A declarative table, not a conditional chain (CONTRIBUTING.md §3). Scanned via findRowByKind (ACK
+// PROVENANCE / RE-SCORE, near kMaterialityBars above) rather than a hand-rolled loop: the loop spelling is
+// the single most re-derived body in this tree (serialize.h's bytesPerTokenFor, namingconsistency's
+// groupFor, lanes' findClaimByKey, ingest's lookupLang all carry it), and this function's OWN find_if was
+// reported as a fifth copy of it the moment it was first written that way — sharing findRowByKind with
+// rescoreNumericMajor's own kMaterialityBars lookup (a genuine sibling: same file, same "kind → its
+// declarative row" shape, same reason to exist) resolves that without forcing a shared abstraction onto the
+// other four, unrelated ones.
 struct FacetAttr { std::string_view kind; const char* attr; };
 inline constexpr FacetAttr kFacetAttrs[] = {
-    { "short-horizon-churn", "churn"   },   // self / ambient
-    { "api-surface",         "surface" },   // new-symbol / contract-change
-    { "duplication",         "idiom"   },   // the recognized clone-body shape (cloneidiom.h)
+    { "short-horizon-churn",        "churn"   },   // self / ambient
+    { "api-surface",                "surface" },   // new-symbol / contract-change
+    { "duplication",                "idiom"   },   // the recognized clone-body shape (cloneidiom.h)
+    { "new-clone-of-reused-helper", "idiom"   },   // T13/fix2 gave this kind duplication's idiom demotion (Regression::facet
+                                                    // is populated the same way, from the same CloneIdiomVerdict); this row was
+                                                    // missing, so a demoted row's idiom name never reached the reader even
+                                                    // though sev="minor" fired correctly — a disclosure gap, not a gating one.
 };
 
 inline const char* facetAttrName( std::string_view kind ) noexcept
 {
-    const auto* const end = std::end( kFacetAttrs );
-    const auto* const hit = std::find_if( std::begin( kFacetAttrs ), end, [ kind ]( const FacetAttr& f ) { return f.kind == kind; } );
-    return hit != end ? hit->attr : nullptr;
+    const FacetAttr* const hit = findRowByKind( std::begin( kFacetAttrs ), std::end( kFacetAttrs ), kind );
+    return hit != nullptr ? hit->attr : nullptr;
 }
 
 // §P6.6: `sym` is a canonical id `path::scope::name` (resolve.h::canonicalId) whose PATH segment is
@@ -3781,34 +5871,7 @@ inline std::string displaySym( const std::string& sym, std::string_view root )
 // that cannot round-trip through both is refused at the flag rather than mangled at the emitter.
 inline bool scopeGlobMatch( std::string_view s, std::string_view p ) noexcept
 {
-    std::size_t si = 0, pi = 0, starAt = std::string_view::npos, resumeAt = 0;
-    while( si < s.size() )
-    {
-        if( pi < p.size() && ( p[ pi ] == '?' || p[ pi ] == s[ si ] ) )
-        {
-            ++si;
-            ++pi;
-        }
-        else if( pi < p.size() && p[ pi ] == '*' )
-        {
-            starAt   = pi++;      // remember the last `*` and where its tail may resume, so a failed suffix
-            resumeAt = si;        // match backtracks by one character instead of giving up
-        }
-        else if( starAt != std::string_view::npos )
-        {
-            pi = starAt + 1;
-            si = ++resumeAt;
-        }
-        else
-        {
-            return false;
-        }
-    }
-    while( pi < p.size() && p[ pi ] == '*' )
-    {
-        ++pi;                     // trailing stars may still match the empty tail
-    }
-    return pi == p.size();
+    return wildcardMatch( s, p );   // arch.h — one wildcard loop for the scope patterns and resolve.h's workspace globs
 }
 
 // The wildcard-free arm: a root-anchored prefix that must end ON a component boundary, so `alpha` can never
@@ -3942,6 +6005,49 @@ inline bool scopeCovers( const Scope& sc, const Regression& r )
 // string, collision-free, sorted) so the rewritten file is byte-stable. Unknown/malformed lines degrade+skip
 // exactly like readBaseline. Deliberately NOT pinned to a HEAD sha: an acked finding ("fixture, dead by
 // design") stays accepted across commits until the file is edited or the finding worsens.
+// ─── ACK PROVENANCE CONFIDENCE — how the row's was=/now=/facet= were arrived at ────────────────────────
+//
+// A tri-state, not the bool it replaces, because the ledger now has THREE honestly-different states and a
+// bool can only name two. `Measured` is a row whose provenance the ack path read off the live delta it was
+// accepting — the finding was in front of the binary at the moment the row was written. `Reconstructed` is
+// a row a later pass HEALED from facts about the tree as it stands TODAY (backfillCloneAckProvenance), for
+// a legacy row whose accept-time measurement was never recorded. The two must never be pooled in a
+// published number: a reconstructed row says "this is what the finding looks like now", which is a
+// different claim from "this is what was measured when it was accepted", and CLAUDE.md's honesty contract
+// is exactly the rule that a claim you cannot support must be labelled rather than rounded into one you can.
+//
+// `None` is a legacy row — nothing to re-score from, and NOT inferable from was/now alone: 0 is a
+// legitimate measured value (dead-code and both clone kinds always carry was=0), so an ABSENT token, not a
+// zero one, is the tell.
+//
+// FRESHNESS, the rule that keeps Reconstructed from rotting into a lie. A reconstruction describes the tree
+// on the day it was taken, and a marker alone would not stop a reader six months later from treating it as
+// a fact about the row. So it is a CACHE, not a record: backfillCloneAckProvenance RE-DERIVES every
+// Reconstructed row whose group it can still find, on every --quality-ack, so a value that can be checked
+// is never older than the last ack.
+//
+// A value it CANNOT check is left alone and counted, never cleared. Not finding a group proves nothing —
+// the scan may be scoped, capped, degraded, or run next to a different tree entirely — and deleting derived
+// data on the strength of a floor would be a worse error than carrying an unverified one, because it is not
+// reversible. The disclosure carries the unverified count for exactly this reason.
+//
+// Measured rows are never re-derived: a measurement outranks anything a later pass could compute, and that
+// ordering is what the whole axis means.
+enum class AckProvenance : std::uint8_t
+{
+    None = 0,        // legacy row — no now=/was= on the line at all
+    Measured,        // read off the live delta this row was accepted from
+    Reconstructed,   // healed from the CURRENT tree by a backfill pass — see backfillCloneAckProvenance
+    Unknown,         // now=/was= present, but prov= names a spelling this binary never wrote — round-tripped
+                      // verbatim (AckRecord::provRaw) rather than promoted into either real claim; see
+                      // ackProvenanceFor for why guessing either direction is the honesty-contract violation.
+};
+
+// The token `prov=` carries in the ledger. Omitted entirely for Measured, the same OMIT-when-default rule
+// cid=/by= follow and for the same reason: a repo whose rows are all measured keeps a ledger byte-identical
+// to the one it would have without this axis, so adding it moves zero bytes until a backfill actually runs.
+inline constexpr std::string_view kAckProvReconToken = "recon";
+
 struct AckRecord
 {
     std::string   kind;
@@ -3958,14 +6064,226 @@ struct AckRecord
     // malformed, and a separate record line would fire the reader's own malformed-line degrade on every one
     // of them. Empty rows are written byte-identically to the way they are written today.
     std::string   by;
+    // RE-SCORE PROVENANCE (round 2026-09-22) — the measured facet values that decided THIS finding's
+    // severity at the moment it was accepted, so a LATER run can re-evaluate it under a different threshold
+    // (the planned knob sweep) by reading the ledger alone, with no re-ingest and no git history replay.
+    // `was`/`now` are the exact (was,now) pair perSymbolKind compared against the kind's bar/minorDelta —
+    // see rescoreNumericMajor, which is the single formula both the live report and this re-score consult.
+    // `facet` is Regression::facet verbatim (idiom name / self·ambient / new-symbol·contract-change) for the
+    // kinds whose severity is not a bar comparison at all (duplication, new-clone-of-reused-helper — see
+    // kFacetAttrs). `path`/`line` mirror Regression's own P2.5 locator (empty path = none available, same
+    // honesty rule). Serialized as OPTIONAL named tokens (`now=`/`was=`/`facet=`/`p=<path>:<line>`), same
+    // shape and same reasoning as cid=/by= — see readAckRecords for the grammar and the legacy-row handling.
+    //
+    // `hasProvenance` is NOT serialized itself — it is the READ-side fact "did this line carry now=/was= at
+    // all", which is what tells a legacy row (written by a pre-provenance binary, or hand-edited down to the
+    // bare grammar) from a new one. It cannot be inferred from was/now alone: 0 is a legitimate measured
+    // value (dead-code and the two clone kinds always carry was=0), so an ABSENT token, not a zero one, is
+    // the tell. A caller doing mechanical re-scoring (see rescoreAckRecord) must read this flag and count a
+    // false as "cannot answer, legacy row" — never guess, and never treat it as a non-match (the hash key is
+    // still the only identity; this flag only gates whether the OPTIONAL extra facts are trustworthy).
+    //
+    // WHAT A LEGACY ROW CAN AND CANNOT GET BACK, measured on this repo's own 1,623-row ledger rather than
+    // assumed. No row anchors a COMMIT — `cid` identifies the symbol's at-accept-time body for forward
+    // matching, not which tree pair produced was/now, and `by` is an ownership scope, not a ref. That makes
+    // the answer DIFFER BY KIND, and the difference is the whole reason a backfill is possible at all:
+    //
+    //   * The two CLONE kinds (duplication, new-clone-of-reused-helper — 288 rows here, 62 of them the
+    //     reuse-decline kind) need no commit anchor, because their severity is not a bar comparison over
+    //     was/now at all: it is `facet`, the clone idiom verdict. Their ack key IS cloneGroupHash (the
+    //     sorted member canonIds), classifyCloneGroupIdioms runs over every clone group in the CURRENT tree
+    //     regardless of newness, and `was` is 0 BY CONSTRUCTION at both kinds' push_back sites. So today's
+    //     tree answers all three — see backfillCloneAckProvenance, which heals exactly these rows and marks
+    //     them AckProvenance::Reconstructed, never Measured.
+    //   * The four NUMERIC kinds (complexity/verbosity/nesting/params — 320 rows here) genuinely cannot be
+    //     healed from this file or from today's tree. `now` for a legacy row is at best `ackNow` itself (the
+    //     ratchet floor, which is exactly r.now at the row's LAST acceptance in the common single-ack case,
+    //     but indistinguishable from a stale carried-forward max after a re-ack); `was` has no stand-in and
+    //     cannot be recomputed without the two commits that were diffed. Those rows stay AckProvenance::None
+    //     and are reported as such rather than given a guessed value. Recovering them is a git-archaeology
+    //     pass over the COMMITTED ledger's own blame (320 rows blame to 86 distinct commits at b939ef4f, a
+    //     ~13-minute one-time crawl), which is a separate lane and would record a MEASURED was, not a
+    //     reconstructed one — a re-diff of the real tree pair is a measurement, so it must not reuse
+    //     prov=recon.
+    //   * The remaining 1,015 rows (short-horizon-churn, dead-code, api-surface, error-masking) have no
+    //     materiality question for a bar sweep to re-ask — none of them has a kMaterialityBars row at all, so
+    //     rescoreNumericMajor's lookup misses and no recovered was/now would change a verdict.
+    //
+    // See the ledger's own PROVENANCE header comment (renderAckRecords) for the reader-facing version.
+    std::uint32_t was           = 0;
+    std::uint32_t now           = 0;
+    std::string   facet;
+    std::string   path;
+    std::uint32_t line          = 0;
+    AckProvenance provenance    = AckProvenance::None;
     std::string   reason;
+    // The literal `prov=` token text when `provenance == Unknown` — a spelling neither this binary's
+    // canonical `recon` nor its "absent/live" Measured spelling, so there is nothing true to compute from
+    // it. Kept verbatim so a hand-written or future-binary value ROUND-TRIPS through a read+rewrite instead
+    // of being silently promoted into a false "reconstructed by us" claim or silently dropped. Empty for
+    // every other provenance. See ackProvenanceFor / ackProvenanceTokens.
+    std::string   provRaw;
+
+    // "is there anything here to re-score at all" — the question every pre-existing call site asked of
+    // the bool this replaces, kept as a predicate so adding the confidence axis changed no caller's
+    // meaning. A caller that CARES which kind of provenance it has reads `provenance` directly.
+    bool hasProvenance() const noexcept { return provenance != AckProvenance::None; }
 };
+
+// The re-score entry point over a whole AckRecord: strips the P0.3 zero-magnitude origin suffix
+// (`:new-symbol`/`:preexisting`) off `kind` before the table lookup — that suffix is an ACK-IDENTITY
+// discriminator (ackKindToken), never one of the nine finding kinds rescoreNumericMajor's table knows about
+// — then defers to it. nullopt covers both "this row cannot be rescored" cases at once: no provenance at
+// all (a legacy row), or a facet-driven/presence kind rescoreNumericMajor's table does not cover.
+inline std::optional<bool> rescoreAckRecord( const AckRecord& r, std::optional<std::uint32_t> barOverride = std::nullopt,
+                                              std::optional<std::uint32_t> minorDeltaOverride = std::nullopt ) noexcept
+{
+    if( !r.hasProvenance() )
+    {
+        return std::nullopt;
+    }
+    std::string_view  bareKind = r.kind;
+    const std::size_t colon    = bareKind.find( ':' );
+    if( colon != std::string_view::npos )
+    {
+        bareKind = bareKind.substr( 0, colon );
+    }
+    return rescoreNumericMajor( bareKind, r.was, r.now, barOverride, minorDeltaOverride );
+}
 
 inline std::string ackMapKey( const std::string& kind, std::uint64_t key )
 {
     char hex[ 20 ];
-    std::snprintf( hex, sizeof( hex ), "%016llx", static_cast<unsigned long long>( key ) );
+    rw::formatTo( hex, sizeof( hex ), "{:016x}", static_cast<unsigned long long>( key ) );
     return kind + " " + hex;
+}
+
+// ─── THE LEGACY-ACK BACKFILL — what a row written before provenance existed CAN still get back ─────────
+//
+// THE PROBLEM. `--quality-ack` records provenance only for rows it WRITES, so a ledger that predates the
+// feature heals forward and no further: this repo's own 1,623 rows carry none, and the knob sweep the
+// provenance exists for can therefore re-score none of its own history. The obvious fix — anchor each row
+// to a commit and re-diff it — is a real one, but it is aimed at the NUMERIC kinds, and measuring first
+// showed that is not where the rows are: of the 1,623, only 320 are numeric-bar rows at all. The 288 CLONE
+// rows (62 of them the reuse-decline kind the sweep specifically wants) would be untouched by ANY recovered
+// was=, because neither clone kind has a kMaterialityBars row — rescoreNumericMajor's lookup misses, so their
+// severity is `facet` and no value of was/now changes it. A commit anchor would have been a correct answer
+// to a different question.
+//
+// WHAT MAKES THE CLONE KINDS HEALABLE WITHOUT GIT AT ALL. Three facts line up, and all three are needed:
+//   * their ack identity IS cloneGroupHash — the sorted member canonIds — so a row names a member SET that
+//     can be looked for in any tree, not a magnitude that only meant something against one baseline;
+//   * classifyCloneGroupIdioms runs over every clone group in the current tree regardless of newness, so
+//     the verdict is recomputable now (computeDelta exports it as CloneIdiomFact rather than paying for a
+//     second clone pass);
+//   * `was` is 0 BY CONSTRUCTION at both kinds' push_back sites — it is not being guessed at or defaulted,
+//     it is the only value either kind has ever written.
+//
+// WHAT THIS IS NOT. The member-set hash is over member IDENTITIES, not their bodies, so a group can still
+// hash the same today while the bodies that made it a clone have drifted. A healed facet is therefore the
+// answer to "would this group's idiom demote it NOW", not "did it demote it THEN" — a different question,
+// and for a threshold sweep arguably the more useful one, but not the same claim. That is exactly why these
+// rows are marked AckProvenance::Reconstructed and never Measured: pooling the two would publish a number
+// nobody can audit, which is the failure mode CLAUDE.md's honesty contract names.
+//
+// WHAT STAYS LEGACY, on purpose. A numeric row is not touched — `ackNow` is a plausible stand-in for its
+// `now`, but `was` has no stand-in at all, and half a triple would be worse than none (rescoreAckRecord
+// reads presence, not value). Recovering those needs the commit that accepted the row; the committed
+// ledger's own blame is that anchor, and it is a separate lane — see AckRecord's doc comment for the
+// measured cost and for why the LAST write, not the first appearance, is the commit to re-diff.
+//
+// IDEMPOTENT AND DETERMINISTIC, both by construction rather than by care — but NOT because a row that
+// already carries provenance is left alone: a Measured row is the only row never rewritten (a measurement
+// outranks anything this pass could derive, so it can never be downgraded to Reconstructed); a Reconstructed
+// row IS rewritten on every run whose group is still found (`++out.refreshed`, not skipped), re-derived from
+// the same deterministic facts about the CURRENT tree. Idempotence therefore holds because that re-derivation
+// is a pure function of (member-set hash, current tree) and produces the same bytes every time — not because
+// the row is skipped. `acks` is a btree_map so the walk is (kind,key) sorted, and `facts` is sorted+deduped by
+// its producer so the lookup is a binary search over a stable sequence.
+struct AckBackfill
+{
+    std::size_t resolved   = 0;   // legacy clone rows reconstructed from the current tree for the first time
+    std::size_t refreshed  = 0;   // already-reconstructed rows RE-DERIVED against this tree (see the freshness rule)
+    std::size_t unverified = 0;   // reconstructions this run could NOT re-derive — left exactly as they were, and said so
+    std::size_t unresolved = 0;   // legacy clone rows whose member set does not clone here — honestly left alone
+    std::size_t ineligible = 0;   // rows of a kind no current-tree fact can answer for (numeric, churn, presence)
+    // Rows this pass did not CONSIDER: a measurement outranks anything it could derive, so it returns before
+    // any other counter. Carried so the five counts above plus this one account for every row in the ledger —
+    // without it the disclosure prints numbers that visibly do not sum, and a reader who checks (one did) is
+    // left deciding between a transcription error and a real hole. An unexplained gap in a report whose whole
+    // claim is that its floors are honest costs more than the line it takes to close it.
+    std::size_t measured   = 0;
+};
+
+inline AckBackfill backfillCloneAckProvenance( gtl::btree_map<std::string, AckRecord>& acks,
+                                                const std::vector<CloneIdiomFact>& facts )
+{
+    // `facts` must arrive sorted by hash — the lookup below binary-searches it. NOT spelled as an EXPECTS:
+    // a promise may only call accessors (test/selfcheckcheck.sh arm C) and std::is_sorted is an O(n) scan,
+    // so asserting it here would cost the whole sequence on every call to restate what its single producer
+    // already guarantees unconditionally (computeDelta sorts and dedupes cloneIdiomsOut before returning).
+    AckBackfill out;
+    for( auto& [ mapKey, rec ] : acks )
+    {
+        (void) mapKey;   // the (kind,key) it was derived from — rec already carries both fields
+        if( rec.provenance == AckProvenance::Measured )
+        {
+            ++out.measured;   // a measurement outranks anything this pass could derive — never rewritten, only counted
+            continue;
+        }
+        // The ':new-symbol' / ':preexisting' suffix is an ACK-IDENTITY discriminator (ackKindToken), not a
+        // finding kind — strip it before the kind test, the same way computeStaleAcks does.
+        std::string_view  base  = rec.kind;
+        const std::size_t colon = base.find( ':' );
+        if( colon != std::string_view::npos )
+        {
+            base = base.substr( 0, colon );
+        }
+        if( base != "duplication" && base != "new-clone-of-reused-helper" )
+        {
+            ++out.ineligible;   // untouched, including a hand-planted prov= on a kind this pass does not own
+            continue;
+        }
+        const bool wasReconstructed = ( rec.provenance == AckProvenance::Reconstructed );
+        const auto hit              = std::lower_bound( facts.begin(), facts.end(), rec.key,
+                                                        []( const CloneIdiomFact& f, std::uint64_t k ) { return f.hash < k; } );
+        if( hit == facts.end() || hit->hash != rec.key )
+        {
+            // ABSENCE IS A FLOOR, NOT A VERDICT — and this is the one place it was tempting to forget it.
+            // An earlier draft WITHDREW a reconstruction whose group it could not find, on the reasoning that
+            // a value the tree cannot support should not survive. That is wrong for the same reason
+            // staleForCloneKind refuses to call a clone target "gone": `facts` carries what this run FOUND,
+            // and a run can fail to find a group because the scan was scoped or excluded, because a file hit
+            // the size cap, because a parse degraded — or because the ledger is simply being read next to a
+            // different tree, which is exactly what qackconcurrencycheck arm 7's transplant probe does, and
+            // what caught this. Destroying 231 rows on the strength of a floor is not a freshness rule, it is
+            // the guess CLAUDE.md's honesty contract forbids, made irreversibly.
+            //
+            // So nothing is cleared. The row keeps the values it had, and the run SAYS it could not verify
+            // them — an unverified count a reader can act on, rather than data silently deleted.
+            ++( wasReconstructed ? out.unverified : out.unresolved );
+            continue;
+        }
+        // `was` is 0 for both clone kinds at every site that writes one — this is the construction, not a
+        // default. `now` is the ratchet floor, which is the accepted `now` for a row acked once and a
+        // carried-forward max for one re-acked since; it is disclosed as reconstructed either way, and
+        // neither clone kind feeds a bar comparison, so no verdict can turn on the difference. `facet` is
+        // the load-bearing value: it is what decides these kinds' severity.
+        rec.was        = 0;
+        rec.now        = rec.ackNow;
+        rec.facet      = hit->idiom;
+        rec.provenance = AckProvenance::Reconstructed;
+        rec.provRaw.clear();   // this run just derived a REAL reconstruction — any prior unrecognized spelling is superseded
+        ++( wasReconstructed ? out.refreshed : out.resolved );
+    }
+    // Every row this pass looked at landed in exactly one counter (`continue`d after incrementing it, or
+    // fell through to the resolved/refreshed increment above) — a plain size_t sum with no accessor behind
+    // it, so it costs nothing to state and nothing to check. This is the invariant a reader would otherwise
+    // verify by hand (the review that found this backfill had zero self-checks in +380 lines did exactly
+    // that, over two separate runs, before trusting the six numbers on stderr).
+    ENSURES( out.resolved + out.refreshed + out.unverified + out.unresolved + out.ineligible + out.measured == acks.size(),
+              "every ack row lands in exactly one backfill counter" );
+    return out;
 }
 
 // ─── ACK RATCHET REASON CLOBBER (round 2026-08-29 fix) ─────────────────────────────────────────────────
@@ -4101,6 +6419,7 @@ inline std::string normalizeLegacyAckKind( const std::string& kind, std::uint32_
 // different language, and a caller that rejects the value restores `reason` itself.
 inline bool takeAckNamedToken( std::string& reason, std::string_view name, std::string& valueOut )
 {
+    ASSUME_NO_ALIAS( reason, valueOut );
     if( reason.size() < name.size() || reason.compare( 0, name.size(), name ) != 0 )
     {
         return false;
@@ -4115,23 +6434,50 @@ inline bool takeAckNamedToken( std::string& reason, std::string_view name, std::
     return true;
 }
 
-inline std::uint64_t takeAckCidPrefix( std::string& reason )
+// The GRAMMAR half shared by every numeric ack token (cid= below, now=/was= further down): parse `name`'s
+// value off the front of `reason` in `base`; a missing token is `false` with `reason` untouched, and a
+// PRESENT-but-malformed one is also `false`, `reason` restored to what it was, and `*wasMalformed` (when the
+// caller wants to know) set so it — not this shared parser — can decide whether that specific case is worth
+// its own DISCLOSE. It cannot decide that itself: cid='s degrade already has one (a ratchet-grandfathered
+// site — see takeAckCidPrefix); a brand-new one-argument DISCLOSE is a shape test/selfcheckcheck.sh refuses
+// on new code, and now=/was= below stay silent on purpose (the malformed text staying visible in `reason` is
+// still the disclosure a human reviewing the file sees — see takeAckUintPrefix's own comment).
+inline bool takeAckNumericToken( std::string& reason, std::string_view name, int base, std::uint64_t& valueOut, bool* wasMalformed = nullptr )
 {
-    const std::string untouched = reason;   // the restore point for the degrade below
-    std::string       hex;
-    if( !takeAckNamedToken( reason, "cid=", hex ) )
+    const std::string untouched = reason;
+    std::string       digits;
+    if( !takeAckNamedToken( reason, name, digits ) )
     {
-        return 0;
+        return false;
     }
     char*      stop = nullptr;
-    const auto v    = std::strtoull( hex.c_str(), &stop, 16 );
-    if( hex.empty() || stop == nullptr || *stop != '\0' )
+    const auto v    = std::strtoull( digits.c_str(), &stop, base );
+    if( digits.empty() || stop == nullptr || *stop != '\0' )
     {
-        DEGRADED_PATH_ALERT( "quality: unparseable cid= on an ack line — kept as reason text, content identity unavailable for that row" );
         reason = untouched;
-        return 0;
+        if( wasMalformed != nullptr )
+        {
+            *wasMalformed = true;
+        }
+        return false;
     }
-    return v;
+    valueOut = v;
+    return true;
+}
+
+inline std::uint64_t takeAckCidPrefix( std::string& reason )
+{
+    std::uint64_t v         = 0;
+    bool          malformed = false;
+    if( takeAckNumericToken( reason, "cid=", 16, v, &malformed ) )
+    {
+        return v;
+    }
+    if( malformed )
+    {
+        DISCLOSE( "quality: unparseable cid= on an ack line — kept as reason text, content identity unavailable for that row" );
+    }
+    return 0;
 }
 
 // P1.4 — the provenance twin of takeAckCidPrefix: an optional leading `by=<scope spec>` token. Same degrade
@@ -4149,11 +6495,173 @@ inline std::string takeAckByPrefix( std::string& reason )
     }
     if( val.empty() || !scopeSpecIsSpellable( val ) )
     {
-        DEGRADED_PATH_ALERT( "quality: unspellable by= on an ack line — kept as reason text, provenance unavailable for that row" );
+        DISCLOSE( "quality: unspellable by= on an ack line — kept as reason text, provenance unavailable for that row" );
         reason = untouched;
         return {};
     }
     return val;
+}
+
+// RE-SCORE PROVENANCE — the read side of AckRecord's was=/now=/facet=/p= tokens (see the struct's own doc
+// comment for what each carries and why). A plain decimal `<uint>` token, same shared parser as cid= above
+// (takeAckNumericToken) and the same "left in reason, untouched" degrade on a malformed value — but silent:
+// a value this binary could not have written stays visible as text in the file a human reviews (the same
+// disclosure cid='s DISCLOSE call spells out loud), without a NEW one-argument DISCLOSE call, a shape
+// test/selfcheckcheck.sh refuses on code that did not carry one already.
+// The only integer spelling this binary writes into the ledger's now=/was=/p=:<line> slots: one to ten ASCII
+// decimal digits, no sign, no whitespace, a value that fits std::uint32_t. Deliberately NOT strtoul/strtoull:
+// both accept a leading '-' and negate (now=-1 read back as 4294967295), a value past 32 bits was narrowed to
+// its low half (now=4294967296 read back as 0), and unsigned long is 64 bits on LP64 but 32 on Windows, so the
+// same committed line read back differently per platform. `out` is written only on success.
+inline bool parseAckLedgerUint32( std::string_view s, std::uint32_t& out ) noexcept
+{
+    if( s.empty() || s.size() > 10 )
+    {
+        return false;
+    }
+    std::uint64_t v = 0;
+    for( const char c : s )
+    {
+        if( c < '0' || c > '9' )
+        {
+            return false;
+        }
+        v = v * 10u + static_cast<std::uint64_t>( c - '0' );
+    }
+    if( v > std::numeric_limits<std::uint32_t>::max() )
+    {
+        return false;
+    }
+    out = static_cast<std::uint32_t>( v );
+    return true;
+}
+
+inline bool takeAckUintPrefix( std::string& reason, std::string_view name, std::uint32_t& valueOut )
+{
+    const std::string untouched = reason;
+    std::string       digits;
+    if( !takeAckNamedToken( reason, name, digits ) )
+    {
+        return false;
+    }
+    if( !VALIDATE( parseAckLedgerUint32( digits, valueOut ), "an ack ledger now=/was= value is plain decimal that fits 32 bits" ) )
+    {
+        reason = untouched;   // same visible-in-reason degrade as any other malformed token; never a fabricated value
+        return false;
+    }
+    return true;
+}
+
+// `p=<path>:<line>` — the SAME p="path:line" spelling the live report emits (P2.5), read back off one
+// whitespace-free token. Split on the LAST ':' (repo paths are always '/'-separated — CONTRIBUTING.md's
+// "paths are /-separated inside the program" — so a genuine ':' inside one is not a spelling this binary
+// ever writes); when the suffix after it is not all-digits, there is no reliable line boundary, so the
+// WHOLE token is kept as the path and line stays 0 — a best-effort locator beats none, and a wrong line
+// number is a much smaller loss than dropping the locator outright. Never disclosed: unlike a malformed
+// cid=/now=, a mis-split path:line still answers "which file", the question this token exists for.
+inline void splitAckLocator( const std::string& token, std::string& pathOut, std::uint32_t& lineOut )
+{
+    const std::size_t colon = token.rfind( ':' );
+    if( colon == std::string::npos )
+    {
+        pathOut = token;
+        return;
+    }
+    std::uint32_t v = 0;
+    if( !VALIDATE( parseAckLedgerUint32( std::string_view( token ).substr( colon + 1 ), v ), "an ack ledger p= line is plain decimal that fits 32 bits" ) )
+    {
+        pathOut = token;   // whole-token fallback: the text stays the path, the line stays unknown
+        return;
+    }
+    pathOut = token.substr( 0, colon );
+    lineOut = v;
+}
+
+// The five re-score tokens together, ORDER-TOLERANT the same way cid=/by= are: renderAckRecords always
+// writes them now=,was=,prov=,facet=,p= (in that order), but a hand-edit or a 3-way merge can reorder them,
+// so the reader tries all five against whatever is left at the front of `reason`, in a loop, until a pass
+// takes nothing. Provenance is present iff BOTH now= and was= were present — the pair rescoreAckRecord's
+// table needs together; a lone one (a hand-truncated line) is treated as no provenance rather than a half-
+// answer. `prov=` then says WHICH of the two confidences it is (AckProvenance); absent means Measured,
+// which is what keeps a ledger of live-written rows byte-identical to one written without this axis.
+// `prov=`'s VALUE → the confidence it names, decided in one place so takeAckProvenance below stays a token
+// loop and nothing else. `hasPair` is "both now= and was= were present", because provenance is the PAIR:
+// without it there is nothing for a confidence to qualify, whatever prov= says.
+//
+// An UNRECOGNIZED value degrades to Unknown, never to Measured and never to Reconstructed. Reading it as
+// Measured would let a future spelling this binary does not know silently promote itself into the
+// audited-as-measured population — the exact direction the honesty contract forbids guessing in. Reading it
+// as Reconstructed (an earlier version of this function did) is the OTHER direction of the same mistake: it
+// claims backfillCloneAckProvenance verified this row from the current tree, which is false for any row that
+// pass does not own (every numeric/churn/presence kind — see AckBackfill::ineligible) and unproven for a
+// clone-kind row whose group this run cannot find either. `writeAckRecords` would then serialize a plain
+// hand-typed value as the ledger's own canonical `prov=recon` spelling — a claim of verified reconstruction
+// this binary never performed. AckRecord::provRaw carries the exact bytes instead: caller-side
+// (`takeAckProvenance`) stores `provToken` there when this function returns Unknown, and
+// `ackProvenanceTokens` writes `prov=<provRaw>` verbatim, so an unrecognized value ROUND-TRIPS through a
+// read+rewrite unchanged rather than being rewritten into either claim. A clone-kind row still gets one real
+// chance to become genuinely Reconstructed: backfillCloneAckProvenance runs on every row regardless of this
+// function's verdict, and treats Unknown the same as legacy (its member-set hash may still be found in the
+// CURRENT tree) — so it self-corrects into the real spelling when the tree can prove it, and round-trips
+// otherwise. It is never withdrawn: the same "absence is a floor, not a verdict" rule that keeps the backfill
+// from deleting an unverified reconstruction (see backfillCloneAckProvenance) applies here too — an
+// unrecognized token is unproven, not disproven, and this codebase's ratchet never destroys a row on a floor.
+inline AckProvenance ackProvenanceFor( bool hasPair, std::string_view provToken )
+{
+    if( !hasPair )
+    {
+        return AckProvenance::None;
+    }
+    if( provToken.empty() || provToken == "live" )
+    {
+        return AckProvenance::Measured;   // absent IS measured — that is what keeps a live-written ledger byte-identical
+    }
+    if( provToken == kAckProvReconToken )
+    {
+        return AckProvenance::Reconstructed;   // the one spelling this binary itself writes for a healed row
+    }
+    // Anything else — a hand-edit, or a spelling some future binary writes — is NOT ours to interpret. It is
+    // also not a trace site: a one-argument DISCLOSE ships nothing (Diagnostics.h §4b), there is no sink in a
+    // pure token parser to pass, and answerUnchanged would be a false claim because this choice DOES change
+    // the row's confidence class. The caller (takeAckProvenance) captures `provToken` verbatim into
+    // AckRecord::provRaw so it round-trips instead.
+    return AckProvenance::Unknown;
+}
+
+// ONE pass of the token loop: take whichever re-score token is at the front of `reason` right now, or
+// report that none is. Split from the loop below because they are two jobs — which tokens exist and how one
+// is spelled, versus how many times to look — and the five spellings do not share a type (two uints, two
+// bare strings, one path:line pair), so a declarative table would have to carry a variant and five setters
+// to say what five named lines already say. Returns false the moment nothing matches, which is what ends
+// the loop; each token is guarded by its own "not taken yet" test so a repeated token is left in `reason`
+// rather than silently overwriting the first one.
+inline bool takeOneAckProvenanceToken( std::string& reason, AckRecord& rec, bool& gotNow, bool& gotWas, std::string& prov )
+{
+    std::string tok;
+    if( !gotNow && takeAckUintPrefix( reason, "now=", rec.now ) ) { gotNow = true; return true; }
+    if( !gotWas && takeAckUintPrefix( reason, "was=", rec.was ) ) { gotWas = true; return true; }
+    if( prov.empty() && takeAckNamedToken( reason, "prov=", prov ) ) { return true; }
+    if( rec.facet.empty() && takeAckNamedToken( reason, "facet=", rec.facet ) ) { return true; }
+    if( rec.path.empty() && takeAckNamedToken( reason, "p=", tok ) ) { splitAckLocator( tok, rec.path, rec.line ); return true; }
+    return false;
+}
+
+inline void takeAckProvenance( std::string& reason, AckRecord& rec )
+{
+    bool        gotNow = false, gotWas = false;
+    std::string prov;
+    for( int pass = 0; pass < 5; ++pass )   // at most 5 tokens, each taken at most once — 5 passes always suffices
+    {
+        if( !takeOneAckProvenanceToken( reason, rec, gotNow, gotWas, prov ) )
+        {
+            break;   // nothing matched this pass — no more re-score tokens at the front of reason
+        }
+    }
+    rec.provenance = ackProvenanceFor( gotNow && gotWas, prov );
+    if( rec.provenance == AckProvenance::Unknown )
+    {
+        rec.provRaw = prov;   // round-trip the exact bytes — see ackProvenanceFor for why this is not our call to relabel
+    }
 }
 
 // ─── THE READER-SIDE TWIN OF THE ACK REASON CLOBBER (2nd site, round 2026-08-30) ───────────────────────
@@ -4194,13 +6702,13 @@ inline gtl::btree_map<std::string, AckRecord> readAckRecords( const std::string&
 {
     badLines = 0;
     gtl::btree_map<std::string, AckRecord> out;
-    std::ifstream f( path );
-    if( !f )
-    {
-        return out;
-    }
-    std::string line;
-    while( std::getline( f, line ) )
+    // openRegularFileStream, not a stream opened on the name: a FIFO planted at the ledger's name blocked that open until
+    // a writer appeared, so --quality-delta hung before any output, and a link to /dev/zero never reached end of file.
+    // Anything that is not a regular file now reads as no ledger, and stderr says so (docparse.h). Still one line at a
+    // time, as the std::ifstream it replaces read it: a large ledger is never held whole.
+    rw::pathguard::NoFollowRead ledger = docparse::detail::openRegularFileStream( "the quality-acks ledger", path );
+    std::string                 line;
+    while( ledger.readLine( line ) )
     {
         while( !line.empty() && ( line.back() == '\r' || line.back() == '\n' ) )
         {
@@ -4215,7 +6723,7 @@ inline gtl::btree_map<std::string, AckRecord> readAckRecords( const std::string&
         std::uint64_t key = 0;
         std::uint32_t ackNow = 0;
         is >> tag >> kind >> std::hex >> key >> std::dec >> ackNow;
-        if( tag != "ack" || is.fail() ) { DEGRADED_PATH_ALERT( "quality: malformed ack line skipped" ); ++badLines; continue; }
+        if( tag != "ack" || is.fail() ) { DISCLOSE( "quality: malformed ack line skipped" ); ++badLines; continue; }
         kind = normalizeLegacyAckKind( kind, ackNow );               // P0.3 migration — see the note at ackKindToken
         std::string reason;
         std::getline( is, reason );
@@ -4231,20 +6739,25 @@ inline gtl::btree_map<std::string, AckRecord> readAckRecords( const std::string&
           // is hand-edited and 3-way merged, and a reader that only accepts one order silently loses a field
             cid = takeAckCidPrefix( reason );
         }
+
+        AckRecord rec;
+        rec.kind = kind; rec.key = key; rec.ackNow = ackNow; rec.cid = cid; rec.by = by;
+        takeAckProvenance( reason, rec );   // now=/was=/prov=/facet=/p= — order-tolerant; sets rec.provenance
         while( !reason.empty() && reason.back() == '\r' )
         {
             reason.pop_back(); // CRLF tolerance on the trailing field too
         }
+        rec.reason = reason;
 
         const std::string mapKey = ackMapKey( kind, key );
         const auto        it     = out.find( mapKey );
         if( it == out.end() )
         {
-            out[ mapKey ] = AckRecord{ kind, key, ackNow, cid, by, reason };
+            out[ mapKey ] = std::move( rec );
         }
         else
         {
-            mergeDuplicateAckRecord( it->second, AckRecord{ kind, key, ackNow, cid, by, reason } );
+            mergeDuplicateAckRecord( it->second, std::move( rec ) );
         }
     }
     return out;
@@ -4279,7 +6792,7 @@ inline gtl::btree_map<std::string, AckRecord> readAckRecords( const std::string&
 //
 // WHY THE WAIT IS LONG. The critical section spans a whole delta computation (seconds, cold), not a splice,
 // so mcpedit's ~200 ms budget would time out on essentially every real contention and degrade straight back
-// into the bug. 60 s of 10 ms polls, then DEGRADED_PATH_ALERT and proceed lock-free: the pre-fix behavior is
+// into the bug. 60 s of 10 ms polls, then DISCLOSE and proceed lock-free: the pre-fix behavior is
 // the floor, never a hang. flock is released by the kernel when the fd closes, so a crashed peer cannot
 // wedge the ledger.
 //
@@ -4299,32 +6812,32 @@ struct SidecarWriteLock
         const std::string identity = canonEc ? sidecarPath : canon.string();
 
         char name[ 64 ];
-        std::snprintf( name, sizeof( name ), "ripwire-sidecar-%016llx.lock",
+        rw::formatTo( name, sizeof( name ), "ripwire-sidecar-{:016x}.lock",
                        static_cast<unsigned long long>( fnv1a64( identity ) ) );
         const std::string lockDir = cacheDirLadder() + "/locks";
-        ::mkdir( lockDir.c_str(), 0700 );
-        ::chmod( lockDir.c_str(), 0700 );
+        os::mkdir( lockDir.c_str(), 0700 );
+        os::chmod( lockDir.c_str(), 0700 );
         const std::string lockPath = resolveCacheBlobPath( lockDir, name );
 
-        fd = ::open( lockPath.c_str(), O_RDWR | O_CREAT, 0644 );
+        fd = os::open( lockPath.c_str(), O_RDWR | O_CREAT, 0644 );
         if( fd < 0 )
         {
-            DEGRADED_PATH_ALERT( "quality: ack-ledger lockfile open failed; proceeding lock-free (a concurrent --quality-ack can lose rows)" );
+            DISCLOSE( "quality: ack-ledger lockfile open failed; proceeding lock-free (a concurrent --quality-ack can lose rows)" );
             return;
         }
         for( int waitedMs = 0; ; waitedMs += 10 )
         {
-            if( ::flock( fd, LOCK_EX | LOCK_NB ) == 0 ) { locked = true; break; }
+            if( os::flock( fd, LOCK_EX | LOCK_NB ) == 0 ) { locked = true; break; }
             if( errno != EWOULDBLOCK || waitedMs >= maxWaitMs )
             {
                 break;
             }
             struct timespec ts{ 0, 10 * 1000 * 1000 };   // 10 ms
-            ::nanosleep( &ts, nullptr );
+            os::nanosleep( &ts, nullptr );
         }
         if( !locked )
         {
-            DEGRADED_PATH_ALERT( "quality: ack-ledger lock contended past the wait budget; proceeding lock-free (a concurrent --quality-ack can lose rows)" );
+            DISCLOSE( "quality: ack-ledger lock contended past the wait budget; proceeding lock-free (a concurrent --quality-ack can lose rows)" );
         }
     }
 
@@ -4334,15 +6847,68 @@ struct SidecarWriteLock
         {
             if( locked )
             {
-                ::flock( fd, LOCK_UN );
+                os::flock( fd, LOCK_UN );
             }
-            ::close( fd );
+            os::close( fd );
         }
     }
 
     SidecarWriteLock( const SidecarWriteLock& )            = delete;
     SidecarWriteLock& operator=( const SidecarWriteLock& ) = delete;
 };
+
+// RE-SCORE PROVENANCE, serialized: the `now= was= [prov=] [facet=] [p=]` run of tokens one ack row carries,
+// or "" for a legacy row. Its own function rather than four branches inside renderAckRecords, which is a
+// row FORMATTER and stays one — the ledger has grown three optional token families now (cid=, by=, and this
+// one), and the third is what made a fourth nested conditional in the writer indefensible.
+//
+// now=/was= are written together whenever the row carries provenance AT ALL — even when a value is
+// legitimately 0 (dead-code and both clone kinds always are). The token's PRESENCE, not its value, is what a
+// later reader (rescoreAckRecord) uses to tell a provenance-bearing row from a legacy one.
+//
+// prov= is written only for the WEAKER confidences. Measured emits nothing, so a ledger whose rows were all
+// written from a live delta is byte-identical to one written before the confidence axis existed — the same
+// OMIT-when-default rule cid=/by= follow, and what keeps qackconcurrencycheck arm 7's round-trip over the
+// real 1,623-row ledger from moving a single byte until a backfill actually runs. Reconstructed writes the
+// canonical `recon` spelling; Unknown writes AckRecord::provRaw verbatim — never `recon` — so a hand-typed or
+// future-binary spelling this binary does not understand round-trips through a read+rewrite unchanged
+// instead of being relabelled as a reconstruction this binary never performed (see ackProvenanceFor).
+inline std::string ackProvenanceTokens( const AckRecord& r )
+{
+    if( !r.hasProvenance() )
+    {
+        return {};
+    }
+    EXPECTS( r.provenance != AckProvenance::Unknown || !r.provRaw.empty(),
+             "takeAckProvenance always pairs Unknown with the raw token it was read from" );
+    std::ostringstream t;
+    t << "now=" << r.now << " was=" << r.was << ' ';
+    if( r.provenance == AckProvenance::Reconstructed )
+    {
+        t << "prov=" << kAckProvReconToken << ' ';
+    }
+    else if( r.provenance == AckProvenance::Unknown )
+    {
+        // Never scopeSpecIsSpellable-gated like facet=/p= below: provRaw was read back by takeAckNamedToken,
+        // which only ever takes a single whitespace-delimited token in the first place, so it cannot contain
+        // a space or newline to begin with — there is nothing here a spellability check could catch.
+        t << "prov=" << r.provRaw << ' ';   // round-trip verbatim — never our canonical spelling, never claimed as ours
+    }
+    // facet= and p= are single whitespace-delimited tokens, so a value that cannot be spelled as one is OMITTED,
+    // the same closed-set rule by= uses (scopeSpecIsSpellable). A repository path may contain a space: written
+    // verbatim, `p=my dir/a.py:1` read back as path `my`, line 0, with the rest pushed into the reason, and the
+    // next ack committed that damage. A newline would split the record in two. An absent locator is the honest
+    // degrade: nothing reads p= to decide anything, and the finding's own key still identifies the row.
+    if( !r.facet.empty() && scopeSpecIsSpellable( r.facet ) )
+    {
+        t << "facet=" << r.facet << ' ';
+    }
+    if( !r.path.empty() && scopeSpecIsSpellable( r.path ) )
+    {
+        t << "p=" << r.path << ':' << r.line << ' ';
+    }
+    return t.str();
+}
 
 // the ledger's CANONICAL bytes for this map — what writeAckRecords publishes. Exposed on its own (H10,
 // capture-audit 2026-09-04) so an ack with nothing to accept can tell "the file is already canonical, leave
@@ -4352,11 +6918,12 @@ inline std::string renderAckRecords( const gtl::btree_map<std::string, AckRecord
 {
     std::ostringstream f;
     f << "# ripwire quality acks v1 — written by --quality-ack; a finding stays suppressed until it worsens past its acked magnitude\n";
-    f << "# format: ack <kind> <16-hex-key> <ackNow> [cid=<16-hex-content-id>] [by=<scope that acked it>] <reason to end of line> — one per line, kept SORTED by (kind,key) on every write (merge-friendly)\n";
+    f << "# format: ack <kind> <16-hex-key> <ackNow> [cid=<16-hex-content-id>] [by=<scope that acked it>] [now=<uint> was=<uint>] [prov=recon] [facet=<token>] [p=<path>:<line>] <reason to end of line> — one per line, kept SORTED by (kind,key) on every write (merge-friendly)\n";
+    f << "# PROVENANCE: now=/was=/facet=/p= exist only on rows a provenance-aware binary WROTE OR REFRESHED (2026-09-22+); a legacy row heals FORWARD on its next --quality-ack. prov=recon marks a row a backfill RECONSTRUCTED from the CURRENT tree rather than measured when it was accepted: it answers 'would this be gating now', NOT 'was it gating then'. A recon row is a CACHE, not a dated record — every --quality-ack re-derives the ones whose clone group it can still find, so a checkable value is never older than the last ack; one whose group this run did NOT find is left untouched and counted as unverified on stderr, because not finding a group is a floor (scoped scan, capped file, different tree), never proof it is gone. Absent prov= means measured live, and a measurement is never overwritten by a reconstruction. Only the two clone kinds can be reconstructed (their key is a member-set hash, so today's idiom verdict is recomputable); a numeric row's was= still needs the commit that accepted it, which no field here records.\n";
     for( const auto& [ mapKey, r ] : acks )                       // btree order → byte-stable, always-sorted file (the merge-friendly guarantee)
     {
         char hex[ 20 ];
-        std::snprintf( hex, sizeof( hex ), "%016llx", static_cast<unsigned long long>( r.key ) );
+        rw::formatTo( hex, sizeof( hex ), "{:016x}", static_cast<unsigned long long>( r.key ) );
         f << "ack " << r.kind << ' ' << hex << ' ' << r.ackNow << ' ';
         // R1: cid= is OMITTED entirely when unavailable rather than written as a zero — a row that never had
         // a content identity must not be indistinguishable from one whose body hashed to 0, and a repo that
@@ -4364,7 +6931,7 @@ inline std::string renderAckRecords( const gtl::btree_map<std::string, AckRecord
         if( r.cid != 0 )
         {
             char cidHex[ 20 ];
-            std::snprintf( cidHex, sizeof( cidHex ), "%016llx", static_cast<unsigned long long>( r.cid ) );
+            rw::formatTo( cidHex, sizeof( cidHex ), "{:016x}", static_cast<unsigned long long>( r.cid ) );
             f << "cid=" << cidHex << ' ';
         }
         // P1.4: same OMIT-when-unavailable rule cid= follows, and for the same reason — a repo whose sessions
@@ -4374,7 +6941,7 @@ inline std::string renderAckRecords( const gtl::btree_map<std::string, AckRecord
         {
             f << "by=" << r.by << ' ';
         }
-        f << ( r.reason.empty() ? "(no reason given)" : r.reason ) << '\n';
+        f << ackProvenanceTokens( r ) << ( r.reason.empty() ? "(no reason given)" : r.reason ) << '\n';
     }
     return f.str();
 }
@@ -4387,7 +6954,8 @@ inline bool writeAckRecords( const std::string& path, const gtl::btree_map<std::
     // concurrent run in eight left a single stray character on its own line in the committed ledger.
     if( !atomicWriteFile( path, renderAckRecords( acks ) ) )
     {
-        DEGRADED_PATH_ALERT( "quality: cannot write acks file" );
+        DISCLOSE( Diagnostics::answerRefused, "both callers report the failed publish and exit non-zero; no ledger is claimed written",
+                  "quality: cannot write acks file" );
         return false;
     }
     return true;
@@ -4495,14 +7063,14 @@ inline IdentityAliases identityAliases( const IngestResult& ing, const Graph& g,
         }
         const bool          hasCanon = ( i < g.canonId.size() && !g.canonId[i].empty() );
         const std::uint64_t curCanon = hasCanon ? fnv1a64( canonicalId( rel, s.scope, s.name ) ) : 0;
-        const std::uint64_t curPath  = pathQualifiedKey( rel, s.scope, s.name );
+        const std::uint64_t curPath  = pathQualifiedKey( rel, s );
         for( const std::string& anc : ancByFile[ s.fileId ] )
         {
             if( hasCanon )
             {
                 link( fnv1a64( canonicalId( anc, s.scope, s.name ) ), curCanon );
             }
-            link( pathQualifiedKey( anc, s.scope, s.name ), curPath );
+            link( pathQualifiedKey( anc, s ), curPath );
         }
     }
     // drop the entries poisoned by ambiguity above, so no consumer has to know about the 0 sentinel
@@ -4550,7 +7118,7 @@ inline void addSchemeAliases( IdentityAliases& al, const IngestResult& ing, cons
         }
         const std::string   rel{ relForHash( ing.files[ s.fileId ], root ) };
         const std::uint64_t oldKey = fnv1a64( canonicalId( rel, s.scope, s.name ) );
-        const std::uint64_t newKey = pathQualifiedKey( rel, s.scope, s.name );
+        const std::uint64_t newKey = pathQualifiedKey( rel, s );
         if( oldKey == newKey || oldKey == 0 || newKey == 0 )
         {
             continue;
@@ -4614,6 +7182,8 @@ inline std::size_t remapSnapshotIdentity( Snapshot& base, const IdentityAliases&
     healMap( base.paramsBySym );
     healMap( base.defsBySym );
     healMap( base.maskBySym );
+    healMap( base.maskReportBySym );
+    healMap( base.placeholderBySym );
     healMap( base.bodyHashBySym );
 
     // the two SORTED SETS — same add-never-overwrite rule, then restore the sorted invariant every
@@ -4939,9 +7509,9 @@ inline std::size_t applyAckRatchet( std::vector<Regression>& regs, const gtl::bt
 //     decides whether it still crosses that kind's bar.
 //   dead-code / api-surface — locBySym for existence, membership in the current `dead` / `publicApi` set
 //     for whether the state the finding named is still true right now.
-//   error-masking — locBySym for existence, `maskBySym[key] > 0` for whether a masking construct is still
-//     there (maskBySym only carries symbols with at least one hit — see errorMaskCountsBySym — so absence
-//     IS zero, not "unknown").
+//   error-masking / placeholder — locBySym for existence, `maskBySym[key] > 0` / `placeholderBySym[key] > 0`
+//     for whether a construct is still there (each map only carries symbols with at least one hit — see
+//     constructCountsBySym — so absence IS zero, not "unknown").
 //   duplication / new-clone-of-reused-helper — the ack key IS a member-set hash (cloneGroupHash), not a
 //     single symbol's key, so there is no one "target" to test existence of; only whether that EXACT group
 //     still clones today is checkable. Its absence is reported finding-gone, never target-gone: decomposing
@@ -5024,14 +7594,16 @@ inline std::optional<StaleAckWhy> staleForSetMembership( std::uint64_t key, cons
     return std::binary_search( liveSet.begin(), liveSet.end(), key ) ? std::nullopt : std::optional<StaleAckWhy>( StaleAckWhy::FindingGone );
 }
 
-inline std::optional<StaleAckWhy> staleForErrorMasking( std::uint64_t key, const Snapshot& snap )
+// error-masking and placeholder share one shape: locBySym for existence, then the kind's per-symbol COUNT
+// map (maskBySym / placeholderBySym, each carrying only symbols with at least one hit, so absence IS zero).
+inline std::optional<StaleAckWhy> staleForConstructCount( std::uint64_t key, const Snapshot& snap, const gtl::btree_map<std::uint64_t, std::uint32_t>& counts )
 {
     if( snap.locBySym.find( key ) == snap.locBySym.end() )
     {
         return StaleAckWhy::TargetGone;
     }
-    const auto it = snap.maskBySym.find( key );   // absent or zero — maskBySym only carries symbols with >=1 hit
-    return ( it == snap.maskBySym.end() || it->second == 0 ) ? std::optional<StaleAckWhy>( StaleAckWhy::FindingGone ) : std::nullopt;
+    const auto it = counts.find( key );
+    return ( it == counts.end() || it->second == 0 ) ? std::optional<StaleAckWhy>( StaleAckWhy::FindingGone ) : std::nullopt;
 }
 
 // duplication / new-clone-of-reused-helper: the key IS a member-set hash, not one symbol's key, so a miss
@@ -5078,7 +7650,11 @@ inline std::vector<StaleAck> computeStaleAcks( const gtl::btree_map<std::string,
         }
         else if( base == "error-masking" )
         {
-            why = staleForErrorMasking( rec.key, snap );
+            why = staleForConstructCount( rec.key, snap, snap.maskBySym );
+        }
+        else if( base == "placeholder" )
+        {
+            why = staleForConstructCount( rec.key, snap, snap.placeholderBySym );
         }
         else if( base == "duplication" || base == "new-clone-of-reused-helper" )
         {
@@ -5242,7 +7818,7 @@ inline std::string staleAcksXml( const std::vector<StaleAck>& staleAcks, EscapeF
     for( const StaleAck& sa : staleAcks )
     {
         char hex[ 20 ];
-        std::snprintf( hex, sizeof( hex ), "%016llx", static_cast<unsigned long long>( sa.key ) );
+        rw::formatTo( hex, sizeof( hex ), "{:016x}", static_cast<unsigned long long>( sa.key ) );
         out += "<sa kind=\"";
         out += sa.kind;
         out += "\" key=\"";
@@ -5288,7 +7864,7 @@ inline std::string staleAcksJsonArray( const std::vector<StaleAck>& staleAcks ) 
         }
         first = false;
         char hex[ 20 ];
-        std::snprintf( hex, sizeof( hex ), "%016llx", static_cast<unsigned long long>( sa.key ) );
+        rw::formatTo( hex, sizeof( hex ), "{:016x}", static_cast<unsigned long long>( sa.key ) );
         out += "{\"kind\":\"";
         out += rw::jsonesc::escapeMcp( sa.kind );
         out += "\",\"key\":\"";
@@ -5392,12 +7968,30 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                                              std::string_view root = {},
                                              const std::vector<std::string>& excludes = {},
                                              std::size_t maxFileBytes = kDefaultMaxFileBytes,
-                                             std::size_t* registerMacroExcludedOut = nullptr )   // P2.2: honest disclosure count, additive+optional — see isDeadCandidate
+                                             std::size_t* registerMacroExcludedOut = nullptr,   // P2.2: honest disclosure count, additive+optional — see isDeadCandidate
+                                             std::size_t* apiNewSurfaceOut = nullptr,          // Q-DIAL-4: the api-surface new-symbol COUNT that replaced N never-gating rows
+                                             std::vector<CloneIdiomFact>* cloneIdiomsOut = nullptr,   // every CURRENT-tree clone group's (hash, idiom), for the legacy-ack backfill
+                                             std::size_t* declinedCallExcludedOut = nullptr,          // symbols kept out of dead-code ONLY by a declined call (declinedCallMayReach)
+                                             std::size_t* valueRefExcludedOut = nullptr )             // ... ONLY because a table/field/argument holds them as a VALUE
 {
+    if( declinedCallExcludedOut )
+    {
+        *declinedCallExcludedOut = 0;
+    }
+    if( valueRefExcludedOut )
+    {
+        *valueRefExcludedOut = 0;
+    }
+    ASSUME( registerMacroExcludedOut == nullptr || registerMacroExcludedOut != apiNewSurfaceOut,
+                 "computeDelta: registerMacroExcludedOut and apiNewSurfaceOut must be distinct" );   // both default to nullptr, so the object form would dereference null
     std::vector<Regression> regs;
     if( registerMacroExcludedOut )
     {
         *registerMacroExcludedOut = 0;
+    }
+    if( apiNewSurfaceOut )
+    {
+        *apiNewSurfaceOut = 0;
     }
 
     // A4-P10 — HOIST the per-symbol quality key. It materializes a path-qualified string + hashes it; the
@@ -5427,7 +8021,7 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     // THE ORACLE is `base.locBySym` — computeSnapshot populates it for EVERY symbol that has a canonId
     // (public or not, body or not), so "is this canonId in locBySym" is the one clean, kind-independent
     // "existed at the baseline" test. It generalizes the api-surface kind's own isNewSymbol tier (B10.2e),
-    // which used exactly this map, to all ten kinds rather than adding a parallel mechanism.
+    // which used exactly this map, to every kind rather than adding a parallel mechanism.
     //
     // PER-KIND RULE (the ambiguous kinds decided deliberately, not by default):
     //   complexity / verbosity / nesting / params / api-surface / error-masking — the finding IS a symbol:
@@ -5447,6 +8041,10 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     //     be present in the baseline's bodyHashBySym ("a symbol absent from the baseline is a first write,
     //     never a REwrite"), so this kind can never produce a new-symbol row. Recorded explicitly below
     //     rather than derived, so the invariant is visible at the push site.
+    //   placeholder — ALWAYS new-symbol by construction, the mirror image of churn: the finding is the added
+    //     stub or TODO comment, which did not exist at the baseline whatever symbol it lands in. A placeholder
+    //     is an unfinished statement about new code, never evidence that something that worked got worse, so
+    //     it is printed and never gates.
     //
     // WHAT "PREEXISTING" CANNOT DETECT (stated in the XML comment + --help too): identity is the
     // root-relative canonId `path::scope::name`, so a symbol that was RENAMED or MOVED to another file reads
@@ -5471,12 +8069,12 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     // a canonId, so ANY other per-symbol record existing while locBySym is empty is only possible for a v1
     // sidecar; a genuinely-empty HEAD leaves every map and vector empty together.
     const bool baselineIsWhollyEmpty = base.locBySym.empty() && base.ccxBySym.empty() && base.nestBySym.empty()
-                                    && base.paramsBySym.empty() && base.maskBySym.empty() && base.bodyHashBySym.empty()
+                                    && base.paramsBySym.empty() && base.maskBySym.empty() && base.placeholderBySym.empty() && base.bodyHashBySym.empty()
                                     && base.cloneGroups.empty() && base.dead.empty() && base.publicApi.empty();
     const bool originOracleOk = !base.locBySym.empty() || baselineIsWhollyEmpty;
     if( !originOracleOk )
     {
-        DEGRADED_PATH_ALERT( "quality: baseline has no per-symbol loc map (pre-Q1 format) — origin unclassifiable, gating every finding" );
+        DISCLOSE( "quality: baseline has no per-symbol loc map (pre-Q1 format) — origin unclassifiable, gating every finding" );
     }
 
     const auto existedAtBaseline = [ & ]( std::uint64_t symKey )
@@ -5515,7 +8113,7 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     // relForHash spelling every sidecar key already uses) + the symbol's own 1-based start line.
     const auto stampLoc = [ & ]( NodeId i )
     {
-        VERIFY( !regs.empty() );
+        ASSUME( !regs.empty() );
         if( i >= ing.symbols.size() )
         {
             return; // degrade: no locator rather than a wrong one
@@ -5557,8 +8155,18 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     // the trap is handled the same way for every one of them.
     // `minorDelta` is the kind's materiality tier: a regression whose growth (now − was) is under it is
     // reported sev="minor" and does not gate exit 2 (0 = no tier, every regression is major).
+    //
+    // Q-DIAL-3 — `growthTiered` swaps that flat delta tier for the pair of thresholds kMaterialGrowthPct /
+    // kSubBarGrowthPct define, for complexity and verbosity only:
+    //   OVER the bar   — gate on a bar CROSSING (was <= bar < now) or on growth >= 25%; anything else is a
+    //                    real row, printed, sev="minor". It names debt the change did not create.
+    //   UNDER the bar  — a DOUBLING that clears the floor is a minor row instead of silence. Nothing here can
+    //                    gate: the symbol is still under its bar, and the row exists to be seen, not to stop
+    //                    a commit.
+    // `metricOf` takes the NodeId rather than the Symbol because verbosity's metric is not on the Symbol any
+    // more (codeLoc is read off the body bytes); the other three still just read a field.
     const auto perSymbolKind =
-        [ & ]( const char* kindName, std::uint32_t bar, std::uint32_t minorDelta,
+        [ & ]( const char* kindName, std::uint32_t bar, std::uint32_t minorDelta, bool growthTiered,
                const gtl::btree_map<std::uint64_t, std::uint32_t>& baseMap,
                auto metricOf )
     {
@@ -5570,7 +8178,7 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                 continue;
             }
             std::uint32_t& slot = nowBySym[ keyByNode[i] ];
-            slot = std::max( slot, metricOf( ing.symbols[i] ) );
+            slot = std::max( slot, metricOf( i ) );
         }
         ScratchMap<std::uint8_t> reported( ing.symbols.size() );
         for( NodeId i = 0; i < ing.symbols.size(); ++i )
@@ -5580,7 +8188,7 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                 continue;
             }
             const std::uint64_t key   = keyByNode[i];
-            if( !insertScratchSeen( reported, key, "quality: per-symbol seen scratch capacity exceeded" ) )
+            if( !insertScratchSeen( reported, key ) )
             {
                 continue; // already reported at an earlier overload
             }
@@ -5592,19 +8200,42 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
             const std::uint32_t now = nowIt->second;
             const auto          it  = baseMap.find( key );
             const std::uint32_t was = ( it == baseMap.end() ) ? 0u : it->second;
-            if( now > was && now > bar )
+            if( now <= was )
             {
-                regs.push_back( { kindName, g.canonId[i], was, now, key, minorDelta > 0 && now - was < minorDelta,
+                continue;   // nothing got worse on this axis
+            }
+            const std::uint64_t growthPct = ( std::uint64_t( now - was ) * 100 ) / std::max( was, 1u );
+            if( now > bar )
+            {
+                // numericRegressionIsMajor is the SAME formula rescoreNumericMajor calls when a later run
+                // re-scores this row's stored was=/now= off the ack ledger (see AckRecord's doc comment) —
+                // one body, so the live report and a re-score can never silently disagree.
+                const bool material = numericRegressionIsMajor( was, now, bar, minorDelta, growthTiered, growthPct );
+                regs.push_back( { kindName, g.canonId[i], was, now, key, !material,
                                   {}, !existedAtBaseline( key ) } );          // origin: the finding IS this symbol
+                stampLoc( i );
+            }
+            else if( growthTiered && was > 0 && growthPct >= kSubBarGrowthPct && now >= subBarGrowthFloor( bar ) )
+            {
+                // Q-DIAL-3 — still UNDER the bar, so this can never gate; it is the row that turns synthetics
+                // S4b (6 → 55 LOC) and S8-sub-bar (ccx 5 → 13) from silence into something a reader can see.
+                // `was > 0` is load-bearing, not defensive: growth is a RATIO and a brand-new symbol has
+                // nothing to double from, so without it every added function of 40 code lines or ccx 10
+                // reported as "grew 4200%". Measured on the 40-commit ref-pair replay: 38 of the 57 rows this
+                // tier first produced were exactly that (`was="0"`), including every symbol of the vendored
+                // timsort landing at 08416403.
+                regs.push_back( { kindName, g.canonId[i], was, now, key, /*isMinor=*/true,
+                                  {}, !existedAtBaseline( key ) } );
                 stampLoc( i );
             }
         }
     };
 
-    perSymbolKind( "complexity", kCcxBar,   kMinorCcxDelta,   base.ccxBySym,    []( const Symbol& s ){ return s.ccx; } );
-    perSymbolKind( "verbosity",  kLocBar,   kMinorLocDelta,   base.locBySym,    []( const Symbol& s ){ return s.loc; } );
-    perSymbolKind( "nesting",    kNestBar,  0,                base.nestBySym,   []( const Symbol& s ){ return std::uint32_t( s.maxNest ); } );
-    perSymbolKind( "params",     kParamBar, kMinorParamDelta, base.paramsBySym, []( const Symbol& s ){ return std::uint32_t( s.params ); } );
+    const std::vector<std::uint32_t> nowCodeLoc = codeLocByNode( ing );   // Q-DIAL-3 — the same rule computeSnapshot recorded the baseline with
+    perSymbolKind( "complexity", kCcxBar,   kMinorCcxDelta,   true,  base.ccxBySym,    [ & ]( NodeId i ){ return ing.symbols[i].ccx; } );
+    perSymbolKind( "verbosity",  kLocBar,   kMinorLocDelta,   true,  base.locBySym,    [ & ]( NodeId i ){ return nowCodeLoc[i]; } );
+    perSymbolKind( "nesting",    kNestBar,  0,                false, base.nestBySym,   [ & ]( NodeId i ){ return std::uint32_t( ing.symbols[i].maxNest ); } );
+    perSymbolKind( "params",     kParamBar, kMinorParamDelta, false, base.paramsBySym, [ & ]( NodeId i ){ return std::uint32_t( ing.symbols[i].params ); } );
 
     // PERF (P5W2) — the working-tree clone pass is the dominant --quality-delta cost: on a large private C++ corpus the
     // Type-3 pass alone is ~2.7-3.2 s (60 M intra-bucket pair-visits; tokenization is only ~3 %). It is a PURE
@@ -5626,6 +8257,94 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     const std::vector<CloneIdiomVerdict> exactIdioms = classifyCloneGroupIdioms( ing, exactClones );
     const std::vector<CloneIdiomVerdict> type3Idioms = classifyCloneGroupIdioms( ing, type3Clones );
 
+    // THE BACKFILL EXPORT. Deliberately taken BEFORE either reporting lambda runs, and without any of their
+    // filters: a legacy ack row is healed by matching its member-set hash, and that row was accepted under a
+    // baseline this run knows nothing about, so the group it names is almost never "new" HERE. Filtering by
+    // newness — or by the all-test-script skip, or by the fan-in floor — would hide exactly the rows the
+    // backfill exists to reach. Sorted and deduped by hash so the consumer can binary_search it and so two
+    // runs over the same tree export byte-identical facts (the determinism contract; both clone passes are
+    // themselves deterministic, and a group found by BOTH passes hashes the same and must collapse to one).
+    if( cloneIdiomsOut != nullptr )
+    {
+        const auto collect = [ & ]( const std::vector<CloneGroup>& cgs, const std::vector<CloneIdiomVerdict>& vx )
+        {
+            for( std::size_t ci = 0; ci < cgs.size() && ci < vx.size(); ++ci )
+            {
+                cloneIdiomsOut->push_back( { cloneGroupHash( cgs[ci], ing, root ), std::string( cloneIdiomName( vx[ci].idiom ) ) } );
+            }
+        };
+        collect( exactClones, exactIdioms );
+        collect( type3Clones, type3Idioms );
+        std::sort( cloneIdiomsOut->begin(), cloneIdiomsOut->end(),
+                   []( const CloneIdiomFact& a, const CloneIdiomFact& b )
+                   { return a.hash != b.hash ? a.hash < b.hash : a.idiom < b.idiom; } );
+        cloneIdiomsOut->erase( std::unique( cloneIdiomsOut->begin(), cloneIdiomsOut->end(),
+                                            []( const CloneIdiomFact& a, const CloneIdiomFact& b ) { return a.hash == b.hash; } ),
+                               cloneIdiomsOut->end() );
+    }
+
+    // ── Q-DIAL-5 (2026-09-10) — three shapes that are not THIS CHANGE'S duplication ─────────────────────
+    // Duplication's gating precision over 40 replayed commits was 0%: 11 gating rows, 9 noise and 2 wrong.
+    // Three mechanisms produced them, and each is a property of the GROUP rather than of its text, so each is
+    // decidable here without touching the clone matcher:
+    //   (a) ONE OVERLOAD SET — every member shares one canonical id. Overloads of a function are near-
+    //       identical by construction (emitTo|emitTo, sort::stable|sort::stable); reporting them as a copy is
+    //       reporting the language.
+    //   (b) WITHDRAWN — see the note below.
+    //   (c) VENDORED — every member sits under a vendored path (see isVendoredPath). Upstream's shape is not
+    //       this repo's to fix, and one commit produced 9 such rows.
+    // ONE-FILE IS NOT ON THIS LIST, and the reason is worth more than the rows it would have dropped. The
+    // audit's labelling rule W3b called a group whose members share one file "sibling/alternate
+    // implementations" (mergeHi|mergeLo, gallopLeft|gallopRight) and 13 groups were labelled WRONG by it. The
+    // clause was written, and TWO of this repo's own gates went red on it: test/clonededupcheck.sh's whole
+    // positive case is a copy of a reused helper appended to the SAME file, and test/qualitycheck.sh §3 pins
+    // a dup1/dup2 pair inside one new file as a duplication finding. Both were written deliberately, and both
+    // are right: a copy-pasted body is duplication wherever it lands, and file identity cannot tell a
+    // deliberate specialization from a paste. A hand rule in a labelling script does not outrank two gates
+    // that encode the opposite policy, so the drop is withdrawn rather than argued around. The rows it aimed
+    // at need the discriminator the acks themselves use — no shared domain identifier — which is a
+    // cloneidiom.h round, not a group-shape predicate.
+    //
+    // NOT a token floor either: raising kMinCloneTokens was measured and REFUTED. The canonical true positive
+    // (synthetic S1, a 12-line copy of a reused helper) is 59 tokens, while the idiom collisions in the same
+    // replay run 22, 24, 31, 36, 56, 65, 66, 74, 78, 91, 92, 96, 114 and 127 — a floor above 22 loses true
+    // positives before it clears any noise. Token count is the wrong axis.
+    const std::vector<std::string> vendoredPrefixes = vendoredPathPrefixes( root );
+    const auto cloneGroupIsOutOfScope = [ & ]( const CloneGroup& cg )
+    {
+        if( cg.members.size() < 2 )
+        {
+            return false;
+        }
+        bool             oneId   = true;
+        bool             allVend = true;
+        std::string_view firstId;
+        bool             haveFirst = false;
+        for( NodeId m : cg.members )
+        {
+            if( m >= ing.symbols.size() || m >= g.canonId.size() )
+            {
+                return false;   // unclassifiable member — never claim a whole-group property
+            }
+            const std::uint32_t f = ing.symbols[m].fileId;
+            if( f >= ing.files.size() )
+            {
+                return false;
+            }
+            if( !isVendoredPath( relForHash( ing.files[f], root ), vendoredPrefixes ) )
+            {
+                allVend = false;
+            }
+            if( !haveFirst )
+            {
+                firstId = g.canonId[m]; haveFirst = true;
+                continue;
+            }
+            if( g.canonId[m] != firstId ) { oneId = false; }
+        }
+        return oneId || allVend;
+    };
+
     gtl::btree_map<std::uint64_t, std::uint8_t> dupSeen;
     const auto reportNewClones =
         [ & ]( const std::vector<CloneGroup>& cgs, const std::vector<CloneIdiomVerdict>& vx )
@@ -5646,11 +8365,15 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
             bool allTestScript = !cg.members.empty();
             for( NodeId m : cg.members )
             {
-                if( m >= ing.symbols.size() || !isTestScriptPath( ing.files[ ing.symbols[m].fileId ] ) ) { allTestScript = false; break; }
+                if( m >= ing.symbols.size() || !isTestScriptPath( rootRelPath( ing, ing.symbols[m].fileId ) ) ) { allTestScript = false; break; }
             }
             if( allTestScript )
             {
                 continue;
+            }
+            if( cloneGroupIsOutOfScope( cg ) )
+            {
+                continue;   // Q-DIAL-5 — an overload set, one file, or vendored upstream (see the block above)
             }
             if( !dupSeen.insert( { h, 1 } ).second )
             {
@@ -5686,6 +8409,8 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     const std::vector<std::uint64_t> topLevelCallees = topLevelCalleeNameHashes( ing );   // W1-S2: dead-kind evidence, built once
     const std::vector<std::string>   macroNames      = registeredMacroNames( root );      // P2.2: built-ins + .ripwire_config
     const std::vector<NodeId>        macroIds        = registeredMacroSymbolIds( ing, macroNames );
+    const std::vector<NodeId>        pythonDispatch  = pythonDispatchedMethodIds( ing, g );
+    const ValueRefIndex              valueRefs( ing );                                     // reference-as-value round: the --dead-code verb's rule
     for( NodeId i = 0; i < ing.symbols.size(); ++i )
     {
         if( i >= g.canonId.size() || g.canonId[i].empty() )
@@ -5693,11 +8418,27 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
             continue;
         }
         bool macroExempt = false;
-        if( !isDeadCandidate( ing, g, i, topLevelCallees, macroIds, &macroExempt ) )
+        if( !isDeadCandidate( ing, g, i, topLevelCallees, macroIds, pythonDispatch, &macroExempt ) )
         {
             if( macroExempt && registerMacroExcludedOut )
             {
                 ++( *registerMacroExcludedOut );   // P2.2: would be dead-code but for the macro exemption — disclosed count
+            }
+            continue;
+        }
+        if( declinedCallMayReach( g, i ) )
+        {
+            if( declinedCallExcludedOut )
+            {
+                ++( *declinedCallExcludedOut );    // would be dead-code but for a declined call that may reach it — disclosed count
+            }
+            continue;
+        }
+        if( valueRefs.isValueReferenced( i ) )   // checked LAST: one entity, one reason (the --dead-code verb's order)
+        {
+            if( valueRefExcludedOut )
+            {
+                ++( *valueRefExcludedOut );        // a table, field or argument holds it as a value — disclosed count
             }
             continue;
         }
@@ -5748,6 +8489,17 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
         std::uint32_t& slot = nowParamsBySym[ keyByNode[i] ];
         slot = std::max( slot, std::uint32_t( ing.symbols[i].params ) );
     }
+    // Q-DIAL-4 — the two inputs the tiering below reads. `paramsRowKeys` is derived from the rows ALREADY
+    // pushed rather than plumbed out of perSymbolKind: `params` is the only kind that can have reported an
+    // arity change by now, and reading it off `regs` keeps the fold honest even if that kind's own gate moves.
+    std::vector<std::uint64_t> paramsRowKeys;
+    for( const Regression& r : regs )
+    {
+        if( r.kind == "params" ) { paramsRowKeys.push_back( r.key ); }
+    }
+    std::sort( paramsRowKeys.begin(), paramsRowKeys.end() );
+    const std::vector<std::uint8_t> trailingDefaults = trailingDefaultByNode( ing );
+
     ScratchMap<std::uint8_t> apiSeen( ing.symbols.size() );
     for( NodeId i = 0; i < ing.symbols.size(); ++i )
     {
@@ -5756,7 +8508,7 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
             continue;
         }
         const std::uint64_t key = keyByNode[i];
-        if( !insertScratchSeen( apiSeen, key, "quality: api seen scratch capacity exceeded" ) )
+        if( !insertScratchSeen( apiSeen, key ) )
         {
             continue; // overload of an already-reported symbol
         }
@@ -5764,7 +8516,21 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
         if( !std::binary_search( base.publicApi.begin(), base.publicApi.end(), key ) )
         {
             const bool isNewSymbol = !existedAtBaseline( key );                // SAME oracle the r26 origin axis uses — one source of truth
-            regs.push_back( { "api-surface", g.canonId[i], 0, 0, key, isNewSymbol, isNewSymbol ? "new-symbol" : "contract-change", isNewSymbol } );
+            if( isNewSymbol )
+            {
+                // Q-DIAL-4 — A COUNT, NOT N ROWS. This row could never gate (the legend says so), it is one
+                // per new export, and it dominated the document: 103 of 119 api-surface rows over 40 replayed
+                // commits, 193 of the 1,177 rows in this repo's own committed ack ledger — acked one at a
+                // time, by hand, for a fact the header can state in one attribute. api-new-surface= on the
+                // root says how much new public surface arrived; nothing is hidden, and nothing about it was
+                // ever actionable per row.
+                if( apiNewSurfaceOut )
+                {
+                    ++( *apiNewSurfaceOut );
+                }
+                continue;
+            }
+            regs.push_back( { "api-surface", g.canonId[i], 0, 0, key, false, "contract-change", false } );   // a visibility flip: it existed, and it is public now
             stampLoc( i );
             continue;
         }
@@ -5775,21 +8541,56 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
             continue; // no baseline params recorded — nothing to compare
         }
         const std::uint32_t nowParams = nowParamsBySym[ key ];                // MAX-aggregated — see the overload-trap note above
-        if( nowParams != pit->second )
+        if( nowParams == pit->second )
         {
-            regs.push_back( { "api-surface", g.canonId[i], pit->second, nowParams, key, false, "contract-change", false } );   // origin: reached only for a symbol already in the baseline public set
-            stampLoc( i );
+            continue;
         }
+        if( nowParams < pit->second )
+        {
+            continue;   // Q-DIAL-4 — the surface got SMALLER. This document's first sentence is "only what a
+                        // change made WORSE"; three rows over 40 commits reported an arity DROP as a
+                        // regression (probeBodyCost 7->5, selectMonotoneBodySubset 7->5,
+                        // liftPackageDirMention 4->3). Drift is not the contract this verb publishes.
+        }
+        if( std::binary_search( paramsRowKeys.begin(), paramsRowKeys.end(), key ) )
+        {
+            continue;   // Q-DIAL-4 — ONE FACT, ONE ROW. The `params` kind already reported this symbol's arity
+                        // change, and it is the highest-precision kind in the table (77% TRUE); a second row
+                        // saying the same thing under another kind is what agents ack. Synthetic S3
+                        // (3 -> 7 parameters) produced two rows for one edit.
+        }
+        // Q-DIAL-4 — one ADDED parameter that carries a DEFAULT is source-compatible by construction: every
+        // existing caller still compiles, which is what 113 of this repo's 132 api-surface acks say in those
+        // words. Still a row (the contract moved), reported sev="minor".
+        const bool trailingDefault = nowParams == pit->second + 1 && i < trailingDefaults.size() && trailingDefaults[i] != 0;
+        regs.push_back( { "api-surface", g.canonId[i], pit->second, nowParams, key, trailingDefault, "contract-change", false } );   // origin: reached only for a symbol already in the baseline public set
+        stampLoc( i );
     }
 
     // ── §D#4-1 error-masking (GitClear +47%) ──────────────────────────────────────────────────────────────
     // NEW error-masking constructs vs baseline, per symbol: aggregate the current side to a per-canonId COUNT
-    // (SUM over overloads, mirroring computeSnapshot's errorMaskCountsBySym), and flag a symbol whose count
+    // (SUM over overloads, mirroring computeSnapshot's constructCountsBySym), and flag a symbol whose count
     // GREW vs the baseline count (was 0 for a symbol/mask absent from the baseline). No bar — any NEW masking
     // construct is the regression; the count magnitude is the was/now signal. A pre-existing empty catch in an
     // UNTOUCHED symbol keeps the same count on both sides → not flagged (the quality-delta contract).
+    //
+    // REPORT-ONLY SHAPES (noise control). The widened handler shapes (log-only / rethrow-only) gate only in a
+    // language kHandlerShapeGates lists; elsewhere they are counted in maskReportBySym as well. A row whose
+    // growth is entirely report-only shapes — the GATING part of the count (total minus report-only) did not
+    // grow — is still printed, as sev="minor", so it never fires exit 2. One row per symbol either way, so the
+    // ack identity (kind, key) and the magnitude it ratchets on stay what they were.
+    //
+    // PLACEHOLDER (the eleventh kind) rides the same pass: a stub or TODO the change ADDED, per symbol, the same
+    // grew-vs-baseline count. It is new-symbol BY CONSTRUCTION — the finding is the added placeholder itself,
+    // code that did not exist at the baseline — so it is marked origin="new-symbol" on every row and never
+    // gates, whatever symbol it lands in (the same way short-horizon-churn is preexisting by construction).
     {
-        const gtl::btree_map<std::uint64_t, std::uint32_t> nowMask = errorMaskCountsBySym( ing, root );
+        const ConstructCounts nowCounts = constructCountsBySym( ing, root );
+        const auto countIn = []( const gtl::btree_map<std::uint64_t, std::uint32_t>& m, std::uint64_t key )
+        {
+            const auto it = m.find( key );
+            return ( it == m.end() ) ? 0u : it->second;
+        };
         // report each canonId once, at its first defining symbol (a mask count is a per-canonId magnitude).
         ScratchMap<std::uint8_t> maskSeen( ing.symbols.size() );
         for( NodeId i = 0; i < ing.symbols.size(); ++i )
@@ -5798,22 +8599,25 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
             {
                 continue;
             }
-            const std::uint64_t key = keyByNode[i];
-            const auto          nit = nowMask.find( key );
-            if( nit == nowMask.end() )
+            const std::uint64_t key     = keyByNode[i];
+            const std::uint32_t nowMask = countIn( nowCounts.mask, key );
+            const std::uint32_t nowStub = countIn( nowCounts.placeholder, key );
+            if( ( nowMask == 0 && nowStub == 0 ) || !insertScratchSeen( maskSeen, key ) )
             {
-                continue; // this symbol masks no errors now
+                continue; // nothing here now, or already reported at an earlier overload of this id
             }
-            if( !insertScratchSeen( maskSeen, key, "quality: mask seen scratch capacity exceeded" ) )
+            const std::uint32_t wasMask = countIn( base.maskBySym, key );
+            if( nowMask > wasMask )
             {
-                continue; // already reported at an earlier overload of this id
+                const std::uint32_t nowGating = nowMask - std::min( nowMask, countIn( nowCounts.maskReport, key ) );
+                const std::uint32_t wasGating = wasMask - std::min( wasMask, countIn( base.maskReportBySym, key ) );
+                regs.push_back( { "error-masking", g.canonId[i], wasMask, nowMask, key, nowGating <= wasGating, {}, !existedAtBaseline( key ) } );
+                stampLoc( i );
             }
-            const std::uint32_t now = nit->second;
-            const auto          bit = base.maskBySym.find( key );
-            const std::uint32_t was = ( bit == base.maskBySym.end() ) ? 0u : bit->second;
-            if( now > was )
+            const std::uint32_t wasStub = countIn( base.placeholderBySym, key );
+            if( nowStub > wasStub )
             {
-                regs.push_back( { "error-masking", g.canonId[i], was, now, key, false, {}, !existedAtBaseline( key ) } );
+                regs.push_back( { "placeholder", g.canonId[i], wasStub, nowStub, key, false, {}, true } );   // new-symbol by construction (above)
                 stampLoc( i );
             }
         }
@@ -5851,13 +8655,13 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                 std::vector<std::uint8_t> fixtureByFile( ing.files.size(), 0 );
                 for( std::uint32_t f = 0; f < ing.files.size(); ++f )
                 {
-                    fixtureByFile[f] = isFixturePath( ing.files[f] ) ? 1 : 0;
+                    fixtureByFile[f] = isFixturePath( rootRelPath( ing, f ) ) ? 1 : 0;
                 }
 
                 // B10.2d — SELF-vs-AMBIENT window cutoff, same basis as gates 1/3 (HEAD's own committer epoch
                 // minus the window, never wall-clock). A failed lookup (should not happen here since refOk
                 // already proved resolvable history, but kept defensive) leaves churnCutoffEpoch==0, which
-                // degrades every symbol below to AMBIENT (churnEditTouchesHotLine is gated on `> 0`).
+                // degrades every symbol below to AMBIENT (churnEditWindowCommitCount is gated on `> 0`).
                 std::int64_t churnCutoffEpoch = 0;
                 {
                     const std::string epochStr = gitOneLine( std::string( root ), "log -1 --format=%ct HEAD 2>/dev/null" );
@@ -5883,9 +8687,9 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                         continue;
                     }
                     const Symbol& s = ing.symbols[i];
-                    if( s.kind == SymKind::Section )
+                    if( s.kind == SymKind::Section || s.kind == SymKind::ModuleScope )
                     {
-                        continue; // doc sections churn by design (exempt)
+                        continue; // doc sections churn by design; a module scope has no body to churn (exempt)
                     }
                     if( s.fileId >= commitCounts.size() || commitCounts[s.fileId] < kShortHorizonMinCommits )
                     {
@@ -5898,8 +8702,8 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                     // W1-S2: join on the path-qualified identity, NOT keyByNode — a scope-less symbol's
                     // bare-canonId key folded every same-named symbol in the tree into one identity, so
                     // gates 2+3 judged cross-file FOLDS (see bodyHashesBySym's doc; gate: §1d).
-                    const std::uint64_t key = pathQualifiedKey( relForHash( ing.files[ s.fileId ], root ), s.scope, s.name );
-                    if( !insertScratchSeen( churnSeen, key, "quality: churn seen scratch capacity exceeded" ) )
+                    const std::uint64_t key = pathQualifiedKey( relForHash( ing.files[ s.fileId ], root ), s );
+                    if( !insertScratchSeen( churnSeen, key ) )
                     {
                         continue; // one report per (file, scope, name) identity — same-file overloads fold
                     }
@@ -5925,13 +8729,23 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                     }
 
                     // B10.2d: SELF vs AMBIENT — does THIS diff modify a pre-existing line that was itself
-                    // last committed inside the window? See the section comment above churnEditTouchesHotLine.
-                    const bool self = churnCutoffEpoch > 0
-                                    && churnEditTouchesHotLine( churnHunkMemo, std::string( root ),
-                                                                std::string( relForHash( ing.files[ s.fileId ], root ) ),
-                                                                s.line, s.loc, churnCutoffEpoch );
+                    // last committed inside the window? See the section comment above churnEditWindowCommitCount.
+                    // Q-DIAL-1 — ONE blame-derived number decides both the facet and the severity (see
+                    // churnEditWindowCommitCount): >=1 in-window commit on the edited lines is SELF, and it
+                    // is now INFORMATIONAL exactly as AMBIENT already was; >= kShortHorizonMinCommits is the
+                    // rewrite-thrash that gates. Measured on twelve LANDED commits of this repo (audit Q1
+                    // §2b): the old "SELF gates" rule fired 135 of 171 gating rows, 0% of them a finding a
+                    // reviewer would act on, because on an active branch the symbol you wrote this week and
+                    // are touching again is churn="self" by construction.
+                    const std::uint32_t windowCommits = churnCutoffEpoch > 0
+                                                      ? churnEditWindowCommitCount( churnHunkMemo, std::string( root ),
+                                                                                    std::string( relForHash( ing.files[ s.fileId ], root ) ),
+                                                                                    s.line, s.loc, churnCutoffEpoch )
+                                                      : 0u;
+                    const bool self  = windowCommits > 0;
+                    const bool gates = windowCommits >= kShortHorizonMinCommits;
                     regs.push_back( { "short-horizon-churn", g.canonId[i], 0, commitCounts[ s.fileId ], key,
-                                      !self, self ? "self" : "ambient", false } );   // now = window commit count on the file; origin: ALWAYS preexisting (gate 2 above required a baseline body)
+                                      !gates, self ? "self" : "ambient", false } );   // now = window commit count on the file; origin: ALWAYS preexisting (gate 2 above required a baseline body)
                     stampLoc( i );
                 }
             }
@@ -5948,14 +8762,35 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
     {
         const auto* ro = g.inEdges.rowOffsets();
         gtl::btree_map<std::uint64_t, std::uint8_t> reuseSeen;   // clone-group count is not strictly bounded by symbol count, so keep the unbounded sorted map here
-        const auto reportReusedClones = [ & ]( const std::vector<CloneGroup>& cgs )
+        // T13/fix2: reportReusedClones read the SAME clone vectors as reportNewClones (duplication, above)
+        // but carried neither of its two demotions — the all-test-script skip and the idiom→minor demotion —
+        // so a clone group entirely composed of test SCRIPTS (sibling shell gates repeating the house
+        // mcp_call()-style boilerplate by convention) fired this kind even though `duplication` exempts the
+        // identical shape. Both demotions now mirror reportNewClones exactly: the skip continues outright
+        // (never a row), and the idiom verdict rides the row the same way (vd.demoted / cloneIdiomName).
+        const auto reportReusedClones = [ & ]( const std::vector<CloneGroup>& cgs, const std::vector<CloneIdiomVerdict>& vx )
         {
-            for( const CloneGroup& cg : cgs )
+            for( std::size_t ci = 0; ci < cgs.size(); ++ci )
             {
+                const CloneGroup&        cg = cgs[ci];
+                const CloneIdiomVerdict& vd = vx[ci];
                 const std::uint64_t h = cloneGroupHash( cg, ing, root );
                 if( std::binary_search( base.cloneGroups.begin(), base.cloneGroups.end(), h ) )
                 {
                     continue; // group already existed → not new
+                }
+                // B10.1a (mirrors reportNewClones): a clone group ENTIRELY composed of test-SCRIPT members
+                // is fixture-class noise — sibling shell test scripts repeat near-identical setup/ok/no
+                // boilerplate by convention (see isTestScriptPath). Exempt only when every member is a test
+                // script, so a real src/ ↔ test-script clone (still worth a look) is unaffected.
+                bool allTestScript = !cg.members.empty();
+                for( NodeId m : cg.members )
+                {
+                    if( m >= ing.symbols.size() || !isTestScriptPath( rootRelPath( ing, ing.symbols[m].fileId ) ) ) { allTestScript = false; break; }
+                }
+                if( allTestScript )
+                {
+                    continue;
                 }
                 // r27 SUSPICION-C FIX — "the reused helper is preexisting BY CONSTRUCTION" was asserted here
                 // (and in fbc527e's commit message) but never ENFORCED: fan-in ≥ 3 is trivially reached by a
@@ -5985,6 +8820,11 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                 {
                     continue; // no PREEXISTING reused helper in the group
                 }
+                if( cloneGroupIsOutOfScope( cg ) )
+                {
+                    continue;   // Q-DIAL-5 — the same three shapes, on the same groups: a helper cannot have
+                                // eroded its own reuse by being overloaded, and an upstream body is not ours.
+                }
                 if( !reuseSeen.insert( { h, 1 } ).second )
                 {
                     continue; // same member-set already reported
@@ -6007,12 +8847,13 @@ inline std::vector<Regression> computeDelta( const IngestResult& ing, const Grap
                         joined += " | ";
                     }
                 }
-                regs.push_back( { "new-clone-of-reused-helper", joined, 0, maxFanin, h, false, {}, cloneGroupIsNew( cg ) } );   // now = the eroded helper's fan-in; ack identity = the member-set hash
+                regs.push_back( { "new-clone-of-reused-helper", joined, 0, maxFanin, h, vd.demoted,
+                                  std::string( cloneIdiomName( vd.idiom ) ), cloneGroupIsNew( cg ) } );   // now = the eroded helper's fan-in; ack identity = the member-set hash
                 stampCloneLoc( cg );
             }
         };
-        reportReusedClones( exactClones );
-        reportReusedClones( type3Clones );
+        reportReusedClones( exactClones, exactIdioms );
+        reportReusedClones( type3Clones, type3Idioms );
     }
 
     std::sort( regs.begin(), regs.end(), []( const Regression& a, const Regression& b )
@@ -6041,6 +8882,28 @@ inline bool isHeaderPath( std::string_view path ) noexcept
 // re-deriving it. The --dead-code block below keeps only what is its own — the per-file sourceFor() cache
 // that amortizes this scan across every candidate in the tree; a single-symbol check has nothing to
 // amortize, so it calls this directly on its own one-off read.
+//
+// 0.6.6 D4: a `static` inside a COMMENT is not a linkage specifier. A Python def's signature span runs on through the
+// comment lines that open its body, so `# the static type is unchanged` there made a pytest method a "high-confidence"
+// internal-linkage row. offsetInComment answers, for a byte of the span, whether a line comment (`//` or `#`) opened
+// earlier on its line or a `/*` opened earlier in the span is still unclosed — language-agnostic, because a sig span
+// opens at the def itself, so a `#` or `//` before the token on its line is a comment in every grammar that has one
+// (a `#` inside a string literal reads as a comment too: the conservative side, one row fewer, never one more).
+inline bool offsetInComment( std::string_view source, std::size_t spanBegin, std::size_t position ) noexcept
+{
+    EXPECTS( spanBegin <= position && position <= source.size() );
+    const std::size_t newline   = position == 0 ? std::string_view::npos : source.rfind( '\n', position - 1 );
+    const std::size_t lineBegin = std::max( spanBegin, newline == std::string_view::npos ? std::size_t( 0 ) : newline + 1 );
+    const std::string_view head = source.substr( lineBegin, position - lineBegin );
+    if( head.find( '#' ) != std::string_view::npos || head.find( "//" ) != std::string_view::npos )
+    {
+        return true;
+    }
+    const std::string_view span  = source.substr( spanBegin, position - spanBegin );
+    const std::size_t      open  = span.rfind( "/*" );
+    return open != std::string_view::npos && span.find( "*/", open + 2 ) == std::string_view::npos;
+}
+
 inline bool sourceHasStaticToken( std::string_view source, std::size_t sigStartByte, std::size_t sigEndByte ) noexcept
 {
     const std::size_t begin = std::min( sigStartByte, source.size() );
@@ -6056,13 +8919,100 @@ inline bool sourceHasStaticToken( std::string_view source, std::size_t sigStartB
         const auto isIdentifier = []( char c ) noexcept { return std::isalnum( static_cast<unsigned char>( c ) ) || c == '_'; };
         const bool leftBoundary  = position == begin || !isIdentifier( source[ position - 1 ] );
         const bool rightBoundary = position + token.size() == end || !isIdentifier( source[ position + token.size() ] );
-        if( leftBoundary && rightBoundary )
+        if( leftBoundary && rightBoundary && !offsetInComment( source, begin, position ) )
         {
             return true;
         }
         position += token.size();
     }
     return false;
+}
+
+// The nearest non-blank, non-comment line above a Python def at `defByte` (or the def's own first byte) opens with '@'.
+inline bool pythonDefIsDecorated( std::string_view source, std::size_t defByte ) noexcept
+{
+    EXPECTS( defByte <= source.size() );
+    const std::size_t own = source.find_first_not_of( " \t", defByte );
+    if( own != std::string_view::npos && source[ own ] == '@' )
+    {
+        return true;
+    }
+    std::size_t lineEnd = defByte == 0 ? std::string_view::npos : source.rfind( '\n', defByte - 1 );   // the newline ending the line above
+    while( lineEnd != std::string_view::npos && lineEnd > 0 )
+    {
+        const std::size_t prevNewline = source.rfind( '\n', lineEnd - 1 );
+        const std::size_t lineBegin   = prevNewline == std::string_view::npos ? 0 : prevNewline + 1;
+        const std::size_t text        = source.find_first_not_of( " \t\r", lineBegin );
+        const bool        blankOrNote = text == std::string_view::npos || text >= lineEnd || source[ text ] == '#';
+        if( !blankOrNote )
+        {
+            return source[ text ] == '@';
+        }
+        lineEnd = prevNewline;
+    }
+    return false;
+}
+
+// The nearest `class <Name>(…):` header above `beforeByte` names a *TestCase among its OWN bases.
+inline bool pythonClassBasesNameTestCase( std::string_view source, std::string_view className, std::size_t beforeByte )
+{
+    const std::string header = "class " + std::string( className );
+    for( std::size_t at = source.rfind( header, beforeByte ); at != std::string_view::npos; at = at == 0 ? std::string_view::npos : source.rfind( header, at - 1 ) )
+    {
+        const std::size_t after = at + header.size();
+        if( after < source.size() && ( source[ after ] == '(' || source[ after ] == ':' || source[ after ] == ' ' ) )
+        {
+            const std::size_t colon = source.find( ':', after );
+            return source.substr( after, colon == std::string_view::npos ? 0 : colon - after ).find( "TestCase" ) != std::string_view::npos;
+        }
+    }
+    return false;
+}
+
+// 0.6.6 D4: a DECORATED Python def. It is not a --dead-code / dead_code_candidate= row, and it is counted apart from the
+// test-runner roots below (decorated-excluded=), because the reason differs: a decorator MAY register the def (`@app.route`,
+// `@pytest.fixture`, `@click.command` — the registry's call is invisible to the graph), but a plain wrapper
+// (`@staticmethod`, `@property`, `@functools.lru_cache`) registers nothing. Such a row's only Python "linkage" evidence is a
+// non-comment `static` token (a parameter named static), which is never real linkage, so dropping it removes a claim the
+// detector could not back; the count says how many were dropped for this reason alone. Python only.
+inline bool pythonDecoratedDef( const Symbol& s, std::string_view source ) noexcept
+{
+    return s.lang == Lang::Python && s.sigStartByte <= source.size() && pythonDefIsDecorated( source, s.sigStartByte );
+}
+
+// 0.6.6 D4: a Python def that a TEST RUNNER reaches with no call the index can see — so zero in-edges on it is not
+// evidence of anything, and --dead-code / --safe-delete's dead_code_candidate= must not name it (runner-root-excluded=):
+//   * pytest discovery in a test_*.py / *_test.py file: a `test*` function or method, and the xunit-style hooks
+//     (setup_module, setup_method, teardown_class …);
+//   * unittest: a `test*` method or a setUp/tearDown/setUpClass/tearDownClass/asyncSetUp/asyncTearDown hook of a class
+//     whose OWN base list names a *TestCase (unittest.TestCase, IsolatedAsyncioTestCase, a framework's TestCase).
+// Not covered, all on the "still reported" side: a TestCase subclass reached only through an intermediate base class,
+// and pytest's python_files/python_functions overrides from a config file. Python only; every other language is false.
+inline bool pythonRunnerRoot( std::string_view path, const Symbol& s, std::string_view source ) noexcept
+{
+    if( s.lang != Lang::Python || s.sigStartByte > source.size() )
+    {
+        return false;
+    }
+    const std::size_t      slash      = path.rfind( '/' );
+    const std::string_view baseName   = slash == std::string_view::npos ? path : path.substr( slash + 1 );
+    const bool             pytestFile = ( baseName.starts_with( "test_" ) || baseName.ends_with( "_test.py" ) ) && baseName.ends_with( ".py" );
+    const std::string_view name       = s.name;
+    constexpr std::array<std::string_view, 8> kXunitHooks = { "setup_module", "teardown_module", "setup_function", "teardown_function",
+                                                              "setup_class",  "teardown_class",  "setup_method",   "teardown_method" };
+    constexpr std::array<std::string_view, 6> kUnittestHooks = { "setUp", "tearDown", "setUpClass", "tearDownClass", "asyncSetUp", "asyncTearDown" };
+    const auto listed = []( const auto& table, std::string_view n ) noexcept { return std::find( table.begin(), table.end(), n ) != table.end(); };
+    if( pytestFile && ( name.starts_with( "test" ) || listed( kXunitHooks, name ) ) )
+    {
+        return true;
+    }
+    if( s.scope.empty() || !( name.starts_with( "test" ) || listed( kUnittestHooks, name ) ) )
+    {
+        return false;
+    }
+    const std::size_t scopeSep = s.scope.rfind( "::" );
+    return pythonClassBasesNameTestCase( source, scopeSep == std::string::npos ? std::string_view( s.scope ) : std::string_view( s.scope ).substr( scopeSep + 2 ),
+                                         s.sigStartByte );
 }
 
 // lane/safe-delete: the --dead-code high-confidence PRECONDITIONS on symbol KIND/PLACEMENT alone — a

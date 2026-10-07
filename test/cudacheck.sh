@@ -34,7 +34,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 FIX="$ROOT/test/cudafix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -150,7 +150,9 @@ printf '%s' "$MAP" | grep -q 'n="rk_devAccum"' \
 #     indexing the table. The test reads the attributes off the <uses> element rather than grepping the
 #     document for `external="1"`, because the schema LEGEND explains that attribute in prose — a naive
 #     whole-output grep matches the legend and fails on a correct run.
-"$BIN" "$FIX" --no-cache --uses=rk_scaleTable >"$TMP/u2" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact, whose root also carries schema= before of=; this arm pins the full-default
+# root spelling (<uses of= defs= external=), so it asks for the full legend.
+"$BIN" "$FIX" --no-cache --uses=rk_scaleTable --legend=full >"$TMP/u2" 2>/dev/null
 grep -q 'role="read" p="[^"]*reduceKernels\.cu:[0-9]' "$TMP/u2" \
     && grep -q 'uses of="rk_scaleTable" defs="[1-9][0-9]*" external="0"' "$TMP/u2" \
     && ok "--uses=rk_scaleTable resolves the device-side read to a real def (defs>=1, external=0)" \
@@ -173,20 +175,20 @@ grep -q '__global__ void rk_reduceSum' "$TMP/exp2" \
 # ── 9) determinism + G4 well-formedness + minification ────────────────────────────────────────────────
 "$BIN" "$FIX" --no-cache >"$TMP/a" 2>/dev/null
 "$BIN" "$FIX" --no-cache >"$TMP/b" 2>/dev/null
-cmp -s "$TMP/a" "$TMP/b" && ok "determinism (two cold runs byte-identical)" || no "non-deterministic on a .cu corpus"
+if cmp -s "$TMP/a" "$TMP/b"; then ok "determinism (two cold runs byte-identical)"; else no "non-deterministic on a .cu corpus"; fi
 "$BIN" "$FIX" >"$TMP/w1" 2>/dev/null; "$BIN" "$FIX" >"$TMP/w2" 2>/dev/null
-cmp -s "$TMP/w1" "$TMP/w2" && ok "determinism (warm/cached runs byte-identical)" || no "warm run differs from itself"
+if cmp -s "$TMP/w1" "$TMP/w2"; then ok "determinism (warm/cached runs byte-identical)"; else no "warm run differs from itself"; fi
 cmp -s "$TMP/a" "$TMP/w2" && ok "warm run matches the cold run (cache carries .cu/.cuh facts correctly)" \
                           || no "warm .cu run differs from cold — cache/parserVer mismatch"
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/a" 2>/dev/null && ok "G4: .cu map XML well-formed" || no "G4: malformed XML on a .cu corpus"
+    if xmllint --noout "$TMP/a" 2>/dev/null; then ok "G4: .cu map XML well-formed"; else no "G4: malformed XML on a .cu corpus"; fi
 else
     ok "xmllint unavailable — G4 skipped"
 fi
-[ "$( grep -c '' "$TMP/a" )" -le 1 ] && ok "output is minified (no stray newlines)" || no "newlines outside CDATA"
+if [ "$( grep -c '' "$TMP/a" )" -le 1 ]; then ok "output is minified (no stray newlines)"; else no "newlines outside CDATA"; fi
 
 # ── 10) the user-visible language list names CUDA (doc/binary agreement) ──────────────────────────────
-"$BIN" --help 2>&1 | grep -qi 'CUDA' \
+"$BIN" --help=all 2>&1 | grep -qi 'CUDA' \
     && ok "--help advertises CUDA" || no "--help does not mention CUDA"
 grep -qi 'CUDA' "$ROOT/README.md" \
     && ok "README advertises CUDA" || no "README does not mention CUDA"

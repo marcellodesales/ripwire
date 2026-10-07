@@ -19,12 +19,14 @@
 // The real agent-value over raw grep is unchanged and is not the index: it is CODE-AWARENESS — every hit
 // carries its enclosing symbol chain, its matched line, and optional context lines.
 
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — graceful-degrade when regex matching throws mid-scan (never terminate)
+#include "infra/stackthreads.h" // rw::runOnStackThreads — the scan threads, with a stack the regex line bound is computed for
+#include "infra/Diagnostics.h"  // DISCLOSE — graceful-degrade when regex matching throws mid-scan (never terminate)
 #include "didyoumean.h"         // R1a: the ONE near-miss suggester — the zero-hit follow-up reuses it, never a second one
 #include "docparse.h"           // docparse::detail::readWholeFile — the canonical whole-file byte read (reused, not re-rolled)
 #include "filter.h"             // §P11.1: rw::pathTierOf — the shared source/test/doc ORDERING tier
 #include "ingest.h"             // §R-J: rw::looksBinary / rw::kBinarySniffCap — the shared NUL-sniff, reused by grepCollectAux
 #include "model.h"
+#include "regexguard.h"         // THE owner of a user's regex: the screens, the compile, and the guarded match
 
 #include <algorithm>
 #include <atomic>
@@ -34,7 +36,6 @@
 #include <filesystem>           // R-H: the span-tier byte budget prices a hit file BEFORE parsing it
 #include <iterator>
 #include <optional>
-#include <regex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -63,7 +64,9 @@ inline std::uint32_t triAt( const std::string& s, std::size_t i ) noexcept
 // outside every indexed symbol. The emitters attach that symbol's 1-hop caller count straight off the
 // in-edge CSR, which needs the id, not just the breadcrumb name. Trailing with a default member
 // initializer, so the pre-field aggregate initializers keep their meaning unchanged.
-struct GrepHit { std::uint32_t fileId; std::uint32_t line; std::string enclosing; std::string text; std::string before; std::string after; NodeId enclosingId = kNoNode; };
+// `lineBytes` = the WHOLE matched line's byte length, set ONLY when kGrepMatchedLineMaxBytes cut `text`;
+// 0 means "not truncated" and costs the emitters nothing (the pr_converged shape — presence is the fact).
+struct GrepHit { std::uint32_t fileId; std::uint32_t line; std::string enclosing; std::string text; std::string before; std::string after; NodeId enclosingId = kNoNode; std::uint32_t lineBytes = 0; };
 
 // ─── Russ Cox regex→trigram prefilter ─────────────────────────────────────────────────────────────
 //
@@ -281,6 +284,8 @@ inline bool matchesOnlyEmpty( const RegexInfo& r )
 // (e.g. `(ab|cd)(ef|gh)` → abef, abgh, cdef, cdgh, whose trigrams the AND can then require).
 inline bool crossProduct( const std::vector<std::string>& a, const std::vector<std::string>& b, std::vector<std::string>& out )
 {
+    ASSUME_NO_ALIAS( a, out );   // inputs are only read: a self-product crossProduct( v, v, out ) is valid,
+    ASSUME_NO_ALIAS( b, out );   // so the contract is each input against the output, never a against b
     if( a.size() * b.size() > kMaxExactSet )
     {
         return false;
@@ -523,6 +528,58 @@ inline TriQuery finishQuery( RegexInfo r )
     return std::move( r.match );
 }
 
+// ── numbered escapes: `\xHH`, `\uHHHH`, `\cX`, a backreference `\N…` — the escapes whose TAIL the engine reads ──
+// (2026-09-23) The analyser took `\x66` for the letters x, 6, 6 and required THAT trigram of every file, so a pattern
+// spelling one byte by number dropped every file that matched it, at capped="0" (`\x66s::exists`: 0 files where the
+// full scan and ripgrep answer 10). A reader must step over exactly the characters the engine reads as the escape,
+// and may name the byte only when it is certain; otherwise it is one byte the reader does not vouch for (ALL).
+inline bool isNumberedRegexEscape( char e ) noexcept
+{
+    return e == 'x' || e == 'u' || e == 'c' || ( e >= '1' && e <= '9' );
+}
+
+// Up to `want` hex digits at s[pos…], consumed; their value when every digit was present and the byte is ASCII, else
+// -1. A value at or past 0x80 is left unknown on purpose: the engine compares `char`s, and that byte's signedness is
+// not this reader's call.
+inline int regexHexByteAt( const std::string& s, std::size_t& pos, std::size_t want ) noexcept
+{
+    std::size_t got   = 0;
+    unsigned    value = 0;
+    while( got < want && pos < s.size() && std::isxdigit( static_cast<unsigned char>( s[ pos ] ) ) )
+    {
+        const char d = s[ pos++ ];
+        const unsigned char u = static_cast<unsigned char>( d );
+        value = value * 16 + unsigned( std::isdigit( u ) ? d - '0' : std::tolower( u ) - 'a' + 10 );
+        ++got;
+    }
+    ENSURES( got <= want, "no more digits are consumed than the escape has" );
+    return ( got == want && value < 0x80 ) ? int( value ) : -1;
+}
+
+// The tail of the numbered escape whose letter `e` was just consumed, stepped over as the engine steps over it: the
+// byte `\xHH` / `\u00HH` spells when certain, else -1 (`\cX` and a backreference are never one known byte).
+inline int regexNumberedEscapeByte( const std::string& s, std::size_t& pos, char e ) noexcept
+{
+    EXPECTS( e == 'x' || e == 'u' || e == 'c' || ( e >= '1' && e <= '9' ), "the callers route only the escapes whose tail the engine reads" );
+    if( e == 'x' || e == 'u' )
+    {
+        return regexHexByteAt( s, pos, e == 'x' ? 2 : 4 );
+    }
+    if( e == 'c' )
+    {
+        if( pos < s.size() && std::isalpha( (unsigned char)s[ pos ] ) )
+        {
+            ++pos;                                       // the control letter
+        }
+        return -1;
+    }
+    while( pos < s.size() && std::isdigit( (unsigned char)s[ pos ] ) )
+    {
+        ++pos;                                           // the rest of a backreference's number
+    }
+    return -1;
+}
+
 // ── A small recursive-descent parser for the ECMAScript-subset we analyze ──────────────────────────
 //
 // Grammar (precedence low→high):  alt := concat ('|' concat)*   concat := repeat*   repeat := atom quant?
@@ -539,10 +596,13 @@ public:
     // Parse the whole pattern → the sound trigram query. On any parse shortfall we are conservative (ALL).
     TriQuery analyze()
     {
-        pos_ = 0;
+        pos_           = 0;
+        skippedClass_  = false;
         RegexInfo r = parseAlt();
         // trailing unparsed input (shouldn't happen for valid regex) ⇒ be safe
-        if( pos_ != s_.size() )
+        // skippedClass_: a lookaround's skip-to-matching-')' loop passed an unescaped '[' — a class may
+        // hold '(' or ')', so the depth count past it is not trustworthy (see the skip loop below).
+        if( pos_ != s_.size() || skippedClass_ )
         {
             return TriQuery::all();
         }
@@ -552,6 +612,7 @@ public:
 private:
     const std::string& s_;
     std::size_t        pos_ = 0;
+    bool                skippedClass_ = false;   // set by the lookaround skipper; see analyze()
 
     bool   eof()  const { return pos_ >= s_.size(); }
     char   peek() const { return s_[ pos_ ]; }
@@ -632,20 +693,39 @@ private:
 
     RegexInfo parseAtom()
     {
+        EXPECTS( pos_ < s_.size(), "parseConcat hands an atom only while pattern bytes remain" );
         const char c = peek();
         if( c == '(' )
         {
             next();                                      // consume '('
-            // skip a non-capturing / lookaround prefix "(?...":   (?:  (?=  (?!  (?<=  (?<!
+            // "(?:...)" is an ORDINARY group: it CONSUMES its content when matching, unlike a lookaround.
+            // Reading it as ε (the old code below did, for every "(?..." prefix) let a seam trigram span
+            // across it — `std::(?:string)&` required the seam "::&" of every file, because "string" was
+            // never in the query, and every real `std::string&` occurrence dropped at capped="0".
+            if( pos_ + 1 < s_.size() && peek() == '?' && s_[ pos_ + 1 ] == ':' )
+            {
+                pos_ += 2;                                // consume '?:'
+                RegexInfo inner = parseAlt();
+                if( !eof() && peek() == ')' )
+                {
+                    next();                                // consume ')'
+                }
+                return inner;
+            }
+            // skip a lookaround prefix "(?...":   (?=  (?!  (?<=  (?<!
             if( !eof() && peek() == '?' )
             {
                 // lookarounds are zero-width assertions for matching; for INDEXING treat the whole group as
                 // ε (anchor-like) — sound, since we can't rely on its content appearing literally.
-                // Consume to the matching ')'.
+                // Consume to the matching ')'. A class inside the lookaround may hold '(' or ')' of its
+                // own (`(?=[(])`), which this depth count can't tell from real parens — set skippedClass_
+                // so analyze() falls back to ALL instead of trusting a depth that may have closed early
+                // or late.
                 int depth = 1; next();                   // consume '?'
                 while( !eof() && depth > 0 )
                 {
                     char d = next();
+                    if( d == '[' ) { skippedClass_ = true; }
                     if( d == '(' ) { ++depth; }
                     else if( d == ')' ) { --depth; }
                     else if( d == '\\' && !eof() )
@@ -671,22 +751,7 @@ private:
         if( c == '\\' )
         {
             next();                                      // consume '\'
-            if( eof() )
-            {
-                return riAnchor();
-            }
-            const char e = next();
-            // word/space/digit classes and boundaries → unknown char or anchor (sound)
-            if( e == 'b' || e == 'B' || e == 'A' || e == 'Z' || e == 'z' )
-            {
-                return riAnchor();
-            }
-            if( e == 'w' || e == 'W' || e == 'd' || e == 'D' || e == 's' || e == 'S' )
-            {
-                return riAnyChar();
-            }
-            // an escaped metacharacter / ordinary char → that literal byte
-            return riLiteral( std::string( 1, unescape( e ) ) );
+            return parseEscape();
         }
         if( c == ')' || c == '|' )
         {
@@ -752,25 +817,26 @@ private:
         bool degrade = false;
         while( !eof() && peek() != ']' )
         {
-            char lo;
-            if( peek() == '\\' ) { next(); if( eof() ) { degrade = true; break; } char e = next(); if( std::strchr( "wWdDsS", e ) ) { degrade = true; } lo = unescape( e ); }
-            else
-            {
-                lo = next();
-            }
+            const char lo = classByte( degrade );
             if( !eof() && peek() == '-' && pos_ + 1 < s_.size() && s_[ pos_ + 1 ] != ']' )   // a range lo-hi
             {
                 next();                                  // consume '-'
-                char hi = ( peek() == '\\' ) ? ( next(), unescape( next() ) ) : next();
+                const char hi = classByte( degrade );
                 if( hi < lo || ( hi - lo ) > 6 )
                 {
                     degrade = true; // wide range ⇒ don't enumerate (ALL)
                 }
                 else
                 {
-                    for( char ch = lo; ch <= hi; ++ch )
+                    // int, not char: `char` is signed on every ABI this builds for (arm64 and x86_64
+                    // alike), so CHAR_MAX == 0x7f. When hi == 0x7f (a portable, accepted `\x7f`/`\u007f`
+                    // escape), a `char` loop counter can never exceed it and `ch <= hi` never goes false —
+                    // an infinite loop, unbounded memory growth. An int counter keeps today's signed-char
+                    // range ordering (a raw byte >= 0x80 in `hi` is still negative as char, so `hi < lo`
+                    // above still degrades that case to ALL) while actually terminating at hi.
+                    for( int ch = lo; ch <= hi; ++ch )
                     {
-                        chars.push_back( std::string( 1, ch ) );
+                        chars.push_back( std::string( 1, char( ch ) ) );
                     }
                 }
             }
@@ -792,6 +858,57 @@ private:
             return riAnyChar();
         }
         return riCharSet( std::move( chars ) );
+    }
+
+    // Everything after a `\` (already consumed): a boundary/anchor is ε; a numbered escape is its byte or one unknown
+    // byte; a named byte (`\n` …) or an escaped metacharacter is that byte; any other letter (`\w` `\d` `\s` and their
+    // negations — the screen refuses the rest upstream) is one unknown byte (ALL). Every branch is sound.
+    RegexInfo parseEscape()
+    {
+        if( eof() )
+        {
+            return riAnchor();
+        }
+        const char e = next();
+        if( e == 'b' || e == 'B' || e == 'A' || e == 'Z' || e == 'z' )
+        {
+            return riAnchor();
+        }
+        if( isNumberedRegexEscape( e ) )
+        {
+            const int byte = regexNumberedEscapeByte( s_, pos_, e );
+            return byte >= 0 ? riLiteral( std::string( 1, char( byte ) ) ) : riAnyChar();
+        }
+        const char byte = unescape( e );
+        return ( byte != e || !std::isalpha( (unsigned char)e ) ) ? riLiteral( std::string( 1, byte ) ) : riAnyChar();
+    }
+
+    // One member of a `[...]` class: a plain byte, or the byte an escape spells. An escape that is not ONE known byte
+    // (`\w`, `\b` = backspace here, `\uHHHH` past ASCII, `\cX`, a backreference) degrades the class to ALL, its tail
+    // stepped over as the engine steps over it (`[\x66]s::exists` used to enumerate {x,6,6} and drop every file).
+    char classByte( bool& degrade )
+    {
+        EXPECTS( pos_ < s_.size(), "the class loop reads a member only while a byte is left before ']'" );
+        if( peek() != '\\' )
+        {
+            return next();
+        }
+        next();                                          // consume '\'
+        if( eof() )
+        {
+            degrade = true;
+            return '\\';
+        }
+        const char e = next();
+        if( isNumberedRegexEscape( e ) )
+        {
+            const int byte = regexNumberedEscapeByte( s_, pos_, e );
+            degrade = degrade || byte < 0;
+            return byte < 0 ? e : char( byte );
+        }
+        const char byte = unescape( e );
+        degrade = degrade || ( byte == e && std::isalpha( (unsigned char)e ) );
+        return byte;
     }
 
     // map an escaped char to its literal byte (the common ones); default = the char itself.
@@ -940,7 +1057,22 @@ inline constexpr std::size_t kGrepMatchedLineMaxBytes = 512;
 
 // The MATCHED line itself (P5): the text the agent actually searched for, which neither the bare hit nor
 // the before/after blocks ever showed. Empty when the hit line is out of range (degrade, never OOB).
-inline std::string grepMatchedLine( const std::string& s, const std::vector<std::size_t>& lineStarts, std::uint32_t line )
+//
+// THE CUT IS DISCLOSED, not silent. `fullBytesOut` (optional) is set to the WHOLE line's byte length when
+// — and only when — the cap fired, and left alone otherwise, so a caller's 0 means "not truncated". This
+// is the ONE piece of content a grep answer carries, and a 512-byte source line and a truncated 50 KB
+// minified line used to print byte-identical payloads with nothing on the row telling them apart
+// (METHODOLOGY §9 #3/#4: never cut silently, and the honesty lives in an attribute). The number is the
+// TRUE size rather than a bare capped="1" because it is what decides the reader's next move — the row
+// already carries the deterministic follow-up (p=/l= and the root's next=), and how much was dropped is
+// what says whether following it is worth a read.
+//
+// No ellipsis here, deliberately, and this is where this cut differs from cleanSig's: a grep payload is
+// RAW FILE BYTES by contract — the boolean --and/--not filter reads the same line (grepWholeLine below),
+// and the --at= follow-up on the row is expected to reproduce it — so a character that is not in the file
+// must not be spliced into it. The attribute carries the fact instead.
+inline std::string grepMatchedLine( const std::string& s, const std::vector<std::size_t>& lineStarts, std::uint32_t line,
+                                    std::uint32_t* fullBytesOut = nullptr )
 {
     const std::uint32_t lineCount = grepRealLineCount( s, lineStarts );
     if( line < 1 || line > lineCount )
@@ -950,6 +1082,10 @@ inline std::string grepMatchedLine( const std::string& s, const std::vector<std:
     std::string text = grepLineRangeText( s, lineStarts, lineCount, line, line );
     if( text.size() > kGrepMatchedLineMaxBytes )
     {
+        if( fullBytesOut != nullptr )
+        {
+            *fullBytesOut = std::uint32_t( text.size() );
+        }
         std::size_t cut = kGrepMatchedLineMaxBytes;
         while( cut > 0 && ( static_cast<unsigned char>( text[cut] ) & 0xC0 ) == 0x80 )
         {
@@ -1012,8 +1148,20 @@ static_assert( sizeof( GrepRawHit ) == 12, "GrepRawHit must stay a 12-byte POD" 
 // reason: the cap used to be an `int` derived from `cap * 4`, so `--limit=536870912` overflowed the product
 // NEGATIVE, collected nothing, and the release binary reported hits="0" hits_capped="0" at exit 0 — a
 // confident false zero. There is no int arithmetic left between the CLI value and this comparison.
-inline void grepScanText( const std::string& text, const std::string& pat,
-                          const std::regex* re, std::size_t hitCapCount, std::vector<GrepMatchSite>& out )
+//
+// `isAbandoned` says the regex engine ABANDONED a match in this text (RegexVerdict::Exhausted): the sites
+// appended before it are real, but the file's answer is unknown past that line, so the caller must not
+// present the collection as a measurement (a literal scan never sets it). `regexLinesSkipped` counts the lines
+// `linePolicy` kept from the engine because they were longer than its stack can take (src/regexguard.h,
+// maxEngineSubjectBytes): a match on one of them is neither found nor ruled out, so the hits are a floor.
+struct GrepScanVerdict
+{
+    bool          isAbandoned       = false;
+    std::uint32_t regexLinesSkipped = 0;
+};
+
+[[nodiscard]] inline GrepScanVerdict grepScanText( const std::string& text, const std::string& pat, const GuardedRegex* re,
+                                                   std::size_t hitCapCount, std::vector<GrepMatchSite>& out, RegexLinePolicy linePolicy = {} )
 {
     std::uint32_t line    = 1;
     std::size_t   scanned = 0;
@@ -1022,27 +1170,57 @@ inline void grepScanText( const std::string& text, const std::string& pat,
 
     if( re != nullptr )
     {
-        // std::sregex_iterator can throw regex_error (error_complexity/error_space) mid-scan on a
-        // catastrophic-backtracking pattern over a pathological file — construction succeeded (the pattern
-        // itself compiled fine), the blowup happens during matching. Only construction was guarded before
-        // this (A4-F10); an uncaught throw here reached std::terminate and killed the whole run over one
-        // bad file. Degrade: keep this file's hits so far and move on to the next file.
-        try
+        // LINE-ORIENTED MATCHING (2026-09-09) — each line is its own search range, which is what makes
+        // `^` and `$` LINE anchors without asking the standard library for `std::regex::multiline`.
+        //
+        // Two things forced this shape, and both are load-bearing:
+        //
+        //  1. THE SEMANTICS. Handing the whole file to one iterator made ECMAScript's `^` match only at
+        //     offset 0 and `$` only at end-of-file, in a verb whose every answer is a LINE (`l=`, one line
+        //     of CDATA). `--regex='^#include'` reported 1 hit on src/ where rg reported 1648. grep, rg,
+        //     tgrep and every editor's find box read those anchors per line; so does this now.
+        //  2. WHY NOT std::regex::multiline. It is the obvious fix and it is not usable. Apple libc++'s
+        //     `__l_anchor_multiline<char>::__exec` reads `*std::prev(__s.__current_)` before testing
+        //     whether the match position IS the first character, so at offset 0 it reads one byte BEFORE
+        //     the buffer. Measured 2026-09-09 on this tree: a 40-line standalone with no ripwire code —
+        //     default-constructed regex, assigned, `sregex_iterator` per file — faults on 74 of ~130 of
+        //     this repository's own headers, single-threaded, and `--regex='^'` over src/ crashed 8 of 10
+        //     runs (EXC_BAD_ACCESS in that frame, address one byte low; SIGBUS when the string's buffer
+        //     starts a page). Content-dependent, because a byte before a heap buffer is usually readable.
+        //     A gate cannot defend against a standard-library out-of-bounds read; not using the node can.
+        //
+        // Consequence, stated because it is a real narrowing: a match may no longer SPAN lines. `.` never
+        // could (ECMAScript's dot excludes line terminators), but `[\s\S]*` could and now cannot — the
+        // same line-oriented contract grep and rg have, where crossing lines is an opt-in mode neither
+        // this verb nor rg's default offers. A trailing `\r` is outside every line's range, so `$` behaves
+        // on CRLF input the way rg's `--crlf` does rather than never matching.
+        //
+        // The engine can give up DURING a match (libc++'s error_complexity/error_stack) on a pattern the
+        // structural screen passed — overlapping alternation, (a|a)+z, over a pathological line. Only
+        // construction was guarded before A4-F10, and an uncaught throw here reached std::terminate; A4-F10
+        // then skipped the rest of the file, which kept the run alive but left a silent floor. GuardedRegex
+        // now owns the catch and says Exhausted: this file's sites so far are kept, scanning it stops (as the
+        // skip did), and the caller is told, so the answer is refused by name instead of printed as a count.
+        //
+        // A trailing newline TERMINATES the last line, it does not begin an empty one, and an empty
+        // file has no lines at all: grep reports one match of `^` per real line and none in an empty
+        // file. Without both guards a zero-width pattern gains one phantom hit per file, on a line
+        // number no reader could open. GuardedRegex::forEachLineMatch owns the line loop and both rules,
+        // together with the literal paths (a literal pattern never reaches the engine; a line holding none
+        // of the pattern's required literals is never handed to it) and the long-line skip — one owner, so
+        // the fast paths and the engine read lines the same way (test/regexguardcheck.sh arm (j) diffs them).
+        const RegexLineScan scan = re->forEachLineMatch( text, linePolicy, [ & ]( std::uint32_t line, std::size_t byteOffset )
         {
-            for( auto it = std::sregex_iterator( text.begin(), text.end(), *re ); it != std::sregex_iterator(); ++it )
-            {
-                const std::size_t pos = std::size_t( it->position() );
-                out.push_back( { lineAt( pos ), std::uint32_t( pos ) } );
-                if( out.size() >= hitCapCount )
-                {
-                    break;
-                }
-            }
-        }
-        catch( const std::regex_error& )
+            out.push_back( { line, std::uint32_t( byteOffset ) } );
+            return out.size() < hitCapCount;
+        } );
+        if( scan.verdict == RegexVerdict::Exhausted )
         {
-            DEGRADED_PATH_ALERT( "grep: regex match blew up (catastrophic backtracking?) — file skipped" );
+            DISCLOSE( Diagnostics::answerRefused, "the verdict makes --regex refuse by name (the file and the cause on stderr, exit 1); no hit is reported",
+                      "grep: the regex engine abandoned a match (catastrophic backtracking?) — the verb refuses the answer" );
         }
+        scanned = text.size();   // the literal branch's cursor is not shared with this one; keep it honest
+        return { scan.verdict == RegexVerdict::Exhausted, scan.skippedLineCount };
     }
     else
     {
@@ -1057,7 +1235,26 @@ inline void grepScanText( const std::string& text, const std::string& pat,
             pos = text.find( pat, pos + 1 );
         }
     }
+    return {};
 }
+
+// ── THE syntax option set every --regex construction uses ─────────────────────────────────────────────
+//
+// One constant, three construction sites (the compile probe below, the indexed-file worker, and the
+// unindexed-aux scan). A pattern that COMPILES under one flag set and MATCHES under another is a defect
+// with no symptom, and this file spelled the literal out three times.
+//
+// NOTE WHAT IS **NOT** HERE: `std::regex::multiline`. Line anchors are what this verb owes its reader,
+// but that flag is how you do NOT get them on this platform — Apple libc++'s `__l_anchor_multiline`
+// reads one byte before the buffer at offset 0 and faults on real source text (the measurement is in
+// grepScanText's header, where the replacement lives). `^` and `$` are line anchors because
+// grepScanText searches ONE LINE AT A TIME, not because of a syntax option. Leave this set alone: the
+// prefilter's compile probe and both scanners must agree about what compiles, and adding `multiline`
+// here would reintroduce a standard-library out-of-bounds read that no gate in this tree can catch.
+// The trigram prefilter is unaffected either way — Cox treats an anchor as ε (riAnchor above), which is
+// sound under both readings, so no candidate set narrows on one.
+// Gated by test/grepanchorcheck.sh.
+constexpr auto kGrepRegexSyntax = kRegexEcmaScript | kRegexOptimize;
 
 // §P0.4 — does the user's --regex pattern COMPILE? An invalid pattern is a user error, not a measurement:
 // `--regex='(fnv1a'` used to return hits="0" at exit 0 with an empty stderr, byte-identical to a true
@@ -1068,261 +1265,13 @@ inline void grepScanText( const std::string& text, const std::string& pat,
 // trigram PREFILTER's parse (RegexAnalyzer, see the note at the top of that section) is allowed to fail and
 // degrade: it only ever widens the candidate set, so its imprecision cannot change a result. Refusing here,
 // ahead of both paths, is also why --no-prefilter refuses identically.
-// L5 (Linux runtime probe) — the ONE place the two standard libraries disagree about what a valid pattern
-// IS, closed here so the binary answers the same question on both.
 //
-// ECMAScript's IdentityEscape forbids `\<letter>` for any letter that is not a recognised escape, and libc++
-// enforces it: `--regex='\Q\E'` is refused on macOS. libstdc++ does not — on Ubuntu the same pattern
-// COMPILES, with `\Q` silently meaning the literal letter Q. That is the worse half of the split: the
-// lenient side does not error, it answers a DIFFERENT question and hands the result back as a measurement.
-//
-// So the pattern is screened before either engine sees it, against the escapes libc++ actually accepts
-// (measured with a probe, not inferred from the grammar): `\b \B \d \D \s \S \w \W \f \n \r \t \v` alone,
-// plus `\c \x \u`, whose TAILS the engine still validates. Everything else after a backslash — digits
-// (back-references), `$`, `_`, punctuation, any non-ASCII byte — is left entirely to the engine, which
-// agrees about all of it. So this rejects EXACTLY the set libc++ already rejected and nothing more: no
-// pattern that searches on macOS today stops searching, and Linux stops silently misreading the Perl-isms.
-inline constexpr std::string_view kPortableRegexLetterEscapes = "bBdDsSwWfnrtv";   // valid on their own
-inline constexpr std::string_view kPortableRegexPrefixEscapes = "cxu";             // valid with a tail the engine checks
-
-inline std::optional<std::string> nonPortableRegexEscape( const std::string& pat )
-{
-    for( std::size_t i = 0; i + 1 < pat.size(); ++i )
-    {
-        if( pat[i] != '\\' )
-        {
-            continue;
-        }
-
-        const char escaped = pat[ i + 1 ];
-        ++i;                                                                          // consume it: `\\Q` is an escaped backslash then a plain Q, not an escaped Q
-        const bool isAsciiLetter =    ( escaped >= 'a' && escaped <= 'z' )
-                                   || ( escaped >= 'A' && escaped <= 'Z' );
-        if( !isAsciiLetter )
-        {
-            continue;
-        }
-        if( kPortableRegexLetterEscapes.find( escaped ) != std::string_view::npos )
-        {
-            continue;
-        }
-        if( kPortableRegexPrefixEscapes.find( escaped ) != std::string_view::npos )
-        {
-            continue;
-        }
-
-        return   std::string( "unsupported escape sequence '\\" ) + escaped + "' — the portable ECMAScript escapes are "
-                 "\\b \\B \\d \\D \\s \\S \\w \\W \\f \\n \\r \\t \\v \\cX \\xHH \\uHHHH (some C++ standard libraries accept '\\"
-               + escaped + "' and silently read it as the literal '" + escaped + "', so it is refused rather than answered differently per platform)";
-    }
-    return std::nullopt;
-}
-
-// M2 (Linux runtime probe) — the SECOND thing the two standard libraries disagree about, and the worse
-// one. `--regex='(a+)+b'` over a long run of 'a' with no 'b' is the textbook catastrophic-backtracking
-// shape: every way of splitting the run between the inner and the outer repetition is a distinct path,
-// so a backtracking engine explores O(2^n) of them before it can report no-match.
-//
-// Apple libc++ has a complexity budget and gives up in well under a second with
-// regex_error(error_complexity), which grepScanText's catch turns into a skipped file — the original
-// A4-F10 "degrade, don't die" contract, and the only behaviour this repo had ever observed. libstdc++ has
-// NO such budget: it never throws, so that catch is never reached and the process simply backtracks. The
-// first real Linux run (Ubuntu 24.04, clang 18 + libstdc++) was still CPU-bound at 560 s on the very
-// fixture the gate uses, i.e. on Linux a pathological --regex does not degrade — it hangs the tool.
-//
-// So the pattern is screened HERE, structurally, before either engine is handed it, for the same reason
-// and in the same shape as the L5 escape screen above: the verdict must be a pure function of the pattern
-// text, not of whose backtracker is linked in and not of what happens to be in the corpus. Refusal is the
-// right outcome rather than a silent skip — a skipped file reads as a measurement, an exit-1 refusal that
-// names the construct cannot.
-//
-// M2-b (Linux RE-smoke) — the first cut of this screen refused only an unbounded quantifier over a group
-// that repeated WITHOUT bound inside it, and let (a?)+ and (a{1,3})+ through as "bounded inner, cannot
-// blow up". That was libc++ behaviour written down as a law. On Ubuntu 24.04 / clang 18 / libstdc++ both
-// of those patterns HANG — the re-smoke killed them on the harness's wall-clock cap, on the same fixture
-// and in the same way as (a+)+b, and they had been shipping as this gate's "must still scan" controls.
-// BOUNDED IS NOT UNAMBIGUOUS: '(a?)+' splits a run of 'a' in as many ways as '(a+)+' does, because the
-// inner may also match EMPTY, and '(a{1,3})+' because the inner's width varies. So the screen is widened
-// rather than the verdict split per platform.
-//
-// WHAT IS CAUGHT: an unbounded quantifier ('*', '+', '{n,}') applied to a group that contains ANY
-// quantifier anywhere inside it, at any nesting depth — bounded ones included. (X+)+, (X*)*, (X+)*,
-// (X{n,})+, ((X+))+, ((X)+)+, (X+|Y)+ as before, and now (X?)+, (X{m,n})+, ((X)?)+ and (X{n})+ too.
-// Exact '{n}' is in ON PURPOSE: a fixed-count inner is only unambiguous when what it repeats is itself
-// fixed-width, and '((ab|c){2})+d' is a real bomb that reading the quantifier alone cannot tell apart from
-// '(a{3})+b'. A screen that must return ONE verdict on two different backtrackers cannot make that call.
-//
-// WHAT IS DELIBERATELY NOT CAUGHT, so the guard does not quietly eat working patterns: a group with no
-// quantifier inside passes however it is quantified, so (abc)+, (a|b)+ and (a)+b pass; a BOUNDED outer
-// quantifier passes whatever the group contains, which is what keeps the workaround this very message
-// suggests — '(\s*\w+){1,20}' — legal; an UNQUANTIFIED group passes whatever it contains, so (a+)b, (a?)b
-// and (a+)(b)+ pass; '+' inside a character class or behind a backslash is a literal, so [a+]+ and (\+)+
-// pass; and the '?' that opens '(?:', '(?=' or '(?!' is a group MODIFIER, not a quantifier, so (?:abc)+
-// passes while (?:a+)+b is still refused. The known GAP is overlapping alternation — (a|a)+b is a real
-// bomb whose branches only overlap semantically — which is why grepScanText's mid-match catch is kept as
-// belt-and-braces rather than removed. Every one of these cases is an arm of test/regexbombcheck.sh.
-//
-// Scope: this screens --regex, the one place a user's own pattern meets an unbounded corpus. The --arch
-// path-rule regexes take the same engine but come from a committed rules file, not from the command line.
-struct RegexQuantifier { bool isPresent; bool isUnbounded; std::size_t lengthCount; };
-
-// reads the quantifier at `at`, if there is one. '?' and '{n,m}' are quantifiers but BOUNDED; anything
-// that is not a well-formed '{' interval is not a quantifier at all, just a literal brace.
-inline RegexQuantifier regexQuantifierAt( const std::string& pat, std::size_t at )
-{
-    if( at >= pat.size() )
-    {
-        return { false, false, 0 };
-    }
-    if( pat[at] == '*' || pat[at] == '+' )
-    {
-        return { true, true, 1 };
-    }
-    if( pat[at] == '?' )
-    {
-        return { true, false, 1 };
-    }
-    if( pat[at] != '{' )
-    {
-        return { false, false, 0 };
-    }
-
-    std::size_t cursor         = at + 1;
-    std::size_t lowerDigitCount = 0;
-    while( cursor < pat.size() && pat[ cursor ] >= '0' && pat[ cursor ] <= '9' ) { ++cursor; ++lowerDigitCount; }
-    if( lowerDigitCount == 0 )
-    {
-        return { false, false, 0 };
-    }
-    if( cursor < pat.size() && pat[cursor] == '}' )
-    {
-        return { true, false, ( cursor + 1 ) - at }; // {n} — exact, bounded
-    }
-    if( cursor >= pat.size() || pat[cursor] != ',' )
-    {
-        return { false, false, 0 };
-    }
-
-    ++cursor;
-    std::size_t upperDigitCount = 0;
-    while( cursor < pat.size() && pat[ cursor ] >= '0' && pat[ cursor ] <= '9' ) { ++cursor; ++upperDigitCount; }
-    if( cursor >= pat.size() || pat[cursor] != '}' )
-    {
-        return { false, false, 0 };
-    }
-
-    return { true, upperDigitCount == 0, ( cursor + 1 ) - at };                                           // {n,} unbounded, {n,m} bounded
-}
-
-// '(?:' / '(?=' / '(?!' — a '?' immediately after '(' opens a NON-CAPTURING or lookaround group. It is a
-// group MODIFIER, not a quantifier, and reading it as one (which M2-b's widened flag otherwise would)
-// refuses every '(?:abc)+' ever written. Returns how many characters the scan must step over.
-inline std::size_t regexGroupModifierLength( const std::string& pat, std::size_t openAt )
-{
-    return ( openAt + 1 < pat.size() && pat[ openAt + 1 ] == '?' ) ? 1 : 0;
-}
-
-// The one refusal this screen emits, kept out of the scan loop so the loop reads as the small state
-// machine it is. `outerQuant` is the quantifier character that was applied to the offending group.
-inline std::string catastrophicRegexMessage( char outerQuant )
-{
-    return   std::string( "catastrophic backtracking: the unbounded quantifier '" ) + outerQuant + "' is applied to a group whose contents "
-             "already repeat (the (X+)+ / (X*)* / (X+)* / (X{n,})+ family, and equally the bounded-inner (X?)+ / (X{m,n})+ / (X{n})+ one). "
-             "Every way of splitting the input between the inner and the outer repetition is a separate path, so matching a non-matching "
-             "line costs time exponential in its length; a BOUNDED inner is no defence, because it is ambiguity and not unboundedness that "
-             "multiplies the paths. std::regex has no backtracking budget you can set, and the standard libraries do not agree about it — "
-             "libc++ abandons the match in under a second, libstdc++ never gives up at all (measured on Ubuntu 24.04 / clang 18 / libstdc++: "
-             "'(a+)+b' still running after 560 s, and '(a?)+b' and '(a{1,3})+b' both still running when the harness killed them) — so this "
-             "is refused rather than answered differently per platform. Workaround: collapse the two repetitions into one, since the outer "
-             "adds no string the inner does not already match ('(a+)+' is the language of 'a+', '(a?)+' of 'a*', '(a{1,3})+' of 'a+'), or "
-             "make the OUTER bounded with an explicit interval ('(\\s*\\w+){1,20}')";
-}
-
-inline std::optional<std::string> catastrophicRegexConstruct( const std::string& pat )
-{
-    // one flag per OPEN group: does anything inside it, at any depth, carry a quantifier — of ANY kind?
-    // (M2-b: this used to track only UNBOUNDED inner repetition, which let the libstdc++-hanging (a?)+ and
-    // (a{1,3})+ through. Unbounded is a subset of "any", so widening the flag is the whole behaviour change
-    // — the refusal condition below still requires the OUTER quantifier to be unbounded.)
-    std::vector<char> hasQuantifierInsideGroup;
-    bool              isInsideClass = false;
-
-    for( std::size_t i = 0; i < pat.size(); ++i )
-    {
-        const char c = pat[ i ];
-
-        // the two contexts where a quantifier character is just a character
-        if( c == '\\' )     { ++i; continue; }                                         // '\+' is a literal plus
-        if( isInsideClass )
-        {
-            if( c == ']' )
-            {
-                isInsideClass = false;
-            }
-            continue;
-        } // '[a+]' is a literal plus
-        if( c == '[' )      { isInsideClass = true; continue; }
-
-        // group open / close — the close is where the whole verdict is made
-        if( c == '(' ) { hasQuantifierInsideGroup.push_back( 0 ); i += regexGroupModifierLength( pat, i ); continue; }
-        if( c == ')' )
-        {
-            if( hasQuantifierInsideGroup.empty() )
-            {
-                continue; // unbalanced: the compile probe below owns that error
-            }
-
-            const bool isRepeatingInside = hasQuantifierInsideGroup.back() != 0;
-            hasQuantifierInsideGroup.pop_back();
-            const RegexQuantifier quant = regexQuantifierAt( pat, i + 1 );
-
-            if( quant.isPresent && quant.isUnbounded && isRepeatingInside )
-            {
-                return catastrophicRegexMessage( pat[ i + 1 ] );
-            }
-
-            // the group is now an ATOM of its parent: a quantifier anywhere inside it — or ON it — is a
-            // quantifier inside the parent too, which is what makes ((a+))+, ((a)+)+ and ((a)?)+ visible
-            if( !hasQuantifierInsideGroup.empty() && ( isRepeatingInside || quant.isPresent ) )
-            {
-                hasQuantifierInsideGroup.back() = 1;
-            }
-            if( quant.isPresent )
-            {
-                i += quant.lengthCount; // step over the quantifier we just judged
-            }
-            continue;
-        }
-
-        // a plain quantifier: it marks the innermost enclosing group, if any (top-level repetition is fine)
-        const RegexQuantifier quant = regexQuantifierAt( pat, i );
-        if( quant.isPresent && !hasQuantifierInsideGroup.empty() )
-        {
-            hasQuantifierInsideGroup.back() = 1;
-        }
-        if( quant.isPresent )
-        {
-            i += quant.lengthCount - 1;
-        }
-    }
-    return std::nullopt;
-}
-
+// The screens and the compile live in src/regexguard.h (compileGuardedRegex), shared with every other entry
+// point a user's pattern reaches; this wrapper pins --regex's own syntax set to them, so the probe compiles
+// under exactly the flags the scanners below match with.
 inline std::optional<std::string> regexCompileError( const std::string& pat )
 {
-    if( std::optional<std::string> portability = nonPortableRegexEscape( pat ) )
-    {
-        return portability; // L5: one verdict on every platform, so it runs first
-    }
-    if( std::optional<std::string> bomb = catastrophicRegexConstruct( pat ) )
-    {
-        return bomb; // M2: likewise — decided from the text, before any engine sees it
-    }
-
-    try                                { const std::regex probe( pat, std::regex::ECMAScript | std::regex::optimize ); (void)probe; }
-    catch( const std::regex_error& e ) { return std::string( e.what() ); }
-    catch( ... )                       { return std::string( "invalid regular expression" ); }
-    return std::nullopt;
+    return compileGuardedRegex( pat, kGrepRegexSyntax ).refusal;
 }
 
 // regex=false → literal substring; regex=true → ECMAScript regex. Every ingested file is read and scanned
@@ -1336,12 +1285,13 @@ inline std::optional<std::string> regexCompileError( const std::string& pat )
 //
 // DETERMINISM (a hard law, and this is a parallel path): the workers write into per-file slots they alone
 // own, and NOTHING downstream depends on the order in which files finished. The budget is applied AFTER
-// the fan-out, in ascending fileId order — exactly the order the old serial candidate loop consumed —
-// so which hits survive a truncation is a pure function of the corpus, never of thread scheduling.
+// the fan-out, in the canonical tier-then-path order below (it used to be ascending fileId, which let the
+// ceiling keep an early doc file's hits and drop a later source file's) — so which hits survive a
+// truncation is a pure function of the corpus, never of thread scheduling, and always the order's tail.
 //
 // §P11.1 — the returned ORDER is TIER-then-path, not path alone. Plain path-alphabetical order plus the
 // caller's fixed row cap is a systematic bias against code on any doc-bearing repo: on ripwire's own tree
-// `--grep=DEGRADED_PATH_ALERT` filled 66 of its 100 shown rows with markdown and left no `test/` row at all,
+// `--grep=DISCLOSE` filled 66 of its 100 shown rows with markdown and left no `test/` row at all,
 // because `AGENTS.md` and other long-named docs sort above `src/` and the cap always cuts the tail. Ordering HERE
 // rather than in the emitter keeps the CLI verb and the MCP `grep` verb on ONE order — they already share
 // this collection precisely so they cannot diverge. Path-alphabetical survives untouched INSIDE a tier, so
@@ -1368,12 +1318,42 @@ inline constexpr std::size_t kGrepCollectionBudget = 4000000;
 // indexed file end to end — a file the worker could not read, or a worker that died mid-scan, makes the
 // hit set a floor, and a floor must never wear the claim. Both are deterministic facts of the corpus/disk
 // state, not of thread timing (the read either succeeds or fails per file, whichever worker draws it).
+// The DISCLOSE sink a grepCollect worker writes from its own thread: the flag GrepCollection::degraded is built from
+// after the join. Atomic because any worker may be the one that throws; relaxed because the join orders it.
+struct ScanWorkerDegrade
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        WorkerThrew,   // an exception escaped the per-file loop: the files that worker had not reached are unscanned
+    };
+    std::atomic<bool>& degraded;
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        degraded.store( true, std::memory_order_relaxed );
+    }
+};
+
 struct GrepCollection
 {
     std::vector<GrepRawHit> raw;
     bool                    isBudgetReached = false;
     std::uint32_t           unreadableFiles = 0;
     bool                    degraded        = false;
+    // A --regex scan whose engine ABANDONED a match (RegexVerdict::Exhausted) in this many indexed files; the
+    // lowest such fileId names one in the refusal. Nonzero ⇒ the hit set is a floor, so `degraded` is set too,
+    // and the CLI refuses it by name rather than print a count the engine never finished (literal scans: 0).
+    std::uint32_t           regexAbandonedFiles     = 0;
+    std::uint32_t           firstRegexAbandonedFile = 0;
+    // A --regex scan's lines the engine was never handed because they were longer than a scan thread's stack can take
+    // (GrepScanVerdict). A match there is neither found nor ruled out, so nonzero makes hits= a floor; it does NOT set
+    // `degraded` — every other line was read, and the answer is printed with the count beside it rather than refused.
+    // `regexStackBytes` is the ONE stack size every scan thread was told (runOnStackThreads settles it before any file is
+    // read, so no file's outcome depends on which thread took it; below kGrepScanStackBytes means the system refused the
+    // full size), and `regexLineBytesMax` the engine line bound that size gives this pattern — the same on every thread
+    // (SIZE_MAX where the engine does not recurse per byte). Both 0 for a literal scan.
+    std::uint64_t           regexLinesSkipped       = 0;
+    std::size_t             regexLineBytesMax       = 0;
+    std::size_t             regexStackBytes         = 0;
 
     // The scan-side completeness conditions, stated ONCE for both emitters (the CLI XML root and the MCP
     // JSON payload) so the condition cannot fork between them — each emitter ANDs in only its own arms
@@ -1381,7 +1361,49 @@ struct GrepCollection
     bool cleanScan() const noexcept { return !isBudgetReached && unreadableFiles == 0 && !degraded; }
 };
 
-inline GrepCollection grepCollect( const IngestResult& ing, const std::string& pat, bool regex = false, bool noPrefilter = false )
+// How many files a regex scan abandoned, and the lowest fileId among them — read in ascending fileId order
+// after the join, so the file a refusal names is a pure function of the corpus, never of which worker
+// finished first.
+struct AbandonedFileCount { std::uint32_t count; std::uint32_t firstFileId; };
+inline AbandonedFileCount countAbandonedFiles( const std::vector<char>& perFileAbandoned ) noexcept
+{
+    AbandonedFileCount out{ 0, 0 };
+    for( std::uint32_t f = 0; f < std::uint32_t( perFileAbandoned.size() ); ++f )
+    {
+        if( perFileAbandoned[f] == 0 )
+        {
+            continue;
+        }
+        if( out.count == 0 )
+        {
+            out.firstFileId = f;
+        }
+        ++out.count;
+    }
+    return out;
+}
+
+// THE SCAN THREADS' STACK — explicit, because libstdc++'s regex matcher recurses once per state it visits and a
+// long matching line is a deep recursion: on the 8 MiB glibc default `--regex='a*b'` died with SIGSEGV on a line of
+// about 26 KB. A bigger stack moves that line bound up in proportion (maxEngineSubjectBytes) and costs only address
+// space until a match actually recurses. 256 MiB × 16 workers is 4 GiB reserved, committed only as deep as the
+// deepest line goes, and at most half of each stack by construction. MEASURED in the lane that set it (thread
+// start-up and a warm scan of this tree, 8 MiB vs 256 MiB, interleaved: no difference past run-to-run noise); the
+// line bounds it buys are in the CHANGELOG entry. Literal scans use the same threads and never recurse.
+inline constexpr std::size_t kGrepScanStackBytes = 256 * 1024 * 1024;
+
+// FAULT INJECTION (non-NDEBUG; faultSwitchOn is constexpr false under NDEBUG): RIPWIRE_FAULT_SCAN_STACK_MIXED=1 refuses every
+// ODD scan thread any stack above half of what was asked, so one scan obtains two sizes — the degrade a strict overcommit
+// policy or an address-space ulimit produces, made deterministic and reachable on every platform (regexguardcheck arm (n)).
+inline bool isScanStackRefusedByFault( std::size_t threadIndex, std::size_t tryBytes, std::size_t askedBytes ) noexcept
+{
+    static const bool isMixed = rw::faultSwitchOn( "RIPWIRE_FAULT_SCAN_STACK_MIXED" );
+    return isMixed && threadIndex % 2 == 1 && tryBytes > askedBytes / 2;
+}
+
+// `stackBytes` is the size the scan threads ask for; only a gate's fault switch or a caller testing the degrade passes less.
+inline GrepCollection grepCollect( const IngestResult& ing, const std::string& pat, bool regex = false, bool noPrefilter = false,
+                                   std::size_t stackBytes = kGrepScanStackBytes )
 {
     const std::uint32_t fileCount   = std::uint32_t( ing.files.size() );
     const std::size_t   budgetCount = kGrepCollectionBudget;
@@ -1405,108 +1427,117 @@ inline GrepCollection grepCollect( const IngestResult& ing, const std::string& p
 
     // ── pass 1: parallel scan, one worker per hardware thread, one file at a time ──────────────────────
     std::vector<std::vector<GrepMatchSite>> perFileSites( fileCount );   // slot f written by exactly one worker
+    std::vector<char>                       perFileAbandoned( regex ? fileCount : 0, 0 );   // slot f: the engine abandoned a match in f
+    std::vector<std::uint32_t>              perFileSkipped( regex ? fileCount : 0, 0 );     // slot f: lines too long for the engine in f
+    std::atomic<std::size_t>                engineLineBytesMax { 0 };    // every worker stores the SAME value: one settled stack, one pattern
     std::atomic<std::uint32_t>              nextFileId { 0 };
     std::atomic<std::uint32_t>              unreadableCount { 0 };       // T1: files the scan could not read
     std::atomic<bool>                       workerDegraded { false };    // T1: a worker died mid-scan
-    const auto                              fileWorker = [ & ]
+    ScanWorkerDegrade                       workerDegradeSink{ workerDegraded };   // the DISCLOSE sink a worker writes it through
+    const auto                              fileWorker = [ & ]( std::size_t stackBytes )
     {
-        std::regex reLocal;
-        if( regex ) { try { reLocal = std::regex( pat, std::regex::ECMAScript | std::regex::optimize ); } catch( ... ) { workerDegraded.store( true, std::memory_order_relaxed ); return; } }
-        std::string text;
+        const RegexCompile reLocal = regex ? compileGuardedRegex( pat, kGrepRegexSyntax ) : RegexCompile{};
+        const RegexLinePolicy linePolicy{ regex ? reLocal.regex.maxEngineSubjectBytes( stackBytes ) : SIZE_MAX, !noPrefilter };
+        engineLineBytesMax.store( regex ? linePolicy.engineLineBytesMax : 0, std::memory_order_relaxed );
+        if( reLocal.refusal )
+        {
+            workerDegraded.store( true, std::memory_order_relaxed );
+            return;
+        }
         try
         {
             for( std::uint32_t f = nextFileId.fetch_add( 1 ); f < fileCount; f = nextFileId.fetch_add( 1 ) )
             {
-                text.clear();
                 // unreadable file ⇒ degrade to empty bytes and keep going (what the index build did too:
                 // it left an empty `contents` entry rather than dropping the file from the corpus) — but
                 // COUNT it (T1): a scan that skipped a file's bytes may not claim completeness.
-                if( !docparse::detail::readWholeFile( diskPath( ing, f ), text ) )
+                std::optional<std::string> fileBytes = docparse::detail::readWholeFile( diskPath( ing, f ) );
+                if( !fileBytes )
                 {
-                    text.clear();
                     unreadableCount.fetch_add( 1, std::memory_order_relaxed );
                 }
+                const std::string text = std::move( fileBytes ).value_or( std::string() );
                 if( regex && !noPrefilter && !triQueryMatchesText( prefilterQuery, text ) )
                 {
                     continue;
                 }
-                grepScanText( text, pat, regex ? &reLocal : nullptr, budgetCount, perFileSites[f] );
+                const auto [ isAbandoned, linesSkipped ] = grepScanText( text, pat, regex ? &reLocal.regex : nullptr, budgetCount, perFileSites[f], linePolicy );
+                if( isAbandoned )
+                {
+                    perFileAbandoned[f] = 1;
+                }
+                if( linesSkipped != 0 )
+                {
+                    perFileSkipped[f] = linesSkipped;
+                }
             }
         }
         catch( ... )   // a throw escaping a worker thread is std::terminate — degrade to partial hits instead
         {
-            workerDegraded.store( true, std::memory_order_relaxed );     // T1: the hit set is partial now
-            DEGRADED_PATH_ALERT( "grep: scan worker degraded (exception swallowed) — partial hit set" );
+            // T1: the hit set is partial now — the CLI prints scan_degraded="1" and counts_floor="1" from it
+            DISCLOSE( workerDegradeSink, ScanWorkerDegrade::DisclosureWhy::WorkerThrew, "grep: scan worker degraded (exception swallowed) — partial hit set" );
         }
     };
+    // symmetric bare scope: the workers live exactly as long as the scan. A regex scan runs on the scan threads
+    // even when one worker is enough — the line bound is a promise about the stack the match runs on.
+    std::size_t scanStackBytes = 0;
     {
-        // symmetric bare scope: the workers live exactly as long as the scan
         const unsigned    hwThreadCount = std::thread::hardware_concurrency();
         const std::size_t workerCount   = std::min<std::size_t>( { hwThreadCount ? hwThreadCount : 1u, fileCount, 16 } );
-        if( workerCount <= 1 )
+        if( workerCount <= 1 && !regex )
         {
-            fileWorker();
+            fileWorker( kCallerStackBytesFloor );
         }
         else
         {
-            std::vector<std::thread> workers;
-            workers.reserve( workerCount );
-            for( std::size_t w = 0; w < workerCount; ++w )
-            {
-                workers.emplace_back( fileWorker );
-            }
-            for( std::thread& worker : workers )
-            {
-                worker.join();
-            }
+            scanStackBytes = runOnStackThreads( workerCount, stackBytes, fileWorker, &isScanStackRefusedByFault );
         }
     }
 
-    // ── pass 2: apply the budget in ascending fileId order (thread-order-independent) ──────────────────
-    std::vector<GrepRawHit> raw;
-    for( std::uint32_t f = 0; f < fileCount && raw.size() < budgetCount; ++f )
+    // ── pass 2: RANK the hit files, THEN spend the budget in that order (thread-order-independent) ────────
+    // §P11.1: the canonical order is TIER-then-path (see this function's header comment), keyed once per FILE
+    // through filter.h's shared pathTierIndexOver/compareTierThenPath (the LB-G key every tier-sorted verb
+    // uses), never inside a per-hit comparator: pathTierOf() lowercases an extension into a fresh std::string.
+    // RANK BEFORE CUT: the budget used to run in ascending fileId order BEFORE this sort, so when it fired the
+    // survivors were whatever files the crawl listed first. On a fixture of two hit-dense docs/*.md files and
+    // one src/ file the answer read files="2" hits="4000000" hits_capped="1" and held no source hit at all —
+    // the head of the tier order lost to its tail. Ranked first, the ceiling only ever drops the TAIL of the
+    // canonical order (the least relevant tier's last files), so the collected list is a PREFIX of the uncapped
+    // one. The fileId tiebreak makes the order total (two roots may spell one path).
+    std::vector<std::uint32_t> hitFileIds;
+    hitFileIds.reserve( fileCount );
+    for( std::uint32_t f = 0; f < fileCount; ++f )
     {
+        if( !perFileSites[f].empty() )
+        {
+            hitFileIds.push_back( f );
+        }
+    }
+    {
+        const std::vector<std::uint8_t> tierOfFile = pathTierIndexOver( ing, hitFileIds, []( std::uint32_t f ) { return f; } );
+        std::sort( hitFileIds.begin(), hitFileIds.end(), [ & ]( std::uint32_t a, std::uint32_t b )
+                   {
+                       const int c = compareTierThenPath( ing, tierOfFile, a, b );
+                       return c != 0 ? c < 0 : a < b;
+                   } );
+    }
+    std::vector<GrepRawHit> raw;
+    for( std::size_t rankIndex = 0; rankIndex < hitFileIds.size() && raw.size() < budgetCount; ++rankIndex )
+    {
+        const std::uint32_t f = hitFileIds[rankIndex];
         for( const GrepMatchSite& site : perFileSites[f] )
         {
             raw.push_back( { f, site.line, site.byteOffset } );
             if( raw.size() >= budgetCount )
             {
-                break;
+                break;   // a file the ceiling cuts part-way keeps its FIRST sites; every later-ranked file is dropped whole
             }
         }
     }
+    ASSUME( raw.size() <= budgetCount, "pass 2 stops at the ceiling" );
 
-    // §P11.1: the canonical order is TIER-then-path (see this function's header comment). The key is
-    // materialized ONCE PER FILE, not evaluated inside the comparator: pathTierOf() lowercases an extension
-    // into a fresh std::string, and with the §A1 ceiling this list is ~10^6 rows — O(n log n) calls to it
-    // would allocate millions of times. fileRank is a dense position in the tier-then-path order, so the
-    // comparator below is pure integer work and a file's hits stay contiguous (pass 4's one-read-per-file
-    // caching depends on that).
-    std::vector<std::uint32_t> hitFileIds;
-    hitFileIds.reserve( fileCount );
-    {
-        std::vector<char> fileHasHitsForRank( fileCount, 0 );
-        for( const GrepRawHit& h : raw )
-        {
-            fileHasHitsForRank[h.fileId] = 1;
-        }
-        for( std::uint32_t f = 0; f < fileCount; ++f )
-        {
-            if( fileHasHitsForRank[f] )
-            {
-                hitFileIds.push_back( f );
-            }
-        }
-    }
-    std::sort( hitFileIds.begin(), hitFileIds.end(), [ & ]( std::uint32_t a, std::uint32_t b )
-               {
-                   const PathTier ta = pathTierOf( ing.files[a] ), tb = pathTierOf( ing.files[b] );
-                   if( ta != tb )
-                   {
-                       return ta < tb;
-                   }
-                   return ing.files[a] < ing.files[b];
-               } );
+    // fileRank is a dense position in the tier-then-path order, so the comparator below is pure integer work and
+    // a file's hits stay contiguous (pass 4's one-read-per-file caching depends on that).
     std::vector<std::uint32_t> fileRank( fileCount, UINT32_MAX );
     for( std::uint32_t rankIndex = 0; rankIndex < std::uint32_t( hitFileIds.size() ); ++rankIndex )
     {
@@ -1529,8 +1560,15 @@ inline GrepCollection grepCollect( const IngestResult& ing, const std::string& p
     // read the bit BEFORE the move — a braced-init-list is evaluated left to right, so `raw.size()` after
     // `std::move( raw )` would read a moved-from vector and always report "not capped"
     const bool isBudgetReached = raw.size() >= budgetCount;
+    const auto [ regexAbandonedFiles, firstRegexAbandonedFile ] = countAbandonedFiles( perFileAbandoned );
+    std::uint64_t regexLinesSkipped = 0;
+    for( const std::uint32_t skipped : perFileSkipped )
+    {
+        regexLinesSkipped += skipped;
+    }
     return { std::move( raw ), isBudgetReached, unreadableCount.load( std::memory_order_relaxed ),
-             workerDegraded.load( std::memory_order_relaxed ) };
+             workerDegraded.load( std::memory_order_relaxed ) || regexAbandonedFiles != 0, regexAbandonedFiles, firstRegexAbandonedFile,
+             regexLinesSkipped, engineLineBytesMax.load( std::memory_order_relaxed ), regex ? scanStackBytes : 0 };
 }
 
 // ─── §R-J (Wave-2 harvest item R-J) — query-file / unsupported-ext TEXT visibility ─────────────────────
@@ -1562,6 +1600,7 @@ struct GrepAuxHit
     std::string   path;
     std::uint32_t line;
     std::string   text;   // matched line, same kGrepMatchedLineMaxBytes cap as an indexed hit
+    std::uint32_t lineBytes = 0;   // ... and the same disclosure: the WHOLE line's size when that cap cut it, else 0
 };
 
 // What grepCollectAux scanned, and exactly why any candidate was excluded — every one of these is a COUNT
@@ -1579,29 +1618,36 @@ struct GrepAuxCollection
     std::uint32_t           filesUnreadable      = 0;   // open/read failed after the crawl saw it (deleted/permission mid-run)
     bool                    candidatesCapped     = false;
     bool                    degraded             = false;   // regex failed to COMPILE — nothing was scanned, mirrors GrepCollection's construction-failure case
-};
+    std::uint32_t           regexAbandonedFiles  = 0;       // the engine abandoned a match in this many unindexed files (see GrepCollection)
+    std::string             firstRegexAbandonedPath;        // the first of them, in the candidate list's own path order
+    std::uint64_t           regexLinesSkipped    = 0;       // lines too long for the engine in unindexed files (see GrepCollection)
+    std::size_t             regexLineBytesMax    = 0;       // the engine line bound of this scan's one thread (see GrepCollection)
+    std::size_t             regexStackBytes      = 0;       // that thread's stack (see GrepCollection); 0 for a literal scan
 
-// Scans the crawl's own "unsupported-ext, text-looking" population — CrawlSkips::unsupported, already
-// computed once at ingest time by recordPreSizeDrop/recordCrawlDrop, no second crawl — for `pat`,
-// additively to grepCollect()'s indexed-file scan. `maxAuxFileBytes` reuses the SAME per-file ceiling the
-// crawl applies to indexed files (cfg.maxFileBytes / kDefaultMaxFileBytes): a query file this large would
-// already have been an --max-file-size casualty had it carried a supported extension, so scanning past that
-// ceiling here would silently reintroduce the hazard the crawl exists to cap. Sequential by design — the
-// candidate population is capped at kMaxSkipRowsPerClass (500), far below where grepCollect's worker-pool
-// fan-out would pay for itself.
-inline GrepAuxCollection grepCollectAux( const CrawlSkips& skips, const std::string& pat, bool regex, std::size_t maxAuxFileBytes )
-{
-    GrepAuxCollection out;
-    out.candidatesCapped = skips.unsupported.size() < skips.unsupportedFiles;
-
-    std::regex re;
-    if( regex )
+    // The DISCLOSE sink for the unindexed scan's own degrade: the scan threw part-way, so `degraded` (which the CLI
+    // prints as scan_degraded="1" with counts_floor="1") is set and the hits so far are kept.
+    enum class DisclosureWhy : std::uint8_t
     {
-        try { re = std::regex( pat, std::regex::ECMAScript | std::regex::optimize ); }
-        catch( ... ) { out.degraded = true; return out; }   // T1: nothing scanned — a caller may not read this empty set as a complete zero
+        ScanThrew,
+    };
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        degraded = true;
     }
 
-    std::string               text;
+    void noteRegexAbandoned( const std::string& path )
+    {
+        if( regexAbandonedFiles++ == 0 )
+        {
+            firstRegexAbandonedPath = path;
+        }
+    }
+};
+
+// The per-file loop grepCollectAux runs, on whichever thread it chose (below). `re` is null for a literal scan.
+inline void scanUnsupportedFiles( const CrawlSkips& skips, const std::string& pat, const GuardedRegex* re, std::size_t maxAuxFileBytes,
+                                  RegexLinePolicy linePolicy, GrepAuxCollection& out )
+{
     std::vector<GrepMatchSite> sites;
     std::vector<std::size_t>  lineStarts;
     for( const SkippedFile& row : skips.unsupported )
@@ -1611,12 +1657,13 @@ inline GrepAuxCollection grepCollectAux( const CrawlSkips& skips, const std::str
             ++out.filesSkippedOversize;
             continue;
         }
-        text.clear();
-        if( !docparse::detail::readWholeFile( row.path, text ) )
+        const std::optional<std::string> fileBytes = docparse::detail::readWholeFile( row.path );
+        if( !fileBytes )
         {
             ++out.filesUnreadable;
             continue;
         }
+        const std::string& text = *fileBytes;
         if( looksBinary( text ) )
         {
             ++out.filesSkippedBinary;
@@ -1625,7 +1672,12 @@ inline GrepAuxCollection grepCollectAux( const CrawlSkips& skips, const std::str
         ++out.filesScanned;
 
         sites.clear();
-        grepScanText( text, pat, regex ? &re : nullptr, kGrepCollectionBudget, sites );
+        const auto [ isAbandoned, linesSkipped ] = grepScanText( text, pat, re, kGrepCollectionBudget, sites, linePolicy );
+        if( isAbandoned )
+        {
+            out.noteRegexAbandoned( row.path );
+        }
+        out.regexLinesSkipped += linesSkipped;
         if( sites.empty() )
         {
             continue;
@@ -1639,8 +1691,58 @@ inline GrepAuxCollection grepCollectAux( const CrawlSkips& skips, const std::str
         }
         for( const GrepMatchSite& s : sites )
         {
-            out.hits.push_back( GrepAuxHit{ row.path, s.line, grepMatchedLine( text, lineStarts, s.line ) } );
+            std::uint32_t auxLineBytes = 0;
+            std::string   auxText        = grepMatchedLine( text, lineStarts, s.line, &auxLineBytes );
+            out.hits.push_back( GrepAuxHit{ row.path, s.line, std::move( auxText ), auxLineBytes } );
         }
+    }
+}
+
+// Scans the crawl's own "unsupported-ext, text-looking" population — CrawlSkips::unsupported, already
+// computed once at ingest time by recordPreSizeDrop/recordCrawlDrop, no second crawl — for `pat`,
+// additively to grepCollect()'s indexed-file scan. `maxAuxFileBytes` reuses the SAME per-file ceiling the
+// crawl applies to indexed files (cfg.maxFileBytes / kDefaultMaxFileBytes): a query file this large would
+// already have been an --max-file-size casualty had it carried a supported extension, so scanning past that
+// ceiling here would silently reintroduce the hazard the crawl exists to cap. Sequential by design — the
+// candidate population is capped at kMaxSkipRowsPerClass (500), far below where grepCollect's worker-pool
+// fan-out would pay for itself.
+// `stackBytes`: what the scan thread asks for — collectGrepScanPhases passes the size grepCollect's threads settled on, so
+// the unindexed scan never runs on MORE stack than the indexed one did.
+inline GrepAuxCollection grepCollectAux( const CrawlSkips& skips, const std::string& pat, bool regex, std::size_t maxAuxFileBytes,
+                                         std::size_t stackBytes = kGrepScanStackBytes )
+{
+    GrepAuxCollection out;
+    out.candidatesCapped = skips.unsupported.size() < skips.unsupportedFiles;
+
+    const RegexCompile re = regex ? compileGuardedRegex( pat, kGrepRegexSyntax ) : RegexCompile{};
+    if( re.refusal )
+    {
+        out.degraded = true;   // T1: nothing scanned — a caller may not read this empty set as a complete zero
+        return out;
+    }
+
+    // A regex scan runs on one scan thread for the same reason grepCollect's workers do: the line bound is a promise
+    // about the stack the match runs on. The body is the whole scan; a throw out of a thread is std::terminate, so
+    // it degrades the collection the way a grepCollect worker does.
+    const auto scanAll = [ & ]( std::size_t settledBytes )
+    {
+        try
+        {
+            out.regexLineBytesMax = regex ? re.regex.maxEngineSubjectBytes( settledBytes ) : 0;
+            scanUnsupportedFiles( skips, pat, regex ? &re.regex : nullptr, maxAuxFileBytes, RegexLinePolicy{ regex ? out.regexLineBytesMax : SIZE_MAX, true }, out );
+        }
+        catch( ... )
+        {
+            DISCLOSE( out, GrepAuxCollection::DisclosureWhy::ScanThrew, "grep: the unindexed scan degraded (exception swallowed) — partial hit set" );
+        }
+    };
+    if( regex )
+    {
+        out.regexStackBytes = runOnStackThreads( 1, stackBytes, scanAll, &isScanStackRefusedByFault );
+    }
+    else
+    {
+        scanUnsupportedFiles( skips, pat, nullptr, maxAuxFileBytes, RegexLinePolicy{}, out );
     }
     return out;
 }
@@ -1711,11 +1813,7 @@ inline std::vector<GrepHit> grepEnrich( const IngestResult& ing, std::span<const
             return;
         }
         loadedFileId = f;
-        fileText.clear();
-        if( !docparse::detail::readWholeFile( diskPath( ing, f ), fileText ) )
-        {
-            fileText.clear(); // degrade: no text, never a crash
-        }
+        fileText     = docparse::detail::readWholeFile( diskPath( ing, f ) ).value_or( std::string() ); // degrade: no text, never a crash
         lineStarts.clear();
         lineStarts.push_back( 0 );
         for( std::size_t i = 0; i < fileText.size(); ++i )
@@ -1737,9 +1835,9 @@ inline std::vector<GrepHit> grepEnrich( const IngestResult& ing, std::span<const
         {
             chain = e->scope.empty() ? e->name : ( e->scope + "::" + e->name );
         }
-        GrepHit h{ r.fileId, r.line, std::move( chain ), {}, {}, {}, e ? e->id : kNoNode };
+        GrepHit h{ r.fileId, r.line, std::move( chain ), {}, {}, {}, e ? e->id : kNoNode, 0 };
         ensureFileLoaded( r.fileId );
-        h.text = grepMatchedLine( fileText, lineStarts, r.line );
+        h.text = grepMatchedLine( fileText, lineStarts, r.line, &h.lineBytes );
         if( ctxBefore > 0 )
         {
             h.before = grepContextSlice( fileText, lineStarts, r.line, ctxBefore, /*before=*/true );
@@ -1825,7 +1923,11 @@ inline std::vector<GrepFileGroup> grepGroupByFile( std::span<const GrepHit> hits
             bool folded = false;
             for( GrepCollapsedHit& c : group.hits )
             {
-                if( c.hit.text == h.text )
+                // lineBytes joins the fold key: two >512 B lines can share a byte-identical 512 B PREFIX
+                // and differ in true length, and folding those under one row would print one line_bytes=
+                // for sites it does not describe. Untruncated rows all carry 0, so this is byte-identical
+                // to the old key everywhere the cap did not fire.
+                if( c.hit.text == h.text && c.hit.lineBytes == h.lineBytes )
                 {
                     c.more.push_back( GrepHitSite{ h.line, h.enclosing, h.enclosingId } );
                     folded = true;
@@ -1906,11 +2008,7 @@ inline GrepCollection grepApplyBooleanTerms( const IngestResult& ing, GrepCollec
             return;
         }
         loadedFileId = f;
-        fileText.clear();
-        if( !docparse::detail::readWholeFile( diskPath( ing, f ), fileText ) )
-        {
-            fileText.clear();   // degrade: an unreadable file satisfies nothing rather than crashing
-        }
+        fileText     = docparse::detail::readWholeFile( diskPath( ing, f ) ).value_or( std::string() );   // degrade: an unreadable file satisfies nothing rather than crashing
         lineStarts.clear();
         lineStarts.push_back( 0 );
         for( std::size_t i = 0; i < fileText.size(); ++i )
@@ -1992,6 +2090,8 @@ struct GrepTierReport
     std::uint32_t suppressedComment = 0;   // classified hits held back because a tighter tier was non-empty
     std::uint32_t suppressedString  = 0;
     std::uint32_t tieredFileCount   = 0;   // hit files actually parsed (≤ the budgets)
+    std::uint32_t hitFileCount      = 0;   // hit files the classification had to cover: tier_files=, the TOTAL beside
+                                           // tier_parsed= once a budget stops it (the cut says how much it left)
     std::uint32_t unclassifiedHits  = 0;   // hits in files past the budget, or with no grammar — NEVER suppressed
     const char*   emittedTier       = "code";        // "code" | "comment" | "string" | "comment+string" — §F4's served tier
     const char*   budgetHit         = nullptr;       // nullptr | "files" | "bytes" — E5's disclosed bail-out
@@ -2006,6 +2106,54 @@ struct GrepTierReport
                            || std::strcmp( emittedTier, "code" ) != 0 );
     }
 };
+
+// A file where a bare word parses as CODE although it is a command word, a key or a value: a shell script,
+// YAML, TOML, JSON. A literal's code-tier hit there is a use of it (`set -g escape-time 0`), the same reading a
+// doc-file hit gets from its path tier. Extension-keyed, like filter.h's pathTierOf.
+inline bool isBareWordCodePath( std::string_view p )
+{
+    const std::string ext = docparse::lowerExtOf( p );
+    for( const std::string_view e : { std::string_view( ".sh" ), std::string_view( ".bash" ), std::string_view( ".zsh" ), std::string_view( ".yaml" ),
+                                      std::string_view( ".yml" ), std::string_view( ".toml" ), std::string_view( ".json" ) } )
+    {
+        if( ext == e )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The span-tier LIFT (grepApplySpanTiers): does no CLASSIFIED code-tier hit sit in source code, while a
+// classified string-tier hit sits in source code? "Source code" = filter.h's PathTier::Source and not a bare-word
+// file above, for BOTH halves. Unclassified hits never vote, the same rule the tier election itself follows.
+inline bool grepLiteralLiftsStrings( const IngestResult& ing, const std::vector<GrepRawHit>& raw, const std::vector<std::uint8_t>& hitTier )
+{
+    EXPECTS( hitTier.size() == raw.size(), "one tier byte per raw hit" );
+    const std::vector<std::uint8_t> tierOfFile = pathTierIndexOver( ing, raw, []( const GrepRawHit& r ) { return r.fileId; } );
+    bool                            sourceString = false;
+    std::uint32_t                   lastCodeFile = UINT32_MAX;
+    for( std::size_t h = 0; h < raw.size(); ++h )
+    {
+        const std::uint32_t f        = raw[h].fileId;
+        const bool          isSource = f < tierOfFile.size() && tierOfFile[f] == std::uint8_t( PathTier::Source );
+        if( hitTier[h] == std::uint8_t( SpanTier::String ) )
+        {
+            // the SAME "source code" both halves mean: a string in a shell/YAML/TOML/JSON file under a source path is not
+            // "a source file holds it as a string", any more than a bare word there is a code hit (review item 3)
+            sourceString = sourceString || ( isSource && !isBareWordCodePath( rootRelPath( ing, f ) ) );
+        }
+        else if( hitTier[h] == std::uint8_t( SpanTier::Code ) && isSource && f != lastCodeFile )
+        {
+            lastCodeFile = f;
+            if( !isBareWordCodePath( rootRelPath( ing, f ) ) )
+            {
+                return false;   // a code hit in source code: the code tier answers, today's rule stands
+            }
+        }
+    }
+    return sourceString;
+}
 
 // Filters `collected.raw` order-preserving (already tier-then-path sorted — filtering never reorders), the
 // same post-filter shape as grepApplyBooleanTerms above, and runs AFTER it: tiering the survivors of a
@@ -2035,7 +2183,10 @@ inline GrepCollection grepApplySpanTiers( const IngestResult& ing, GrepCollectio
             hitFileIds.push_back( r.fileId );
         }
     }
+    report.hitFileCount = std::uint32_t( hitFileIds.size() );
     // ── the bounded prefix: files are admitted in order until either budget would be exceeded ──────────
+    // The order is the collection's tier-then-path rank, so the budget classifies source files first and leaves
+    // the least relevant tier's tail unclassified (never suppressed: an unclassified hit is always served).
     std::uint64_t plannedBytes = 0;
     std::size_t   plannedFiles = 0;
     for( const std::uint32_t fileId : hitFileIds )
@@ -2060,6 +2211,8 @@ inline GrepCollection grepApplySpanTiers( const IngestResult& ing, GrepCollectio
 
     const SpanTierBatch batch = spanTiersOfFiles( std::span<const std::string>( tierPaths ), useMemo );
     report.tieredFileCount    = std::uint32_t( tierPaths.size() );
+    ASSUME( report.tieredFileCount <= report.hitFileCount, "the budget admits a prefix of the hit files" );
+    ASSUME( ( report.budgetHit == nullptr ) == ( report.tieredFileCount == report.hitFileCount ), "a budget fires exactly when it leaves a hit file unclassified" );
 
     // fileId → index into the parsed batch; UINT32_MAX ⇒ past the budget, i.e. UNCLASSIFIED
     std::vector<std::uint32_t> batchIndexOf( ing.files.size(), UINT32_MAX );
@@ -2071,9 +2224,13 @@ inline GrepCollection grepApplySpanTiers( const IngestResult& ing, GrepCollectio
     // ── classify every hit once, then choose the tier to serve ────────────────────────────────────────
     // One byte per hit, with UNCLASSIFIED as a fourth value rather than a second parallel array: the
     // collection ceiling is 4M raw hits, so a second array is 4 MB spent to say what one spare value says.
-    constexpr std::uint8_t    kUnclassifiedTier = 3;
+    // Both spelled off ingest.h's kSpanTierCount (proven exact at compile time): UNCLASSIFIED is the first value past
+    // the last SpanTier, so an appended tier moves it instead of colliding with it, and the counter grows with the
+    // enum instead of being indexed past its end. serveMask below is a u8 bit per tier, hence the bound.
+    static_assert( kSpanTierCount < 8, "serveMask holds one bit per SpanTier in a std::uint8_t" );
+    constexpr std::uint8_t    kUnclassifiedTier = std::uint8_t( kSpanTierCount );
     std::vector<std::uint8_t> hitTier( collected.raw.size(), kUnclassifiedTier );
-    std::uint32_t             tierHitCount[3] = { 0, 0, 0 };
+    std::uint32_t             tierHitCount[kSpanTierCount] = {};
     for( std::size_t h = 0; h < collected.raw.size(); ++h )
     {
         const GrepRawHit&   r     = collected.raw[h];
@@ -2098,7 +2255,16 @@ inline GrepCollection grepApplySpanTiers( const IngestResult& ing, GrepCollectio
     // serves the one tier it has. The choice is made over the CLASSIFIED hits only — an unclassified hit
     // cannot vote for a tier nobody proved it belongs to, and it is emitted either way.
     std::uint8_t serveMask = 0;
-    if( tierHitCount[std::size_t( SpanTier::Code )] > 0 )
+    if( tierHitCount[std::size_t( SpanTier::Code )] > 0 && grepLiteralLiftsStrings( ing, collected.raw, hitTier ) )
+    {
+        // The literal question (comparison table tmux-16 / textual-16, 2026-09-30): every code hit is a USAGE of
+        // the literal — a test/doc file, or a shell/YAML/TOML/JSON file where a bare word parses as code — while
+        // source code holds it as a string. That string is the answer ("which code reads escape-time"), so it
+        // is served beside the code tier instead of riding as suppressed_string=; comments stay held back.
+        serveMask          = std::uint8_t( ( 1u << std::size_t( SpanTier::Code ) ) | ( 1u << std::size_t( SpanTier::String ) ) );
+        report.emittedTier = "code+string";
+    }
+    else if( tierHitCount[std::size_t( SpanTier::Code )] > 0 )
     {
         serveMask          = std::uint8_t( 1u << std::size_t( SpanTier::Code ) );
         report.emittedTier = "code";
@@ -2156,6 +2322,33 @@ struct GrepEncRow
     std::uint32_t       defCount    = 0; // ids.size() — disclosed as defs= when > 1
     std::uint32_t       cx          = 0; // max cx across ids (the decl carries 0; the def carries the number)
 };
+
+// The ONE rule for which enclosing row may carry a freshness-pinned handle (the CLI's h= under --handles, the MCP grep
+// twin's `handle`): exactly one editable definition. Returns that def's id, or kNoNode with `omitted` naming the reason in
+// the vocabulary the CLI legend defines — "ambiguous" (the name grouped several definitions), "non-code" (a document/data
+// section has no safe definition span). Minting itself stays with each surface (the CLI hashes the file it reads, the MCP
+// index holds its own byte hash), so a handle that cannot be proven is that surface's "unreadable".
+inline NodeId grepEncHandleCandidate( const IngestResult& ing, const GrepEncRow& row, const char*& omitted )
+{
+    omitted = nullptr;
+    if( row.defCount != 1 || row.ids.size() != 1 )
+    {
+        omitted = "ambiguous";
+        return kNoNode;
+    }
+    const NodeId id = row.ids.front();
+    if( id >= ing.symbols.size() )
+    {
+        omitted = "ambiguous";   // not an indexed definition at all — nothing a handle could pin
+        return kNoNode;
+    }
+    if( ing.symbols[id].kind == SymKind::Section )
+    {
+        omitted = "non-code";
+        return kNoNode;
+    }
+    return id;
+}
 
 template<class GraphT>
 inline std::vector<GrepEncRow> grepEnclosingRows( const IngestResult& ing, const GraphT& g, std::span<const GrepHit> hits )

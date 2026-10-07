@@ -39,10 +39,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -124,7 +125,7 @@ D="$( fresh r3 )"; dirty "$D"
 ( cd "$D" && "$BIN" . --no-cache --quality-baseline --allow-dirty > "$D/b.out" 2>"$D/b.err" ); rc=$?
 [ "$rc" -eq 0 ] && ok "R3: --allow-dirty writes the baseline (rc=0)" \
                 || no "R3: --allow-dirty did not write (rc=$rc): $( cat "$D/b.err" )"
-[ -f "$D/.ripwire_quality_baseline" ] && ok "R3: the sidecar exists" || no "R3: no sidecar on disk"
+if [ -f "$D/.ripwire_quality_baseline" ]; then ok "R3: the sidecar exists"; else no "R3: no sidecar on disk"; fi
 ABS="$( grep -E '^absorbed ' "$D/.ripwire_quality_baseline" 2>/dev/null | awk '{print $2}' )"
 { [ -n "$ABS" ] && [ "$ABS" -ge 1 ]; } \
     && ok "R3: the sidecar records what it absorbed (absorbed $ABS)" \
@@ -132,7 +133,8 @@ ABS="$( grep -E '^absorbed ' "$D/.ripwire_quality_baseline" 2>/dev/null | awk '{
 grep -qE '^dirty 1' "$D/.ripwire_quality_baseline" 2>/dev/null \
     && ok "R3: the sidecar records that it was pinned on a dirty tree (dirty 1)" \
     || no "R3: the sidecar does not record the dirty pin"
-( cd "$D" && "$BIN" . --no-cache --quality-delta > "$D/d.xml" 2>"$D/d.err" ); rc=$?
+# L1 (2026-09-19): the CLI default legend is compact; R4 reads the FULL legend's baseline_absorbed definition, so it asks for it.
+( cd "$D" && "$BIN" . --no-cache --quality-delta --legend=full > "$D/d.xml" 2>"$D/d.err" ); rc=$?
 R="$( root_of "$D/d.xml" )"
 printf '%s' "$R" | grep -q 'baseline="sidecar"' \
     && ok "R4: the sidecar is honored (baseline=\"sidecar\")" \
@@ -175,9 +177,9 @@ echo "── R7 — determinism + well-formedness ──────────
 D="$( fresh r7 )"; dirty "$D"
 ( cd "$D" && "$BIN" . --no-cache --quality-baseline --allow-dirty >/dev/null 2>&1 )
 ( cd "$D" && "$BIN" . --no-cache --quality-delta > q1 2>/dev/null; "$BIN" . --no-cache --quality-delta > q2 2>/dev/null )
-cmp -s "$D/q1" "$D/q2" && ok "R7: --quality-delta is byte-identical across runs" || no "R7: --quality-delta is not deterministic"
+if cmp -s "$D/q1" "$D/q2"; then ok "R7: --quality-delta is byte-identical across runs"; else no "R7: --quality-delta is not deterministic"; fi
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$D/q1" 2>/dev/null && ok "R7: the carrying delta is well-formed XML" || no "R7: the carrying delta is not well-formed"
+    if xmllint --noout "$D/q1" 2>/dev/null; then ok "R7: the carrying delta is well-formed XML"; else no "R7: the carrying delta is not well-formed"; fi
 else
     echo "  SKIP  xmllint not installed"
 fi

@@ -40,6 +40,8 @@
 //
 
 #pragma once
+#include "emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // ---- configuration (override by #define-ing before the include) -------------
 #ifndef PROFILE_ENABLED
@@ -79,8 +81,8 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
-#include <pthread.h>
 
+#include "os.h"                    // rw::os::gettid / pthread_main_np / pthread_getname_np — thread identity, per platform
 #include "fastmath.h"              // ALWAYS_INLINE + cache-line size (via platform.h), fastmath::min/max (integral)
 #include "profilePmc.h"            // prof::pmc — optional Apple Silicon HW counters
 
@@ -90,15 +92,8 @@
 
 // Thread IDENTITY — the numeric tid and "am I the process's initial thread" — has no portable spelling.
 // This file was written against Darwin's pthread_threadid_np / pthread_main_np extensions; on Linux NEITHER
-// is declared, which is exactly where the first public CI run stopped on both ubuntu legs. See
-// detail::threadIdNumeric() / detail::isInitialThread() below for the three branches.
-#if defined( __linux__ )
-  #include <sys/syscall.h>        // SYS_gettid — the kernel task id pthread_threadid_np returns on Darwin
-  #include <unistd.h>             // ::syscall, ::getpid
-#elif !defined( __APPLE__ )
-  #include <functional>           // std::hash<std::thread::id> — the last-resort numeric id
-  #include <thread>               // std::this_thread::get_id
-#endif
+// is declared, which is exactly where the first public CI run stopped on both ubuntu legs. The per-platform
+// bodies live in os.h (rw::os::gettid / pthread_main_np / pthread_getname_np); detail:: below only names them.
 
 namespace prof
 {
@@ -385,50 +380,28 @@ private:
 namespace detail
 {
 
-// Darwin's pthread_threadid_np returns the 64-bit kernel thread id. Linux's equivalent is the tid
-// SYS_gettid yields (what gdb/htop/perf show), so a report row can still be matched against a tracer.
+// The 64-bit kernel thread id — what gdb/htop/perf show — so a report row can be matched against a tracer.
 inline uint64_t threadIdNumeric() noexcept
 {
-#if defined( __APPLE__ )
-    uint64_t tid = 0;
-    pthread_threadid_np( nullptr, &tid );
-    return tid;
-#elif defined( __linux__ )
-    return (uint64_t) ::syscall( SYS_gettid );
-#else
-    return (uint64_t) std::hash<std::thread::id>{}( std::this_thread::get_id() );
-#endif
+    return rw::os::gettid();
 }
 
-// Am I the process's initial thread? Linux: the initial thread is the one whose tid EQUALS the pid — the
-// exact definition, not an approximation. Elsewhere there is no such query, so latch the first caller;
-// registration happens on a thread's first PROFILE_SCOPE, and main() runs before any worker is spawned,
-// so this is right on every startup that profiles anything before it goes wide, and degrades to "the
+// Am I the process's initial thread? Where the platform has no such query, rw::os::pthread_main_np latches the
+// first caller: registration happens on a thread's first PROFILE_SCOPE, and main() runs before any worker is
+// spawned, so this is right on every startup that profiles anything before it goes wide, and degrades to "the
 // first profiled thread" otherwise. Wrong only mislabels one report row.
 inline bool isInitialThread() noexcept
 {
-#if defined( __APPLE__ )
-    return pthread_main_np() != 0;
-#elif defined( __linux__ )
-    return ::getpid() == (pid_t) ::syscall( SYS_gettid );
-#else
-    static const std::thread::id firstCaller = std::this_thread::get_id();
-    return std::this_thread::get_id() == firstCaller;
-#endif
+    return rw::os::pthread_main_np() != 0;
 }
 
-// pthread_getname_np is a *_np extension too, but unlike the other two it exists with this exact
-// (thread, buffer, length) signature on both Darwin and glibc/musl. Elsewhere the name stays empty —
-// the report already prints "unnamed" for that case.
+// The thread's own name. Where the platform cannot say, the name stays empty — the report already prints
+// "unnamed" for that case.
 inline void copyThreadName( char* buffer, std::size_t bufferCount ) noexcept
 {
-    VERIFY( buffer != nullptr && bufferCount > 0 );
+    ASSUME( buffer != nullptr && bufferCount > 0 );
     buffer[ 0 ] = '\0';
-#if defined( __APPLE__ ) || defined( __linux__ )
-    pthread_getname_np( pthread_self(), buffer, bufferCount );
-#else
-    (void) bufferCount;
-#endif
+    rw::os::pthread_getname_np( rw::os::pthread_self(), buffer, bufferCount );
 }
 
 }   // namespace detail
@@ -518,8 +491,8 @@ public:
             }
             else
             {
-                std::fprintf( stderr,
-                    "PROFILE WARNING: thread %llu (%s) still running at exit — join it "
+                rw::emitTo( stderr,
+                    "PROFILE WARNING: thread {} ({}) still running at exit — join it "
                     "before main() returns; leaking its profile data to stay safe\n",
                     (unsigned long long) d->tid, d->name[ 0 ] ? d->name : "unnamed" );
             }
@@ -715,36 +688,18 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-// Optimizer barriers for micro-benchmarks. Without these the compiler is free
-// to delete a benchmarked loop whose results are never read (dead-store
-// elimination) or hoist a loop-invariant computation out of the timed region —
-// either way the measured time is meaningless. clobberMemory() is an empty asm
-// that "may read/write all memory" — but on its own it does NOT help for a
-// non-escaped local buffer: the compiler can prove the asm has no way to reach
-// an address it never saw, so it still elides/hoists. escape() closes that gap.
-ALWAYS_INLINE void clobberMemory() noexcept
-{
-    asm volatile( "" : : : "memory" );
-}
-
-// escape() — feed a buffer's address INTO an (empty) asm that also clobbers
-// memory. Once the pointer has visibly escaped, the compiler must assume the asm
-// may read AND write through it, so it (a) emits any pending stores to the buffer
-// before the barrier and (b) reloads from it afterwards. Call escape() on BOTH
-// the input and the output of a benchmarked pass to stop the optimizer deleting
-// the stores OR hoisting a loop-invariant computation out of the timed loop.
-ALWAYS_INLINE void escape( const volatile void* p ) noexcept
-{
-    asm volatile( "" : : "r,m"( p ) : "memory" );
-}
-
-// Pin a single value so the compiler can't fold it away (the scalar twin of
-// escape; use when there's a result register rather than a buffer).
-template< class T >
-ALWAYS_INLINE void doNotOptimize( T& value ) noexcept
-{
-    asm volatile( "" : "+r,m"( value ) : : "memory" );
-}
+// Optimizer barriers for micro-benchmarks live in Diagnostics.h, not here.
+//
+// This file used to carry its own clobberMemory() / escape() / doNotOptimize(), three inline-asm
+// barriers with NO caller anywhere in the tree and the same job as Diagnostics::ClobberMemory and
+// Diagnostics::DoNotOptimize one layer down — which are called, and which already carry a portable
+// `#else` arm for a front end without inline asm. Two implementations of one barrier is the shape
+// where the unused copy silently rots, and this header's own rule (platform.h: "Every macro and
+// constant below has a real call site above this layer; nothing is kept in case") says which copy
+// goes. Removed 2026-09-20, with the cl.exe seam: they were also three of the tree's remaining
+// `asm volatile` sites, and porting a facility nobody calls is the worse half of that trade.
+// Use Diagnostics::ClobberMemory / Diagnostics::DoNotOptimize.
+// ----------------------------------------------------------------------------
 
 // ============================================================================
 // report() — snapshot (under locks) -> convert -> sort -> print. Cold path.
@@ -779,7 +734,7 @@ struct ThreadSnap
 // AFTER the map — on stdout it would trail the document (ill-formed XML, dead
 // `| xmllint` pipes) and vanish under `>file`. stderr also unifies with the
 // leaked-thread warning in teardown() and prof::pmc's diagnostics.
-__attribute__(( format( printf, 1, 2 ) ))
+RW_PRINTF_FORMAT( 1, 2 )
 inline void report_printf( const char* fmt, ... ) noexcept
 {
     va_list args;
@@ -804,23 +759,23 @@ inline void fmt_count( char* buf, std::size_t sz, uint64_t v ) noexcept
 {
     if( v < 1000ull )
     {
-        std::snprintf( buf, sz, "%llu", (unsigned long long)v );
+        rw::formatTo( buf, sz, "{}", (unsigned long long)v );
     }
     else if( v < 1000000ull )
     {
-        std::snprintf( buf, sz, "%.2fk", double( v ) * 1e-3 );
+        rw::formatTo( buf, sz, "{:.2f}k", double( v ) * 1e-3 );
     }
     else if( v < 1000000000ull )
     {
-        std::snprintf( buf, sz, "%.2fM", double( v ) * 1e-6 );
+        rw::formatTo( buf, sz, "{:.2f}M", double( v ) * 1e-6 );
     }
     else if( v < 1000000000000ull )
     {
-        std::snprintf( buf, sz, "%.2fG", double( v ) * 1e-9 );
+        rw::formatTo( buf, sz, "{:.2f}G", double( v ) * 1e-9 );
     }
     else
     {
-        std::snprintf( buf, sz, "%.2fT", double( v ) * 1e-12 );
+        rw::formatTo( buf, sz, "{:.2f}T", double( v ) * 1e-12 );
     }
 }
 
@@ -878,13 +833,13 @@ inline void name_and_loc( const Row& r, char* nameBuf, std::size_t nameSz,
     trim_pretty( r.site->pretty, fn, sizeof( fn ) );
     if( r.site->description )
     {
-        std::snprintf( nameBuf, nameSz, "%s [%s]", fn, r.site->description );
+        rw::formatTo( nameBuf, nameSz, "{} [{}]", rw::cstr( fn ), r.site->description );
     }
     else
     {
-        std::snprintf( nameBuf, nameSz, "%s", fn );
+        rw::formatTo( nameBuf, nameSz, "{}", rw::cstr( fn ) );
     }
-    std::snprintf( locBuf, locSz, "%s:%d", r.site->file, r.site->line );
+    rw::formatTo( locBuf, locSz, "{}:{}", r.site->file, r.site->line );
 }
 
 inline int index_of_site( const ThreadSnap& s, const Site* site )
@@ -927,8 +882,10 @@ inline void print_tree_node( const ThreadSnap& s, const std::vector<std::vector<
 
     char indented[ 208 ];
     const int pad = depth * 2;
-    std::snprintf( indented, sizeof( indented ), "%*s%s%s", pad, "", nameBuf,
-                   multiParent ? " *" : "" );
+    // %*s -> {:{}}: std::format takes the VALUE first and the width as the following argument, where
+    // printf takes the width first. Proven byte-identical across pad 0..16.
+    rw::formatTo( indented, sizeof( indented ), "{:{}}{}{}", "", pad, rw::cstr( nameBuf ),
+                  multiParent ? " *" : "" );
 
     // Percentage is share of the thread's top-level time (a fixed, bounded denominator),
     // not child/parent -- the latter is meaningless once a child aggregates many callers.
@@ -1323,7 +1280,7 @@ inline void report()
 
 #define PROF_SCOPE_IMPL_( desc, id )                                                       \
     static const ::prof::Site PROF_CAT( prof_site_, id ) {                                 \
-        __PRETTY_FUNCTION__, ::prof::detail::basename( __FILE__ ), ( desc ), __LINE__ };    \
+        _PRETTYFUNCTION_, ::prof::detail::basename( __FILE__ ), ( desc ), __LINE__ };       \
     static thread_local ::prof::Record* const PROF_CAT( prof_rec_, id ) =                  \
         ::prof::detail::tls_acquire( &PROF_CAT( prof_site_, id ) );                         \
     ::prof::ScopedTimer PROF_CAT( prof_timer_, id ) { PROF_CAT( prof_rec_, id ) }

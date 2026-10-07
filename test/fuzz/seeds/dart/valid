@@ -1,7 +1,7 @@
-class FuzzProbe {
-  const FuzzProbe.named();
-  static int get value => 1;
-  int run() => helper<int>(value);
+class A {
+  int f(int x) => x * 2;
+  void g() {
+    this..f(1)..f(2);
+  }
 }
-
-T helper<T>(T value) => value;
+int top() => 1;

@@ -38,7 +38,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -133,9 +133,9 @@ grep -q '^feat-doc def DOC\.md:' "$TMP/rows" \
 
 # determinism + well-formedness of the changed verb
 "$BIN" "$R" --whereis=parseArgs --limit=200 >"$TMP/w2.xml" 2>/dev/null
-cmp -s "$W" "$TMP/w2.xml" && ok "GUARD §A7: whereis is byte-identical run-to-run" || no "§A7: whereis is non-deterministic"
+if cmp -s "$W" "$TMP/w2.xml"; then ok "GUARD §A7: whereis is byte-identical run-to-run"; else no "§A7: whereis is non-deterministic"; fi
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$W" 2>/dev/null && ok "GUARD §A7: whereis XML well-formed" || no "§A7: whereis XML malformed"
+    if xmllint --noout "$W" 2>/dev/null; then ok "GUARD §A7: whereis XML well-formed"; else no "§A7: whereis XML malformed"; fi
 fi
 
 # ── §A6a: an ambiguous --edit-check REFUSES and hands back the spellings ────────────────────────────────
@@ -166,7 +166,8 @@ grep -q -- '--edit-check=.*h\.h:helper' "$TMP/ecerr" \
     && ok "§A6a: the refusal gives one spelling as a ready-to-run example" || { no "§A6a: refusal has no runnable example"; cat "$TMP/ecerr"; }
 
 # the qualified form still WORKS, and answers about that file's contract only.
-ECQ="$( "$BIN" "$R" --edit-check=one/h.h:helper --no-cache 2>/dev/null )"; ECQ_RC=$?
+# L1 (2026-09-19): the CLI default legend is compact, whose root leads with schema=; this reads sym= as the root's first attribute, so it asks for the full legend.
+ECQ="$( "$BIN" "$R" --edit-check=one/h.h:helper --no-cache --legend=full 2>/dev/null )"; ECQ_RC=$?
 { [ "$ECQ_RC" -eq 0 ] && printf '%s' "$ECQ" | grep -q '<edit-check sym="helper"'; } \
     && ok "GUARD §A6a: the qualified file:name form proceeds (exit 0) exactly as before" \
     || { no "§A6a: --edit-check=one/h.h:helper failed (exit $ECQ_RC)"; printf '%s\n' "$ECQ" | head -c 400; }
@@ -176,7 +177,7 @@ printf '%s' "$ECQ" | grep -q 'p="[^"]*one/h.h:2"' \
 
 # an UNAMBIGUOUS bare name is untouched (this fix must not turn every symbol into a refusal).
 ECU_RC=0; "$BIN" "$R" --edit-check=dispatch --no-cache >/dev/null 2>&1 || ECU_RC=$?
-[ "$ECU_RC" -eq 0 ] && ok "GUARD §A6a: an unambiguous bare name still answers (exit 0)" || no "§A6a: --edit-check=dispatch exited $ECU_RC (want 0)"
+if [ "$ECU_RC" -eq 0 ]; then ok "GUARD §A6a: an unambiguous bare name still answers (exit 0)"; else no "§A6a: --edit-check=dispatch exited $ECU_RC (want 0)"; fi
 
 # ── §A6b(ii): a file: qualifier naming a file with NO such def REFUSES, like its three siblings ─────────
 U_RC=0; "$BIN" "$R" --uses=core.h:helper --no-cache >"$TMP/uout" 2>"$TMP/uerr" || U_RC=$?

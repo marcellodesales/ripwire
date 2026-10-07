@@ -56,7 +56,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
+#include <span>
 #include <string_view>
 namespace rw
 {
@@ -168,6 +170,204 @@ inline bool isPythonBuiltin( std::string_view name ) noexcept
 inline bool isCFamilyStdName( std::string_view name ) noexcept
 {
     return std::binary_search( std::begin( kCFamilyStdNames ), std::end( kCFamilyStdNames ), name, rw::sortutil::svLess );
+}
+
+// The INLINE ABI namespaces a standard library implementation opens inside namespace std — the one fact
+// graph.h's keepStdQualifiedCandidates needs beyond the literal `std`. Symbol::scope and Reference::qualifier
+// are both the IMMEDIATE segment, so a def written in `namespace std { inline namespace __1 { … } }` carries
+// scope "__1", and a call written `std::__1::move( x )` carries qualifier "__1". Provenance, per spelling:
+//   __1 __2   libc++ <__config>: _LIBCPP_ABI_NAMESPACE is `__` + _LIBCPP_ABI_VERSION (1 = the stable ABI every
+//             shipping toolchain uses, 2 = the unstable next ABI)
+//   __ndk1    the Android NDK's libc++ build defines _LIBCPP_ABI_NAMESPACE=__ndk1
+//   __Cr      Chromium's bundled libc++ build defines _LIBCPP_ABI_NAMESPACE=__Cr
+//   __cxx11   libstdc++ <bits/c++config.h>: _GLIBCXX_BEGIN_NAMESPACE_CXX11 opens `inline namespace __cxx11`
+//             (the dual-ABI std::string and std::list)
+//   __8       libstdc++ configured with the versioned namespace (_GLIBCXX_INLINE_VERSION, GCC 8 onward)
+// RESERVED SPELLINGS ONLY, on purpose. Every entry starts with a double underscore, which [lex.name] reserves to
+// the implementation, so no conforming program names a namespace or an alias this way. The standard's own inline
+// namespaces (`literals`, `chrono_literals`, …) are NOT here: those are legal user spellings, and a user's
+// `mylib::literals::f()` must never read as a std-qualified call.
+// Read by binary_search through svLess inside keepStdQualifiedCandidates, its only consumer — the lookup lives
+// there rather than as a fourth `isX( name )` one-liner here, because --quality-delta reads that sibling shape as
+// a gating clone group (measured on this lane: 35 tokens, five members). The assert below keeps the search valid.
+inline constexpr std::string_view kStdInlineNamespaceNames[] = { "__1", "__2", "__8", "__Cr", "__cxx11", "__ndk1" };
+
+static_assert( std::is_sorted( std::begin( kStdInlineNamespaceNames ), std::end( kStdInlineNamespaceNames ), rw::sortutil::svLess )
+               && std::adjacent_find( std::begin( kStdInlineNamespaceNames ), std::end( kStdInlineNamespaceNames ) ) == std::end( kStdInlineNamespaceNames ),
+               "kStdInlineNamespaceNames must be strictly sorted (binary search)" );
+
+
+// ── FE-A: the JS/TS GLOBAL tables (graph.h FalseEdgeRules; gate test/falseedgecheck.sh). A call on a global object
+// (`JSON.stringify( b )`, `Buffer.from( p )`, `crypto.subtle.verify( … )`) or to a global function (`fetch( u )`) reaches
+// the runtime, never an in-repo definition the calling file does not import, declare or shadow — yet the name ladder
+// bound each of them to the lone same-named in-repo function, getter or object property. A name in these tables, used
+// in a file that binds no name of that spelling (no import, require, declaration, parameter or local — the extractor
+// records each as a JsShadow or ModuleAlias binding, ingest_jsimports.h), is a call outside the tree: external=.
+// PROVENANCE — Node 26.9.0, the global object as an ES MODULE sees it (the `node -e` REPL adds every builtin module as
+// a global, so the module form is the honest one), identifier-shaped own property names only:
+//   node --no-warnings m.mjs, m.mjs:
+//     const n=Object.getOwnPropertyNames(globalThis).filter(k=>/^[A-Za-z_][A-Za-z0-9_]*$/.test(k));
+//     console.log(n.filter(k=>typeof globalThis[k]==='function'&&/^[a-z]/.test(k)).sort());            // kJsGlobalFunctionNames
+//     console.log(n.filter(k=>/^[A-Z]/.test(k)&&['function','object'].includes(typeof globalThis[k])).sort(),   // kJsGlobalObjectNames:
+//                 n.filter(k=>/^[a-z]/.test(k)&&typeof globalThis[k]==='object').sort());              //   both lists
+//   kJsGlobalObjectNames takes both lists minus `global` and `globalThis`, which name the global object ITSELF and so
+//   are kJsGlobalAliasNames below, with the browser's `self` and `window`: a call through an alias is external only when
+//   the called name is itself in a global table (`globalThis.fetch( u )`), because a script's own top-level function is
+//   reachable as `window.f()`. A global object name is ALSO a global function when called bare (`Symbol()`, `new URL()`).
+//   Browser-only globals (`document`, `alert`, `requestAnimationFrame`) are not in Node's list: a stated floor.
+inline constexpr std::string_view kJsGlobalObjectNames[] = {
+    "AbortController", "AbortSignal", "AggregateError", "Array", "ArrayBuffer", "AsyncDisposableStack", "Atomics", "BigInt", "BigInt64Array",
+    "BigUint64Array", "Blob", "Boolean", "BroadcastChannel", "Buffer", "ByteLengthQueuingStrategy", "CloseEvent", "CompressionStream",
+    "CountQueuingStrategy", "Crypto", "CryptoKey", "CustomEvent", "DOMException", "DataView", "Date", "DecompressionStream", "DisposableStack",
+    "Error", "ErrorEvent", "EvalError", "Event", "EventTarget", "File", "FinalizationRegistry", "Float16Array", "Float32Array", "Float64Array",
+    "FormData", "Function", "Headers", "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map", "Math", "MessageChannel",
+    "MessageEvent", "MessagePort", "Navigator", "Number", "Object", "Performance", "PerformanceEntry", "PerformanceMark", "PerformanceMeasure",
+    "PerformanceObserver", "PerformanceObserverEntryList", "PerformanceResourceTiming", "Promise", "Proxy", "QuotaExceededError", "RangeError",
+    "ReadableByteStreamController", "ReadableStream", "ReadableStreamBYOBReader", "ReadableStreamBYOBRequest", "ReadableStreamDefaultController",
+    "ReadableStreamDefaultReader", "ReferenceError", "Reflect", "RegExp", "Request", "Response", "Set", "SharedArrayBuffer", "Storage", "String",
+    "SubtleCrypto", "SuppressedError", "Symbol", "SyntaxError", "TextDecoder", "TextDecoderStream", "TextEncoder", "TextEncoderStream",
+    "TransformStream", "TransformStreamDefaultController", "TypeError", "URIError", "URL", "URLPattern", "URLSearchParams", "Uint16Array",
+    "Uint32Array", "Uint8Array", "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet", "WebAssembly", "WebSocket", "WritableStream",
+    "WritableStreamDefaultController", "WritableStreamDefaultWriter", "console", "crypto", "navigator", "performance", "process", "sessionStorage"
+};
+inline constexpr std::string_view kJsGlobalFunctionNames[] = {
+    "atob", "btoa", "clearImmediate", "clearInterval", "clearTimeout", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent",
+    "escape", "eval", "fetch", "isFinite", "isNaN", "parseFloat", "parseInt", "queueMicrotask", "setImmediate", "setInterval", "setTimeout",
+    "structuredClone", "unescape"
+};
+inline constexpr std::string_view kJsGlobalAliasNames[] = { "global", "globalThis", "self", "window" };
+
+// FE-A: Go's predeclared FUNCTIONS (The Go Programming Language Specification, "Predeclared identifiers" — Functions,
+// go1.21+, which added clear/max/min). A bare Go call that no same-package function answers (graph.h FalseEdgeRules —
+// a bare call reaches only its own package) is external= when its name is one of these, and unresolved= otherwise (a
+// local closure the extractor does not record). 18 names, transcribed from the spec's list; sorted.
+inline constexpr std::string_view kGoBuiltinNames[] = {
+    "append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max", "min", "new", "panic", "print", "println",
+    "real", "recover"
+};
+
+// ── THE BUILTIN-METHOD TABLES — the member twin of the tables above (graph.h BuiltinMethodGate; gate
+// test/builtinbindcheck.sh). A member call `d.get( k )` whose receiver's type no evidence rule proved is resolved by
+// NAME alone, and when a repository defines exactly one method called `get` that lone definition used to take
+// every such call: on a real Python corpus one `ConnectionPool.get` collected 611 callers, almost all of them
+// `dict.get`. A name in these tables is a method of the language's own builtin map, list, set or string type, so a
+// receiver of unproven type is at least as likely to be one of those as an instance of the in-repo class. The gate
+// therefore keeps the ladder's edge only when the caller's FILE gives evidence for one of its targets (it names the
+// defining class or a class in its inheritance cone); otherwise the edge is removed and the call counted (declined, or
+// external when no target is reachable at all). It never adds or retargets an edge. A name NOT in a table keeps the
+// ladder unchanged: the list decides only WHEN evidence is required, never what the target is.
+//
+// PROVENANCE, per table — each is generated by the one command shown, so it can be regenerated and diffed, never
+// edited by hand. Public (non-underscore) methods only; the sortedness static_asserts below are the compile-time proof
+// the binary search is valid.
+//   kPythonBuiltinMethodNames — CPython 3.13.3, the builtin types dict list set frozenset str bytes bytearray tuple:
+//     python3 -c "print(sorted({n for t in (dict,list,set,frozenset,str,bytes,bytearray,tuple) for n in dir(t) if not n.startswith('_')}))"
+//     79 names.
+//   kJsBuiltinMethodNames — Node 26.9.0 (V8), the prototypes of Object Array Map Set WeakMap WeakSet String Promise,
+//     function-valued own properties minus `constructor` and the `__`-prefixed legacy accessors:
+//     node -e "const s=new Set();for(const t of [Object,Array,Map,Set,WeakMap,WeakSet,String,Promise])for(const n of
+//       Object.getOwnPropertyNames(t.prototype)){if(n==='constructor'||n.startsWith('__'))continue;
+//       if(typeof Object.getOwnPropertyDescriptor(t.prototype,n).value==='function')s.add(n)}console.log([...s].sort())"
+//     102 names. TypeScript reads the same table: it runs on the same builtin objects.
+//   kRubyBuiltinMethodNames — Ruby 4.0.7, Hash Array String public_instance_methods(false), identifier-shaped names only
+//     (operators such as `<<` and `[]` are never a call reference's name):
+//     ruby -e 'puts [Hash,Array,String].flat_map{|t| t.public_instance_methods(false)}.map(&:to_s)
+//       .select{|n| n =~ /\A[a-z_][A-Za-z0-9_]*[?!=]?\z/}.uniq.sort'
+//     233 names.
+// NO TABLE, BY DESIGN, for the other indexed languages — each reason is recorded in graph.h beside BuiltinMethodGate:
+// Java, Kotlin, C#, Swift, Rust and ObjC record no declared parameter or local type (and an ObjC message send carries no
+// receiver shape), so a gate would decline their typed true edges along with the false ones; Go's builtin types have
+// no methods, and its stdlib-type receivers (`sync.Pool.Get`) need the same missing declared-type evidence; C and C++
+// already carry declared-type evidence (Rule 2, 2b, CHA-lite) and want an evidence-against rule instead.
+inline constexpr std::string_view kPythonBuiltinMethodNames[] = {
+    "add", "append", "capitalize", "casefold", "center", "clear", "copy", "count", "decode", "difference", "difference_update", "discard", "encode",
+    "endswith", "expandtabs", "extend", "find", "format", "format_map", "fromhex", "fromkeys", "get", "hex", "index", "insert", "intersection",
+    "intersection_update", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit", "isdisjoint", "isidentifier", "islower", "isnumeric",
+    "isprintable", "isspace", "issubset", "issuperset", "istitle", "isupper", "items", "join", "keys", "ljust", "lower", "lstrip", "maketrans",
+    "partition", "pop", "popitem", "remove", "removeprefix", "removesuffix", "replace", "reverse", "rfind", "rindex", "rjust", "rpartition", "rsplit",
+    "rstrip", "setdefault", "sort", "split", "splitlines", "startswith", "strip", "swapcase", "symmetric_difference", "symmetric_difference_update",
+    "title", "translate", "union", "update", "upper", "values", "zfill"
+};
+inline constexpr std::string_view kJsBuiltinMethodNames[] = {
+    "add", "anchor", "at", "big", "blink", "bold", "catch", "charAt", "charCodeAt", "clear", "codePointAt", "concat", "copyWithin", "delete",
+    "difference", "endsWith", "entries", "every", "fill", "filter", "finally", "find", "findIndex", "findLast", "findLastIndex", "fixed", "flat",
+    "flatMap", "fontcolor", "fontsize", "forEach", "get", "getOrInsert", "getOrInsertComputed", "has", "hasOwnProperty", "includes", "indexOf",
+    "intersection", "isDisjointFrom", "isPrototypeOf", "isSubsetOf", "isSupersetOf", "isWellFormed", "italics", "join", "keys", "lastIndexOf", "link",
+    "localeCompare", "map", "match", "matchAll", "normalize", "padEnd", "padStart", "pop", "propertyIsEnumerable", "push", "reduce", "reduceRight",
+    "repeat", "replace", "replaceAll", "reverse", "search", "set", "shift", "slice", "small", "some", "sort", "splice", "split", "startsWith",
+    "strike", "sub", "substr", "substring", "sup", "symmetricDifference", "then", "toLocaleLowerCase", "toLocaleString", "toLocaleUpperCase",
+    "toLowerCase", "toReversed", "toSorted", "toSpliced", "toString", "toUpperCase", "toWellFormed", "trim", "trimEnd", "trimLeft", "trimRight",
+    "trimStart", "union", "unshift", "valueOf", "values", "with"
+};
+inline constexpr std::string_view kRubyBuiltinMethodNames[] = {
+    "all?", "any?", "append", "append_as_bytes", "ascii_only?", "assoc", "at", "b", "bsearch", "bsearch_index", "byteindex", "byterindex", "bytes",
+    "bytesize", "byteslice", "bytesplice", "capitalize", "capitalize!", "casecmp", "casecmp?", "center", "chars", "chomp", "chomp!", "chop", "chop!",
+    "chr", "clear", "codepoints", "collect", "collect!", "combination", "compact", "compact!", "compare_by_identity", "compare_by_identity?",
+    "concat", "count", "crypt", "cycle", "deconstruct", "deconstruct_keys", "dedup", "default", "default=", "default_proc", "default_proc=", "delete",
+    "delete!", "delete_at", "delete_if", "delete_prefix", "delete_prefix!", "delete_suffix", "delete_suffix!", "detect", "difference", "dig",
+    "downcase", "downcase!", "drop", "drop_while", "dump", "dup", "each", "each_byte", "each_char", "each_codepoint", "each_grapheme_cluster",
+    "each_index", "each_key", "each_line", "each_pair", "each_value", "empty?", "encode", "encode!", "encoding", "end_with?", "eql?", "except",
+    "fetch", "fetch_values", "fill", "filter", "filter!", "find", "find_index", "first", "flatten", "flatten!", "force_encoding", "freeze", "getbyte",
+    "grapheme_clusters", "gsub", "gsub!", "has_key?", "has_value?", "hash", "hex", "include?", "index", "insert", "inspect", "intern", "intersect?",
+    "intersection", "invert", "join", "keep_if", "key", "key?", "keys", "last", "length", "lines", "ljust", "lstrip", "lstrip!", "map", "map!",
+    "match", "match?", "max", "member?", "merge", "merge!", "min", "minmax", "next", "next!", "none?", "oct", "one?", "ord", "pack", "partition",
+    "permutation", "pop", "prepend", "product", "push", "rassoc", "rehash", "reject", "reject!", "repeated_combination", "repeated_permutation",
+    "replace", "reverse", "reverse!", "reverse_each", "rfind", "rindex", "rjust", "rotate", "rotate!", "rpartition", "rstrip", "rstrip!", "sample",
+    "scan", "scrub", "scrub!", "select", "select!", "setbyte", "shift", "shuffle", "shuffle!", "size", "slice", "slice!", "sort", "sort!", "sort_by!",
+    "split", "squeeze", "squeeze!", "start_with?", "store", "strip", "strip!", "sub", "sub!", "succ", "succ!", "sum", "swapcase", "swapcase!", "take",
+    "take_while", "to_a", "to_ary", "to_c", "to_f", "to_h", "to_hash", "to_i", "to_proc", "to_r", "to_s", "to_str", "to_sym", "tr", "tr!", "tr_s",
+    "tr_s!", "transform_keys", "transform_keys!", "transform_values", "transform_values!", "transpose", "undump", "unicode_normalize",
+    "unicode_normalize!", "unicode_normalized?", "union", "uniq", "uniq!", "unpack", "unpack1", "unshift", "upcase", "upcase!", "update", "upto",
+    "valid_encoding?", "value?", "values", "values_at", "zip"
+};
+
+// ONE sortedness proof for the three tables above, taking the table as a span, so the three stay one shape rather than
+// three near-copies of the assert this file already spells per table. The lookup is graph.h BuiltinMethodGate::appliesTo,
+// its only reader, which picks the table by language first.
+constexpr bool isStrictlySortedTable( std::span<const std::string_view> table ) noexcept
+{
+    return std::is_sorted( table.begin(), table.end(), rw::sortutil::svLess ) && std::adjacent_find( table.begin(), table.end() ) == table.end();
+}
+static_assert( isStrictlySortedTable( kPythonBuiltinMethodNames ), "kPythonBuiltinMethodNames must be strictly sorted (binary search)" );
+static_assert( isStrictlySortedTable( kJsBuiltinMethodNames ), "kJsBuiltinMethodNames must be strictly sorted (binary search)" );
+static_assert( isStrictlySortedTable( kRubyBuiltinMethodNames ), "kRubyBuiltinMethodNames must be strictly sorted (binary search)" );
+static_assert( isStrictlySortedTable( kJsGlobalObjectNames ), "kJsGlobalObjectNames must be strictly sorted (binary search)" );
+static_assert( isStrictlySortedTable( kJsGlobalFunctionNames ), "kJsGlobalFunctionNames must be strictly sorted (binary search)" );
+static_assert( isStrictlySortedTable( kJsGlobalAliasNames ), "kJsGlobalAliasNames must be strictly sorted (binary search)" );
+static_assert( isStrictlySortedTable( kGoBuiltinNames ), "kGoBuiltinNames must be strictly sorted (binary search)" );
+
+// FE-A: which JS/TS global table holds `name` (graph.h FalseEdgeRules, ingest_jsimports.h) — an object (`JSON`; also a
+// constructor when called bare), a function (`fetch`), or a name for the global object itself (`globalThis`).
+enum class JsGlobal : std::uint8_t { None, Object, Function, GlobalObject };
+inline JsGlobal jsGlobalKindOf( std::string_view name ) noexcept
+{
+    const auto holds = [ name ]( std::span<const std::string_view> table ) { return std::ranges::binary_search( table, name, rw::sortutil::svLess ); };
+    if( holds( kJsGlobalObjectNames ) )
+    {
+        return JsGlobal::Object;
+    }
+    if( holds( kJsGlobalFunctionNames ) )
+    {
+        return JsGlobal::Function;
+    }
+    return holds( kJsGlobalAliasNames ) ? JsGlobal::GlobalObject : JsGlobal::None;
+}
+inline bool isJsGlobalName( std::string_view name ) noexcept   // an object or a function: a name a bare call can mean
+{
+    switch( jsGlobalKindOf( name ) )
+    {
+        case JsGlobal::Object:
+        case JsGlobal::Function:
+        {
+            return true;
+        }
+        case JsGlobal::GlobalObject:
+        case JsGlobal::None:
+        {
+            return false;
+        }
+    }
+    return false;
 }
 
 }   // namespace externalnames

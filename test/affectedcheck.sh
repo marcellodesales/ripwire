@@ -26,7 +26,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -69,12 +69,19 @@ printf 'void unrelated_helper() { }\n'                             > "$R/test/de
 
 run(){ perl -e 'alarm 15; exec @ARGV' "$BIN" "$R" "$@" --no-cache 2>/dev/null; }
 runec(){ perl -e 'alarm 15; exec @ARGV' "$BIN" "$R" "$@" --no-cache >/dev/null 2>"$TMP/err.txt"; }
-# extract the basenames of the emitted <test p="..."/> entries, sorted
-tset(){ printf '%s' "$1" | grep -oE '<test p="[^"]*"' | grep -oE '[^/"]*"$' | sed 's/"$//' | sort | tr '\n' ','; }
+# The basenames of the emitted test rows, sorted — through test/testrowpaths.py, THE shared reader, like
+# tord() below. This helper was the LAST private reader left in the file the shared reader's own docstring
+# names among the six it converted (review of #214), so that claim was false while it stood. It split EVERY
+# row's p= on ',' — including a single <test> row's — and a path containing ',' is never grouped (testmap.h
+# refuses to, so that p= is one path, not a list), which turned such a row into two names that name nothing.
+# The shared reader splits only a QUALIFIED group row and decodes entities, so the two helpers in this file
+# can no longer disagree about what a row is.
+tset(){ printf '%s' "$1" | python3 "$ROOT/test/testrowpaths.py" paths xml | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ','; }
 cnt(){  printf '%s' "$1" | grep -oE 'tests="[0-9]+"' | head -1 | grep -oE '[0-9]+'; }
 
 # ── 1) change core.cpp → exactly the two tests that reach its symbols ────────────────────────────────
-A="$( run --affected=src/core.cpp )"
+# L1 (2026-09-19): the CLI default legend is compact; $A and $COLL feed arms that read the FULL legend's prose, so they ask for it.
+A="$( run --affected=src/core.cpp --legend=full )"
 { [ "$( cnt "$A" )" = 2 ] && [ "$( tset "$A" )" = "test_leaf.cpp,test_mid.cpp," ]; } \
     && ok "--affected=src/core.cpp: exactly {test_leaf.cpp,test_mid.cpp}, tests=2" \
     || no "--affected=src/core.cpp wrong (tests=$( cnt "$A" ) set=$( tset "$A" ))"
@@ -221,7 +228,7 @@ printf '%s' "$A" | grep -q 'a path count; not every one invokes the binary' \
 # an agent which tests to run. A test file cannot "reach" a change it is part of; it is in the answer because
 # the argument MATCHED it, which is a different fact and is labelled as one.
 CTRL="$( run --affected=src/geo.cpp )"       # unambiguous: matches src/geo.cpp only
-COLL="$( run --affected=geo.cpp )"           # matches src/geo.cpp AND test/check_geo.cpp
+COLL="$( run --affected=geo.cpp --legend=full )"           # matches src/geo.cpp AND test/check_geo.cpp
 ONLYT="$( run --affected=check_geo.cpp )"    # matches the TEST file alone
 attr(){ printf '%s' "$2" | grep -oE "$1=\"[0-9]+\"" | head -1 | grep -oE '[0-9]+'; }
 
@@ -268,7 +275,9 @@ done
 
 # ── 7) H2H-Graft F1: rows in EVIDENCE order, stem partner first, hops= disclosed ──────────────────────
 # Ordered basenames (NOT sorted — the order IS the claim).
-tord(){ printf '%s' "$1" | grep -oE '<test p="[^"]*"' | grep -oE '[^/"]*"$' | sed 's/"$//' | tr '\n' ','; }
+# E1: the files named, in EMITTED order (a <g> row contributes its members in place) — through the shared
+# reader, so this gate and the eight others that ask the same question cannot disagree about what a row is.
+tord(){ printf '%s' "$1" | python3 "$ROOT/test/testrowpaths.py" paths xml | sed 's|.*/||' | tr '\n' ','; }
 D="$( run --affected=src/deep.cpp )"
 [ "$( tord "$D" )" = "deep_test.cpp,test_zdirect.cpp,test_afar.cpp," ] && [ "$( cnt "$D" )" = 3 ] \
     && ok "(7a) --affected=src/deep.cpp: partner first, then hops asc — deep_test, test_zdirect(1), test_afar(2); tests=3" \
@@ -285,12 +294,280 @@ printf '%s' "$D" | grep -q '<affected [^>]*order="evidence"' && printf '%s' "$D"
 # negative: no stem partner exists for core.cpp, so no row may claim one
 printf '%s' "$A" | grep -q 'partner="1"' && no "(7f) core.cpp has no *_test partner yet a row claims partner=\"1\"" \
     || ok "(7f) partner= never fires without a stem match"
-printf '%s' "$A" | grep -q '<test p="test/test_leaf.cpp" hops="1"' && ok "(7g) core.cpp's direct test row carries hops=\"1\"" \
+# E1 (2026-09-12): with no derivable runner the direct test rides a <g hops="1" n= p="…"/> group row when a
+# sibling shares its evidence, and a single <test p= hops="1"> row otherwise — hops="1" is asserted either way.
+printf '%s' "$A" | grep -qE '<test p="test/test_leaf\.cpp" hops="1"|<g hops="1" n="[0-9]+" p="([^"]*,)?test/test_leaf\.cpp(,[^"]*)?"' \
+    && ok "(7g) core.cpp's direct test row carries hops=\"1\"" \
     || no "(7g) core.cpp rows lack hops="
+
+# ── 7h) the RUN-FIRST head (comparison table hono-20 / textual-20) ─────────────────────────────────────
+# A tests-to-run answer listed 80-249 files by evidence, and nothing marked which rows carry the most direct evidence:
+# textual's snapshot test sat inside an undifferentiated tier of 157. run_first=N marks the head of the evidence order
+# — every changed/partner/hops=1 row, or when none exists the rows at the smallest hops= — as a RUN ORDER, never a skip
+# list (the walk is name-based; the rest can still exercise the change), and the rest stays listed (no drop).
+# RED on main 953818d6: no run_first= anywhere. (7p) pins the "not a skip list" reading in the legend that carries it.
+printf 'int farleaf() { return 9; }\n'                            > "$R/src/farleaf.cpp"
+printf 'int farbridge() { return farleaf(); }\nint farbridge2() { return farbridge(); }\n' > "$R/src/farbridge.cpp"
+printf 'void nf_one() { farbridge(); }\n'                         > "$R/test/test_nfone.cpp"
+printf 'void nf_two() { farbridge2(); }\n'                        > "$R/test/test_nftwo.cpp"
+D="$( run --affected=src/deep.cpp )"
+printf '%s' "$D" | grep -q '<affected [^>]*run_first="2"' \
+    && ok "(7h) --affected=src/deep.cpp: run_first=\"2\" — the partner and the hops=1 row, ahead of hops=2" \
+    || no "(7h) expected run_first=\"2\" on the --affected root, got: $( printf '%s' "$D" | grep -o '<affected [^>]*>' )"
+FAR="$( run --affected=src/farleaf.cpp )"
+if printf '%s' "$FAR" | grep -q '<affected [^>]*run_first="1"' && [ "$( tord "$FAR" )" = "test_nfone.cpp,test_nftwo.cpp," ]; then
+    ok "(7i) no partner or hops=1 row: the nearest hop tier (test_nfone, hops=2) is the run-first tier, hops=3 still listed"
+else
+    no "(7i) expected run_first=\"1\" over test_nfone,test_nftwo; got $( printf '%s' "$FAR" | grep -o '<affected [^>]*>' ) order=$( tord "$FAR" )"
+fi
+printf '%s' "$( run --affected=src/via.cpp )" | grep -q 'run_first=' \
+    && no "(7j) a list that is ALL run-first carries run_first= (it splits nothing)" \
+    || ok "(7j) a list whose every row is run-first carries no run_first= (it splits nothing)"
+printf '%s' "$D" | sed 's/-->.*//' | grep -q 'run_first=N' \
+    && ok "(7k) the legend defines run_first= in the answer that carries it" \
+    || no "(7k) run_first= emitted without its legend clause"
+printf '%s' "$D" | sed 's/-->.*//' | grep -q 'not a skip list' \
+    && ok "(7p) the run_first= reading says it is a run order, not a skip list" \
+    || no "(7p) the run_first= legend lost 'not a skip list' — the head would read as the whole obligation"
+TG="$( run --test-gate=src/deep.cpp )"
+printf '%s' "$TG" | grep -q '<test-gate [^>]*run_first="2"' \
+    && ok "(7l) --test-gate=src/deep.cpp carries the same run_first=\"2\"" \
+    || no "(7l) --test-gate root lacks run_first=\"2\": $( printf '%s' "$TG" | grep -o '<test-gate [^>]*>' )"
+printf '%s' "$TG" | sed 's/-->.*//' | grep -q 'run_first=N' \
+    && ok "(7m) the --test-gate legend defines run_first=" || no "(7m) --test-gate emits run_first= undefined"
+run --test-gate=src/deep.cpp --json | grep -q '"run_first":2' \
+    && ok "(7n) --test-gate --json carries \"run_first\":2" || no "(7n) --test-gate --json lacks run_first"
+AF_MCP="$( printf '%s\n%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"affected","arguments":{"path":"'"$R"'","files":"src/deep.cpp"}}}' \
+    | perl -e 'alarm 30; exec @ARGV' "$BIN" "$R" --mcp --no-cache 2>/dev/null | tail -1 )"
+printf '%s' "$AF_MCP" | grep -q 'run_first=\\"2\\"' \
+    && ok "(7o) the MCP affected twin carries run_first=\"2\" (one renderer)" \
+    || { no "(7o) the MCP affected twin lacks run_first"; printf '%s\n' "$AF_MCP" | cut -c1-300; }
+rm -f "$R/src/farleaf.cpp" "$R/src/farbridge.cpp" "$R/test/test_nfone.cpp" "$R/test/test_nftwo.cpp"
+
+# ── 8) issue #60: a call with no enclosing NAMED function is still a call ─────────────────────────────
+# @YogevKr's reproduction, verbatim in shape: a node:test arrow callback calls the changed function, and
+# the test file's name does not share the source file's stem, so the filename-partner fallback cannot fire.
+# The CONTROL is the same assertion moved into a named function — the contrast that isolated the defect.
+# Before ingest_model.h mintModuleScopeOwners the callback arm read tests="0" and the named arm tests="1";
+# both must now read 1, and they must agree, because the two source shapes mean the same thing.
+echo "=== (8) #60: an arrow-callback call and a named-function call give the SAME tests ==="
+T60="$TMP/issue60"; mkdir -p "$T60/arrow/src" "$T60/arrow/test" "$T60/named/src" "$T60/named/test"
+for v in arrow named; do
+    printf 'export function bounded(text: string): string {\n  return text.replace(/x/g, "");\n}\n' > "$T60/$v/src/bounded.ts"
+done
+printf 'import test from "node:test";\nimport assert from "node:assert/strict";\nimport { bounded } from "../src/bounded.ts";\ntest("bounded removes x", () => { assert.equal(bounded("x value"), " value"); });\n' > "$T60/arrow/test/behavior.test.ts"
+printf 'import test from "node:test";\nimport assert from "node:assert/strict";\nimport { bounded } from "../src/bounded.ts";\nfunction checkBounded() { assert.equal(bounded("x value"), " value"); }\ntest("bounded removes x", checkBounded);\n' > "$T60/named/test/behavior.test.ts"
+AR="$( "$BIN" "$T60/arrow" --no-cache --affected=src/bounded.ts 2>/dev/null )"
+NA="$( "$BIN" "$T60/named" --no-cache --affected=src/bounded.ts 2>/dev/null )"
+arrowTests="$( attr tests "$AR" )"; namedTests="$( attr tests "$NA" )"
+[ "$namedTests" = 1 ] && ok "(8) the named-function control still reports tests=\"1\"" \
+    || no "(8) the named-function control reports tests=\"${namedTests:-absent}\" — the contrast proves nothing"
+[ "$arrowTests" = 1 ] && ok "(8) the arrow-callback arm reports tests=\"1\" (the pre-#60 binary reports 0)" \
+    || no "(8) the arrow-callback arm reports tests=\"${arrowTests:-absent}\", expected 1"
+[ "$arrowTests" = "$namedTests" ] && ok "(8) both source shapes give the SAME tests= ($arrowTests)" \
+    || no "(8) arrow=$arrowTests named=$namedTests — the two shapes still disagree"
+printf '%s' "$AR" | grep -q 'p="test/behavior\.test\.ts"' \
+    && ok "(8) the arrow arm NAMES test/behavior.test.ts, whose stem never matches bounded.ts" \
+    || no "(8) the arrow arm reports a count but not the file: $AR"
+# --test-gate must FAIL (exit 4) while that test is not in the run set — the verb an agent acts on.
+"$BIN" "$T60/arrow" --no-cache --test-gate=src/bounded.ts >"$TMP/tg60.xml" 2>/dev/null
+tgrc=$?
+[ "$tgrc" = 4 ] && ok "(8) --test-gate exits 4 on the arrow arm: the test to run is named, not silently zero" \
+    || no "(8) --test-gate exited $tgrc on the arrow arm, expected 4"
+grep -q 'behavior\.test\.ts' "$TMP/tg60.xml" \
+    && ok "(8) --test-gate names test/behavior.test.ts as the test to run" \
+    || no "(8) --test-gate exits non-zero but never names the test: $( head -c 400 "$TMP/tg60.xml" )"
+
+# ── 8b) issue #60, @alex-michaud's arm: the same root cause in ORDINARY PRODUCTION code ───────────────
+# No test file, no test framework: a module top-level call is framework registration / DI wiring / route
+# setup, and --callers and --impact both used to be one short. The named-function call in the same file is
+# the control: it was always counted, and it must still be.
+echo "=== (8b) #60: a module top-level call is a caller ==="
+P60="$TMP/issue60prod/src"; mkdir -p "$P60"
+printf 'export function setPhase(phase: string): void {\n  console.log(phase)\n}\n' > "$P60/lifecycle.ts"
+printf "import { setPhase } from './lifecycle'\n\nexport function boot(): void {\n  setPhase('booting')\n}\n\nsetPhase('starting')\n" > "$P60/index.ts"
+CA="$( "$BIN" "$TMP/issue60prod" --no-cache --callers=setPhase 2>/dev/null )"
+IM="$( "$BIN" "$TMP/issue60prod" --no-cache --impact=setPhase 2>/dev/null )"
+[ "$( attr count "$CA" )" = 2 ] && ok "(8b) --callers=setPhase count=\"2\" (the pre-#60 binary reports 1)" \
+    || no "(8b) --callers=setPhase count=\"$( attr count "$CA" )\", expected 2"
+[ "$( attr reaches "$IM" )" = 2 ] && ok "(8b) --impact=setPhase reaches=\"2\" (the pre-#60 binary reports 1)" \
+    || no "(8b) --impact=setPhase reaches=\"$( attr reaches "$IM" )\", expected 2"
+printf '%s' "$CA" | grep -q '<s t="fn" n="boot" p="src/index.ts:3"/>' \
+    && ok "(8b) the named-function caller row is unchanged — no existing edge moved" \
+    || no "(8b) the boot row changed shape: $CA"
+printf '%s' "$CA" | grep -q '<s t="modscope" n="&lt;file-scope&gt;" p="src/index.ts:1"/>' \
+    && ok "(8b) the module-scope caller is a LABELLED t=\"modscope\" row, not a fabricated function" \
+    || no "(8b) --callers=setPhase has no modscope row: $CA"
+# HONESTY, IN EVERY POSTURE. The default CLI legend is compact and the clause is a present-only term
+# (compactlegend.h, keyed on the t= VALUE); --legend=full takes the conditional clause in graphlegend.h.
+# Both must define the kind, and the two must be asserted separately — a reader holds one or the other.
+printf '%s' "$CA" | grep -q '(t=modscope)' \
+    && ok "(8b) the compact callers legend defines t=\"modscope\" in the document that emits it" \
+    || no "(8b) --callers emits t=\"modscope\" and its compact legend never defines it"
+printf '%s' "$IM" | grep -q '(t=modscope)' \
+    && ok "(8b) the compact impact legend defines t=\"modscope\" too" \
+    || no "(8b) --impact emits t=\"modscope\" and its compact legend never defines it"
+for v in callers impact; do
+    F="$( "$BIN" "$TMP/issue60prod" --no-cache --$v=setPhase --legend=full 2>/dev/null )"
+    printf '%s' "$F" | grep -q 'modscope" is a row for a file' \
+        && ok "(8b) --$v --legend=full defines t=\"modscope\" as well" \
+        || no "(8b) --$v --legend=full emits t=\"modscope\" with no definition"
+done
+# …and the clause costs 0 bytes where no such row exists (the "0 bytes when inert" placement rule).
+NM="$( "$BIN" "$T60/named" --no-cache --callers=bounded 2>/dev/null )"
+printf '%s' "$NM" | grep -q 'modscope' \
+    && no "(8b) a callers answer with no modscope row still pays for the clause" \
+    || ok "(8b) no modscope row ⇒ no clause: the definition costs 0 bytes when inert"
+# BLAST RADIUS: an unrelated symbol's counts must not move. lonely() in the ORIGINAL corpus is reached by
+# no test and called by nobody; leaf() is called from one named function and one test.
+LON="$( "$BIN" "$R" --no-cache --callers=lonely 2>/dev/null )"
+[ "$( attr count "$LON" )" = 0 ] && ok "(8b) control: --callers=lonely is still count=\"0\" — no count moved that should not" \
+    || no "(8b) control: --callers=lonely is now count=\"$( attr count "$LON" )\""
+MIDC="$( "$BIN" "$R" --no-cache --callers=leaf 2>/dev/null )"
+[ "$( attr count "$MIDC" )" = 2 ] && ok "(8b) control: --callers=leaf still count=\"2\" (mid + test_leaf)" \
+    || no "(8b) control: --callers=leaf is now count=\"$( attr count "$MIDC" )\", expected 2"
+
+# ── 8c) #60 honesty: the kind is defined in every POSTURE and SURFACE that shows it ────────────────────
+# The first round defined t="modscope" only on the default <s> rows of --callers/--impact. The kind reaches
+# a reader through a dozen spellings — a columnar <kind> array item, <h n=>, <edge caller=>, <u sym=>,
+# <c n=> — and "a definition where the reader meets it" is the whole contract. The compact dialect now keys
+# the reading on the NAME (compactlegend.h kModScopeEscapedName), which every surface escapes identically;
+# the full dialect takes graphlegend.h modScopeLegend( bool ) at each verb, on that verb's own row set.
+echo "=== (8c) #60: t=\"modscope\" defined in every posture that shows it ==="
+sawmod(){ printf '%s' "$2" | grep -q '&lt;file-scope&gt;'; }                       # does this document SHOW one?
+defmod(){ printf '%s' "$2" | grep -qE 't=modscope|modscope" is a row'; }           # …and define it?
+for POSTURE in default compact full columnar; do
+    case "$POSTURE" in
+        default)  EXTRA="" ;;
+        compact)  EXTRA="--legend=compact" ;;
+        full)     EXTRA="--legend=full" ;;
+        columnar) EXTRA="--format=columnar" ;;
+    esac
+    for V in "--callers=setPhase" "--impact=setPhase"; do
+        O="$( "$BIN" "$TMP/issue60prod" --no-cache $V $EXTRA 2>/dev/null )"
+        if sawmod "$V" "$O"; then
+            defmod "$V" "$O" && ok "(8c) $V $POSTURE: row shown AND kind defined" \
+                || no "(8c) $V $POSTURE: shows <file-scope> with NO definition anywhere in the document"
+        else
+            no "(8c) $V $POSTURE: no <file-scope> row at all — the posture arm proves nothing"
+        fi
+    done
+done
+# the surfaces beyond <s> rows: a graph-query row, a safe-delete caller row, a callees selector
+for PAIR in "--graph-query=all()|full" "--graph-query=all()|compact" "--safe-delete=setPhase|full" "--safe-delete=setPhase|compact"; do
+    V="${PAIR%|*}"; L="${PAIR#*|}"
+    O="$( "$BIN" "$TMP/issue60prod" --no-cache "$V" --legend=$L 2>/dev/null )"
+    if sawmod "$V" "$O"; then
+        defmod "$V" "$O" && ok "(8c) $V --legend=$L: row shown AND kind defined" \
+            || no "(8c) $V --legend=$L: shows <file-scope> with NO definition"
+    else
+        no "(8c) $V --legend=$L: no <file-scope> row — the arm proves nothing"
+    fi
+done
+# …and 0 bytes on a corpus with NO file-scope call at all, in every one of those postures (the placement
+# rule). The control corpus has to be built for it: every other fixture in this gate holds a top-level shell
+# command or a node:test call, which is exactly the shape that mints an owner.
+NOMS="$TMP/noms/src"; mkdir -p "$NOMS"
+printf 'int leafy() { return 1; }\nint stalk() { return leafy(); }\n' > "$NOMS/tree.cpp"
+for L in compact full; do
+    for V in "--callers=leafy" "--graph-query=all()"; do
+        O="$( "$BIN" "$TMP/noms" --no-cache "$V" --legend=$L 2>/dev/null )"
+        printf '%s' "$O" | grep -q 'modscope' \
+            && no "(8c) $V --legend=$L pays for the clause with no modscope row in the document" \
+            || ok "(8c) $V --legend=$L: no row ⇒ no clause (0 bytes when inert)"
+    done
+done
+
+# ── 8e) #60 MED-3 residual: --for and the full dialect on the verbs the first sweep missed ────────────
+# The name-keyed compact rule covers everything that goes through compactLegendText. Two families do not:
+# --for builds its own two legend strips (verbs_for.h, present-only bits), and the full dialect is per-verb.
+echo "=== (8e) #60: --for, and --legend=full on the verbs that were bare ==="
+for L in compact full; do
+    O="$( "$BIN" "$TMP/issue60prod" --no-cache --for='module scope of a file' --legend=$L 2>/dev/null )"
+    if printf '%s' "$O" | grep -q '&lt;file-scope&gt;'; then
+        printf '%s' "$O" | grep -q 'modscope' \
+            && ok "(8e) --for --legend=$L: row shown AND kind defined" \
+            || no "(8e) --for --legend=$L: shows <file-scope> with NO definition (the entry verb, bare)"
+    else
+        no "(8e) --for --legend=$L: no <file-scope> row — the arm proves nothing"
+    fi
+done
+for V in "--edit-check=setPhase" "--tree" "--path=<file-scope>,setPhase" "--connect=<file-scope>,setPhase" "--pack-task=<file-scope> setPhase"; do
+    O="$( "$BIN" "$TMP/issue60prod" --no-cache "$V" --legend=full 2>/dev/null )"
+    if printf '%s' "$O" | grep -q '&lt;file-scope&gt;'; then
+        printf '%s' "$O" | grep -q 'modscope' \
+            && ok "(8e) $V --legend=full: row shown AND kind defined" \
+            || no "(8e) $V --legend=full: shows <file-scope> with NO definition"
+    else
+        no "(8e) $V --legend=full: no <file-scope> row — the arm proves nothing"
+    fi
+done
+# inert again, in both --for dialects: the clause is a present-only bit, not a constant
+for L in compact full; do
+    "$BIN" "$TMP/noms" --no-cache --for='a leafy stalk' --legend=$L 2>/dev/null | grep -q 'modscope' \
+        && no "(8e) --for --legend=$L pays for the clause on a corpus with no owner" \
+        || ok "(8e) --for --legend=$L: no owner ⇒ no clause (0 bytes when inert)"
+done
+
+# ── 8f) #60 LOW-2: --for's clause rides on the ROW SET, not on the corpus ─────────────────────────────
+# The first cut of this bit tested the whole symbol table, so a corpus holding ONE top-level call paid the
+# clause on every --for answer — ~154 B compact / ~250 B full on the most-used verb, in front of the rows.
+# It now reads the head of the rank-ordered surface the <d> and <hops> rows are drawn from, so it rides
+# when an owner can actually be in the answer and costs nothing when it cannot. The corpus below has an
+# owner (index.ts's top-level call) AND a query that ranks nowhere near it: that combination is the arm.
+echo "=== (8f) #60: --for pays for the clause only when an owner row can be in the answer ==="
+for L in compact full; do
+    OWNED="$( "$BIN" "$TMP/issue60prod" --no-cache --for='module scope of a file' --legend=$L 2>/dev/null )"
+    printf '%s' "$OWNED" | grep -q 'modscope\|MODULE SCOPE' \
+        && ok "(8f) --for --legend=$L on a query that reaches the owner: the clause is present" \
+        || no "(8f) --for --legend=$L: an owner row is reachable and the clause is missing"
+done
+# THE NEGATIVE HALF NEEDS A REAL CORPUS: on a two-file fixture every symbol ranks, so an owner is always in
+# the head and the corpus-wide bug would hide. This repository has owners (704 shell files hold top-level
+# calls) and enough symbols that a technical query's ranked head reaches none of them — which is exactly
+# the shape that paid ~154 B on every answer before this fix.
+for L in compact full; do
+    for Q in "rank the graph with pagerank" "crawl the directory tree" "emit xml attributes"; do
+        AWAY="$( "$BIN" "$ROOT" --no-cache --for="$Q" --legend=$L 2>/dev/null )"
+        if printf '%s' "$AWAY" | grep -q '&lt;file-scope&gt;'; then
+            printf '%s' "$AWAY" | grep -q 'modscope\|MODULE SCOPE' \
+                && ok "(8f) --for --legend=$L '$Q': shows an owner row and defines it" \
+                || no "(8f) --for --legend=$L '$Q': shows an owner row with no definition"
+        else
+            printf '%s' "$AWAY" | grep -q 'modscope\|MODULE SCOPE' \
+                && no "(8f) --for --legend=$L '$Q': NO owner row in the answer, yet the clause still rides — the bit is corpus-wide again" \
+                || ok "(8f) --for --legend=$L '$Q': no owner row ⇒ no clause, on a corpus that HAS owners"
+        fi
+    done
+done
+
+# ── 8d) #60 MED-2: the legend says the owner has no body, and --expand agrees ──────────────────────────
+# Every clause naming this kind says "no body to expand". --expand used to answer either the WHOLE FILE
+# (the whole-file serving always undercuts an empty bundle) or shown="0" capped="1" — a cap over a body
+# that does not exist, and "a false _capped is a wrong answer". Both now answer bodyless, capped="0", with
+# the count named and defined.
+echo "=== (8d) #60: --expand on a module-scope owner is bodyless, not capped, not the file ==="
+EX="$( "$BIN" "$TMP/issue60prod" --no-cache --expand='<file-scope>' 2>/dev/null )"
+printf '%s' "$EX" | grep -q 'capped="0"' && printf '%s' "$EX" | grep -q 'bodyless="1"' \
+    && ok '(8d) --expand=<file-scope> answers capped="0" bodyless="1"' \
+    || no "(8d) --expand=<file-scope>: $( printf '%s' "$EX" | grep -oE '<bodies [^>]*>' )"
+printf '%s' "$EX" | grep -q 'mode="whole-file"' \
+    && no "(8d) --expand=<file-scope> served the WHOLE FILE — the legend says it has no body" \
+    || ok "(8d) --expand=<file-scope> did not fall back to serving the file"
+printf '%s' "$EX" | grep -q 'bodyless=N' \
+    && ok "(8d) bodyless= is defined in the document that emits it" \
+    || no "(8d) --expand emits bodyless= and never defines it"
+EXN="$( "$BIN" "$T60/named" --no-cache --expand=bounded 2>/dev/null )"
+printf '%s' "$EXN" | grep -q 'bodyless=' \
+    && no "(8d) an ordinary body's answer carries bodyless= (absent-at-zero broken)" \
+    || ok "(8d) control: an ordinary --expand carries no bodyless= and no clause"
 
 # ── 6) xml well-formed ───────────────────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    printf '%s' "$A" | xmllint --noout - 2>/dev/null && ok "--affected xml well-formed" || no "--affected xml malformed"
+    if printf '%s' "$A" | xmllint --noout - 2>/dev/null; then ok "--affected xml well-formed"; else no "--affected xml malformed"; fi
 else
     printf '  SKIP  xml well-formed (no xmllint)\n'
 fi

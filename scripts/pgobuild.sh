@@ -36,7 +36,8 @@ CORPUS="$ROOT"
 reuse=0
 
 cmake_extra=()   # --cmake-extra ARG (repeatable): appended to BOTH configures — the release
-                 # pipeline passes -DCMAKE_BUILD_TYPE=Release (and the cross leg its OSX arch)
+                 # pipeline passes -DCMAKE_BUILD_TYPE=Release (through 0.6.1 the macOS x64 cross leg also
+                 # passed its OSX arch)
 while [ $# -gt 0 ]; do
     case "$1" in
         --corpus)         CORPUS="${2:-}"; shift 2 ;;
@@ -113,6 +114,6 @@ cmake --build "$OPT" -j "$JOBS" >"$OPT/build.log" 2>&1 || {
 
 echo "pgobuild: done — $OPT/ripwire (profile: $PROFILE)"
 echo "pgobuild: verify before you trust it:"
-echo "  $OPT/ripwire $ROOT >a; $OPT/ripwire $ROOT >b; diff -q a b        # determinism is a contract"
+echo "  t=\$(mktemp -d); $OPT/ripwire $ROOT >\"\$t/a\"; $OPT/ripwire $ROOT >\"\$t/b\"; diff -q \"\$t/a\" \"\$t/b\"   # determinism is a contract (outputs outside the tree)"
 echo "  diff -q <($OPT/ripwire $ROOT) <($ROOT/build/ripwire $ROOT)       # PGO must not change a byte of output"
 echo "  RIPWIRE_BIN=$OPT/ripwire python3 $ROOT/test/pargates.py $ROOT $OPT/ripwire -j 6"

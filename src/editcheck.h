@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // editcheck.h — the shared contract-comparison core behind --edit-check=SYM (CLI, B11/L5) and the MCP
 // edit_check verb (L4). "Did MY edit change a contract someone depends on", at
@@ -20,10 +23,14 @@
 #include "arch.h"           // fnv1a64
 #include "gitstamp.h"       // r26-stamp Task A: gitstamp::atAttr — the at="<sha>[+dirty]" root anchor
 #include "graphlegend.h"    // §H4 §3.4: the shared counts_floor= marker + floor/counting-unit legend tail
+#include "pageview.h"       // LB-G: pageWindow / effectiveRowCap / pagingDisclosure — the ONE paging vocabulary
+#include "editcheckdecl.h"   // the C/C++ declaration/definition identity: editCheckTieDeclaration / editCheckDeclDefaults
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -44,6 +51,21 @@ struct EditCheckContract
     std::uint32_t nowDefs;      //   baseline fact a MAX cannot express; see editCheckVerdict for why it exists
     bool          wasPublic;
     bool          nowPublic;
+    bool          defsUnmeasured;   // the baseline carried no definition COUNT: that fact is not compared (defs_unmeasured="1")
+    // The DISCLOSE sink for a comparison that cannot be made, in whole or in part: the emitter prints what it sets.
+    enum class DisclosureWhy : std::uint8_t
+    {
+        NoHeadBaseline,           // no git HEAD: status="no-baseline", nothing claimed
+        BaselineDefsCountMissing, // a snapshot with no definition count for the key (a cache defect): that dimension is skipped
+    };
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        switch( why )
+        {
+            case DisclosureWhy::NoHeadBaseline:           status = "no-baseline"; break;
+            case DisclosureWhy::BaselineDefsCountMissing: defsUnmeasured = true; wasDefs = nowDefs; break;
+        }
+    }
 };
 
 // the overload set sharing `focus`'s DEFINITION SITE (same file + scope + name) — the was/now comparison MUST
@@ -54,14 +76,27 @@ struct EditCheckContract
 // unions three unrelated free functions named `empty` in three different files into one "overload set" and
 // reports one contract for all of them. Two definitions are one contract only when they share a file AND a
 // scope — which is exactly what the `file:name` selector can pick out.
+//
+// The CONTRACT ID a definition folds under is its canonical id minus an Elixir `name/N` arity. Elixir keys a
+// callable by arity, so run/1 and run/2 are two canonical ids — two entities — but ONE contract at one
+// definition site, exactly as C++ overloads of `f` are, and a widened arity is the very change this verb
+// exists to report (PR #81 review item 4: run(x) -> run(x, y) answered "new-symbol" with 0 callers;
+// test/elixirnamearitycheck.sh arm C). Every other language: the canonical id itself, unchanged.
+inline std::string_view editCheckContractId( const std::string& canon, const Symbol& s ) noexcept
+{
+    return s.lang == Lang::Elixir ? elixirBaseName( canon ) : std::string_view( canon );
+}
+
 inline std::vector<NodeId> editCheckOverloadSet( const IngestResult& ing, const Graph& g, NodeId focus )
 {
     std::vector<NodeId> overloadNodes;
     if( focus < g.canonId.size() && !g.canonId[ focus ].empty() )
     {
+        const std::string_view focusContract = editCheckContractId( g.canonId[ focus ], ing.symbols[ focus ] );
         for( NodeId i = 0; i < ing.symbols.size(); ++i )
         {
-            if( i < g.canonId.size() && g.canonId[i] == g.canonId[ focus ] && ing.symbols[i].fileId == ing.symbols[ focus ].fileId )
+            if( i < g.canonId.size() && !g.canonId[i].empty() && ing.symbols[i].fileId == ing.symbols[ focus ].fileId
+                && editCheckContractId( g.canonId[i], ing.symbols[i] ) == focusContract )
             {
                 overloadNodes.push_back( i );
             }
@@ -74,27 +109,118 @@ inline std::vector<NodeId> editCheckOverloadSet( const IngestResult& ing, const 
     return overloadNodes;
 }
 
+// The C/C++ declaration/definition identity (one contract, the declaration's defaults) lives in editcheckdecl.h.
+
 // ── §A6a: the DISTINCT contracts one --edit-check selector matched ───────────────────────────────────────
 // A contract is per definition site. --callers may honestly UNION the callers of every overload (it says so:
 // defs="3"); this verb may not — "did I break a contract?" answered about a definition the agent never edited
 // is worse than no answer, because status="unchanged" reads as reassurance. So a selector that matches more
 // than one definition SITE is REFUSED, and the refusal hands back the spellings that pick one.
 //
-// The group key is (file, scope) — see editCheckOverloadSet on why canonId alone is not enough. `spelling` is
-// what the caller should retype: `file:name` when that file holds exactly one group, else the canonical id
-// (both resolve through resolveAllByNameQualified).
+// The group key is (file, scope) — see editCheckOverloadSet on why canonId alone is not enough — with ONE exception for
+// the post-hoc verb: a C/C++ declaration group folds into the definition group it provably declares (editCheckFoldDeclGroups,
+// the identity rule in editcheckdecl.h), because a prototype and its definition are one contract. `spelling` is what the
+// caller should retype: `file:name` when that file holds exactly one group, else the canonical id (both resolve through
+// resolveAllByNameQualified), verified by editCheckRoundTripSpelling.
 struct EditCheckGroup
 {
     NodeId      lowestNode;    // the lowest-id definition in the group — the focus resolveFocus would have picked
-    std::string spelling;      // a selector that resolves to THIS group and no other
+    std::string spelling;      // a selector that resolves to THIS group and no other (when `unique`)
+    bool        declOnly;      // only C/C++ declarations, beside a group that holds a definition: never offered (M2)
+    bool        unique;        // `spelling` was verified to resolve to this group alone
 };
 
-inline std::vector<EditCheckGroup> editCheckGroups( const IngestResult& ing, const Graph& g, std::span<const NodeId> matches )
+// The (file, contract) KEYS of a match list with each key's members, in first-seen order: matches arrive in ascending
+// node id (resolveAllByNameQualified walks ing.symbols in order), so members[i][0] IS group i's lowest id.
+struct EditCheckGroupKeys
 {
-    // one pass, keyed by (fileId, canonId): matches arrive in ascending node id (resolveAllByNameQualified
-    // walks ing.symbols in order), so the first node seen for a key IS the group's lowest id.
-    std::vector<EditCheckGroup>               groups;
     std::vector<std::pair<std::uint32_t, std::string>> keys;
+    std::vector<std::vector<NodeId>>                   members;
+};
+
+inline bool editCheckDeclOnlyGroup( const IngestResult& ing, const std::vector<NodeId>& members )
+{
+    return std::all_of( members.begin(), members.end(), [ & ]( NodeId m )
+                        { return langCompatible( ing.symbols[m].lang, Lang::C ) && !isDefinitionNotDeclaration( ing.symbols[m] ); } );
+}
+
+// THE FOLD (2026-10-01, the identity rule in editcheckdecl.h): a group made only of C/C++ declarations is dropped when
+// every one of them DECLARES (editCheckTieDeclaration) a definition in the match list AND all of those definitions sit in
+// ONE other group — the declaration and its definition are then one contract, answered at the definition. A declaration
+// that declares nothing in the list, or definitions in two groups (one header, a posix.cpp and a win.cpp), keeps its
+// group: those are distinct contracts and the refusal still counts them.
+// The ONE group every declaration of group `groupIndex` declares into, or groupCount when some declaration declares
+// nothing in the list or the declarations land in two groups. `declares( decl, def )` is the identity rule's verdict.
+template <class Declares>
+inline std::size_t editCheckDeclTargetGroup( const IngestResult& ing, const EditCheckGroupKeys& gk, std::size_t groupIndex, Declares& declares )
+{
+    const std::size_t groupCount = gk.keys.size();
+    std::size_t       target     = groupCount;
+    for( NodeId decl : gk.members[ groupIndex ] )
+    {
+        bool declaresAny = false;
+        for( std::size_t other = 0; other < groupCount; ++other )
+        {
+            const bool hits = other != groupIndex && std::any_of( gk.members[ other ].begin(), gk.members[ other ].end(), [ & ]( NodeId def )
+            {
+                return isDefinitionNotDeclaration( ing.symbols[ def ] ) && declares( decl, def );
+            } );
+            if( hits && target != groupCount && target != other )
+            {
+                return groupCount;   // definitions in two groups: two contracts, nothing to fold into
+            }
+            target      = hits ? other : target;
+            declaresAny = declaresAny || hits;
+        }
+        if( !declaresAny )
+        {
+            return groupCount;
+        }
+    }
+    return target;
+}
+
+inline void editCheckFoldDeclGroups( const IngestResult& ing, EditCheckGroupKeys& gk )
+{
+    const std::size_t groupCount = gk.keys.size();
+    if( groupCount < 2 )
+    {
+        return;
+    }
+    EditCheckSources                                  sources( ing, EditCheckSpliced{} );
+    std::deque<std::pair<NodeId, EditCheckSignature>> defSigs;   // each definition's signature, read once (a deque: stable refs)
+    const auto defSigOf = [ & ]( NodeId def ) -> const EditCheckSignature&
+    {
+        const auto at = std::find_if( defSigs.begin(), defSigs.end(), [ def ]( const auto& entry ) { return entry.first == def; } );
+        if( at != defSigs.end() )
+        {
+            return at->second;
+        }
+        defSigs.emplace_back( def, editCheckSignatureOf( sources, ing.symbols[ def ] ) );
+        return defSigs.back().second;
+    };
+    const auto declares = [ & ]( NodeId decl, NodeId def )
+    {
+        return editCheckTieDeclaration( ing, sources, decl, def, defSigOf( def ) ).tie == EditCheckTie::Declares;
+    };
+
+    EditCheckGroupKeys kept;
+    for( std::size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex )
+    {
+        if( editCheckDeclOnlyGroup( ing, gk.members[ groupIndex ] ) && editCheckDeclTargetGroup( ing, gk, groupIndex, declares ) < groupCount )
+        {
+            continue;   // folded into the definition group it declares
+        }
+        kept.keys.push_back( gk.keys[ groupIndex ] );
+        kept.members.push_back( gk.members[ groupIndex ] );
+    }
+    ENSURES( !kept.keys.empty() );   // a folded group always names a kept one as its target
+    gk = std::move( kept );
+}
+
+inline EditCheckGroupKeys editCheckGroupKeys( const IngestResult& ing, const Graph& g, std::span<const NodeId> matches, bool foldDecls )
+{
+    EditCheckGroupKeys gk;
     for( NodeId m : matches )
     {
         if( m >= ing.symbols.size() )
@@ -102,13 +228,66 @@ inline std::vector<EditCheckGroup> editCheckGroups( const IngestResult& ing, con
             continue;
         }
         const std::uint32_t fileId = ing.symbols[m].fileId;
-        const std::string   canon  = ( m < g.canonId.size() ) ? g.canonId[m] : ing.symbols[m].name;
-        if( std::find( keys.begin(), keys.end(), std::make_pair( fileId, canon ) ) != keys.end() )
+        const std::string   canon( editCheckContractId( ( m < g.canonId.size() ) ? g.canonId[m] : ing.symbols[m].name, ing.symbols[m] ) );
+        const auto          at = std::find( gk.keys.begin(), gk.keys.end(), std::make_pair( fileId, canon ) );
+        if( at != gk.keys.end() )
         {
+            gk.members[ std::size_t( at - gk.keys.begin() ) ].push_back( m );
             continue;
         }
-        keys.emplace_back( fileId, canon );
-        groups.push_back( EditCheckGroup{ m, std::string{} } );
+        gk.keys.emplace_back( fileId, canon );
+        gk.members.push_back( { m } );
+    }
+    if( foldDecls )
+    {
+        editCheckFoldDeclGroups( ing, gk );
+    }
+    return gk;
+}
+
+// E2 (2026-10-01): every spelling the refusal prints must be ACCEPTED when it is pasted back. `file:name` failed that
+// for a header whose declaration the file:name tier widens to its definitions (#63): `./lib.h:scale` re-resolved to
+// the declaration AND the definition and was refused again. So each shown spelling is re-resolved here and must land on
+// exactly this group; otherwise the canonical id, then the `@FILE:LINE` seed (one place, one symbol) is tried. A
+// cwd-spelled path the file tier would read as a substring of another (`./lib.cpp` inside `./sub/lib.cpp`) now names
+// its own file exactly (graph.h preferExactFile), so it round-trips. When nothing does — a line holding two
+// definitions — `unique` stays false and the refusal SAYS so beside that spelling, never offering it as the example.
+constexpr std::size_t kEditCheckSpellingsShown = 6;
+
+inline void editCheckRoundTripSpelling( const IngestResult& ing, const Graph& g, EditCheckGroup& group, const std::string& canon, bool foldDecls )
+{
+    const Symbol&            s = ing.symbols[ group.lowestNode ];
+    std::vector<std::string> tries{ group.spelling };
+    if( canon != s.name && canon != group.spelling )
+    {
+        tries.push_back( canon );
+    }
+    tries.push_back( "@" + ing.files[ s.fileId ] + ":" + std::to_string( s.line ) );
+    for( const std::string& spelling : tries )
+    {
+        const std::vector<NodeId> again = resolveAllByNameQualified( ing, spelling );
+        const EditCheckGroupKeys  gk    = editCheckGroupKeys( ing, g, again, foldDecls );
+        if( gk.keys.size() == 1 && gk.members[0].front() == group.lowestNode )
+        {
+            group.spelling = spelling;
+            group.unique   = true;
+            return;
+        }
+    }
+}
+
+// `foldDecls` is the post-hoc verb's identity rule (editCheckFoldDeclGroups); the pre-apply preview and the other
+// readers of these groups (the write verbs, --slice) keep one group per (file, scope), so their answers are unchanged.
+inline std::vector<EditCheckGroup> editCheckGroups( const IngestResult& ing, const Graph& g, std::span<const NodeId> matches, bool foldDecls = false )
+{
+    const EditCheckGroupKeys    gk = editCheckGroupKeys( ing, g, matches, foldDecls );
+    const bool                  anyDefinition = !std::all_of( gk.members.begin(), gk.members.end(),
+                                                              [ & ]( const std::vector<NodeId>& members ) { return editCheckDeclOnlyGroup( ing, members ); } );
+    std::vector<EditCheckGroup> groups;
+    for( const std::vector<NodeId>& members : gk.members )
+    {
+        // M2: a declaration-only group beside a definition is never offered — its own answer has no call edges
+        groups.push_back( EditCheckGroup{ members.front(), std::string{}, anyDefinition && editCheckDeclOnlyGroup( ing, members ), false } );
     }
 
     // the spelling: file:name is the form an agent can paste from any p="file:line" row, so prefer it and fall
@@ -117,9 +296,9 @@ inline std::vector<EditCheckGroup> editCheckGroups( const IngestResult& ing, con
     for( std::size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex )
     {
         const Symbol&      s            = ing.symbols[ groups[ groupIndex ].lowestNode ];
-        const std::string& canonOfThis  = keys[ groupIndex ].second;
+        const std::string& canonOfThis  = gk.keys[ groupIndex ].second;
         std::size_t        groupsInFile = 0;
-        for( const auto& [fileId, canon] : keys )
+        for( const auto& [fileId, canon] : gk.keys )
         {
             if( fileId == s.fileId )
             {
@@ -130,7 +309,35 @@ inline std::vector<EditCheckGroup> editCheckGroups( const IngestResult& ing, con
         const bool fileIsEnough = ( groupsInFile == 1 ) || ( canonOfThis == s.name );
         groups[ groupIndex ].spelling = fileIsEnough ? ing.files[ s.fileId ] + ":" + s.name : canonOfThis;
     }
+    // only a refusal prints spellings, and only the first kEditCheckSpellingsShown OFFERED ones
+    for( std::size_t groupIndex = 0, offered = 0; groups.size() > 1 && groupIndex < groups.size() && offered < kEditCheckSpellingsShown; ++groupIndex )
+    {
+        if( !groups[ groupIndex ].declOnly )
+        {
+            editCheckRoundTripSpelling( ing, g, groups[ groupIndex ], gk.keys[ groupIndex ].second, foldDecls );
+            ++offered;
+        }
+    }
     return groups;
+}
+
+// A spelling as the CLI reader pastes it: wrapped in single quotes when it holds a byte a shell would split or expand
+// on (a path with a space). The MCP form (`symbol=`) is a JSON string and is never quoted.
+inline std::string editCheckPasteable( std::string_view exampleForm, const std::string& spelling )
+{
+    const bool cli  = !exampleForm.empty() && exampleForm.front() == '-';
+    const bool safe = std::all_of( spelling.begin(), spelling.end(), []( char c )
+                                   { return namesplit::isIdentChar( c ) || std::string_view( "./:@#+,=-~%" ).find( c ) != std::string_view::npos; } );
+    if( !cli || safe )
+    {
+        return spelling;
+    }
+    std::string quoted = "'";
+    for( const char c : spelling )
+    {
+        quoted += ( c == '\'' ) ? std::string( "'\\''" ) : std::string( 1, c );
+    }
+    return quoted + "'";
 }
 
 // The ONE ambiguity refusal both surfaces print, so the CLI and the MCP verb cannot drift apart: name what is
@@ -147,29 +354,55 @@ inline std::vector<EditCheckGroup> editCheckGroups( const IngestResult& ing, con
 // about a sibling verb's output, which is the worst kind of wrong — an agent can act on it without re-running
 // anything. Each number now carries the noun it actually is. definitionCount >= groups.size() always
 // (collapsing distinct matches into a group can never invent one), which is asserted rather than assumed.
-constexpr std::size_t kEditCheckSpellingsShown = 6;
+//
+// M2 (review of the declaration fold): a declaration-only contract beside a definition is COUNTED, never offered — its
+// own answer reads callers="0" while the definition holds the calls, a false reassurance. A spelling that could not be
+// verified unique says so, and is never the example; with no verified spelling there is no example at all.
+// The offered half of the refusal: the first kEditCheckSpellingsShown offered spellings (declaration-only ones are counted,
+// never listed), how many more there are, and the example — the first VERIFIED spelling, or none.
+struct EditCheckOffer
+{
+    std::string        list;
+    const std::string* example;
+    std::size_t        more;
+    std::size_t        declOnly;
+};
+
+inline EditCheckOffer editCheckOffer( std::span<const EditCheckGroup> groups, std::string_view exampleForm )
+{
+    EditCheckOffer offer{};
+    std::size_t    shown = 0;
+    for( const EditCheckGroup& group : groups )
+    {
+        offer.declOnly += group.declOnly ? 1u : 0u;
+        const bool listed = !group.declOnly && shown < kEditCheckSpellingsShown;
+        offer.more    += ( !group.declOnly && !listed ) ? 1u : 0u;
+        if( listed )
+        {
+            offer.list   += ( shown++ ? ", " : "" ) + editCheckPasteable( exampleForm, group.spelling ) + ( group.unique ? "" : " [no selector names this contract alone]" );
+            offer.example = ( offer.example == nullptr && group.unique ) ? &group.spelling : offer.example;
+        }
+    }
+    return offer;
+}
 
 inline std::string editCheckAmbiguousMessage( std::string_view spec, std::span<const EditCheckGroup> groups,
                                               std::string_view exampleForm, std::size_t definitionCount )
 {
-    VERIFY( groups.size() > 1 );
-    VERIFY( definitionCount >= groups.size() );
+    ASSUME( groups.size() > 1 );
+    ASSUME( definitionCount >= groups.size() );
 
+    const EditCheckOffer offer = editCheckOffer( groups, exampleForm );
     std::string msg = "'" + std::string( spec ) + "' is ambiguous — it matches " + std::to_string( definitionCount )
                     + " definitions in " + std::to_string( groups.size() ) + " distinct contracts, and a contract is per "
                       "definition SITE (--callers may union overloads and disclose defs=\""
-                    + std::to_string( definitionCount ) + "\"; this verb cannot). Qualify one contract: ";
-    const std::size_t shownCount = std::min( groups.size(), kEditCheckSpellingsShown );
-    for( std::size_t groupIndex = 0; groupIndex < shownCount; ++groupIndex )
-    {
-        msg += ( groupIndex ? ", " : "" ) + groups[ groupIndex ].spelling;
-    }
-    if( groups.size() > shownCount )
-    {
-        msg += " (+" + std::to_string( groups.size() - shownCount ) + " more contracts)";
-    }
-
-    msg += " — e.g. " + std::string( exampleForm ) + groups[0].spelling;
+                    + std::to_string( definitionCount ) + "\"; this verb cannot). Qualify one contract: " + offer.list;
+    msg += offer.more ? " (+" + std::to_string( offer.more ) + " more contracts)" : std::string();
+    msg += offer.declOnly ? " (+" + std::to_string( offer.declOnly ) + " declaration-only contract" + ( offer.declOnly > 1 ? "s" : "" )
+                            + " not listed: a declaration has no call edges of its own, so its answer would read callers=\"0\" while a "
+                              "definition of the name holds the calls)" : std::string();
+    msg += offer.example ? " — e.g. " + std::string( exampleForm ) + editCheckPasteable( exampleForm, *offer.example )
+                         : std::string( " — no listed spelling was verified unique" );
     return msg;
 }
 
@@ -244,8 +477,7 @@ inline EditCheckContract editCheckContractVsHead( const IngestResult& ing, const
         // 2026-09-06 stranger audit: a tarball, an export, any non-git tree used to answer "new-symbol" for a
         // symbol that plainly exists — a false contract claim whose only tell was a missing at=. No HEAD means
         // no comparison: say so, claim nothing.
-        res.status = "no-baseline";
-        DEGRADED_PATH_ALERT( "edit-check: no git HEAD baseline — status no-baseline" );
+        DISCLOSE( res, EditCheckContract::DisclosureWhy::NoHeadBaseline, "edit-check: no git HEAD baseline — status no-baseline" );
         return res;
     }
     if( base.locBySym.find( key ) == base.locBySym.end() )
@@ -265,8 +497,9 @@ inline EditCheckContract editCheckContractVsHead( const IngestResult& ing, const
     const auto dit = base.defsBySym.find( key );
     if( dit == base.defsBySym.end() )
     {
-        res.wasDefs = res.nowDefs;
-        DEGRADED_PATH_ALERT( "edit-check: baseline snapshot has no definition count for SYM — defs_was suppressed" );
+        // the count cannot move the verdict (no phantom contract-change out of a cache defect), and the root says the
+        // dimension was not compared, so an "unchanged" is never read as covering a removed overload
+        DISCLOSE( res, EditCheckContract::DisclosureWhy::BaselineDefsCountMissing, "edit-check: baseline snapshot has no definition count for SYM — defs_was suppressed" );
     }
     else
     {
@@ -355,7 +588,7 @@ inline EditCheckVerdict editCheckVerdict( const EditCheckContract& contract, std
     // the two derivations tied together so they cannot drift: editCheckContractVsHead's own status IS the
     // was/now half of exactly this expression, so the change list is empty exactly where that half said
     // unchanged.
-    VERIFY( change.empty() == ( std::string_view( contract.status ) == "unchanged" ) );
+    ASSUME( change.empty() == ( std::string_view( contract.status ) == "unchanged" ) );
     return EditCheckVerdict{ change.empty() ? "unchanged" : "contract-change", std::move( change ) };
 }
 
@@ -398,6 +631,65 @@ inline bool editCheckImplicitReceiver( const Symbol& s ) noexcept
     return ( s.lang == Lang::Python || s.lang == Lang::Ruby ) && !s.scope.empty();
 }
 
+// The arity half of the incompatibility test for one member of the overload set: can a call passing `argCount`
+// arguments bind it? A variadic/defaulted definition (arityExact 0) and an implicit receiver are wildcards; a C/C++
+// definition whose declaration carries defaults accepts [minArity, params] (editCheckDeclDefaults); every other
+// definition's minArity IS its params, so for it this is the exact test.
+inline bool editCheckArityAccepts( const Symbol& os, std::uint16_t minArity, std::uint16_t argCount ) noexcept
+{
+    return os.arityExact == 0 || editCheckImplicitReceiver( os ) || ( minArity <= argCount && argCount <= os.params );
+}
+
+// ── THE CALLEE TEST, with the Elixir arity fold ──────────────────────────────────────────────────────────
+// "Does this call reference name the focus's contract?" For every language but Elixir it is the exact
+// calleeName == name test the in-edge walk already implied, byte for byte. Elixir keys a callable by `name/N`,
+// and an arity edit is a change of that key: after run(x) -> run(x, y) no reference spells run/2, the in-edge
+// walk finds nothing, and the callers of the OLD arity — the ones the edit just broke — are exactly the rows
+// this verb exists to print. So for an Elixir focus a call reference reaches the contract when its arity-less
+// name matches AND the fold-arity ElixirResolver (elixir_resolve.h) binds it, through the caller's own
+// aliases, imports and receiver, to a definition in the overload set: the same lexical evidence the map used,
+// asked about the function rather than one arity of it. Built once per document; `scratch` is the resolver's
+// output buffer, reused across a pass.
+struct EditCheckCalleeTest
+{
+    const IngestResult&           ing;
+    const Symbol&                 focus;
+    std::span<const NodeId>       overloadNodes;
+    std::optional<ElixirResolver> logical;   // engaged for an Elixir focus only
+    std::vector<NodeId>           scratch;
+    EditCheckDeclDefaults         declDefaults;   // per overload: the fewest arguments a matching C/C++ declaration admits
+
+    EditCheckCalleeTest( const IngestResult& input, const Symbol& focusSymbol, std::span<const NodeId> overloads )
+        : ing( input ), focus( focusSymbol ), overloadNodes( overloads ), declDefaults( editCheckDeclDefaults( input, overloads, {} ) )
+    {
+        if( focus.lang == Lang::Elixir )
+        {
+            logical.emplace( ing, /*foldArityKeys=*/true );
+        }
+    }
+
+    bool reaches( const Reference& r )
+    {
+        if( !logical || r.lang != Lang::Elixir )
+        {
+            return r.calleeName == focus.name;
+        }
+        if( elixirBaseName( r.calleeName ) != elixirBaseName( focus.name ) )
+        {
+            return false;
+        }
+        logical->resolve( r, scratch );
+        for( NodeId target : scratch )
+        {
+            if( std::find( overloadNodes.begin(), overloadNodes.end(), target ) != overloadNodes.end() )
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
 // per-node flags for the seen callers whose call-site is incompatible with the CURRENT arity: a call site is
 // flagged only when its argument count is reliably counted AND NO overload could accept it (every overload
 // has a FIXED arity (arityExact!=0) that disagrees — a variadic/default-arg/implicit-receiver wildcard can
@@ -405,17 +697,19 @@ inline bool editCheckImplicitReceiver( const Symbol& s ) noexcept
 // membership test — never an O(callers × references) rescan.
 //
 // The test is one-sided IN THE ARITY only: it never flags a call the compared definitions could accept. It is
-// NOT a proof that the call site binds to those definitions at all — that half is name-based, and the emitted
-// legend says so.
+// NOT a proof that the call site binds to those definitions at all — that half is name-based (module-resolved
+// for Elixir, see EditCheckCalleeTest), and the emitted legend says so.
 inline std::vector<char> editCheckIncompatibleFlags( const IngestResult& ing, std::span<const NodeId> overloadNodes,
-                                                     const std::string& symName, std::span<const char> seenCaller )
+                                                     EditCheckCalleeTest& callee, std::span<const char> seenCaller )
 {
+    // a C/C++ definition whose matching declaration carries defaults accepts the RANGE [minArity, params]
+    // (editCheckDeclDefaults); every other definition's minArity is its params, so the test below is the exact one
+    ASSUME( callee.declDefaults.minArity.size() == overloadNodes.size() );
     const auto provenIncompatible = [ & ]( std::uint16_t argCount ) -> bool
     {
-        for( NodeId ov : overloadNodes )
+        for( std::size_t k = 0; k < overloadNodes.size(); ++k )
         {
-            if( const Symbol& os = ing.symbols[ov];
-                os.arityExact == 0 || editCheckImplicitReceiver( os ) || os.params == argCount )
+            if( editCheckArityAccepts( ing.symbols[ overloadNodes[k] ], callee.declDefaults.minArity[k], argCount ) )
             {
                 return false; // a candidate could still accept it
             }
@@ -429,7 +723,7 @@ inline std::vector<char> editCheckIncompatibleFlags( const IngestResult& ing, st
         {
             continue;
         }
-        if( r.calleeName != symName || !r.argCountKnown )
+        if( !r.argCountKnown || !callee.reaches( r ) )
         {
             continue;
         }
@@ -460,7 +754,7 @@ inline std::vector<char> editCheckIncompatibleFlags( const IngestResult& ing, st
 // rule; a widely-shared name has hundreds of caller rows). Duplicate (node,line) pairs collapse: this is a
 // set of LINES TO OPEN, so two calls on one line are one site.
 inline std::vector<std::pair<NodeId, std::uint32_t>>
-editCheckCallSites( const IngestResult& ing, const std::string& symName, std::span<const char> callerIncompatible )
+editCheckCallSites( const IngestResult& ing, EditCheckCalleeTest& callee, std::span<const char> callerIncompatible )
 {
     std::vector<std::pair<NodeId, std::uint32_t>> sites;
     for( const Reference& r : ing.references )
@@ -469,7 +763,7 @@ editCheckCallSites( const IngestResult& ing, const std::string& symName, std::sp
         {
             continue;
         }
-        if( r.fromSymbol >= callerIncompatible.size() || !callerIncompatible[ r.fromSymbol ] || r.calleeName != symName )
+        if( r.fromSymbol >= callerIncompatible.size() || !callerIncompatible[ r.fromSymbol ] || !callee.reaches( r ) )
         {
             continue;
         }
@@ -498,7 +792,7 @@ inline std::string editCheckSiteList( std::span<const std::pair<NodeId, std::uin
 // 1-hop callers of the overload set (the --callers in-edge walk, unioned), sorted (file, line, name), plus a
 // parallel per-node flag for call-sites PROVABLY incompatible with the CURRENT arity.
 inline std::pair<std::vector<NodeId>, std::vector<char>>
-editCheckCallers( const IngestResult& ing, const Graph& g, std::span<const NodeId> overloadNodes, const std::string& symName )
+editCheckCallers( const IngestResult& ing, const Graph& g, std::span<const NodeId> overloadNodes, EditCheckCalleeTest& callee )
 {
     std::vector<char>   seenCaller( ing.symbols.size(), 0 );
     std::vector<NodeId> callerIds;
@@ -515,8 +809,31 @@ editCheckCallers( const IngestResult& ing, const Graph& g, std::span<const NodeI
             if( NodeId c = ci[k]; c < seenCaller.size() && !seenCaller[c] ) { seenCaller[c] = 1; callerIds.push_back( c ); }
         }
     }
+    // Elixir: the callers of an arity the edit REMOVED have no in-edge to walk — no definition spells their
+    // callee any more — so they are recovered from the reference table through the fold-arity test
+    // (EditCheckCalleeTest). Self is skipped as the in-edge walk skips it (an edge is never a self-loop), and
+    // the sort below makes the union's order independent of which pass found a caller.
+    if( callee.logical )
+    {
+        for( const Reference& r : ing.references )
+        {
+            if( r.role != RefRole::Call || r.fromSymbol >= seenCaller.size() || seenCaller[ r.fromSymbol ] )
+            {
+                continue;
+            }
+            if( std::find( overloadNodes.begin(), overloadNodes.end(), r.fromSymbol ) != overloadNodes.end() )
+            {
+                continue;
+            }
+            if( callee.reaches( r ) )
+            {
+                seenCaller[ r.fromSymbol ] = 1;
+                callerIds.push_back( r.fromSymbol );
+            }
+        }
+    }
 
-    std::vector<char> callerIncompatible = editCheckIncompatibleFlags( ing, overloadNodes, symName, seenCaller );
+    std::vector<char> callerIncompatible = editCheckIncompatibleFlags( ing, overloadNodes, callee, seenCaller );
 
     std::sort( callerIds.begin(), callerIds.end(), [ & ]( NodeId a, NodeId b )
     {
@@ -529,6 +846,183 @@ editCheckCallers( const IngestResult& ing, const Graph& g, std::span<const NodeI
     } );
     return { std::move( callerIds ), std::move( callerIncompatible ) };
 }
+
+// ── THE ANSWER-SAFE WINDOW (2026-09-10) ──────────────────────────────────────────────────────────────────
+// --edit-check emitted every caller row through a bare unwindowed loop, so a widely-shared name answered
+// with the whole in-edge set — MEASURED here at 485 caller rows / 29,743 B for `push_back`, and far past
+// that on a large tree (the case that started this: ~99,000 tokens for ONE symbol). Its four LB-G siblings
+// (callers/callees/impact/uses) have windowed at kCallHierarchyRowCap for a round already.
+//
+// The reason this verb could not simply adopt pageWindow() over its row list is that ITS ROWS ARE NOT ALL
+// CONTEXT. The rows flagged incompatible="1", and the sites_l= line list on each, ARE the answer; the
+// verdict on the root is read against them. Windowing the row list would drop a flagged caller for no
+// better reason than where its file sorts, and the document would then say "one incompatible caller"
+// while naming none of them — or, with the count taken from the page instead of the set, say none exists.
+// A wrong answer carrying capped="1" is still a wrong answer, so the split below is the whole design:
+//
+//   * the VERDICT (status=, defs=, callers=, incompatible=, the was/now group, change=) is computed from
+//     the FULL caller set, before any window exists — removing the window cannot move it;
+//   * FLAGGED rows and their complete sites_l= ride EVERY page, uncut, the way --test-gate's <t> rows do;
+//   * the <def> overload census is the set behind defs= and is never windowed either;
+//   * ONLY the unflagged context rows page, and they page under the family's own vocabulary.
+//
+// `total` here is therefore the UNFLAGGED count, not callers= — pageview.h's rule 6 ("the paging half always
+// describes the report's PRIMARY, --limit/--offset-windowed listing"), the same shape --communities already
+// ships (modules="1146" … total="1146" beside a larger bridges="1613"). The pair beside it is rule 1's
+// noun-prefixed form, shown_unflagged=/unflagged_capped=, because a BARE shown= would have to mean "rows
+// printed" and the flagged rows print outside the window.
+//
+// "unflagged", not "compatible": a row without incompatible="1" is a caller this run did not PROVE
+// incompatible (the arity test is one-sided and skips a call site whose argument count could not be
+// counted). Naming those rows compatible would be a claim the tool cannot make.
+struct EditCheckRowWindow
+{
+    PageWindow  window;          // over the UNFLAGGED rows only, in document order
+    std::size_t unflaggedTotal;  // callers - incompatible: the population the window is taken from
+    std::size_t unflaggedShown;  // window.end - window.begin
+    bool        active;          // emit the disclosure (and its legend clause) at all
+
+    // THE ONE row-membership test, so the emitter's loop carries no window arithmetic of its own: a
+    // condition spelled at the call site is a condition the next edit can spell differently.
+    bool holds( std::size_t unflaggedIndex ) const noexcept
+    {
+        return unflaggedIndex >= window.begin && unflaggedIndex < window.end;
+    }
+    bool cut() const noexcept { return unflaggedShown < unflaggedTotal; }
+};
+
+inline EditCheckRowWindow editCheckRowWindow( std::size_t callerCount, std::size_t incompatibleCount,
+                                              int pageLimit, int pageOffset ) noexcept
+{
+    const std::size_t unflaggedTotal = callerCount - std::min( incompatibleCount, callerCount );
+    const PageWindow  window         = pageWindow( unflaggedTotal, effectiveRowCap( pageLimit, kCallHierarchyRowCap ), pageOffset );
+    const std::size_t shown          = window.end - window.begin;
+    // The family's own activity decision (computePageDisclosure), passed the UNFLAGGED counts: silent when
+    // nothing was cut and no window was spelled, so an answer that fits is byte-identical to what it was.
+    const bool        active         = computePageDisclosure( shown, unflaggedTotal, window.end, pageLimit, pageOffset,
+                                                              /*discloseCap=*/shown < unflaggedTotal ).active;
+    return { window, unflaggedTotal, shown, active };
+}
+
+// The clause that DEFINES the four attributes above where the reader meets them (legendcoveragecheck's
+// rule), and states the split in band — an agent that reads "capped" has to be able to read, on the same
+// screen, that what was capped is not the answer. Emitted only when the window is active, for the reason
+// graphlegend.h's kNeighbourCapLegend is: a call never pays for vocabulary it cannot emit. No double hyphen
+// anywhere in it — it rides inside an XML comment (G4).
+inline constexpr const char* kEditCheckWindowLegend =
+    "THE ANSWER IS NEVER WINDOWED: every caller flagged incompatible=\"1\", the complete sites_l= line list on each, and every "
+    "def row behind defs= ride EVERY page in full — they are never paged and never cut — and status=, defs=, callers= and "
+    "incompatible= are computed over the FULL caller set before any window is taken, so raising or removing the window cannot "
+    "move them. What pages is the UNFLAGGED context rows (callers this run did not flag, which is not a proof they are "
+    "compatible — the arity test above is one-sided): shown_unflagged= is how many of them this page printed, "
+    "unflagged_capped=\"1\" says rows were dropped, and total=/has_more=/next_offset=/offset=/limit= window THAT listing alone, "
+    "so total= is the unflagged count (callers= minus incompatible=), never the caller total. Raise the default cap with "
+    "limit=N (offset=M pages, and a page past the end reads shown_unflagged=\"0\" with has_more=\"0\"); on the root, limit=\"0\" "
+    "means no explicit limit was given and the verb's own default page size shaped the window — never a zero-row page. ";
+
+// defaults_from="decl" (2026-10-01): the clause that reads it, emitted only beside it. No double hyphen (G4).
+inline constexpr const char* kEditCheckDefaultsFromDeclLegend =
+    "defaults_from=\"decl\": a C/C++ definition's own parameter list carries no default, but a DECLARATION of it does: same "
+    "name, the same full scope chain (every enclosing namespace and class, and the written qualifier) and member qualifiers, "
+    "the same parameter types, in the definition's file or a file it #includes directly. The declaration "
+    "and the definition are one contract (the bare name and the declaration's file:name answer about the definition), and "
+    "a call passing from params minus that declaration's defaults up to params arguments is accepted, so it is never "
+    "flagged. A declaration that cannot be tied that way lends nothing, and its definition's callers are judged against "
+    "the definition's own list. ";
+
+// defaults_untied=N (review S2/S3): the declarations the identity rule could NOT prove or refute, that may carry a default,
+// emitted only beside a nonzero incompatible= — a flag one of them might admit is then qualified instead of silent.
+inline constexpr const char* kEditCheckDefaultsUntiedLegend =
+    "defaults_untied=N (only beside a nonzero incompatible=): N C/C++ declarations of this name and scope may carry defaults "
+    "for this definition but could not be tied to it, so their defaults were NOT applied: the definition's file does not "
+    "include theirs directly (a transitive include is not followed), a scope chain could not be read (unbalanced braces, a "
+    "template-qualified name), or a signature could not be parsed (past 16 KiB, a function-pointer parameter). A flagged "
+    "call may be one such a default admits; open the declaration before acting on the flag. ";
+
+// The root attributes that clause defines: rule 1's noun-prefixed pair plus rule 6's paging half, composed
+// in ONE place so the pair and the half cannot come apart. Empty when the window is inactive, which is what
+// keeps an answer that fits byte-identical to what it was.
+inline std::string editCheckWindowAttrs( const EditCheckRowWindow& rowWindow, int pageLimit, int pageOffset )
+{
+    if( !rowWindow.active )
+    {
+        return {};
+    }
+    // §B14 — composed on std::string, not a fixed char[]: the same rule the assembler below follows. Nothing
+    // here is corpus text (both values are counts), so the buffer would in fact have been safe — which is
+    // exactly why it is not worth having, since a reader of test/fixedbufsweep.sh's table would have to
+    // re-derive that. The paging half keeps the family's own char[kPageDisclosureCap], which pagingDisclosure
+    // owns the sizing rule for.
+    std::string attrs = " shown_unflagged=\"" + std::to_string( rowWindow.unflaggedShown )
+                      + "\" unflagged_capped=\"" + ( rowWindow.cut() ? "1" : "0" ) + "\"";
+    char        pab[ kPageDisclosureCap ];
+    attrs += pagingDisclosure( pab, sizeof( pab ), rowWindow.unflaggedTotal, rowWindow.window.end, pageLimit, pageOffset );
+    return attrs;
+}
+
+// est_tokens= is UNCONDITIONAL, matching the per-symbol bundle sibling this verb is read beside (--expand,
+// which prices every answer however small) rather than the neighbour verbs' conditional cap pair: the whole
+// point of the number is to be there BEFORE a caller has to guess whether the next call is affordable.
+//
+// THE ONE pricing step, and it is idempotent by construction: it strips any est_tokens= already on the root
+// and re-splices the converged attribute at the root's closing '>'. That is not defensive coding — the
+// pre-apply preview appends its <overwrite> child AFTER this assembler returns, so the document it hands
+// back is bigger than the one that was priced, and a price that did not cover it would be the exact
+// under-reporting §H7/M11 exist to prevent. editpreview.h re-prices through THIS function; there is no
+// second estimator and no second formula (serialize.h's pricedRootAttr does the conversion and the digit
+// convergence).
+inline void editCheckPriceRoot( std::string& doc )
+{
+    const std::size_t open = doc.find( "<edit-check " );
+    if( open == std::string::npos )
+    {
+        return;
+    }
+    std::size_t close = doc.find( '>', open );
+    if( close == std::string::npos )
+    {
+        return;
+    }
+    constexpr std::string_view kAttrOpen = " est_tokens=\"";
+    if( const std::size_t had = doc.rfind( kAttrOpen, close ); had != std::string::npos && had > open )
+    {
+        if( const std::size_t endq = doc.find( '"', had + kAttrOpen.size() ); endq != std::string::npos && endq < close )
+        {
+            doc.erase( had, endq + 1 - had );
+            close = doc.find( '>', open );
+            if( close == std::string::npos ) { return; }
+        }
+    }
+    std::size_t       estTokens = 0;
+    const std::string priced    = pricedRootAttr( doc.size(), kBytesPerTokenDefault, /*bodyBytes=*/0, &estTokens );
+    doc.insert( close, priced );
+}
+// #60: will this receipt PRINT a <c n="<file-scope>"> caller row? The kind's legend clause is owed exactly
+// then — not when the corpus holds an owner, and not when one is merely a caller the window cut. rowWindow's
+// own holds() is the single row-membership test the emitter's row loop uses, so asking it here means the
+// clause and the rows cannot disagree about which callers the document carries. A flagged (incompatible)
+// caller is always printed, whatever the window says, which is why it short-circuits the same way there.
+inline bool editCheckShowsModuleScope( const IngestResult& ing, const std::vector<NodeId>& callerIds,
+                                       const std::vector<char>& callerIncompatible, const EditCheckRowWindow& rowWindow ) noexcept
+{
+    std::size_t unflaggedIndex = 0;
+    for( const NodeId caller : callerIds )
+    {
+        if( caller >= ing.symbols.size() )
+        {
+            continue;
+        }
+        const bool flagged = caller < callerIncompatible.size() && callerIncompatible[ caller ] != 0;
+        const bool printed = flagged || rowWindow.holds( unflaggedIndex );
+        unflaggedIndex += flagged ? 0u : 1u;
+        if( printed && ing.symbols[ caller ].kind == SymKind::ModuleScope )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 // THE bundle assembler for an ALREADY-RESOLVED `focus` symbol: builds the <edit-check>…</edit-check> XML
 // (status + was/now on contract-change + the flagged 1-hop callers) and returns it as a string — never
@@ -545,9 +1039,27 @@ editCheckCallers( const IngestResult& ing, const Graph& g, std::span<const NodeI
 // It is a FLAG ON THE ONE ASSEMBLER rather than a second emitter on purpose: a preview that could drift from
 // the post-hoc answer would be worth nothing, and test/editpreviewcheck.sh compares the two documents
 // byte-for-byte (modulo the legend, at= and this flag's own attribute).
+//
+// `pageLimit`/`pageOffset` (2026-09-10) are --limit/--offset, and they window the UNFLAGGED context rows and
+// nothing else — see editCheckRowWindow above for why this verb cannot take the family's plain row window.
+// Both default to 0, which is "no explicit window": the verb's own default cap then shapes the page, the
+// same posture the four neighbour verbs took when they adopted kCallHierarchyRowCap.
+//
+// `unprovenDefs` (H1) is the residue the caller's resolver reported for the selector that picked `focus`: same-named
+// definitions a file:name spelling found and could not tie to the file it named. callers=/incompatible= are read from
+// `focus` alone, so without it a declaration whose dropped definition carries the broken caller answered incompatible="0"
+// with nothing beside it. Defaults to 0 — absent attribute, absent clause — for a caller that resolved no file:name.
 inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g, const std::string& root,
                                         std::size_t maxFileBytes, const std::vector<std::string>& excludes, NodeId focus,
-                                        const notes::NoteIndex* ni = nullptr, bool preview = false )
+                                        const notes::NoteIndex* ni = nullptr, bool preview = false,
+                                        int pageLimit = 0, int pageOffset = 0, std::size_t unprovenDefs = 0,
+                                        // L3 follow-up (CodeRabbit 4053600616): read BEFORE the caller nulls `ni`
+                                        // for emptiness (main.cpp's MainDispatch::notesDegraded), so a sidecar
+                                        // that left EVERY line unparsed still reaches this root. Defaults false,
+                                        // matching `ni`'s own nullptr default (the MCP verb passes neither today).
+                                        bool notesDegraded = false,
+                                        // the pre-apply preview's spliced file: its spans index these bytes, not the disk
+                                        const EditCheckSpliced& spliced = {} )
 {
     const Symbol& fsym = ing.symbols[ focus ];
     // R-E (2026-08-17 harvest): same single-root condition every other verb's root= uses (sarif.h) — the ONE
@@ -561,7 +1073,12 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
 
     const std::vector<NodeId> overloadNodes = editCheckOverloadSet( ing, g, focus );
     const EditCheckContract   contract      = editCheckContractVsHead( ing, g, root, maxFileBytes, excludes, focus, overloadNodes );
-    const auto [ callerIds, callerIncompatible ] = editCheckCallers( ing, g, overloadNodes, fsym.name );
+    EditCheckCalleeTest       callee( ing, fsym, overloadNodes );
+    if( spliced.engaged )
+    {
+        callee.declDefaults = editCheckDeclDefaults( ing, overloadNodes, spliced );   // the preview's spans index the spliced bytes
+    }
+    const auto [ callerIds, callerIncompatible ] = editCheckCallers( ing, g, overloadNodes, callee );
 
     // the flagged-caller COUNT, needed BEFORE the headline is written: the verdict joins it with the was/now
     // pair (see editCheckVerdict), so counting it after the status attribute was already emitted is what made
@@ -575,10 +1092,16 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
         }
     }
     const EditCheckVerdict verdict = editCheckVerdict( contract, incompatibleCount );
+    // Declined calls that could have meant this definition (graph.h declinedCallsNaming): callers= cannot count them, so
+    // the root says how many there are — the same count and spelling as --callers' declined_calls=.
+    const std::size_t declinedCalls = declinedCallsNaming( g, overloadNodes );
+    // THE WINDOW, taken AFTER every verdict number above is already fixed and over the UNFLAGGED rows only.
+    // Its position in this function is the guarantee: there is no path by which a window can reach a count.
+    const EditCheckRowWindow rowWindow = editCheckRowWindow( callerIds.size(), incompatibleCount, pageLimit, pageOffset );
     // P3/M21: the call-site lines for the flagged rows. Paid for only when a row will carry them — an
     // unchanged contract with no flagged caller does not scan the reference table at all.
     const std::vector<std::pair<NodeId, std::uint32_t>> callSites =
-        incompatibleCount > 0 ? editCheckCallSites( ing, fsym.name, callerIncompatible )
+        incompatibleCount > 0 ? editCheckCallSites( ing, callee, callerIncompatible )
                               : std::vector<std::pair<NodeId, std::uint32_t>>{};
 
     std::vector<char> esc;
@@ -654,12 +1177,46 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
                        "is that definition, and params_now is its parameter count. "
                        // P3 (L7): next= defined where the reader meets it
                        "next= is the one pasteable follow-up: on a contract-change the uses verb on SYM (the call sites), "
-                       "otherwise the test gate on the definition's file. ";
+                       "otherwise the test gate on the definition's file. "
+                       // M11/§H7: the priced root, defined where it is met. Unconditional, like the attribute.
+                       "est_tokens= prices THIS document, through the tool's ONE emitted-bytes estimator. ";
+    // 2026-09-10: the window clause, emitted only when a window is actually active — see kEditCheckWindowLegend
+    // for why the answer half of the document is exempt from it, and editCheckRowWindow for where that is enforced.
+    if( rowWindow.active )
+    {
+        out += kEditCheckWindowLegend;
+    }
+    if( callee.declDefaults.fromDecl )
+    {
+        out += kEditCheckDefaultsFromDeclLegend;
+    }
+    const bool defaultsUntied = incompatibleCount > 0 && callee.declDefaults.untied > 0;   // only beside flags it may qualify
+    if( defaultsUntied )
+    {
+        out += kEditCheckDefaultsUntiedLegend;
+    }
+    if( contract.defsUnmeasured )
+    {
+        out += "defs_unmeasured=\"1\": the HEAD baseline carries no definition COUNT for this symbol (a cache defect), so that "
+               "fact was not compared — status= rests on the params MAX and publicness alone and cannot see a removed overload. ";
+    }
+    // H1: what callers= and incompatible= did not read, addressed to incompatible= by name — ahead of the floor tail, and
+    // emitted exactly when the root carries unproven_defs= (graphlegend.h unprovenDefsVerbLegend).
+    out += unprovenDefsVerbLegend( UnprovenDefsVerb::EditCheck, unprovenDefs > 0 );
+    out += declinedCallsLegendWithGate( declinedCalls > 0, g.gateDeclinedCalls > 0 );   // exactly when the root carries declined_calls=
     // §H4 §3.4: the shared floor + counting-unit tail, appended from the ONE constant every graph-count verb
     // splices. It is load-bearing HERE more than anywhere: callers="1" on a symbol with an unmodelled second
     // caller is the exact shape §H4 measured, and this legend's own "the tree as it stands" paragraph reads
     // as if the caller SET were complete.
-    out += graphCountDisclosure( g.unindexedFiles > 0 );
+    out += graphCountDisclosure( rw::graphGaugeClauses( g ) );
+    out += modScopeLegend( editCheckShowsModuleScope( ing, callerIds, callerIncompatible, rowWindow ) );   // #60
+    // L3 follow-up (CodeRabbit 4053600616): notes.h's ONE marker, spelled identically on every notes-surfacing
+    // emitter — absent on a clean read (no sidecar, every line parsed, or `ni` itself null, as the MCP verb
+    // passes today), so the L3 inertness contract holds.
+    if( notesDegraded )
+    {
+        out += " ";  out += notes::kNotesDegradedReading;  out += ".";   // plain text: this whole block is ONE open comment
+    }
     out += "-->";
     // §B14 — composed on std::string, NOT snprintf'd into a fixed buffer. `ex()` has already escaped the name
     // and the path, so a truncating snprintf here would cut the ESCAPED form: mid-entity, mid-attribute-name or
@@ -678,12 +1235,16 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
     // map's `overloads=` convention) precisely because the sibling it is read against, --callers, always emits
     // it — an attribute a reader has never seen present cannot warn them.
     char defsAttr[ 32 ];
-    std::snprintf( defsAttr, sizeof( defsAttr ), " defs=\"%zu\"", overloadNodes.size() );
+    rw::formatTo( defsAttr, sizeof( defsAttr ), " defs=\"{}\"", overloadNodes.size() );
     out += defsAttr;
+    if( contract.defsUnmeasured )
+    {
+        out += " defs_unmeasured=\"1\"";   // defined in the legend clause emitted only beside it
+    }
     if( std::string_view( verdict.status ) == "contract-change" )
     {
         char cc[ 192 ];
-        std::snprintf( cc, sizeof( cc ), " params_was=\"%u\" params_now=\"%u\" public_was=\"%d\" public_now=\"%d\" defs_was=\"%u\" defs_now=\"%u\"",
+        rw::formatTo( cc, sizeof( cc ), " params_was=\"{}\" params_now=\"{}\" public_was=\"{}\" public_now=\"{}\" defs_was=\"{}\" defs_now=\"{}\"",
                        contract.wasParams, contract.nowParams, contract.wasPublic ? 1 : 0, contract.nowPublic ? 1 : 0,
                        contract.wasDefs, contract.nowDefs );
         out += cc;
@@ -696,8 +1257,18 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
     // additive-overload shape the legend names, and "zero rows carry incompatible=" was previously an ABSENCE
     // the reader had to notice rather than a number they could read. (Counted above — the headline needs it.)
     char callersOpen[ 64 ];
-    std::snprintf( callersOpen, sizeof( callersOpen ), " callers=\"%zu\" incompatible=\"%zu\"", callerIds.size(), incompatibleCount );
+    rw::formatTo( callersOpen, sizeof( callersOpen ), " callers=\"{}\" incompatible=\"{}\"", callerIds.size(), incompatibleCount );
     out += callersOpen;
+    if( callee.declDefaults.fromDecl )
+    {
+        out += " defaults_from=\"decl\"";   // beside the incompatible= it widened; defined by the clause emitted only with it
+    }
+    if( defaultsUntied )
+    {
+        out += " defaults_untied=\"" + std::to_string( callee.declDefaults.untied ) + "\"";   // beside the flags it may qualify
+    }
+    out += unprovenDefsAttrXml( unprovenDefs );   // H1: beside the incompatible= it qualifies; absent at zero
+    out += declinedCallsAttrXml( declinedCalls ); // callers the resolver declined to bind that could have meant it; absent at zero
     // r26-stamp Task A: the HEAD baseline this contract compares against is only meaningful pinned to a
     // commit (+dirty state) — omitted entirely on a non-git root. Appended LAST (after every pre-existing
     // attribute) so an existing substring-adjacency assertion elsewhere (e.g. "status=\"x\" callers=\"N\"")
@@ -718,6 +1289,11 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
     // tests that reach the definition's file (--test-gate=FILE).
     out += nextAttrXml( std::string_view( verdict.status ) == "contract-change" ? nextFlag( "--uses=", fsym.name )
                                                                                 : nextFlag( "--test-gate=", ecPathRel( fsym.fileId ) ) );
+    // 2026-09-10 — the CONTEXT listing's disclosure, appended past the end of every pre-existing attribute
+    // group for the placement reason stated at root=/preview= above. Rule 1's noun-prefixed pair plus rule 6's
+    // paging half (pageview.h), describing the UNFLAGGED rows and only those. Silent on an answer that fits.
+    out += editCheckWindowAttrs( rowWindow, pageLimit, pageOffset );
+    if( notesDegraded ) { out += notes::kNotesDegradedAttr; }   // L3 follow-up (CodeRabbit 4053600616)
     out += ">";
     // L3/D5 note surfacing (paper-noteedit): a note targeting THIS symbol (its canonical id) or the FILE it
     // is defined in rides as a <note> child of <edit-check>, same shape/order/escaping renderNoteChildren
@@ -743,8 +1319,18 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
             out += "\"/>";
         }
     }
+    // THE PARTITION-PRESERVING WINDOW. Document ORDER is untouched — the rows still come out in the
+    // (file, line, name) order editCheckCallers sorted them into — because the window advances on UNFLAGGED
+    // rows only: a flagged row is emitted wherever it sorts, on every page, and never counts against the
+    // page. Hoisting the flagged rows to the front would have windowed just as safely and reordered a
+    // document other gates read positionally; this way an uncapped answer is byte-identical to what it was.
+    std::size_t unflaggedIndex = 0;
     for( NodeId c : callerIds )
     {
+        if( !callerIncompatible[c] && !rowWindow.holds( unflaggedIndex++ ) )
+        {
+            continue;
+        }
         const Symbol& cs = ing.symbols[c];
         out += "<c n=\"";   out += ex( cs.name );                        // §B14 — std::string, not char[512]
         out += "\" p=\"";   out += ex( ecPathRel( cs.fileId ) );
@@ -762,6 +1348,7 @@ inline std::string editCheckBundleText( const IngestResult& ing, const Graph& g,
         out += "/>";
     }
     out += "</edit-check>";
+    editCheckPriceRoot( out );   // M11: the priced root, LAST — the price covers every byte above it
     return out;
 }
 

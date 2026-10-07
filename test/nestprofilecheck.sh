@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS. `nest=` (Symbol::maxNest) is a MAX: one line at depth 9 and a thousand lines at depth 9
 # report the identical number. That makes two opposite shapes indistinguishable to every consumer that reads
-# it — the quality panel's structural family, --readability's rank, the ensemble join:
+# it — the quality panel's structural family, --biggest-first's rank, the ensemble join:
 #
 #   BLOCKED-SEQUENTIAL   a long function that is a run of scoped steps, each shallow. Easy to read top to
 #                        bottom; the max is set by one inner loop nobody has to hold in their head.
@@ -57,7 +57,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){   printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){   printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }

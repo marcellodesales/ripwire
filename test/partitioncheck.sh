@@ -33,7 +33,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -198,10 +198,14 @@ print(s.split('</bundle>',1)[0])
     || no "the plain bundle's top anchor '$TOPBODY' is missing from the core bundle"
 
 # ── 8) K < N — the rank-median split path, on the committed tiny fixture ──────────────────────────────────
-"$BIN" "$FIX" --pack-task="geometry area rect point python" --partition=4 >"$TMP/fx4" 2>/dev/null
+# #228 MOVED N 4 -> 5. At N=4 this arm read modules=2 only because the fixture was crawled as $ROOT/test/fixture:
+# the `test/` ABOVE the tree tiered every file as a test, which collapsed the surface to two modules. Crawled as
+# `.` the same tree always had four, so K<N never held there. With the tier read root-relative (test/
+# rootspellingcheck.sh) the fixture has four modules under every spelling, and N=5 is the smallest K<N it offers.
+"$BIN" "$FIX" --pack-task="geometry area rect point python" --partition=5 >"$TMP/fx4" 2>/dev/null
 FXP="$( attr partitions "$TMP/fx4" )"; FXS="$( attr split "$TMP/fx4" )"; FXM="$( attr modules "$TMP/fx4" )"
-{ [ "$FXP" = "4" ] && [ "${FXS:-0}" -ge 1 ] && [ "${FXM:-9}" -lt 4 ]; } \
-    && ok "K<N: $FXM modules for 4 partitions → $FXS rank-median split(s), still 4 partitions" \
+{ [ "$FXP" = "5" ] && [ "${FXS:-0}" -ge 1 ] && [ "${FXM:-9}" -lt 5 ]; } \
+    && ok "K<N: $FXM modules for 5 partitions → $FXS rank-median split(s), still 5 partitions" \
     || no "K<N split path did not engage (modules=$FXM split=$FXS partitions=$FXP)"
 
 # ── 9) N unreachable — reported honestly, never faked with empty bundles ──────────────────────────────────
@@ -220,10 +224,10 @@ ERR="$( "$BIN" "$SRC" --partition=4 2>&1 >/dev/null )"; RC=$?
     || { no "bare --partition did not refuse loudly"; printf '  rc=%s err=%s\n' "$RC" "$ERR"; }
 for n in 1 0 17 99; do
     "$BIN" "$SRC" --pack-task="$TASK" --partition=$n >/dev/null 2>&1
-    [ $? -ne 0 ] && ok "--partition=$n refused (out of the documented 2..16 range)" || no "--partition=$n was accepted"
+    if [ $? -ne 0 ]; then ok "--partition=$n refused (out of the documented 2..16 range)"; else no "--partition=$n was accepted"; fi
 done
 "$BIN" "$SRC" --pack-task="$TASK" --partition=abc >/dev/null 2>&1
-[ $? -ne 0 ] && ok "a non-numeric --partition refuses loudly" || no "--partition=abc was accepted"
+if [ $? -ne 0 ]; then ok "a non-numeric --partition refuses loudly"; else no "--partition=abc was accepted"; fi
 
 # --with-graph has no single </ctx> to splice into here — it must SAY so, not drop silently.
 WG="$( "$BIN" "$SRC" --pack-task="$TASK" --partition=2 --with-graph 2>&1 >/dev/null )"
@@ -251,7 +255,7 @@ if command -v xmllint >/dev/null 2>&1; then
     for f in "$TMP/p4" "$TMP/p4big" "$TMP/fx4" "$TMP/fx8"; do
         xmllint --noout "$f" 2>/dev/null || { badxml=$(( badxml + 1 )); echo "     malformed: $f"; }
     done
-    [ "$badxml" -eq 0 ] && ok "every partitioned emission is well-formed XML (G4)" || no "$badxml partitioned emission(s) malformed"
+    if [ "$badxml" -eq 0 ]; then ok "every partitioned emission is well-formed XML (G4)"; else no "$badxml partitioned emission(s) malformed"; fi
 else
     ok "xmllint unavailable — XML well-formedness skipped"
 fi
@@ -262,7 +266,7 @@ x = open( sys.argv[1] ).read()
 outside = re.sub( r'<!\[CDATA\[.*?\]\]>', '', x, flags = re.S )
 sys.exit( 1 if '\n' in outside else 0 )
 PY
-[ $? -eq 0 ] && ok "no newline outside CDATA (minified)" || no "the partitioned document has newlines outside CDATA"
+if [ $? -eq 0 ]; then ok "no newline outside CDATA (minified)"; else no "the partitioned document has newlines outside CDATA"; fi
 
 # ── 13) the MCP explore verb takes the same `partition` argument (one verb, not a new one) ────────────────
 if command -v python3 >/dev/null 2>&1; then
@@ -285,8 +289,12 @@ fi
 #    legend. Contract: the PROSE legend bytes (every comment except the data ones — "<!-- body omitted", "<!-- slice ",
 #    "<!-- truncated -->") of the partitioned document are <= 1.3x the single bundle's legend bytes, and no inner ctx
 #    opens a "<!-- ripwire task bundle for" comment.
-"$BIN" "$ROOT" --pack-task="$TASK" --partition=3 --no-cache >"$TMP/p10.part" 2>/dev/null
-"$BIN" "$ROOT" --pack-task="$TASK" --no-cache >"$TMP/p10.single" 2>/dev/null
+# L1 fix round: the 1.3x ratio is measured in the FULL legend, the dialect it was written for. The compact default's one
+# legend DEFINES the partition envelope (<ctx-partitions> counts, each <bundle>'s role/symbols/bytes/tokens=bytes/2.36, the
+# inner ctx attributes) that a single bundle does not carry, so its ratio measures those definitions, not repetition; the
+# default's own contract — ONE legend, none per slice — is asserted right after this arm.
+"$BIN" "$ROOT" --pack-task="$TASK" --partition=3 --no-cache --legend=full >"$TMP/p10.part" 2>/dev/null
+"$BIN" "$ROOT" --pack-task="$TASK" --no-cache --legend=full >"$TMP/p10.single" 2>/dev/null
 read -r P10_PART P10_SINGLE P10_INNER <<EOF2
 $( python3 - "$TMP/p10.part" "$TMP/p10.single" <<'PY'
 import re, sys
@@ -306,7 +314,16 @@ if [ -n "$P10_SINGLE" ] && [ "$P10_SINGLE" -gt 0 ] && [ $(( P10_PART * 10 )) -le
 else
     no "P10: partitioned prose legend $P10_PART B exceeds 1.3x the single bundle's ${P10_SINGLE:-?} B"
 fi
-[ "$P10_INNER" = 0 ] && ok "P10: no inner ctx repeats the task-bundle legend" || no "P10: $P10_INNER inner ctx document(s) still open a task-bundle legend"
+"$BIN" "$ROOT" --pack-task="$TASK" --partition=3 --no-cache >"$TMP/p10.def" 2>/dev/null
+P10_DEF_LEGENDS="$( python3 -c 'import re, sys
+d = re.sub( r"<!\[CDATA\[.*?\]\]>", "", open( sys.argv[ 1 ], encoding = "utf-8", errors = "replace" ).read(), flags = re.S )
+print( sum( 1 for c in re.findall( r"<!--.*?-->", d, re.S ) if c.startswith( "<!-- ripwire " ) ) )' "$TMP/p10.def" )"
+if [ "$P10_DEF_LEGENDS" = 1 ]; then
+    ok "P10: the partitioned DEFAULT answer carries exactly one legend (none per slice)"
+else
+    no "P10: the partitioned default answer carries ${P10_DEF_LEGENDS:-?} legend comments, want 1"
+fi
+if [ "$P10_INNER" = 0 ]; then ok "P10: no inner ctx repeats the task-bundle legend"; else no "P10: $P10_INNER inner ctx document(s) still open a task-bundle legend"; fi
 
 [ $fail -eq 0 ] && echo "partitioncheck: ALL PASS" || echo "partitioncheck: FAILURES"
 exit $fail

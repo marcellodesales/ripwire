@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // situ.h — situational_awareness (--situ / MCP verb): after an edit, the three things to know about a change
 // set, in one call —
@@ -12,10 +15,12 @@
 #include "graph.h"
 #include "filter.h"
 #include "gitmine.h"
+#include "infra/sortutil.h"   // svLess — string_view order without libstdc++'s length subtraction (#344)
 #include "prcontext.h"   // A3-F17b/A3-F13: reuse the ONE numstat-based mask builder (gitDiffChangedMaskNumstat)
 #include "gitstamp.h"    // r26-stamp Task A: gitstamp::atAttr — the at="<sha>[+dirty]" root anchor
 #include "testmap.h"     // §P11.4: TestRunnerIndex / runAttr — the run= hint on a named test row
 #include "didyoumean.h"  // H6: nearestIndexedFileClause — the ONE path near-miss suggester, shared with the MCP arm
+#include "siblift.h"     // L-D: siblift_detail::dirOf — the ONE "directory of a path" primitive, reused not re-rolled
 #include "serialize.h"   // L2: jsonStr() — writeTestGateReportJson's escaping (self-contained: don't rely on
                          // include-order in whichever TU pulls situ.h in first)
 #include "pageview.h"    // §A3a: the ONE paging/truncation vocabulary — the
@@ -211,7 +216,7 @@ inline bool cliRefusesFileList( const IngestResult& ing, std::string_view flag, 
     {
         return false;
     }
-    std::fprintf( stderr, "%s\n", message.c_str() );
+    rw::emitTo( stderr, "{}\n", message.c_str() );
     return true;
 }
 
@@ -239,9 +244,9 @@ inline bool cliRefusesFileList( const IngestResult& ing, std::string_view flag, 
 // version matched on (scope, name) alone under a majority guard, and `--situ` on this repo's own 17-file
 // diff answered `test/w2verbscheck.sh (10 shared symbols)` — every shell gate here defines `ok`, `no`,
 // `fail`, `run`. Those files all DEFINE those names; none DECLARES them, so they are not a decl/def pair and
-// the corrected rule drops them to zero shared. A symbol is a DEFINITION when its span carries a body
-// (`sigEndByte < endByte`, the same test quality.h's body-shaped checks use) and a pure DECLARATION when it
-// does not; a shared name counts only when the two sides disagree about which it is.
+// the corrected rule drops them to zero shared. A symbol is a DEFINITION when model.h's isDefinitionNotDeclaration
+// says so — its span carries a body, or it is a Kotlin type, which has no forward declaration to pair with — and a
+// pure DECLARATION otherwise; a shared name counts only when the two sides disagree about which it is.
 //
 // THE SECOND GUARD is a MAJORITY test, per (changed file, partner) PAIR and never in aggregate — the same
 // dogfooding run showed why: an aggregate `min()` taken against the LARGEST changed file makes the bar
@@ -267,9 +272,9 @@ inline std::vector<DeclDefPartner> declDefPartners( const IngestResult& ing, con
         ++symsPerFile[ s.fileId ];
     }
 
-    // a symbol whose span carries a body is a DEFINITION; one whose span ends at its signature is a pure
-    // DECLARATION. The one test, spelled once, so both passes below cannot read it differently.
-    const auto isDefinition = []( const Symbol& s ) { return s.sigEndByte < s.endByte; };
+    // the house definition test (model.h isDefinitionNotDeclaration), spelled once, so both passes below cannot read it
+    // differently.
+    const auto isDefinition = []( const Symbol& s ) { return isDefinitionNotDeclaration( s ); };
 
     // Every CHANGED symbol, indexed by its (scope \x1f name) identity. \x1f cannot occur in an identifier,
     // so the join is exact and needs no second field.
@@ -342,18 +347,223 @@ inline std::vector<DeclDefPartner> declDefPartners( const IngestResult& ing, con
     return out;
 }
 
-inline constexpr std::size_t kSituBlastFilesShown = 8;    // section [1] — blast-radius file rows
-inline constexpr std::size_t kSituTestRowsShown   = 25;   // section [2] — tests-to-run rows
-inline constexpr std::size_t kSituPartnerRowsShown = 8;   // section [3] — co-change partner rows
+// C1 F-10 (2026-09-10): --situ is the mid-task verb CLAUDE.md's protocol names, and it cut section [1] to
+// 8 of 69 files and section [3] to 8 of 116 partners with the cut stated in PROSE ONLY and --limit REFUSED —
+// so the one report an agent runs mid-change had no relief on its two widest listings. Both are CONTEXT and
+// now page through pageview.h like every other listing in the tool (--limit=N raises the default, --offset=M
+// pages it). Section [2], tests to run, is the ANSWER — you act on those rows, --test-gate exits 4 on them,
+// and its sibling <t> listing has never been windowed — so it is served WHOLE and has no cap at all any more
+// (kSituTestRowsShown is deleted rather than raised: a cap on an answer is the finding, not the number).
+inline constexpr std::size_t kSituBlastFilesShown = 8;    // section [1] — blast-radius file rows; a raisable DEFAULT
+inline constexpr std::size_t kSituPartnerRowsShown = 8;   // section [3] — co-change partner rows; a raisable DEFAULT
 inline constexpr std::size_t kSituPartnerFileRowsShown = 4;   // section [1] — decl/def partner rows
+inline constexpr std::uint32_t kSituCochangeProbeFiles = 20;  // section [3] — changed files probed for co-change (cut-fix E: disclosed)
+inline constexpr std::size_t kSituSiblingRowsShown = 8;      // section [1] — L-D lexical sibling rows; a raisable DEFAULT
 
-inline std::string situShowingNote( std::size_t shownCap, std::size_t rowTotal, const char* rowNoun )
+// §B12.1 gave this the "showing N of M <noun>" form so a reader could see the gap without a second sentence;
+// C1 F-10 adds the machine half — pageview.h's shown=/total=/capped= spelled in prose, because --situ has no
+// XML root to carry attributes — and the exact pasteable follow-up. All of it appears ONLY on a cut section:
+// an untruncated section is byte-unchanged, and no section ever prints capped=0.
+inline std::string situShowingNote( std::size_t shown, std::size_t rowTotal, const char* rowNoun,
+                                    std::string_view nextInvocation = {}, std::string_view extraAttrs = {} )
 {
-    if( rowTotal <= shownCap )
+    if( rowTotal <= shown )
     {
         return {};
     }
-    return " (showing " + std::to_string( shownCap ) + " of " + std::to_string( rowTotal ) + " " + rowNoun + ")";
+    // ORDER IS THE CONTRACT: the reading first, then the machine attributes, then `next:` LAST — a pasteable
+    // command has to run to the end of the parenthetical or a reader cannot tell where it stops. A5:
+    // `extraAttrs` is the one section-specific fact (section [1] naming --pr-context's own cap), and it is an
+    // ATTRIBUTE spelled beside the triple rather than the 68 B sentence it used to be spliced in as.
+    std::string note = " (showing " + std::to_string( shown ) + " of " + std::to_string( rowTotal ) + " " + rowNoun;
+    note += " — shown=" + std::to_string( shown ) + " total=" + std::to_string( rowTotal ) + " capped=1";
+    note += std::string( extraAttrs );
+    if( !nextInvocation.empty() )
+    {
+        note += "; next: " + std::string( nextInvocation );
+    }
+    return note + ")";
+}
+
+// The three facts --situ's two context sections need about the caller's window, as ONE parameter rather
+// than three: writeSituation already sat at 6 parameters, over the bar, and three more would have been the
+// largest single params regression in the round that is about not letting a listing grow silently.
+struct SituPageArgs
+{
+    int              limit    = 0;    // 0 = the verb's own default row caps (8 and 8)
+    int              offset   = 0;
+    std::string_view selector;        // the caller's own --situ spelling, echoed back in `next:`
+};
+
+// The exact `--situ … --limit=N` that cuts nothing, built from the selector the caller was actually given so
+// it pastes back verbatim (bare --situ reads the git diff; --situ=F1,F2 named its own files).
+inline std::string situNextInvocation( std::string_view selector, std::size_t needed )
+{
+    // Echo the selector with each item's `:line` locator STRIPPED — the same normalization the verb applies
+    // before resolving (stripLineLocator, §P8 seam 2) — so `--situ=F:1148` and `--situ=F` produce byte-identical
+    // reports (selectorchaincheck arm d2) and the pasted follow-up is the canonical spelling, not the caller's.
+    std::string verb = "--situ";
+    if( !selector.empty() )
+    {
+        verb += "=";
+        std::size_t start = 0;
+        while( start <= selector.size() )
+        {
+            const std::size_t comma = selector.find( ',', start );
+            const std::string_view item = selector.substr( start, comma == std::string_view::npos ? std::string_view::npos : comma - start );
+            verb += std::string( stripLineLocator( item ) );
+            if( comma == std::string_view::npos )
+            {
+                break;
+            }
+            verb += ",";
+            start = comma + 1;
+        }
+    }
+    return verb + " --limit=" + std::to_string( needed );
+}
+
+// ── L-D — a changed file's LEXICAL siblings ──────────────────────────────────────────────────────────
+// The files that move WITH a changed file are usually its neighbours by NAME, and the caller-walk can reach
+// none of them: a header does not call the source that implements it, an .inl is not indexed at all, and a
+// harness the graph cannot link (a fixture-built test, a generated main) is reached by nothing. On the frozen
+// question set (PLAN_OUTPUT_ROUTING_LOOP §1.5, lesson L-D) two answers were incomplete for exactly that
+// reason. So section [1] lists them, and the rule is deliberately the dumbest one that is always right:
+//
+//   SAME DIRECTORY, and the same filename stem — or the stem-partner convention testmap.h already owns
+//   (<stem>_test, test_<stem>, <Stem>Test, _unittest, _spec), so widget.cc names widget_test.cc.
+//
+// SAME DIRECTORY is load-bearing, not a performance trick: a same-stem file in another directory is a
+// NAMESAKE, not a partner (RocksDB has db/version_set.cc and utilities/…/version_set_test.cc that are about
+// different things), and listing namesakes would make the block noise on exactly the large corpora it is for.
+//
+// The candidate population is the crawl's, not the INDEX's: a `.inl`, `.ipp` or `.tcc` partner has no grammar
+// in any build, so it never enters ing.files, and it is the sibling a C++ change most often has to edit. Those
+// come from ing.crawlSkips.unsupported — whose ROW list is capped even though its count is exact, which is the
+// one place this list can be short of the truth and is disclosed as unindexed_rows_floor=1 when it applies.
+//
+// STATIC BY CONSTRUCTION: no git, no graph, no history window. That is what makes it cheap, and it is also
+// why it cannot leak a future commit into an answer about the present.
+struct SituSiblings
+{
+    std::vector<std::string> paths;                   // the STORED spelling (relativized by the caller), path-ascending, unique
+    bool                     unindexedRowsFloor = false;   // the crawl's unsupported-extension ROW list was itself cut
+};
+
+// dirOf is siblift.h's (the other same-directory lens) and the stem is mention.h's pathStem — both
+// primitives already existed, and a third spelling of either is the clone --quality-delta reports.
+// One changed file's test: same directory, and the same stem or testmap.h's stem-partner convention. Named
+// so lexicalSiblings below reads as the two loops it is (candidates x changed files) rather than four levels.
+inline bool isLexicalSiblingOf( std::string_view cand, std::string_view changed ) noexcept
+{
+    if( cand == changed || siblift_detail::dirOf( cand ) != siblift_detail::dirOf( changed ) )
+    {
+        return false;
+    }
+    return mention_detail::pathStem( cand ) == mention_detail::pathStem( changed )
+        || isTestPartnerOf( cand, changed ) || isTestPartnerOf( changed, cand );
+}
+
+// ── the directory index the two loops below became ───────────────────────────────────────────────────
+// Second review of #219 (scalability): lexicalSiblings was two nested loops — every candidate against every
+// changed path, with isLexicalSiblingOf re-splitting BOTH paths into directory and stem on each pair — and
+// the sibling ROW cap applies only after collection, so it bounded the ANSWER and never the work. That is
+// O( ( F + U ) x C ), and C is not small on the changes this block exists for. Measured on the function
+// itself, best of 3, on a real llvm-project path population grown to the 182,555-file rung by re-rooting
+// whole copies of the tree, interleaved, best of 5: C=500 2.20 s, C=2,000 9.10 s. A --situ that spends
+// nine seconds deciding which neighbours to NAME is not a mid-task report.
+//
+// SAME DIRECTORY is the rule's most selective clause, so the changed paths are indexed by directory once: a
+// sorted vector and a lower_bound, never a std::map or std::unordered_map (CONTRIBUTING's container rule).
+// Each candidate pays exactly one dirOf and one binary search, and a candidate in a directory nothing changed
+// in costs nothing beyond that. Both views point into ing.files[], which outlives the vector built from them.
+struct ChangedDirRow
+{
+    std::string_view dir;
+    std::string_view path;
+};
+
+// Sorted by ( dir, path ): the directory is the lookup key, and ordering within a directory keeps the scan
+// below deterministic without the caller having to think about it.
+inline std::vector<ChangedDirRow> changedRowsByDir( const IngestResult& ing, const std::vector<char>& changedFile )
+{
+    std::vector<ChangedDirRow> rows;
+    rows.reserve( 64 );
+    for( std::uint32_t f = 0; f < std::uint32_t( ing.files.size() ); ++f )
+    {
+        if( changedFile[f] )
+        {
+            rows.push_back( { siblift_detail::dirOf( ing.files[f] ), ing.files[f] } );
+        }
+    }
+    // svLess on both string_view keys, not operator<: libstdc++'s string_view::_S_compare wraps n1 - n2
+    // and aborts the Linux G1 leg (#344). svLess keeps operator<'s total order, so this sort and
+    // hasLexicalSiblingIn's lower_bound below still name the same order (infra/sortutil.h's contract).
+    std::sort( rows.begin(), rows.end(), []( const ChangedDirRow& a, const ChangedDirRow& b ) noexcept
+               { return a.dir != b.dir ? rw::sortutil::svLess( a.dir, b.dir )
+                                       : rw::sortutil::svLess( a.path, b.path ); } );
+    return rows;
+}
+
+// Is any changed path in `cand`'s OWN directory a lexical sibling of it? This NARROWS the candidates by
+// binary search; the rule itself is still isLexicalSiblingOf, called rather than restated, so it cannot drift
+// from the paragraph that documents it.
+inline bool hasLexicalSiblingIn( const std::vector<ChangedDirRow>& changedByDir, std::string_view cand )
+{
+    const std::string_view candDir = siblift_detail::dirOf( cand );
+    const auto             first   = std::lower_bound( changedByDir.begin(), changedByDir.end(), candDir,
+                                                       []( const ChangedDirRow& row, std::string_view dir ) noexcept { return rw::sortutil::svLess( row.dir, dir ); } );   // svLess: #344, the sort above names the same order
+    for( auto it = first; it != changedByDir.end() && it->dir == candDir; ++it )
+    {
+        if( isLexicalSiblingOf( cand, it->path ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ADDITIVE, deliberately: a file may be BOTH a decl/def partner (symbol identity) and a lexical sibling
+// (name), and the header/implementation pair is the commonest case of exactly that. Suppressing the overlap
+// was tried and reverted — it removed `widget.h` from "the siblings of widget.cc", which is the one row a
+// reader of this block is looking for, to save about 20 B. The two blocks answer two questions, and each
+// answers its own whole.
+inline SituSiblings lexicalSiblings( const IngestResult& ing, const std::vector<char>& changedFile )
+{
+    SituSiblings out;
+    // The candidate order, the sort and the unique below are untouched by the directory index above, so the
+    // rows and their order are identical to the two-loop form's.
+    const std::vector<ChangedDirRow> changedByDir = changedRowsByDir( ing, changedFile );
+    if( changedByDir.empty() )
+    {
+        return out;
+    }
+    const auto consider = [ & ]( std::string_view cand )
+    {
+        if( hasLexicalSiblingIn( changedByDir, cand ) )
+        {
+            out.paths.emplace_back( cand );
+        }
+    };
+    for( std::uint32_t f = 0; f < std::uint32_t( ing.files.size() ); ++f )
+    {
+        if( !changedFile[f] )
+        {
+            consider( ing.files[f] );
+        }
+    }
+    for( const SkippedFile& sk : ing.crawlSkips.unsupported )
+    {
+        consider( sk.path );
+    }
+    std::sort( out.paths.begin(), out.paths.end() );
+    out.paths.erase( std::unique( out.paths.begin(), out.paths.end() ), out.paths.end() );
+    // Review of #219: this used to be gated on a NON-EMPTY result, and the emitter suppressed an empty
+    // block — so when the crawl's 500-row cut removed the only candidate, the report said nothing at all.
+    // That is the silent zero non-negotiable #3 forbids: the cut is a property of the CANDIDATE LIST, not
+    // of the answer, so it is recorded whenever the row list was short and the block speaks even at zero.
+    out.unindexedRowsFloor = ing.crawlSkips.unsupported.size() < ing.crawlSkips.unsupportedFiles;
+    return out;
 }
 
 // Section [1]'s decl/def rows and section [3]'s empty-co-change line, as their own emitters: writeSituation
@@ -367,12 +577,50 @@ inline void writeSituDeclDefRows( std::FILE* out, const std::vector<DeclDefPartn
     {
         return;
     }
-    std::fprintf( out, "        decl/def partners of the file(s) you named (%zu)%s — symbols DECLARED there and DEFINED here, or the reverse (a header/impl pair, a stub, a partial class); NOT transitive dependents, so they are absent from the list below:\n",
+    // A5: the 229 B sentence said one nameable thing the reader could not otherwise know — these rows are
+    // NOT transitive dependents, so they are absent from the [1] list below. That is not_dependents=1.
+    rw::emitTo( out, "        decl/def partners ({}) not_dependents=1{} — symbols declared there and defined here, or the reverse (header/impl, stub, partial class); "
+                       "NOT transitive dependents, so they are absent from the list below:\n",
                   partnerFiles.size(), situShowingNote( kSituPartnerFileRowsShown, partnerFiles.size(), "files" ).c_str() );
     for( std::size_t i = 0; i < partnerFiles.size() && i < kSituPartnerFileRowsShown; ++i )
     {
         const std::string_view pp = pathRel( partnerFiles[i].fileId );
-        std::fprintf( out, "        %.*s  (%u shared symbols)\n", int( pp.size() ), pp.data(), partnerFiles[i].shared );
+        rw::emitTo( out, "        {}  ({} shared symbols)\n", std::string_view( pp.data(), pp.size() ), partnerFiles[i].shared );
+    }
+}
+
+// L-D's rows. `pathRel` takes a STORED path rather than a fileId, because an unindexed sibling (.inl/.ipp)
+// has no fileId at all — the one place this report names a file the index does not hold.
+template <typename PathRelStrFn>
+inline void writeSituSiblingRows( std::FILE* out, const SituSiblings& sibs, PathRelStrFn pathRel, const SituPageArgs& page )
+{
+    // Review of #219: an empty list is NOT nothing to say when the candidate list itself was cut — that zero
+    // is a floor, and a floor a reader cannot see is a confident wrong answer. Silence is kept only for the
+    // honest empty: nothing found, and nothing was hidden from the search.
+    if( sibs.paths.empty() && !sibs.unindexedRowsFloor )
+    {
+        return;
+    }
+    // …and the block does NOT take section [1]'s offset. Review of #219: it did, so `--situ=F --offset=20`
+    // printed "shown=0 total=9 capped=1" with a next= offering --limit=9 — relief that cannot restore rows an
+    // OFFSET removed — and --offset=7 dropped six rows silently. This is a small fixed block with a cap and
+    // --limit, like the decl/def partner rows above it, not a paged listing.
+    const std::size_t cap   = effectiveRowCap( page.limit, int( kSituSiblingRowsShown ) );
+    const std::size_t shown = sibs.paths.size() < cap ? sibs.paths.size() : cap;
+    rw::emitTo( out, "        lexical siblings ({}){}{} — same directory and stem as a changed file (its header/impl partner, its test, its .inl): "
+                       "NOT transitive dependents, so they are absent from the list below; lexical and static, never a graph result{}\n",
+                  sibs.paths.size(),
+                  " not_dependents=1",
+                  situShowingNote( shown, sibs.paths.size(), "files",
+                                   situNextInvocation( page.selector, sibs.paths.size() ) ).c_str(),
+                  sibs.unindexedRowsFloor
+                      ? " — unindexed_rows_floor=1: the crawl rows at most 500 unreadable-extension files, and it hit that cut here, "
+                        "so a sibling no grammar can read may be missing and this count is a FLOOR"
+                      : "" );
+    for( std::size_t i = 0; i < shown; ++i )
+    {
+        const std::string_view rp = pathRel( sibs.paths[i] );
+        rw::emitTo( out, "        {}\n", std::string_view( rp.data(), rp.size() ) );
     }
 }
 
@@ -382,15 +630,16 @@ inline void writeSituEmptyCochangeLine( std::FILE* out, std::size_t coCommits )
 {
     if( coCommits == 0 )
     {
-        std::fprintf( out, "        (the window above mined 0 commits — no git history reached it, so this zero is NOT a measurement of coupling)\n" );
+        rw::emitRaw( out, "        (the window above mined 0 commits — no git history reached it, so this zero is NOT a measurement of coupling)\n" );
         return;
     }
-    std::fprintf( out, "        (none — %zu commits were mined and none co-edited a file outside your diff)\n", coCommits );
+    rw::emitTo( out, "        (none — {} commits were mined and none co-edited a file outside your diff)\n", coCommits );
 }
 
 inline void writeSituation( std::FILE* out, const std::string& root, const IngestResult& ing, const Graph& g,
                             const std::vector<char>& changedFile,
-                            std::uint32_t onlyRoot = UINT32_MAX )   // multi-root §5: co-change mined within that root only
+                            std::uint32_t onlyRoot = UINT32_MAX,   // multi-root §5: co-change mined within that root only
+                            SituPageArgs page = {} )   // C1 F-10: sections [1] and [3] page; section [2] is the answer and never does
 {
     const std::uint32_t F = std::uint32_t( ing.files.size() );
     const std::uint32_t N = std::uint32_t( ing.symbols.size() );
@@ -401,9 +650,15 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
     // from the document, same as every structured verb's root= attribute).
     const bool         situSingleRoot = ing.realPaths.empty();
     const std::string  situRootPrefix = situSingleRoot ? rw::sarif::rootPrefixOf( root ) : std::string();
+    // L-D names one kind of file the index does not hold (an unindexed .inl sibling), so the relativizer is
+    // split in two: the STORED-path form is the primitive, and the fileId form is that same call.
+    const auto          situPathRelStr = [ & ]( std::string_view p ) -> std::string_view
+    {
+        return situSingleRoot ? rw::sarif::rootRelativeUri( p, situRootPrefix ) : p;
+    };
     const auto          situPathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
     {
-        return situSingleRoot ? rw::sarif::rootRelativeUri( ing.files[ fileId ], situRootPrefix ) : std::string_view( ing.files[ fileId ] );
+        return situPathRelStr( ing.files[ fileId ] );
     };
 
     std::uint32_t       nChanged = 0;
@@ -423,10 +678,10 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
         }
     }
 
-    std::fprintf( out, "ripwire situational-awareness — %u changed file(s), %zu symbols in them\n", nChanged, changedSyms.size() );
+    rw::emitTo( out, "ripwire situational-awareness — {} changed file(s), {} symbols in them\n", nChanged, changedSyms.size() );
     if( situSingleRoot )
     {
-        std::fprintf( out, "root: %s\n", root.c_str() );
+        rw::emitTo( out, "root: {}\n", root.c_str() );
     }
     // M10: this report reads git (the diff itself, plus an 18-month co-change mine below) and, before this
     // fix, carried no anchor at all — an agent quoting its numbers into a handoff had nothing checkable to
@@ -435,7 +690,7 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
     const std::string situAtStamp = gitstamp::stampAt( root );
     if( !situAtStamp.empty() )
     {
-        std::fprintf( out, "at: %s\n", situAtStamp.c_str() );
+        rw::emitTo( out, "at: {}\n", situAtStamp.c_str() );
     }
     if( changedSyms.empty() )
     {
@@ -446,11 +701,11 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
         // at all. The MCP JSON twin (mcpverbs.h) already split this correctly; the CLI text form did not.
         if( nChanged == 0 )
         {
-            std::fprintf( out, "  (0 changed files — working tree is clean, nothing to analyze)\n" );
+            rw::emitRaw( out, "  (0 changed files — working tree is clean, nothing to analyze)\n" );
         }
         else
         {
-            std::fprintf( out, "  (no indexed symbols in the %u changed file(s) — nothing to analyze)\n", nChanged );
+            rw::emitTo( out, "  (no indexed symbols in the {} changed file(s) — nothing to analyze)\n", nChanged );
         }
         return;
     }
@@ -486,26 +741,41 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
     // §B12.1: "(showing 8" carried neither a UNIT nor a remainder, so a reader who noticed the 8 rows summed
     // to 59 of the stated 69 symbols had no way to tell whether 8 counted files, symbols or something else.
     // "showing 8 of 17 files" self-explains the gap without a second sentence.
-    std::string blastNote = situShowingNote( kSituBlastFilesShown, affected.size(), "files" );
-    if( !blastNote.empty() )
-    {
-        blastNote.insert( blastNote.size() - 1, "; --pr-context's own per-file blast-radius list is also capped, at 20" );
-    }
-    std::fprintf( out, "  [1] blast radius: %zu symbols across %zu files transitively depend on these changes%s\n",
+    // C1 F-10: the window is pageview.h's, so --limit=N raises the 8 and --offset=M pages it.
+    const PageWindow  blastPage  = pageWindow( affected.size(), effectiveRowCap( page.limit, int( kSituBlastFilesShown ) ), page.offset );
+    const std::size_t blastShown = blastPage.end - blastPage.begin;
+    const std::string blastNote = situShowingNote( blastShown, affected.size(), "files",
+                                                   situNextInvocation( page.selector, affected.size() ),
+                                                   " prcontext_cap=20 (--pr-context's own per-file list is cut at 20 too)" );
+    // R2-AF (round 2, answer-first ordering, owner-approved): the decl/def partner and lexical-sibling
+    // blocks print BEFORE the [1] blast radius header line — both are LOOKUPS ("what else has to change
+    // with this file", "what sits beside it"), not blast-radius members, so a reader gets the cheap answer
+    // before paying for the header's counts. The blast radius line itself moves AS A WHOLE (every cap and
+    // count it carries is unchanged, only its position is), and everything that reads as its own
+    // continuation — the graph-count gauge line, then the affected-file rows — stays right after it,
+    // exactly as before this lane. F3: the decl/def partner FIRST of the two — it is the answer to "what
+    // else has to change with this file" that the dependent-symbol ranking below can never produce, because
+    // a header does not depend on its own source.
+    const std::vector<DeclDefPartner> situPartners = declDefPartners( ing, changedFile );
+    writeSituDeclDefRows( out, situPartners, situPathRel );
+    // L-D: the lexical neighbours of the changed files, which the caller walk above can never reach.
+    const SituSiblings situSibs = lexicalSiblings( ing, changedFile );
+    writeSituSiblingRows( out, situSibs, situPathRelStr, page );
+    rw::emitTo( out, "  [1] blast radius: {} symbols across {} files transitively depend on these changes{}\n",
                   reach.size(), affected.size(), blastNote.c_str() );
-    // F3: the decl/def partner FIRST — it is the answer to "what else has to change with this file" that the
-    // dependent-symbol ranking below can never produce, because a header does not depend on its own source.
-    writeSituDeclDefRows( out, declDefPartners( ing, changedFile ), situPathRel );
-    {   // H5/M15: the same floor + gauge the XML graph verbs mark, in this report's prose (one fold: graphGaugeAttrXml's)
-        std::size_t gaugeAmb = 0, gaugeUnresolved = 0;
-        for( std::uint32_t k : g.ambOut )        { gaugeAmb        += k; }
-        for( std::uint32_t k : g.unresolvedOut ) { gaugeUnresolved += k; }
-        std::fprintf( out, kGraphCountFloorTextLine, gaugeAmb, gaugeUnresolved, graphUnindexedTextClause( g.unindexedFiles ).c_str() );
+    {   // H5/M15: the same floor + gauge the XML graph verbs mark, in this report's prose — through the SAME
+        // fold, graphGaugeTotals, that graphGaugeAttrXml and graphGaugeAttrJson go through. PR #72 (382e66e6)
+        // introduced that fold in the same commit that widened the gauge to three, precisely to stop the two
+        // dialects being a clone pair — and this third copy was left hand-written three lines above the call
+        // that consumes it. A fold honoured in two places out of three is the shape #72 was fixing, not an
+        // exception to it.
+        const auto [gaugeAmb, gaugeUnresolved] = graphGaugeTotals( g.ambOut, g.unresolvedOut );
+        rw::emitTo( out, kGraphCountFloorTextLine, gaugeAmb, gaugeUnresolved, graphUnindexedTextClause( g.unindexedFiles ).c_str() );
     }
-    for( std::size_t i = 0; i < affected.size() && i < kSituBlastFilesShown; ++i )
+    for( std::size_t i = blastPage.begin; i < blastPage.end; ++i )
     {
         const std::string_view rp = situPathRel( affected[i] );
-        std::fprintf( out, "        %.*s  (%u dependent symbols)\n", int( rp.size() ), rp.data(), fileReachers[ affected[i] ] );
+        rw::emitTo( out, "        {}  ({} dependent symbols)\n", std::string_view( rp.data(), rp.size() ), fileReachers[ affected[i] ] );
     }
 
     // (2) tests to run — the test files among the dependents (the --affected set), in EVIDENCE order
@@ -521,26 +791,44 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
     }
     // §H6 (W3FIX): this header printed the FULL count then listed at most 25 rows, silently — on the one
     // section whose sibling --test-gate calls its <t> rows "the COMPLETE obligation".
-    std::fprintf( out, "  [2] tests to run (%zu)%s%s", tests.size(), situShowingNote( kSituTestRowsShown, tests.size(), "tests" ).c_str(),
-                  tests.empty() ? ": (none transitively reach these files)\n"
-                                : " — evidence order: [changed] you edited it, [partner] named after a changed file, then hops (1 = calls a changed symbol directly):\n" );
+    // C1 F-10: this listing had a 25-row cap and no relief. It is the ANSWER — the rows you run, the rows
+    // --test-gate exits 4 on — so it is served whole and carries no showing-note at all: there is nothing to
+    // disclose when nothing can be dropped.
+    // A5: order=evidence is the SAME attribute --affected's root carries for the same ordering, so the two
+    // verbs name it identically; what follows is the reading of the tags the rows themselves print, which has
+    // no attribute form and therefore stays as the shortest sentence that defines them.
+    // A3 / third review of #219: the trailing clause named `root:` UNCONDITIONALLY. A multi-root report
+    // declares no `root:` at all (see situSingleRoot above, which gates that line) and TestRunnerIndex
+    // correctly keeps the absolute command there — so on that report the sentence pointed at an anchor the
+    // reader could not find. That is the same defect this lane fixed in the shared run-hint clause, having
+    // survived in this dialect's own heading because the heading is prose rather than the shared constant.
+    // Both spellings now answer to the ONE predicate that also decides how the command is spelled
+    // (testmap.h runsAreRootRelative, the same one TestRunnerIndex is constructed with), so the sentence and
+    // the command cannot disagree. The order half is shared between the two forms rather than duplicated,
+    // and the single-root form is byte-identical to what it was.
+    static constexpr std::string_view kSituRowsOrder =
+        " order=evidence: [changed] you edited it, [partner] named after a changed file, then hops asc (1 = direct); "
+        "\"(n): a, b\" = n runner-less files sharing that evidence; ";
+    static constexpr std::string_view kSituRunRootRel  = "a (run: …) is relative to root:\n";
+    static constexpr std::string_view kSituRunAbsolute = "a (run: …) is absolute: this report spans several roots, so there is no one root to be relative to:\n";
+    const std::string situRowsHeading =
+        tests.empty() ? std::string( ": (none transitively reach these files)\n" )
+                      : std::string( kSituRowsOrder )
+                            + std::string( rw::runsAreRootRelative( ing, root ) ? kSituRunRootRel : kSituRunAbsolute );
+    rw::emitTo( out, "  [2] tests to run ({}){}", tests.size(), situRowsHeading.c_str() );
     // §P11.4: this section says "tests to run" and named files that are not commands. The runner is appended
     // where one is DERIVABLE and omitted where it is not — see testmap.h; a guessed command is worse than none.
-    const TestRunnerIndex situRunners( ing );
-    for( std::size_t i = 0; i < testRows.size() && i < kSituTestRowsShown; ++i )
-    {
-        const TestRow&         r  = testRows[i];
-        const std::string_view rp = situPathRel( r.fileId );
-        std::fprintf( out, "        %.*s%s%s\n", int( rp.size() ), rp.data(), testRowEvidence( r, EvDialect::Text ).c_str(),
-                      runSuffixTextDisclosed( situRunners, r.fileId ).c_str() );
-    }
+    // E1: runner-less rows with equal evidence are ONE `[hops=N] (n): a, b` line — testmap.h's seam, the multiset unchanged
+    const TestRunnerIndex situRunners( ing, root );
+    rw::emitRaw( out, testRowsJoined( situRunners, evidenceRowsOut( testRows, EvDialect::Text, situPathRel ), TestRowShape{ RowDialect::Text, {}, "        " },
+                                      []( std::string_view s ) { return std::string( s ); } ).c_str() );
     // §B7.3: this section inherits --affected's blind spot without --affected's disclosure — a shell harness
     // runs the compiled BINARY as a subprocess, which is not a call edge, so no test/*.sh gate can EVER be
     // named above, however much of the change it exercises. Same number, same counter as --affected's
     // script_gates_unmodelled= (testmap.h), because it is literally the same blindness on the same traversal
     // — and it matters MOST on the empty listing above, which otherwise reads as "nothing tests this".
-    std::fprintf( out, "        (%zu test/*.sh gates are NOT modelled: script-to-binary edges are not call edges, "
-                       "so they never appear here — a path count, not every one invokes the binary)\n",
+    rw::emitTo( out, "        script_gates_unmodelled={} — test/*.sh gates never appear above: script-to-binary "
+                       "edges are not call edges (a path count)\n",
                   scriptGatesUnmodelledCount( ing ) );
 
     // (3) co-change partners NOT in the diff — "you usually edit these together; did you forget?"
@@ -551,7 +839,12 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
     const std::size_t              coCommits  = coSets.size();
     HashMap<std::uint32_t, double> partnerDeg;
     std::uint32_t                  probed = 0;
-    for( std::uint32_t f = 0; f < F && probed < 20; ++f )
+    std::size_t                    changedCount = 0;   // cut-fix E: the probe's denominator
+    for( std::uint32_t f = 0; f < F; ++f )
+    {
+        changedCount += changedFile[f] ? 1u : 0u;
+    }
+    for( std::uint32_t f = 0; f < F && probed < kSituCochangeProbeFiles; ++f )
     {
         if( !changedFile[f] )
         {
@@ -578,21 +871,32 @@ inline void writeSituation( std::FILE* out, const std::string& root, const Inges
     // §H6 (W3FIX): same undisclosed cap as [2] — 18 partners, 8 rows on this repo's own src/graph.h probe.
     // F2: window=/commits= ride on the header, so the count below is readable as a measurement — or as the
     // absence of one. --cochange, the component this composes, already emits both.
-    std::fprintf( out, "  [3] co-change — usually edited with these but NOT in your diff (%zu) window=\"%s\" commits=\"%zu\"%s:\n",
-                  partners.size(), coWindow.c_str(), coCommits,
-                  situShowingNote( kSituPartnerRowsShown, partners.size(), "files" ).c_str() );
+    const PageWindow  partnerPage  = pageWindow( partners.size(), effectiveRowCap( page.limit, int( kSituPartnerRowsShown ) ), page.offset );
+    const std::size_t partnerShown = partnerPage.end - partnerPage.begin;
+    // cut-fix E: only the first kSituCochangeProbeFiles changed files (file-id order) are probed, so on a larger diff
+    // the partner count above is a FLOOR — THE TRUNCATION VOCABULARY rule 4's marker, with probed= naming how many
+    // of changed_files= were read. Present only when the probe cut (a small diff is byte-identical).
+    const std::string probeCut = changedCount > probed
+        ? " partners_capped=\"1\" probed=\"" + std::to_string( probed ) + "\" changed_files=\"" + std::to_string( changedCount ) + "\""
+        : std::string();
+    // 0.6.7 shallow tail: the window was mined from THIS root's fetched history; on a depth-limited clone the line carries the
+    // shallow="1" the cochange verb's root carries (the at: line's +shallow suffix names the state, this names the measurement).
+    rw::emitTo( out, "  [3] co-change — usually edited with these but NOT in your diff ({}) window=\"{}\" commits=\"{}\"{}{}{}:\n",
+                  partners.size(), coWindow.c_str(), coCommits, gitstamp::shallowAttr( gitstamp::isShallow( root ) ), probeCut.c_str(),
+                  situShowingNote( partnerShown, partners.size(), "files",
+                                   situNextInvocation( page.selector, partners.size() ) ).c_str() );
     if( partners.empty() )
     {
         writeSituEmptyCochangeLine( out, coCommits );
     }
-    for( std::size_t i = 0; i < partners.size() && i < kSituPartnerRowsShown; ++i )
+    for( std::size_t i = partnerPage.begin; i < partnerPage.end; ++i )
     {
         const std::string_view rp = situPathRel( partners[i].first );
-        std::fprintf( out, "        %.*s  (co-edited in %.0f%% of commits)\n", int( rp.size() ), rp.data(), partners[i].second * 100.0 );
+        rw::emitTo( out, "        {}  (co-edited in {:.0f}% of commits)\n", std::string_view( rp.data(), rp.size() ), partners[i].second * 100.0 );
     }
     // P3 (L7): the one follow-up — the gate that turns [2] into an exit code (4 while tests or the untested blast
     // radius are non-empty), on the same tree.
-    std::fprintf( out, "  next: --test-gate\n" );
+    rw::emitRaw( out, "  next: --test-gate\n" );
 }
 
 // ---- structured situational awareness for a DIFF (S5-D) — the same analyses as writeSituation, returned as
@@ -620,8 +924,10 @@ struct SituationFacts
     // Carried on the FACTS, not re-derived per surface, so the CLI report, the MCP JSON and --handoff cannot
     // disclose it three ways or two of them forget.
     std::vector<DeclDefPartner>                   declDef;       // F3: files defining the SAME (scope, name) symbols as the changed set — the header/impl pair the transitive list cannot reach
+    SituSiblings                                  siblings;      // L-D: same-directory, same-stem neighbours of the changed files — STORED spellings (an unindexed .inl has no fileId)
     std::string                                   coWindow;      // the window label its co-change was mined in ("18mo@HEAD"), empty only if never mined
     std::size_t                                   coCommits = 0; // commits that window actually contained — 0 ⇒ the zero above is not a measurement
+    bool                                          shallow = false; // 0.6.7: the root is a depth-limited clone — coCommits and hotspots' churn count only the fetched commits
     std::vector<std::pair<std::uint32_t, std::uint64_t>> hotspots; // (changed file, cx×churn score) for high-risk changed files (score desc, path asc)
     std::vector<std::string>                      modulesTouched; // distinct TOP-LEVEL directory of each changed file (sorted)
 };
@@ -678,7 +984,7 @@ inline SituationFacts computeSituationFacts( const std::string& root, const Inge
     {
         facts.blastDependents.push_back( fileReachers[f] );
     }
-    VERIFY( facts.blastDependents.size() == facts.blastRadius.size() );
+    ASSUME( facts.blastDependents.size() == facts.blastRadius.size() );
 
     // H2H-Graft F1: evidence-ordered rows (changed test files in the diff, stem partners, then hops asc)
     const ChangedFileSplit factsSplit = splitChangedFiles( ing, changedFile );
@@ -702,8 +1008,10 @@ inline SituationFacts computeSituationFacts( const std::string& root, const Inge
     // popen per probed file — up to 40 — the O(files)-subprocess storm). Deterministic for a fixed HEAD.
     const auto                     coSets = gitCommitFileSets( root, ing, "18 months ago", 30 );
     facts.declDef  = declDefPartners( ing, changedFile );  // F3: same relationship, same rule, one implementation
+    facts.siblings = lexicalSiblings( ing, changedFile );   // L-D: the same list the CLI report's [1] prints
     facts.coWindow = defaultWindowLabel( root, "18mo" );   // F2: the composed zero's window travels WITH the zero
     facts.coCommits = coSets.size();
+    facts.shallow   = gitstamp::isShallow( root );         // 0.6.7: ...and so does its qualification (the one probe)
     HashMap<std::uint32_t, double> partnerDeg;
     std::uint32_t                  probed = 0;
     for( std::uint32_t f = 0; f < F && probed < 40; ++f )
@@ -787,6 +1095,13 @@ struct TestGateResult
     std::vector<std::uint32_t> tests;                 // the same rows as file ids, same order — the --affected answer
     ShellGateIndex             shellGates;            // registered shell gates with exact dependency evidence
     std::vector<NodeId>        untested;              // impacted symbols reached by NO test (ccx desc, file asc, name asc)
+    // rv-test-gate-tsjs F3: <file-scope> owners #324 excludes from `untested` above, counted rather than
+    // silently dropped — a real obligation (a module scope no test reaches) must not read as exit 0 with
+    // nothing to say why. Still counted in impactedSymbols; see writeTestGateReport's reconciliation note.
+    std::size_t                untestedModscope = 0;
+    // Declined calls (graph.h declinedCallsNaming) that could have reached a changed symbol or one in its radius: callers
+    // the radius above could not walk, so a test behind one of them is in no row. declined_calls=, absent at zero.
+    std::size_t                declinedCalls    = 0;
     bool                       hasObligations  = false; // !tests.empty() || !untested.empty()
 };
 
@@ -800,7 +1115,7 @@ struct TestGateResult
 // (see that function's banner for why isTestPath, not isTestSymbol, is the right one here).
 inline std::vector<char> testSeedForwardReach( const IngestResult& ing, const Graph& g )
 {
-    return seedForwardReachIf( ing, g, [ & ]( NodeId i ) { return isTestPath( ing.files[ing.symbols[i].fileId] ); } );
+    return seedForwardReachIf( ing, g, [ & ]( NodeId i ) { return isTestPath( rootRelPath( ing, ing.symbols[i].fileId ) ); } );
 }
 
 // The gate's ONE computation, expressed over an explicit CHANGED-SYMBOL set rather than a changed-FILE mask.
@@ -813,8 +1128,7 @@ inline TestGateResult computeTestGateFor( const IngestResult& ing, const Graph& 
                                           const std::vector<NodeId>& changedSyms, const std::vector<char>& isChangedSym,
                                           std::uint32_t changedFileCount, const std::vector<char>* testReachIn )
 {
-    const std::uint32_t F = std::uint32_t( ing.files.size() );
-    TestGateResult      r;
+    TestGateResult r;
     r.changedFiles = changedFileCount;
     if( changedSyms.empty() )
     {
@@ -840,12 +1154,24 @@ inline TestGateResult computeTestGateFor( const IngestResult& ing, const Graph& 
             continue; // the changed symbols are the change, not its radius
         }
         ++r.impactedSymbols;
-        if( !isTestPath( ing.files[f] ) && !testReach[n] )
+        // #324: a <file-scope> (ModuleScope) owner can be a real CALLER in the blast radius (a top-level
+        // statement or anonymous-callback body calling the changed symbol) — it still counts toward
+        // impacted= above — but it is never listed as an UNTESTED obligation: nothing in any language can
+        // name it, so no test can ever be written FOR it, and a row an agent can never discharge is not an
+        // obligation, it is a permanent false alarm. model.h::isUntestableOwner is the ONE predicate this and
+        // flipimpact.h's own untested-hosts loop both apply, so the exclusion cannot drift between the two.
+        if( !isTestPath( rootRelPath( ing, f ) ) && !testReach[n] )
         {
-            r.untested.push_back( n );
+            // rv-test-gate-tsjs F3: counted, never silently dropped.
+            if( isUntestableOwner( ing.symbols[n].kind ) ) { ++r.untestedModscope; } else { r.untested.push_back( n ); }
         }
     }
     r.testRows = rankTestRows( ing, reach, gateDepth, &isChangedSym, gateSplit.src, gateSplit.tests );
+    {
+        std::vector<NodeId> declineTargets( changedSyms.begin(), changedSyms.end() );   // the change and its radius, as --impact counts it
+        declineTargets.insert( declineTargets.end(), reach.begin(), reach.end() );
+        r.declinedCalls = declinedCallsNaming( g, declineTargets );
+    }
     for( const TestRow& row : r.testRows )
     {
         r.tests.push_back( row.fileId );
@@ -975,6 +1301,20 @@ inline void walkUntestedRows( const IngestResult& ing, const TestGateResult& r, 
 // that MUST survive verbatim (test/testgatecheck.sh arm (g)): "UNIT: untested= here counts impacted
 // SYMBOLS", "call EDGES", "defs a gate lights" — the §B12.5 cross-verb unit-collision disclosure this verb
 // shares with --seams and --flip. docs/EVALS.md §5 has the measured before/after byte table.
+// rv-test-gate-tsjs F3: untested_modscope=N is ALWAYS present (like changed=/impacted=/tests=/untested=
+// beside it) — a reader comparing runs needs to tell "0 excluded" from "this build predates the count", and
+// an absent-when-zero convention cannot. The FULL clause is still G4-gated on N>0, since it costs real bytes and
+// a document with nothing excluded has nothing to explain; at N=0 a one-line definition rides instead, because the
+// attribute is on the root either way and a full legend must define every attribute it prints (CodeRabbit on #331:
+// the first-screen gap this used to leave was recorded in test/legendcoverage_baseline.txt, a downward-only file).
+inline constexpr const char* kUntestedModscopeLegend =
+    "untested_modscope=N counts <file-scope> owners excluded from untested= (#324: uncallable, so untestable) "
+    "— still in impacted=, a real caller. tests= counts FILES not symbols, so impacted != "
+    "tests+untested+untested_modscope in general; read this as the excluded count alone, not a sum term. ";
+inline constexpr const char* kUntestedModscopeZeroLegend =
+    "untested_modscope=0: no <file-scope> owner excluded from untested= (#324). ";
+inline const char* untestedModscopeLegend( bool on ) noexcept { return on ? kUntestedModscopeLegend : kUntestedModscopeZeroLegend; }
+
 inline constexpr const char* kTestGateLegend =
     "ripwire test-gate (TDAD-parity, arXiv 2603.17973, -70% agent-caused regressions): tests to run for this "
     "change + the UNTESTED blast radius; exit 4 if tests OR untested is non-empty, else run them and rely on "
@@ -1015,7 +1355,7 @@ inline constexpr const char* kTestGateRowLegend =
 
 // M21(b): the run=/run_unknown= rule, from testmap.h's ONE constant — a rule about <t> rows, so it rides
 // the row-gated legend and the zero-row report (test/donelegendcheck.sh's tg_empty ratchet) pays nothing.
-inline const std::string kTestGateRunLegend{ rw::kRunHintLegendClause };
+inline constexpr std::string_view kTestGateRunLegend = rw::kRunHintLegendClause;
 
 // Emit the --test-gate report as minified XML (house shape) for an ALREADY-COMPUTED gate result. Deterministic
 // + xmllint-clean; the header counts are always full. §A3a: the <u> untested-row list joins pageview.h's
@@ -1081,35 +1421,49 @@ inline void writeTestGateReport( std::FILE* out, const IngestResult& ing, const 
     const bool        tgHasRows  = ( testRows > 0 || !r.untested.empty() );
     const std::string tgRootAttr = ( root.empty() || !tgHasRows ) ? std::string() : ( " root=\"" + ex( root ) + "\"" );
     // H2H-Graft F1: the evidence clause (testmap.h's ONE wording) rides the rows-gated half, like the run= rule.
-    std::fprintf( out, "<!-- %s%s%.*s%s%s-->%s", kTestGateLegend,
-                  tgHasRows ? kTestGateRowLegend : "",
-                  tgHasRows ? int( kTestRowEvidenceLegend.size() ) : 0, kTestRowEvidenceLegend.data(),
-                  tgHasRows ? kTestGateRunLegend.c_str() : "",
-                  rw::graphUnindexedLegend( g.unindexedFiles > 0 ),   // #66: exactly when the root carries the attribute
+    // #324: a module-scope owner (<file-scope>) can no longer be one of the untested rows this report prints
+    // — computeTestGateFor excludes it (model.h::isUntestableOwner) before r.untested is even built, so there
+    // is no t="modscope" shape left for a reader of THIS listing to meet and no legend clause to spend bytes
+    // on here. (It remains a legitimate CALLER row elsewhere — --callers/--impact/--for still carry
+    // rw::modScopeLegend for their own t="modscope" rows; this document has none of those, only <u> rows.)
+    const std::string tgRunFirst = runFirstField( r.testRows, testRows, /*json=*/false );   // hono-20/textual-20: the run-first head
+    rw::emitTo( out, "<!-- {}{}{}{}{}{}{}-->{}", kTestGateLegend,
+                  tgHasRows ? kTestGateRowLegend : "", std::string_view( kTestRowEvidenceLegend.data(), tgHasRows ? int( kTestRowEvidenceLegend.size() ) : 0 ),
+                  runFirstLegend( !tgRunFirst.empty() ),   // exactly when the root carries run_first=
+                  runHintClauseIfRows( testRows, runsAreRootRelative( ing, root ) ),   // the ONE gate: this clause is about <t> rows, so an untested-only report pays nothing
+                  untestedModscopeLegend( r.untestedModscope > 0 ),   // F3: the full clause at N>0, a one-line definition at 0
+                  ( std::string( rw::graphUnindexedLegend( rw::graphGaugeClauses( g ) ) )   // #66: exactly when the root carries the attribute
+                    + ( r.declinedCalls > 0 ? rw::kDeclinedCallsTestGateLegend : "" )                               // exactly when it carries declined_calls=
+                    + rw::declinedCallsGateLegend( r.declinedCalls > 0 && g.gateDeclinedCalls > 0 ) ).c_str(),
                   rw::rootRelPathsLegend( !tgRootAttr.empty() ) );
     // §P11.4: this gate EXITS 4 on the obligation, so its rows carry the command that discharges it — where
     // one is derivable. Absent run= = not derivable (testmap.h states why a fallback would be a lie).
-    const TestRunnerIndex gateRunners( ing );
-    std::fprintf( out, "<test-gate changed=\"%u\" impacted=\"%zu\" tests=\"%zu\" untested=\"%zu\""
-                       " shown_tests=\"%zu\" tests_capped=\"0\" shown_untested=\"%zu\" untested_capped=\"%d\""
-                       " script_gates_unmodelled=\"%zu\" script_gates_registered=\"%zu\" script_gates_mapped=\"%zu\""
-                       " script_gates_unresolved_dynamic=\"%zu\" ccx_bar=\"%u\"%s%s%s%s%s>",
-                  r.changedFiles, r.impactedSymbols, testRows, r.untested.size(),
-                  testRows, shownRows, shownRows < r.untested.size() ? 1 : 0,
+    const TestRunnerIndex gateRunners( ing, root );
+    // shown_tests= / tests_capped= are DERIVED from the rows this document actually emits, not asserted.
+    // tests_capped= was the string literal "0" — a disclosure that could never become "1", so if a <t> row
+    // cap were ever added the attribute would keep saying nothing was cut while something was. It is kept
+    // present at 0 rather than omitted, because pageview.h rule 1 pairs shown_*/=*_capped per LISTING and its
+    // sibling untested_capped="0" is pinned by test/testgatepagecheck.sh (a') and test/impactpartitioncheck.sh:
+    // dropping one half of a documented pair is a new inconsistency, not a fix for this one.
+    const std::size_t shownTests = r.testRows.size() + r.shellGates.obligations.size();
+    rw::emitTo( out, "<test-gate changed=\"{}\" impacted=\"{}\" tests=\"{}\" untested=\"{}\" untested_modscope=\"{}\""
+                       " shown_tests=\"{}\" tests_capped=\"{}\" shown_untested=\"{}\" untested_capped=\"{}\""
+                       " script_gates_unmodelled=\"{}\" script_gates_registered=\"{}\" script_gates_mapped=\"{}\""
+                       " script_gates_unresolved_dynamic=\"{}\" ccx_bar=\"{}\"{}{}{}{}{}{}{}>",
+                  r.changedFiles, r.impactedSymbols, testRows, r.untested.size(), r.untestedModscope,
+                  shownTests, shownTests < testRows ? 1 : 0, shownRows, shownRows < r.untested.size() ? 1 : 0,
                   scriptGatesUnmodelledCount( ing ),
                   r.shellGates.registered, r.shellGates.mapped, r.shellGates.unresolvedDynamic, kTestGateCcxBarMirror,   // P8 (L7): ccx_bar=
+                  tgRunFirst.c_str(),   // hono-20: where the run-first head of the <t> rows ends; absent unless it splits
                   graphCountFloorAttrXml( g ).c_str(),   // M15: gauge + counts_floor="1", the one splice every graph-floored root shares
                   pagingDisclosure( uab, sizeof( uab ), r.untested.size(), uw.end, pageLimit, pageOffset ),
                   gitstamp::atAttr( root ).c_str(), tgRootAttr.c_str(),
-                  nextAttrXml( testGateNextInvocation( ing, r, gateRunners ) ).c_str() );   // P3 (L7)
-    for( const TestRow& row : r.testRows )
-    {
-        std::fprintf( out, "<t p=\"%s\"%s%s/>", ex( tgPathRel( row.fileId ) ).c_str(), testRowEvidence( row, EvDialect::Xml ).c_str(),
-                      runAttrDisclosed( gateRunners, row.fileId, ex ).c_str() );
-    }
+                  declinedCallsAttrXml( r.declinedCalls ).c_str(),   // callers the radius could not walk; absent at zero
+                  nextAttrXml( testGateNextInvocation( ing, r, gateRunners ) ).c_str()  );   // P3 (L7)
+    rw::emitRaw( out, testRowsJoined( gateRunners, evidenceRowsOut( r.testRows, EvDialect::Xml, tgPathRel ), TestRowShape{ RowDialect::Xml, "t" }, ex ).c_str() );   // E1: <g> where no runner is derivable
     for( const ShellGateObligation& gate : r.shellGates.obligations )
     {
-        std::fprintf( out, "<t p=\"%s\" evidence=\"%s\" run=\"%s\"/>", ex( tgPathRel( gate.fileId ) ).c_str(), gate.evidence,
+        rw::emitTo( out, "<t p=\"{}\" evidence=\"{}\" run=\"{}\"/>", ex( tgPathRel( gate.fileId ) ).c_str(), gate.evidence,
                       ex( gateRunners.commandForScript( gate.fileId ) ).c_str() );
     }
     walkUntestedRows( ing, r, uw, [ & ]( std::size_t, const Symbol& s, const std::string& )
@@ -1118,9 +1472,9 @@ inline void writeTestGateReport( std::FILE* out, const IngestResult& ing, const 
         // M21(b): l= — the DEFINING line. Without it a row names a symbol to test and a file to open and
         // leaves the reader to find it; the sibling that prints the same row shape, --flags --flip's
         // <u sym= p= l= ccx=>, has carried the line since it was written. Same attribute, same position.
-        std::fprintf( out, "<u sym=\"%s\" p=\"%s\" l=\"%u\" ccx=\"%u\"/>", ex( s.name ).c_str(), ex( tgPathRel( s.fileId ) ).c_str(), s.line, s.ccx );
+        rw::emitTo( out, "<u sym=\"{}\" p=\"{}\" l=\"{}\" ccx=\"{}\"/>", ex( s.name ).c_str(), ex( tgPathRel( s.fileId ) ).c_str(), s.line, s.ccx );
     } );
-    std::fprintf( out, "</test-gate>" );
+    rw::emitRaw( out, "</test-gate>" );
 }
 
 // L2: --json sibling of writeTestGateReport — same TestGateResult in (the ONE gate decision, computed once
@@ -1157,41 +1511,42 @@ inline void writeTestGateReportJson( std::FILE* out, const IngestResult& ing, co
     const std::size_t testRows = r.tests.size() + r.shellGates.obligations.size();
     // same rows-gate as the XML twin, so the two dialects disclose the SAME facts about the same run rather
     // than one carrying a root the other omits (test/mcpclidiffcheck.sh's parity question).
-    const TestRunnerIndex gateRunnersJ( ing );   // P3 (L7): the root's next= needs the runner index before the rows
+    const TestRunnerIndex gateRunnersJ( ing, root );   // P3 (L7): the root's next= needs the runner index before the rows
     const bool         tgJHasRows  = ( testRows > 0 || !r.untested.empty() );
     const std::string  tgJRootJson = ( root.empty() || !tgJHasRows ) ? std::string() : ( ",\"root\":\"" + jsonStr( root ) + "\"" );
-    std::fprintf( out, "{\"changed\":%u,\"impacted\":%zu,\"tests\":%zu,\"untested\":%zu"
-                       ",\"shown_tests\":%zu,\"tests_capped\":false,\"shown_untested\":%zu,\"untested_capped\":%s"
-                       ",\"script_gates_unmodelled\":%zu,\"script_gates_registered\":%zu,\"script_gates_mapped\":%zu"
-                       ",\"script_gates_unresolved_dynamic\":%zu,\"ccx_bar\":%u%s%s,\"at\":%s%s%s,\"tests_to_run\":[",
-                 r.changedFiles, r.impactedSymbols, testRows, r.untested.size(),
-                 testRows, shownRows, shownRows < r.untested.size() ? "true" : "false",
+    // The XML twin's derived pair, mirrored key-for-key: "tests_capped":false was a literal here too.
+    const std::size_t shownTestsJ = r.testRows.size() + r.shellGates.obligations.size();
+    rw::emitTo( out, "{{\"changed\":{},\"impacted\":{},\"tests\":{},\"untested\":{},\"untested_modscope\":{}"
+                       ",\"shown_tests\":{},\"tests_capped\":{},\"shown_untested\":{},\"untested_capped\":{}"
+                       ",\"script_gates_unmodelled\":{},\"script_gates_registered\":{},\"script_gates_mapped\":{}"
+                       ",\"script_gates_unresolved_dynamic\":{},\"ccx_bar\":{}{}{}{},\"at\":{}{}{}{},\"tests_to_run\":[",
+                 r.changedFiles, r.impactedSymbols, testRows, r.untested.size(), r.untestedModscope,
+                 shownTestsJ, shownTestsJ < testRows ? "true" : "false", shownRows,
+                 shownRows < r.untested.size() ? "true" : "false",
                  scriptGatesUnmodelledCount( ing ), r.shellGates.registered, r.shellGates.mapped, r.shellGates.unresolvedDynamic, kTestGateCcxBarMirror,
+                 runFirstField( r.testRows, testRows, /*json=*/true ).c_str(),   // the XML twin's run_first=
                  graphCountFloorAttrJson( g ).c_str(),   // M15: the JSON twin's gauge + "counts_floor":true
-                 pageJson, atJson.c_str(), tgJRootJson.c_str(),   // M12: root= rides only when the document has rows (same gate as the XML twin)
-                 nextFieldJson( testGateNextInvocation( ing, r, gateRunnersJ ) ).c_str() );   // P3 (L7): the XML twin's next=
-    const TestRunnerIndex gateRunners( ing );                       // §P11.4, the JSON sibling of the XML run=
+                 rw::cstr( pageJson ), atJson.c_str(), tgJRootJson.c_str(),   // M12: root= rides only when the document has rows (same gate as the XML twin)
+                 declinedCallsKeyJson( r.declinedCalls ).c_str(),                // the XML twin's declined_calls=
+                 nextFieldJson( testGateNextInvocation( ing, r, gateRunnersJ ) ).c_str()  );   // P3 (L7): the XML twin's next=
+    const TestRunnerIndex gateRunners( ing, root );                       // §P11.4, the JSON sibling of the XML run=
     const auto            jesc = []( std::string_view s ) { return jsonStr( s ); };
-    for( std::size_t i = 0; i < r.testRows.size(); ++i )
-    {
-        std::fprintf( out, "%s{\"p\":\"%s\"%s%s}", i == 0 ? "" : ",", jsonStr( tgJPathRel( r.testRows[i].fileId ) ).c_str(),
-                      testRowEvidence( r.testRows[i], EvDialect::Json ).c_str(), runFieldJsonDisclosed( gateRunners, r.testRows[i].fileId, jesc ).c_str() );
-    }
+    rw::emitRaw( out, testRowsJoined( gateRunners, evidenceRowsOut( r.testRows, EvDialect::Json, tgJPathRel ), TestRowShape{ RowDialect::Json, "p" }, jesc, "," ).c_str() );   // E1: the XML twin's <g>, "p" an array
     for( std::size_t i = 0; i < r.shellGates.obligations.size(); ++i )
     {
         const ShellGateObligation& gate = r.shellGates.obligations[i];
-        std::fprintf( out, "%s{\"p\":\"%s\",\"evidence\":\"%s\",\"run\":\"%s\"}",
+        rw::emitTo( out, "{}{{\"p\":\"{}\",\"evidence\":\"{}\",\"run\":\"{}\"}}",
                       r.tests.empty() && i == 0 ? "" : ",", jsonStr( tgJPathRel( gate.fileId ) ).c_str(), gate.evidence,
                       jsonStr( gateRunners.commandForScript( gate.fileId ) ).c_str() );
     }
-    std::fprintf( out, "],\"untested_blast_radius\":[" );
+    rw::emitRaw( out, "],\"untested_blast_radius\":[" );
     walkUntestedRows( ing, r, uw, [ & ]( std::size_t i, const Symbol& s, const std::string& )
     {
         // M12: tgJPathRel( s.fileId ), not the raw `path` walkUntestedRows hands in.
-        std::fprintf( out, "%s{\"sym\":\"%s\",\"p\":\"%s\",\"l\":%u,\"ccx\":%u}", i == 0 ? "" : ",",
+        rw::emitTo( out, "{}{{\"sym\":\"{}\",\"p\":\"{}\",\"l\":{},\"ccx\":{}}}", i == 0 ? "" : ",",
                      jsonStr( s.name ).c_str(), jsonStr( tgJPathRel( s.fileId ) ).c_str(), s.line, s.ccx );
     } );
-    std::fprintf( out, "]}" );
+    rw::emitRaw( out, "]}" );
 }
 
 }   // namespace rw

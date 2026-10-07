@@ -28,9 +28,10 @@ FIX="$ROOT/test/rustimportprecisefix"
 . "$ROOT/test/lib/headbinlib.sh"                       # shared sha-keyed cache of the HEAD comparison binary
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 skip(){ printf '  SKIP  %s\n' "$*"; }
+. "$ROOT/test/lib/cxxflags.sh"                          # the ONE flags.make parse (CWE-78: never eval a generated file)
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
 echo "rustimportprecisecheck: BIN=$BIN  FIX=$FIX  TMP=$TMP"
@@ -45,7 +46,7 @@ callee_binds(){  # $1 caller  $2 expected-path-substr  $3 must-NOT-contain-subst
 }
 callee_count(){  # $1 caller  $2 expected count=
   local c; c="$( grep -oE 'count="[0-9]+"' "$TMP/$1.out" | head -1 )"
-  [ "$c" = "count=\"$2\"" ] && ok "$1 has $c callee(s)" || no "$1 callee count wrong (got $c, want count=\"$2\")"
+  if [ "$c" = "count=\"$2\"" ]; then ok "$1 has $c callee(s)"; else no "$1 callee count wrong (got $c, want count=\"$2\")"; fi
 }
 
 # ── (1) PIPELINE resolution ───────────────────────────────────────────────────────────────────────
@@ -66,15 +67,15 @@ grep -q '<inc t="crate::geo::helper"' "$TMP/deps.out" \
 
 # ── monotone-stable header (a precise narrow never MANUFACTURES ambiguity above pre-change) ────────
 famb="$( "$BIN" "$FIX" --no-cache 2>/dev/null | grep -oE 'ambiguous=[0-9]+' | head -1 | grep -oE '[0-9]+' )"
-[ -n "$famb" ] && ok "fixture ambiguous=$famb (see monotonicity below for the bound)" || no "no ambiguous= header"
+if [ -n "$famb" ]; then ok "fixture ambiguous=$famb (see monotonicity below for the bound)"; else no "no ambiguous= header"; fi
 
 # ── determinism + warm==cold ──────────────────────────────────────────────────────────────────────
 "$BIN" "$FIX" --no-cache >"$TMP/d1" 2>/dev/null
 "$BIN" "$FIX" --no-cache >"$TMP/d2" 2>/dev/null
-cmp -s "$TMP/d1" "$TMP/d2" && ok "deterministic (two --no-cache runs identical)" || no "non-deterministic"
+if cmp -s "$TMP/d1" "$TMP/d2"; then ok "deterministic (two --no-cache runs identical)"; else no "non-deterministic"; fi
 "$BIN" "$FIX" --cache="$TMP/c.bin" >"$TMP/cold" 2>/dev/null
 "$BIN" "$FIX" --cache="$TMP/c.bin" >"$TMP/warm" 2>/dev/null
-cmp -s "$TMP/cold" "$TMP/warm" && ok "warm == cold (resolver order-stable through cache)" || no "warm != cold"
+if cmp -s "$TMP/cold" "$TMP/warm"; then ok "warm == cold (resolver order-stable through cache)"; else no "warm != cold"; fi
 
 # ── well-formed XML ───────────────────────────────────────────────────────────────────────────────
 command -v xmllint >/dev/null 2>&1 \
@@ -99,9 +100,25 @@ if [ -f "$FLAGS_MK" ] && [ -f "$LINK_TXT" ] && [ -f "$DRIVER" ]; then
   # toolchain, never assume it.
   CXX="$( awk 'NR==1{ print $1; exit }' "$LINK_TXT" )"
   [ -n "$CXX" ] && command -v "$CXX" >/dev/null 2>&1 || CXX="$( command -v c++ || command -v clang++ )"
-  eval "CXX_FLAGS=(    $( grep -m1 '^CXX_FLAGS ='    "$FLAGS_MK" | sed 's/^CXX_FLAGS =//' ) )"
-  eval "CXX_DEFINES=(  $( grep -m1 '^CXX_DEFINES ='  "$FLAGS_MK" | sed 's/^CXX_DEFINES =//' ) )"
-  eval "CXX_INCLUDES=( $( grep -m1 '^CXX_INCLUDES =' "$FLAGS_MK" | sed 's/^CXX_INCLUDES =//' ) )"
+  # The flags parse is SHARED and shlex-based, never `eval`: test/lib/cxxflags.sh carries the CWE-78
+  # reachability chain, the measured table of which shapes execute, and the proof arms relayed below.
+  cxxflags_load "$FLAGS_MK" \
+      || no "cannot parse $FLAGS_MK without executing it (see the cxxflags: line on stderr)"
+
+  # ── the parse's own proof ─────────────────────────────────────────────────────────────────────────
+  # Three claims, none of which the others imply: the eval spelling this replaced DOES execute a
+  # payload (without that control the rest is vacuous), this parse executes nothing, and it neutralises
+  # the payload rather than silently DROPPING it. Each shape gets its own key and its own control —
+  # several on one flags line mask each other into a false all-clear (test/lib/cxxflags.sh, arm P6).
+  cxxflags_selfproof "$TMP/cxxflags" "$FLAGS_MK" > "$TMP/cxxflags.rows" 2>&1 || true
+  while IFS= read -r _row; do             # a redirect, never a pipe: a pipeline subshell loses fail=1
+      case "$_row" in
+          PASS*) ok "${_row#PASS }" ;;
+          NOTE*) printf '  NOTE  %s\n' "${_row#NOTE }" ;;
+          FAIL*) no "${_row#FAIL }" ;;
+      esac
+  done < "$TMP/cxxflags.rows"
+
   LINK_BODY="$( sed -E 's#^[^ ]+ ##' "$LINK_TXT" )"
   LINK_BODY="$( printf '%s' "$LINK_BODY" | sed -E 's#-o +ripwire##' )"
   LINK_BODY="$( printf '%s' "$LINK_BODY" | sed -E 's#[^ "]*ripwire.dir/src/main.cpp.o##' )"
@@ -131,7 +148,7 @@ monotonic_check()
     # HEAD sha, then reused by all four monotonicity gates and every rerun until HEAD moves.
     local OLDBIN
     OLDBIN="$( ripwire_head_binary "$ROOT" "$TMP" )" \
-        || { skip "monotonicity: pre-change build failed"; return; }
+        || { headbin_refusal $? "monotonicity"; return; }
 
     local ao an
     ao="$( "$OLDBIN" "$FIX" --no-cache 2>/dev/null | grep -oE 'ambiguous=[0-9]+' | head -1 | grep -oE '[0-9]+' )"

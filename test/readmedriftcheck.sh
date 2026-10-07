@@ -76,14 +76,14 @@ README="$ROOT/README.md"
 LINEAGE="$ROOT/docs/LINEAGE.md"
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "readmedriftcheck: no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
 [ -f "$README" ] || { echo "readmedriftcheck: missing $README"; exit 2; }
 [ -f "$LINEAGE" ] || { echo "readmedriftcheck: missing $LINEAGE — arm (E) has no ground truth to check against"; exit 2; }
 
-HELP="$( "$BIN" --help 2>&1 )"
+HELP="$( "$BIN" --help=all 2>&1 )"
 
 # ── (A) derive the distinct flag count from --help ──────────────────────────────────────────────────
 # Reuses flagsurfacecheck.sh's own harvest idiom verbatim (see its "the advertised surface" comment).
@@ -99,13 +99,26 @@ else
 fi
 
 # ── (B) README's stated count must equal the derived count ──────────────────────────────────────────
-stated="$( grep -oE '[0-9]+ long flags advertised' "$README" | head -1 | grep -oE '^[0-9]+' )"
-if [ -z "$stated" ]; then
+# 2026-09-13: this arm took `head -1`, and therefore pinned ONE of the two sites that state the count —
+# the core sentence, not the reference guide's restatement of it in §5. That is E9's failure one arm
+# over: a second copy of a gated number, free to drift alone. EVERY occurrence is checked now, and a
+# failure names the line. The loop reads a here-doc, not a pipeline, so `no` sets fail in THIS shell.
+b_lines="$( grep -nE '[0-9]+ long flags advertised' "$README" || true )"
+b_seen=0; b_bad=""
+while IFS= read -r b_ln; do
+    [ -z "$b_ln" ] && continue
+    b_seen=$(( b_seen + 1 ))
+    b_num="$( printf '%s' "$b_ln" | grep -oE '[0-9]+ long flags advertised' | head -1 | grep -oE '^[0-9]+' )"
+    [ "$b_num" = "$derived" ] || b_bad="$b_bad README.md:${b_ln%%:*}(states $b_num)"
+done <<EOF
+$b_lines
+EOF
+if [ "$b_seen" -eq 0 ]; then
     no "(B) could not find a '<N> long flags advertised' sentence in README.md to check"
-elif [ "$stated" = "$derived" ]; then
-    ok "(B) README.md states $stated flags, matching the derived count"
+elif [ -n "$b_bad" ]; then
+    no "(B) --help has $derived distinct flags; README.md disagrees at:$b_bad"
 else
-    no "(B) README.md states $stated flags but --help currently has $derived distinct flags — update README.md:15"
+    ok "(B) all $b_seen '<N> long flags advertised' site(s) in README.md state $derived, matching the derived count"
 fi
 
 # ── (C) mutation control — a wrong count in a COPY must be caught ───────────────────────────────────
@@ -144,6 +157,12 @@ fi
 # "survey of\n220 tools" across a line boundary would otherwise make a line-oriented grep report "no
 # sentence found" — loud, but for the wrong reason, and one reflow away from a maintainer deleting the
 # arm as broken. Flattening makes the claimed rewrap-immunity actually true.
+# `head -1` in both extractions below is DELIBERATE and covered, not an oversight: (E2) asks whether the
+# FIRST copy agrees with the tables, and (E2b)/(E2d) ask whether EVERY copy agrees with each other — one
+# distinct value each, however many times the claim is printed. The two halves compose: first-copy-correct
+# plus all-copies-equal is all-copies-correct. Neither arm on its own is enough, which is why both exist
+# and why a third spelling of either claim (README says "The survey describes N tools" once) is reported
+# below as the population these matchers do NOT reach rather than left for someone to assume they do.
 counts_from() {                      # $1 = file → prints "M P N" (empty field = not found)
     local f="$1" flat pair survey
     flat="$( sed 's/\*//g' "$f" | tr '\n' ' ' | tr -s ' ' )"
@@ -225,6 +244,96 @@ elif [ "$bad_repos" = "$d_folded" ]; then
     no "(E4) mutation control: the injected wrong count did not take ($bad_repos still equals the derived $d_folded) — the control is vacuous"
 else
     ok "(E4) mutation control: a fabricated repository count ($bad_repos) is correctly seen as disagreeing with the derived count ($d_folded)"
+fi
+
+# (E2b) EVERY copy of the README pair must agree — one distinct value, however many times it is printed.
+#       (E2) extracts the FIRST "<M> repositories and <P> papers" and stops (`head -1`). README carries the pair
+#       TWICE (the <summary> line near the top, and the bolded sentence in the honesty section ~1,600 lines
+#       down), so a second copy that drifted was a published number with NO instrument on it — the exact
+#       merge-clean-but-wrong shape the 2026-09-09 landing round hit four times over (a gate count carried by
+#       two lanes, a stacked count conflicting outright, a printf-parity row, shapingflagcheck's read-site
+#       pin). `sort -u` over ALL matches asserts one distinct pair, which also catches a FUTURE third copy
+#       that disagrees; the copy count is reported, never pinned, so adding a copy is free and drifting one
+#       is not.
+pairs_from() {                       # $1 = file → every distinct "<M> repositories and <P> papers", one per line
+    sed 's/\*//g' "$1" | tr '\n' ' ' | tr -s ' ' | grep -oE '[0-9]+ repositories and [0-9]+ papers' | sort -u
+}
+readme_pairs="$( pairs_from "$README" )"
+readme_pair_copies="$( sed 's/\*//g' "$README" | tr '\n' ' ' | tr -s ' ' | grep -oE '[0-9]+ repositories and [0-9]+ papers' | wc -l | tr -d ' ' )"
+readme_distinct="$( printf '%s\n' "$readme_pairs" | grep -c . )"
+if [ "$readme_distinct" -eq 1 ]; then
+    ok "(E2b) README.md's $readme_pair_copies copies of the lineage pair agree on one value ($readme_pairs)"
+else
+    no "(E2b) README.md prints $readme_distinct DIFFERENT lineage pairs across $readme_pair_copies copies — every copy must agree: $( printf '%s' "$readme_pairs" | tr '\n' ';' )"
+fi
+
+# (E2c) mutation control for (E2b): mutate ONLY THE SECOND copy in a temp copy — the one (E2)'s `head -1`
+#       can never see — assert the mutation took, and re-run the identical extraction; it must now report two
+#       distinct pairs. A control that mutated the first copy would be caught by (E2) and prove nothing about
+#       this arm.
+first_pair="$( printf '%s\n' "$readme_pairs" | head -1 )"
+wrong_pair="$( printf '%s' "$first_pair" | sed -E "s/^[0-9]+/$(( d_folded + 7 ))/" )"
+awk -v pat="$first_pair" -v rep="$wrong_pair" 'BEGIN{c=0} { if (index($0, pat) > 0) { c++; if (c == 2) { sub(pat, rep) } } print }' "$README" > "$TMP/README_second_copy_bad.md"
+if [ "$readme_pair_copies" -lt 2 ]; then
+    no "(E2c) mutation control: README.md carries only $readme_pair_copies copy of the pair, so a second-copy mutation cannot be staged — the control is void, not passed"
+elif [ "$( grep -c -F "$wrong_pair" "$TMP/README_second_copy_bad.md" )" -ne 1 ]; then
+    no "(E2c) mutation control: the second-copy mutation did not take ($wrong_pair not found exactly once in the mutated copy)"
+elif [ "$( pairs_from "$TMP/README_second_copy_bad.md" | grep -c . )" -eq 2 ]; then
+    ok "(E2c) mutation control: a drifted SECOND copy ($wrong_pair) is seen as a second distinct pair — the arm fires where (E2) alone would stay green ((E2) on the mutated copy still reads: $( counts_from "$TMP/README_second_copy_bad.md" | awk '{print $1}' ) repositories)"
+else
+    no "(E2c) mutation control: a drifted second copy was NOT seen as a distinct pair — the arm cannot fail"
+fi
+
+# (E2d) EVERY copy of the SURVEY sentence must agree — the same demand (E2b) makes of the pair, for the
+#       number beside it. `counts_from` reads `survey of <N> tools` with `head -1` too, so until this arm a
+#       drifted SECOND copy of the survey figure was a published number with no instrument on it. The copy
+#       count is reported, never pinned: adding a copy is free and drifting one is not.
+surveys_from() {                     # $1 = file → every distinct "survey of <N> tools", one per line
+    sed 's/\*//g' "$1" | tr '\n' ' ' | tr -s ' ' | grep -oE 'survey of [0-9]+ tools' | sort -u
+}
+readme_surveys="$( surveys_from "$README" )"
+readme_survey_copies="$( sed 's/\*//g' "$README" | tr '\n' ' ' | tr -s ' ' | grep -oE 'survey of [0-9]+ tools' | wc -l | tr -d ' ' )"
+readme_survey_distinct="$( printf '%s\n' "$readme_surveys" | grep -c . )"
+if [ "$readme_survey_copies" -lt 1 ]; then
+    no "(E2d) README.md states no 'survey of <N> tools' sentence at all — the claim cannot have gone right by vanishing"
+elif [ "$readme_survey_distinct" -eq 1 ]; then
+    ok "(E2d) README.md's $readme_survey_copies copies of the survey sentence agree on one value ($readme_surveys)"
+else
+    no "(E2d) README.md prints $readme_survey_distinct DIFFERENT survey figures across $readme_survey_copies copies — every copy must agree: $( printf '%s' "$readme_surveys" | tr '\n' ';' )"
+fi
+
+# (E2e) mutation control for (E2d): mutate ONLY THE SECOND copy — the one (E2)'s `head -1` can never see —
+#       assert the mutation took, then re-run the IDENTICAL extraction over it. A control that mutated the
+#       first copy would be caught by (E2) and would prove nothing about this arm.
+first_survey="$( printf '%s\n' "$readme_surveys" | head -1 )"
+wrong_survey="$( printf '%s' "$first_survey" | sed -E "s/of [0-9]+ tools/of $(( d_surveyed + 7 )) tools/" )"
+awk -v pat="$first_survey" -v rep="$wrong_survey" 'BEGIN{c=0} { if (index($0, pat) > 0) { c++; if (c == 2) { sub(pat, rep) } } print }' "$README" > "$TMP/README_second_survey_bad.md"
+if [ "$readme_survey_copies" -lt 2 ]; then
+    no "(E2e) mutation control: README.md carries only $readme_survey_copies copy of the survey sentence, so a second-copy mutation cannot be staged — the control is void, not passed"
+elif [ "$( grep -c -F "$wrong_survey" "$TMP/README_second_survey_bad.md" )" -ne 1 ]; then
+    no "(E2e) mutation control: the second-copy mutation did not take ($wrong_survey not found exactly once in the mutated copy)"
+elif [ "$( surveys_from "$TMP/README_second_survey_bad.md" | grep -c . )" -eq 2 ]; then
+    ok "(E2e) mutation control: a drifted SECOND survey copy ($wrong_survey) is seen as a second distinct figure — the arm fires where (E2) alone would stay green ((E2) on the mutated copy still reads: $( counts_from "$TMP/README_second_survey_bad.md" | awk '{print $3}' ) tools)"
+else
+    no "(E2e) mutation control: a drifted second survey copy was NOT seen as a distinct figure — the arm cannot fail"
+fi
+
+# (E2f) THE POPULATION THESE MATCHERS DO NOT REACH, stated rather than assumed. Both extractions match one
+#       SPELLING of each claim. README spells the survey figure a third way ("The survey describes N tools"),
+#       which no arm above examines, so this arm counts every `<N> tools` mention and reports how many of them
+#       the checked spelling covers. It FAILS only when an unmatched mention carries a DIFFERENT number from
+#       the derived one — the drift that matters — and otherwise prints the coverage, so the next person to
+#       move that number reads what is and is not instrumented instead of inferring it.
+tools_mentions="$( sed 's/\*//g' "$README" | tr '\n' ' ' | tr -s ' ' | grep -oE '[0-9]+ tools' | sort | uniq -c | tr -s ' ' | sed 's/^ //' )"
+tools_wrong="$( printf '%s\n' "$tools_mentions" | awk -v want="$d_surveyed" '{ n = $2 + 0; if ( n != want ) print $0 }' )"
+# `grep -o | wc -l`, never `grep -c`: the text above is FLATTENED to one line, so a line count reports 1
+# however many mentions it holds — the first draft of this arm printed "all 1 mentions" beside "3 of them",
+# a self-contradicting row that was only visible because the two numbers sat in one sentence.
+tools_total="$( sed 's/\*//g' "$README" | tr '\n' ' ' | tr -s ' ' | grep -oE '[0-9]+ tools' | wc -l | tr -d ' ' )"
+if [ -n "$tools_wrong" ]; then
+    no "(E2f) README.md mentions a tool count that is not the derived $d_surveyed: $( printf '%s' "$tools_wrong" | tr '\n' ';' )"
+else
+    ok "(E2f) all $tools_total '<N> tools' mentions in README.md read $d_surveyed; $readme_survey_copies of them are in the 'survey of N tools' spelling (E2d) examines"
 fi
 
 # (E10) LINEAGE's DISJOINTNESS SENTENCE must carry the same numbers as its own header.
@@ -777,6 +886,211 @@ else
         no "(I2) $LANGPROMPT names paths that do not exist:$missing"
     else
         ok "(I2) every repo path named in $LANGPROMPT resolves (LANG substituted with a real indexed language)"
+    fi
+fi
+
+# ── (J) the SKILLS arm — three defensible counts of one directory, and README states all three ─────
+# WHY. `skills/` can be counted three ways and every one of them is defensible, which is exactly how
+# this drifted. `ls skills/*/SKILL.md` is the ROUTABLE set that skills/CONSOLIDATION.md pins ("30 →
+# 17 routable skills"). `find skills -name SKILL.md` is one more, because it also finds the
+# Hermes-native skill under skills/hermes/. And the set the installer activates for every agent is one
+# FEWER, because ripwire-opt-remarks carries `audience: contributor` in its front matter and
+# install.sh's is_contributor_skill() gates it behind --contributor. Before this arm README.md said
+# seventeen in the install fold and eighteen in two other places, and nothing in the tree could say
+# which was meant — the "one list counts four defensible ways" failure, on a number we advertise.
+#
+# So this arm does not check "the" skill count. It derives all three from the tree, then pins each
+# README sentence to the count it is actually claiming.
+#
+#   (J1) derive routable / all / every-agent, and sanity-check them against each other
+#   (J2) every "<N> task-shaped skills" and "<N> routable skills" claim must equal ROUTABLE
+#   (J3) the install fold's "<N> of the <M> are for using the tool" must equal (every-agent, routable)
+#   (J4) mutation control for (J2) — a fabricated count must be seen as disagreeing
+#
+# A claim whose leading token is neither a numeral nor a number word ("the task-shaped skills that
+# teach your agent…") is prose, not a count, and is skipped on purpose; (J2) requires at least two
+# real claims so that rewording every count away cannot make the arm pass vacuously.
+
+SKILLSDIR="$ROOT/skills"
+WORDS_J="one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+word2num_j(){
+    _w="$( printf '%s' "$1" | tr 'A-Z' 'a-z' )"
+    case "$_w" in ''|*[!0-9]*) ;; *) printf '%s' "$_w"; return 0 ;; esac      # already a numeral
+    _i=0
+    for _x in $WORDS_J; do
+        _i=$(( _i + 1 ))
+        if [ "$_x" = "$_w" ]; then printf '%s' "$_i"; return 0; fi
+    done
+    printf ''
+}
+
+if [ ! -d "$SKILLSDIR" ]; then
+    no "(J1) no $SKILLSDIR directory — the skills arm has no ground truth to check against"
+else
+    routable="$( ls "$SKILLSDIR"/*/SKILL.md 2>/dev/null | wc -l | tr -d ' ' )"
+    allSkillMd="$( find "$SKILLSDIR" -name SKILL.md 2>/dev/null | wc -l | tr -d ' ' )"
+    contribSkills="$( grep -l '^audience: contributor' "$SKILLSDIR"/*/SKILL.md 2>/dev/null | wc -l | tr -d ' ' )"
+    everyAgent=$(( routable - contribSkills ))
+
+    if [ "$routable" -lt 5 ]; then
+        no "(J1) routable skill count looks implausible ('$routable' from skills/*/SKILL.md) — did the layout change?"
+    elif [ "$allSkillMd" -lt "$routable" ]; then
+        no "(J1) find(SKILL.md)=$allSkillMd is below skills/*/SKILL.md=$routable — impossible, the harvest is broken"
+    elif [ "$everyAgent" -lt 1 ] || [ "$everyAgent" -gt "$routable" ]; then
+        no "(J1) every-agent count out of range ($everyAgent of $routable, $contribSkills contributor-audience)"
+    else
+        ok "(J1) derived $routable routable skills, $allSkillMd SKILL.md files in all, $everyAgent activated for every agent ($contribSkills contributor-audience)"
+    fi
+
+    # README prose wraps mid-sentence, so every (J) match runs against a newline-flattened copy.
+    FLAT_J="$( tr '\n' ' ' < "$README" | tr -s ' ' )"
+
+    # ── (J2) every stated skills count must equal the ROUTABLE count ────────────────────────────────
+    j2seen=0; j2bad=""
+    for tok in $( printf '%s' "$FLAT_J" | grep -oE '[A-Za-z0-9]+ (task-shaped|routable) skills' | awk '{print $1}' ); do
+        num="$( word2num_j "$tok" )"
+        [ -z "$num" ] && continue                       # prose, not a count — see the header note
+        j2seen=$(( j2seen + 1 ))
+        [ "$num" = "$routable" ] || j2bad="$j2bad '$tok'(=$num)"
+    done
+    if [ "$j2seen" -lt 2 ]; then
+        no "(J2) found only $j2seen numeric '<N> task-shaped/routable skills' claims in README.md — expected at least 2; was a count reworded away?"
+    elif [ -n "$j2bad" ]; then
+        no "(J2) README.md states$j2bad skills but skills/*/SKILL.md holds $routable — fix the prose, or say which set is being counted"
+    else
+        ok "(J2) all $j2seen stated skills counts in README.md equal the routable count ($routable)"
+    fi
+
+    # ── (J3) the install fold splits routable into every-agent + contributor-gated ───────────────────
+    j3="$( printf '%s' "$FLAT_J" | grep -oE '[A-Za-z0-9]+ of the [A-Za-z0-9]+ are for using the tool' | head -1 )"
+    if [ -z "$j3" ]; then
+        no "(J3) could not find the '<N> of the <M> are for using the tool' sentence in README.md"
+    else
+        j3lo="$( word2num_j "$( printf '%s' "$j3" | awk '{print $1}' )" )"
+        j3hi="$( word2num_j "$( printf '%s' "$j3" | awk '{print $4}' )" )"
+        if [ "$j3lo" = "$everyAgent" ] && [ "$j3hi" = "$routable" ]; then
+            ok "(J3) README.md's '$j3' matches the tree ($everyAgent of $routable; $contribSkills gated behind --contributor)"
+        else
+            no "(J3) README.md says '$j3' but the tree has $everyAgent of $routable for every agent ($contribSkills contributor-audience)"
+        fi
+    fi
+
+    # ── (J4) mutation control for (J2) ──────────────────────────────────────────────────────────────
+    j4wrong=$(( routable + 3 ))
+    j4bad=0
+    for tok in $( printf '%s' "$FLAT_J" | sed -E "s/[A-Za-z0-9]+ (task-shaped|routable) skills/${j4wrong} \1 skills/g" \
+                  | grep -oE '[A-Za-z0-9]+ (task-shaped|routable) skills' | awk '{print $1}' ); do
+        num="$( word2num_j "$tok" )"
+        [ -z "$num" ] && continue
+        [ "$num" = "$routable" ] || j4bad=$(( j4bad + 1 ))
+    done
+    if [ "$j4bad" -ge 1 ]; then
+        ok "(J4) mutation control: a fabricated count ($j4wrong) is correctly seen as disagreeing with the routable count ($routable), in $j4bad claim(s)"
+    else
+        no "(J4) mutation control: injecting $j4wrong changed nothing the check can see — (J2) is vacuous"
+    fi
+fi
+
+# ── (K) the --json ALLOW-LIST arm — a set the binary enumerates and the guide restates ─────────────
+# WHY. --json is an allow-list, and the binary already carries the list: `--help=--json` names every
+# supported verb, and refusing verbs name it again on stderr. README §6.3 restates that list in prose.
+# A verb that gains --json support tomorrow updates the binary and leaves the guide describing a
+# smaller tool — the same defect class as (B) and (J), on a SET rather than a count. This arm reads the
+# binary's own enumeration and requires the two to agree in both directions.
+#
+# `--help=--json` is used rather than a refusal message because it needs no corpus: the arm costs one
+# help invocation, not an index.
+#
+#   (K1) harvest the allow-list from --help=--json and sanity-check its size
+#   (K2) README's §6.3 list must equal it — no verb missing, no verb invented
+#   (K3) mutation control — dropping a verb from a COPY of the README list must be seen
+
+k_help="$( "$BIN" --help=--json 2>&1 | tr '\n' ' ' | tr -s ' ' )"
+k_allow="${k_help%%ALLOW-list*}"          # stop before the text that names the REFUSED verbs
+k_allow="${k_allow#*supported for}"       # start at the allow-list itself
+KTMP="$( mktemp -d )"; trap 'rm -rf "$TMP" "$KTMP"' EXIT
+printf '%s' "$k_allow" | grep -oE '\-\-[a-z][a-z0-9-]+' | sort -u > "$KTMP/bin.txt"
+
+r_json="$( tr '\n' ' ' < "$README" | tr -s ' ' )"
+case "$r_json" in *"It is an allow-list:"*) r_json="${r_json#*It is an allow-list:}" ;; *) r_json="" ;; esac
+r_json="${r_json%%Every other*}"
+printf '%s' "$r_json" | grep -oE '\-\-[a-z][a-z0-9-]+' | sort -u > "$KTMP/readme.txt"
+
+k_binN="$( wc -l < "$KTMP/bin.txt" | tr -d ' ' )"
+if [ "$k_binN" -lt 5 ]; then
+    no "(K1) harvested only $k_binN verbs from --help=--json — the allow-list sentence has moved or been reworded"
+else
+    ok "(K1) harvested $k_binN --json verbs from the binary's own allow-list ($( tr '\n' ' ' < "$KTMP/bin.txt" ))"
+fi
+
+if [ ! -s "$KTMP/readme.txt" ]; then
+    no "(K2) could not find README §6.3's 'It is an allow-list: … Every other' sentence to check"
+else
+    k_missing="$( comm -23 "$KTMP/bin.txt" "$KTMP/readme.txt" | tr '\n' ' ' )"
+    k_extra="$(   comm -13 "$KTMP/bin.txt" "$KTMP/readme.txt" | tr '\n' ' ' )"
+    if [ -n "$k_missing" ] || [ -n "$k_extra" ]; then
+        no "(K2) README §6.3's --json list disagrees with the binary — missing:[${k_missing% }] invented:[${k_extra% }]"
+    else
+        ok "(K2) README §6.3 lists exactly the $k_binN verbs the binary allows for --json"
+    fi
+fi
+
+grep -v -- '--impact' "$KTMP/readme.txt" > "$KTMP/readme_bad.txt" 2>/dev/null || true
+if [ -n "$( comm -23 "$KTMP/bin.txt" "$KTMP/readme_bad.txt" )" ]; then
+    ok "(K3) mutation control: a README list with one verb removed is correctly seen as disagreeing"
+else
+    no "(K3) mutation control: removing a verb changed nothing the comparison can see — (K2) is vacuous"
+fi
+
+# ── (L) the CAP INVENTORY arm — README's fourth advertised number ──────────────────────────────────
+# WHY. §9 states "N compile-time caps and M ranking parameters". That pair has a generator —
+# docs/limits_build.py derives it from src/ and --check proves docs/LIMITS.md against the tree — and
+# nothing tied the README's restatement to it. It was 208 against a real 210 when this arm was
+# written. Same class as (B) and (K): a number with an enumeration behind it and no arm in between.
+#
+# The generator is the ground truth rather than LIMITS.md's prose, so a LIMITS.md that has itself gone
+# stale fails here instead of being believed. It costs ~0.3 s (a python pass over src/, no build), so
+# it stays inside this gate's budget.
+#
+#   (L1) run the generator and parse its "(N caps, M parameters, …)" line
+#   (L2) README's caps/parameters sentence must equal both numbers
+#   (L3) mutation control
+
+if [ ! -f "$ROOT/docs/limits_build.py" ]; then
+    no "(L1) docs/limits_build.py is missing — the cap inventory has no generator to check against"
+else
+    l_out="$( python3 "$ROOT/docs/limits_build.py" --check 2>&1 )"
+    l_caps="$( printf '%s' "$l_out" | grep -oE '[0-9]+ caps' | head -1 | grep -oE '^[0-9]+' )"
+    l_params="$( printf '%s' "$l_out" | grep -oE '[0-9]+ parameters' | head -1 | grep -oE '^[0-9]+' )"
+    if [ -z "$l_caps" ] || [ -z "$l_params" ]; then
+        no "(L1) could not parse a '(N caps, M parameters, …)' line out of limits_build.py --check — did its output change? Got: $( printf '%s' "$l_out" | head -1 )"
+    else
+        ok "(L1) limits_build.py derives $l_caps caps and $l_params ranking parameters from src/"
+    fi
+
+    l_stated="$( tr '\n' ' ' < "$README" | tr -s ' ' | grep -oE '[0-9]+ compile-time caps and [0-9]+ ranking parameters' | head -1 )"
+    if [ -z "$l_stated" ]; then
+        no "(L2) could not find a '<N> compile-time caps and <M> ranking parameters' sentence in README.md"
+    elif [ -z "$l_caps" ]; then
+        no "(L2) skipped: (L1) produced no ground truth to compare against"
+    else
+        l_sc="$( printf '%s' "$l_stated" | awk '{print $1}' )"
+        l_sp="$( printf '%s' "$l_stated" | awk '{print $5}' )"
+        if [ "$l_sc" = "$l_caps" ] && [ "$l_sp" = "$l_params" ]; then
+            ok "(L2) README.md states $l_sc caps and $l_sp ranking parameters, matching the generator"
+        else
+            no "(L2) README.md states '$l_stated' but src/ has $l_caps caps and $l_params ranking parameters — run python3 docs/limits_build.py"
+        fi
+    fi
+
+    if [ -n "$l_caps" ]; then
+        l_wrong=$(( l_caps + 5 ))
+        l_bad="$( printf '%s' "$l_stated" | sed -E "s/^[0-9]+/${l_wrong}/" | awk '{print $1}' )"
+        if [ -n "$l_bad" ] && [ "$l_bad" != "$l_caps" ]; then
+            ok "(L3) mutation control: a fabricated cap count ($l_bad) is correctly seen as disagreeing with $l_caps"
+        else
+            no "(L3) mutation control: injecting a wrong cap count changed nothing the check can see — (L2) is vacuous"
+        fi
     fi
 fi
 

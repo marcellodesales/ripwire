@@ -13,6 +13,11 @@
 #   FIXTURE_UNREAD_FEATURE — declared, never tested                         -> ABSENT (a dead name, not a gate)
 #   flagsfix_wiringFlags_h — a plain include guard (valueless #define)      -> ABSENT (else every header is a gate)
 #   a getenv(computedName) — non-literal argument                           -> ABSENT (cannot be named)
+# 0.6.6 D5 (arm 12, a temp JS/TS corpus): `process.env.NAME` / `process.env["NAME"]` reads are the Node getenv —
+#   a comparison, a `??` default and a bare truthiness test each make a kind="env" gate; a read inside a comment or a
+#   string literal, and `const env = process.env` (no name), do not. Template literals (arm 12t): the plain TEXT of a
+#   backtick template is a string (one line, several lines, nested inside `${}`, after a `${ {…} }` brace), while the
+#   code inside `${…}` is code — so `${process.env.X}` is a gate and `` `set process.env.X` `` is not.
 #
 # Exit 0 = ALL PASS, non-zero = SOME FAILED.
 
@@ -23,16 +28,18 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 CORPUS="$ROOT/test/flagsfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
 
 echo "flagscheck: BIN=$BIN  CORPUS=$CORPUS"
 
-"$BIN" "$CORPUS" --flags --no-cache >"$TMP/a" 2>/dev/null
-"$BIN" "$CORPUS" --flags --no-cache >"$TMP/b" 2>/dev/null
-cmp -s "$TMP/a" "$TMP/b" && ok "determinism (byte-identical)" || no "--flags is non-deterministic"
+# L1 (2026-09-19): the CLI default legend is compact (its root also leads with schema=); these arms read the FULL
+# legend's files= clause and parse the full-default root start-tag, so they ask for it.
+"$BIN" "$CORPUS" --flags --no-cache --legend=full >"$TMP/a" 2>/dev/null
+"$BIN" "$CORPUS" --flags --no-cache --legend=full >"$TMP/b" 2>/dev/null
+if cmp -s "$TMP/a" "$TMP/b"; then ok "determinism (byte-identical)"; else no "--flags is non-deterministic"; fi
 F="$( cat "$TMP/a" )"
 
 # §A10.5: files= is this verb's OWN harvest scan (source + CMakeLists it read looking for gates), a
@@ -111,16 +118,134 @@ fi
 
 # ── 9) well-formed, minified XML (G4) ─────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/a" 2>/dev/null && ok "XML well-formed" || no "XML malformed"
+    if xmllint --noout "$TMP/a" 2>/dev/null; then ok "XML well-formed"; else no "XML malformed"; fi
 else
     ok "xmllint unavailable — well-formedness skipped"
 fi
-[ "$( grep -c '' "$TMP/a" )" -le 1 ] && ok "output is minified (no stray newlines)" || no "output contains newlines outside CDATA"
+if [ "$( grep -c '' "$TMP/a" )" -le 1 ]; then ok "output is minified (no stray newlines)"; else no "output contains newlines outside CDATA"; fi
 
 # ── 10) an empty / gate-free corpus is a clean empty report, not a crash ──────────────────────────────
 mkdir -p "$TMP/bare"; printf 'int main(){return 0;}\n' > "$TMP/bare/m.cpp"
 "$BIN" "$TMP/bare" --flags --no-cache 2>/dev/null | grep -q 'gates="0"' \
     && ok "a gate-free corpus reports gates=0 and exits clean" || no "gate-free corpus did not report gates=0"
+
+# ── 11) MED-1 (rv-s2 review, 2026-09-19): a CMake root-walk that fails MID-SESSION discloses it ────────
+# collectCMakeFiles' own error_code probe (darkflags.h §SEC1) never used to set: libc++ AND libstdc++ swallow
+# EACCES on the ROOT itself under skip_permission_denied (the flag is meant for entries hit mid-walk, not the
+# walk's own starting point), so an unreadable root read as an EMPTY SUCCESSFUL walk — a false `cmake="0"`
+# indistinguishable from a repo with no CMake at all. `--flags` over the plain CLI never reaches this shape:
+# main.cpp's rootIsReadable refuses an unreadable root before any verb runs. The one door in: a WARM
+# in-process index — MCP `flags`, called twice in the SAME `--mcp` session — skips re-validating the root on
+# the second call (ingest already has the file list resident), but collectCMakeFiles' own walk is independent
+# of that cache and runs fresh every time, so it is the one that meets the now-broken root.
+note(){ printf '  NOTE  %s\n' "$*"; }
+if [ "$( id -u )" = "0" ]; then
+    note "11: MED-1 warm-index CMake root-walk — running as root, chmod 0311 does not block anything, skipping"
+elif ! command -v python3 >/dev/null 2>&1; then
+    note "11: MED-1 warm-index CMake root-walk — no python3 for the MCP stdio driver, skipping"
+else
+    MEDFIX="$TMP/medfix"; mkdir -p "$MEDFIX"
+    trap 'chmod -R u+rwx "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
+    printf 'option(FX_DARK "test dark cmake gate" OFF)\n' > "$MEDFIX/CMakeLists.txt"
+    printf '#ifdef FX_DARK\nint darkFn() { return 1; }\n#endif\nint liveFn() { return 2; }\n' > "$MEDFIX/a.cpp"
+    MED_OUT="$( python3 - "$BIN" "$MEDFIX" <<'PY'
+import sys, subprocess, json, os
+
+bin_path, fixture = sys.argv[1], sys.argv[2]
+p = subprocess.Popen( [ bin_path, "--mcp" ], stdin = subprocess.PIPE, stdout = subprocess.PIPE,
+                       stderr = subprocess.DEVNULL, text = True, bufsize = 1 )
+
+def call( req ):
+    p.stdin.write( json.dumps( req ) + "\n" ); p.stdin.flush()
+    return p.stdout.readline()
+
+call( { "jsonrpc": "2.0", "id": 1, "method": "initialize" } )
+r1 = call( { "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": { "name": "flags", "arguments": { "path": fixture, "legend": "compact" } } } )
+os.chmod( fixture, 0o311 )   # x-only: open-by-name still works, readdir (the walk) does not
+r2 = call( { "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": { "name": "flags", "arguments": { "path": fixture, "legend": "compact" } } } )
+os.chmod( fixture, 0o755 )
+p.stdin.close(); p.terminate()
+
+def text( raw ):
+    d = json.loads( raw )
+    if "error" in d: return "__ERROR__:%s" % d[ "error" ]
+    return d[ "result" ][ "content" ][ 0 ][ "text" ]
+
+print( "CALL1\t" + text( r1 ) )
+print( "CALL2\t" + text( r2 ) )
+PY
+)"
+    chmod u+rwx "$MEDFIX" 2>/dev/null   # belt-and-suspenders: the python restore already ran, unless it crashed
+    CALL1="$( printf '%s\n' "$MED_OUT" | grep '^CALL1' )"
+    CALL2="$( printf '%s\n' "$MED_OUT" | grep '^CALL2' )"
+    if [ -z "$CALL1" ] || [ -z "$CALL2" ]; then
+        no "11: MED-1 — the MCP driver produced no CALL1/CALL2 line: $( printf '%s' "$MED_OUT" | head -c 200 )"
+    else
+        echo "$CALL1" | grep -q 'cmake="1"' && ! echo "$CALL1" | grep -q 'cmake_scan_failed' \
+            && ok "11a: MED-1 baseline (root readable) — cmake=\"1\", no cmake_scan_failed" \
+            || no "11a: MED-1 baseline did not read cmake=\"1\" clean: $CALL1"
+        if echo "$CALL2" | grep -q 'cmake="0"'; then
+            echo "$CALL2" | grep -q 'cmake_scan_failed="1"' \
+                && ok "11b: MED-1 warm second call over a root chmod'd 0311 mid-session — cmake=\"0\" cmake_scan_failed=\"1\" (the walk failure is disclosed, not a silent false zero)" \
+                || no "11b: MED-1 — cmake=\"0\" with NO cmake_scan_failed: the false zero from rv-s2's MED-1 finding is back: $CALL2"
+        else
+            no "11b: MED-1 control failed — the second call did not even reproduce cmake=\"0\" (fixture or chmod timing changed): $CALL2"
+        fi
+    fi
+fi
+
+# ── 12) 0.6.6 D5: JavaScript / TypeScript process.env reads are env gates ─────────────────────────────────────
+JS="$TMP/jsenv"; mkdir -p "$JS/src"
+cat >"$JS/src/client.ts" <<'TS'
+const POSTHOG_HOST = process.env.AISLOP_POSTHOG_HOST ?? "https://example.invalid";
+export const isDebug = (): boolean => process.env.AISLOP_TELEMETRY_DEBUG === "1";
+export function send(): void {
+    if (process.env["AISLOP_DRY_RUN"] === "1") {
+        return;
+    }
+    const env = process.env;
+    // process.env.COMMENTED_OUT is not a read
+    const s = "process.env.IN_STRING";
+    void env; void s; void POSTHOG_HOST;
+}
+TS
+printf 'export function run() {\n    if (process.env.FEATURE_X) {\n        return 1;\n    }\n    return 0;\n}\n' >"$JS/src/util.js"
+"$BIN" "$JS" --flags --no-cache --legend=full >"$TMP/js.xml" 2>/dev/null
+JSROOT="$( grep -o '<flags [^>]*>' "$TMP/js.xml" | head -1 )"
+case "$JSROOT" in *'env="4"'*) ok "12: four process.env reads are env gates (env=\"4\")";; *) no "12: expected env=\"4\" on the JS/TS corpus: $JSROOT";; esac
+for n in AISLOP_POSTHOG_HOST AISLOP_TELEMETRY_DEBUG AISLOP_DRY_RUN FEATURE_X; do
+    if grep -q "<gate name=\"$n\" kind=\"env\"" "$TMP/js.xml"; then ok "12: $n is a kind=\"env\" gate"; else no "12: no kind=\"env\" gate for $n"; fi
+done
+for n in COMMENTED_OUT IN_STRING; do
+    grep -q "<gate name=\"$n\"" "$TMP/js.xml" && no "12: $n (comment/string) must not be a gate" || ok "12: $n (comment/string) is not a gate"
+done
+
+# ── 12t) 0.6.6 D5 review B1: the TEXT of a JS/TS template literal is not code; `${…}` inside it is ─────────────────
+JT="$TMP/jstpl"; mkdir -p "$JT/src"
+cat >"$JT/src/templates.ts" <<'TS'
+declare const flag: boolean;
+declare function fn(o: object): string;
+const tpl = `set process.env.TEMPLATE_TEXT first`;
+const withExpr = `mode=${process.env.TEMPLATE_EXPR ?? "x"}`;
+const multi = `line one
+process.env.TEMPLATE_MULTILINE is text here
+and ${ process.env.TEMPLATE_MULTI_EXPR } counts`;
+const nested = `a ${ flag ? `inner process.env.NESTED_TEXT` : process.env.NESTED_EXPR } b`;
+const braced = `${ fn({ k: 1 }) } then process.env.AFTER_BRACE_TEXT`;
+export const after = process.env.AFTER_TEMPLATES === "1";
+void tpl; void withExpr; void multi; void nested; void braced;
+TS
+"$BIN" "$JT" --flags --no-cache --legend=full >"$TMP/jt.xml" 2>/dev/null
+JTROOT="$( grep -o '<flags [^>]*>' "$TMP/jt.xml" | head -1 )"
+case "$JTROOT" in *'env="4"'*) ok "12t: exactly the four code reads in the template corpus are env gates (env=\"4\")";; *) no "12t: expected env=\"4\" on the template corpus: $JTROOT";; esac
+for n in TEMPLATE_EXPR TEMPLATE_MULTI_EXPR NESTED_EXPR AFTER_TEMPLATES; do
+    if grep -q "<gate name=\"$n\" kind=\"env\"" "$TMP/jt.xml"; then ok "12t: $n (code: \${…} or after the template) is a kind=\"env\" gate"; else no "12t: no kind=\"env\" gate for $n"; fi
+done
+for n in TEMPLATE_TEXT TEMPLATE_MULTILINE NESTED_TEXT AFTER_BRACE_TEXT; do
+    if grep -q "<gate name=\"$n\"" "$TMP/jt.xml"; then no "12t: $n is template TEXT and must not be a gate"; else ok "12t: $n (template text) is not a gate"; fi
+done
 
 [ $fail -eq 0 ] && echo "flagscheck: ALL PASS" || echo "flagscheck: FAILURES"
 exit $fail

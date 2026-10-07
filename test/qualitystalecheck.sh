@@ -29,10 +29,11 @@
 # file was stale-and-just-dropped, or stale-and-STILL-THERE (arm 8).
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$PWD/$BIN"
 fail=0
-ok(){ echo "  PASS  $1"; }
+ok(){ echo "  PASS  $1" || { fail=1; echo "  FAIL  could not write the PASS line for: $1"; }; return 0; }
 no(){ echo "  FAIL  $1"; fail=1; }
 
 # Sandboxes whose WRITE BIT this script deliberately clears (arms 7/8b). They must be made writable again
@@ -117,7 +118,8 @@ mcp_err="$( printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
             | "$BIN" --mcp 2>&1 1>/dev/null )"
 [ -z "$mcp_err" ] && ok "R3 incident shape: the MCP stale path prints no stderr either (no warning spam on either arm)" \
     || no "R3 incident shape: the MCP stale path printed stderr: $mcp_err"
-cli_out="$("$BIN" "$MREPO" --quality-delta --no-cache 2>/dev/null)"
+# L1 (2026-09-19): the CLI default legend is compact, whose root leads with schema=; cli_regs reads the full-default root by position, so it asks for the full legend (MCP arm untouched).
+cli_out="$("$BIN" "$MREPO" --quality-delta --no-cache --legend=full 2>/dev/null)"
 cli_regs="$( printf '%s' "$cli_out" | sed -n 's/.*<quality-delta baseline="[^"]*" regressions="\([0-9]*\)".*/\1/p' )"
 printf '%s' "$cli_out" | grep -q 'baseline="git-HEAD (stale sidecar removed)"' \
     && ok "R3 incident shape: the CLI calls the SAME sidecar stale (\"removed\")" \
@@ -168,12 +170,12 @@ echo "$unstamped" | grep -q 'baseline="git-HEAD (stale sidecar removed)"' \
 
 # 6) determinism
 r1="$("$BIN" "$REPO" --quality-delta --no-cache 2>/dev/null)"; r2="$("$BIN" "$REPO" --quality-delta --no-cache 2>/dev/null)"
-[ "$r1" = "$r2" ] && ok "--quality-delta deterministic run-to-run" || no "--quality-delta non-deterministic"
+if [ "$r1" = "$r2" ]; then ok "--quality-delta deterministic run-to-run"; else no "--quality-delta non-deterministic"; fi
 
 # ── DEGRADE-OBSERVABILITY / BUILD-FLAVOUR PROBE (for arms 7 and 8c) ───────────────────────────────────────
-# Arms 7 and 8c assert a DEGRADED_PATH_ALERT, which a Release/NDEBUG build compiles OUT ("if you add a
+# Arms 7 and 8c assert a DISCLOSE, which a Release/NDEBUG build compiles OUT ("if you add a
 # degrade path, it is the PLAIN run that proves it" — CLAUDE.md). Probe the flavour with an UNRELATED,
-# already-gated degrading invocation (--since=notadate) so that a missing alert INSIDE arm 7 is a genuine
+# degrading invocation (a --scip index that opens and fails to decode — see RE-POINTED below) so that a missing alert INSIDE arm 7 is a genuine
 # FAILURE rather than a silent skip — the whole point of the finding is that no alert fired where one was owed.
 #
 # What the missing alert MEANS still has to be decided, and that needs a second, independent reading:
@@ -205,11 +207,11 @@ case "$BUILD_FLAVOUR" in
     *)                                 ndebug_flavour=0 ;;
 esac
 skip(){ printf '  SKIP  %s\n' "$*"; }
-DEGRADE_SKIP_WHY="DEGRADED_PATH_ALERT is compiled out of this binary (--version says build type \"$BUILD_FLAVOUR\", which defines NDEBUG; the unrelated --since=notadate degrade path is silent here too, so alerts are unobservable globally rather than this seam having broken). Proven by the PLAIN-flavour run of the same suite, which CI executes as a second leg for exactly this reason."
+DEGRADE_SKIP_WHY="DISCLOSE is compiled out of this binary (--version says build type \"$BUILD_FLAVOUR\", which defines NDEBUG; the unrelated --scip decode degrade path is silent here too, so alerts are unobservable globally rather than this seam having broken). Proven by the PLAIN-flavour run of the same suite, which CI executes as a second leg for exactly this reason."
 
 # 7) w1 MED #1 — the self-heal unlink FAILS (read-only parent dir). The marker used to say "stale sidecar
 #    removed" on the strength of the CLI's INTENT while the file was demonstrably still on disk (the unlink's
-#    std::error_code was captured and never read), and no DEGRADED_PATH_ALERT fired, so the plain build could
+#    std::error_code was captured and never read), and no DISCLOSE fired, so the plain build could
 #    not observe the degrade either. Post-fix the seam reports what the DISK says: "stale sidecar ignored" (the
 #    same honest string the read-only MCP arm uses, because ignored-not-removed is now the truth), exactly one
 #    alert, and an otherwise UNCHANGED answer — the git-HEAD fallback still runs, so a clean tree still scores 0.
@@ -245,7 +247,7 @@ if [ "$alerts_observable" -eq 1 ]; then
 elif [ "$ndebug_flavour" -eq 1 ]; then
     skip "arm 7's degrade assertions (one [math degraded] alert naming the surviving sidecar and the git-HEAD fallback) — $DEGRADE_SKIP_WHY"
 else
-    no "arm 7: no DEGRADED_PATH_ALERT is observable, yet --version reports build type \"$BUILD_FLAVOUR\", which does NOT define NDEBUG — the alert seam regressed on a flavour that should be able to see it"
+    no "arm 7: no DISCLOSE is observable, yet --version reports build type \"$BUILD_FLAVOUR\", which does NOT define NDEBUG — the alert seam regressed on a flavour that should be able to see it"
 fi
 chmod u+w "$RREPO"; rm -rf "$RREPO"; ROSANDBOXES=""
 
@@ -268,7 +270,7 @@ NOHEAD="$(mktemp -d)"; mkorphan "$NOHEAD"
     || no "setup(8): sandbox is not the stale-pin + no-HEAD shape"
 "$BIN" "$NOHEAD" --quality-delta --no-cache >/dev/null 2>"$REPO/.nohead.err"
 nohead_rc=$?; nohead_err="$(cat "$REPO/.nohead.err")"; rm -f "$REPO/.nohead.err"
-[ "$nohead_rc" -eq 1 ] && ok "stale + no-HEAD still exits 1 (exit-code semantics unchanged)" || no "stale + no-HEAD exit code is $nohead_rc, expected 1"
+if [ "$nohead_rc" -eq 1 ]; then ok "stale + no-HEAD still exits 1 (exit-code semantics unchanged)"; else no "stale + no-HEAD exit code is $nohead_rc, expected 1"; fi
 printf '%s' "$nohead_err" | grep -q 'was STALE (pinned at a different HEAD)' \
     && ok "stale + no-HEAD fatal is STALE-AWARE (mirrors the MCP twin's wording)" \
     || { no "stale + no-HEAD fatal is not stale-aware"; printf '     got: %s\n' "$nohead_err"; }
@@ -285,7 +287,7 @@ NOHEADRO="$(mktemp -d)"; ROSANDBOXES="$ROSANDBOXES $NOHEADRO"; mkorphan "$NOHEAD
 chmod a-w "$NOHEADRO"
 "$BIN" "$NOHEADRO" --quality-delta --no-cache >/dev/null 2>"$REPO/.nohead2.err"
 nohead2_rc=$?; nohead2_err="$(cat "$REPO/.nohead2.err")"; rm -f "$REPO/.nohead2.err"
-[ "$nohead2_rc" -eq 1 ] && ok "stale + no-HEAD + failed unlink still exits 1" || no "stale + no-HEAD + failed unlink exit code is $nohead2_rc, expected 1"
+if [ "$nohead2_rc" -eq 1 ]; then ok "stale + no-HEAD + failed unlink still exits 1"; else no "stale + no-HEAD + failed unlink exit code is $nohead2_rc, expected 1"; fi
 [ -f "$NOHEADRO/.ripwire_quality_baseline" ] \
     && ok "stale + no-HEAD + read-only dir: the sidecar is STILL on disk (the premise of 8b)" \
     || no "8b premise broken: the sidecar was removed from a read-only dir"
@@ -319,7 +321,7 @@ if [ "$alerts_observable" -eq 1 ]; then
 elif [ "$ndebug_flavour" -eq 1 ]; then
     skip "8c's §B12.11 alert-wording assertion (the no-HEAD case must name \"no baseline floor at all\", never an unconditional git-HEAD fallback) — $DEGRADE_SKIP_WHY"
 else
-    no "8c: no DEGRADED_PATH_ALERT is observable, yet --version reports build type \"$BUILD_FLAVOUR\", which does NOT define NDEBUG — the alert seam regressed on a flavour that should be able to see it"
+    no "8c: no DISCLOSE is observable, yet --version reports build type \"$BUILD_FLAVOUR\", which does NOT define NDEBUG — the alert seam regressed on a flavour that should be able to see it"
 fi
 chmod u+w "$NOHEADRO"; rm -rf "$NOHEADRO"; ROSANDBOXES=""
 

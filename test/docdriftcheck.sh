@@ -30,6 +30,12 @@
 # every declined check named in an <unchecked> row; and drift + dated == every anchor that failed, so a
 # record is re-bucketed, never dropped.
 #
+# 0.6.6 D3 (arm FD, a temp corpus): three false drifts a Python repo reported. (FD1) a doc's `= 15,000` was read as 15
+# against the code's 15_000 — a prose thousands separator now continues the literal (a `= 16,000` control still drifts,
+# want="16000"); (FD2) a Python builtin exception (`NameError`) named in a doc was "undefined" — it is now unchecked
+# r="language-builtin" when the corpus has Python; (FD3) a Keep-a-Changelog rename under `### Fixed` below
+# `## [1.8.2] - 2026-03-17` was live drift — a heading inherits the ISO date of the heading it sits under, so it is dated.
+#
 # Exit 0 = ALL PASS, non-zero = SOME FAILED.
 
 set -u
@@ -39,18 +45,20 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 CORPUS="$ROOT/test/docdriftfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
 
 echo "docdriftcheck: BIN=$BIN  CORPUS=$CORPUS"
 
-"$BIN" "$CORPUS" --doc-drift --no-cache >"$TMP/a" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; $TMP/a is compared to a golden recorded from the full default, and its
+# row count greps '<a k=' which the compact legend spells inside its comment, so these runs ask for the full legend.
+"$BIN" "$CORPUS" --doc-drift --no-cache --legend=full >"$TMP/a" 2>/dev/null
 rc=$?
-"$BIN" "$CORPUS" --doc-drift --no-cache >"$TMP/b" 2>/dev/null
-cmp -s "$TMP/a" "$TMP/b" && ok "determinism (byte-identical)" || no "--doc-drift is non-deterministic"
-[ "$rc" = "0" ] && ok "exits 0 (a report, not a gate)" || no "--doc-drift exited $rc, expected 0"
+"$BIN" "$CORPUS" --doc-drift --no-cache --legend=full >"$TMP/b" 2>/dev/null
+if cmp -s "$TMP/a" "$TMP/b"; then ok "determinism (byte-identical)"; else no "--doc-drift is non-deterministic"; fi
+if [ "$rc" = "0" ]; then ok "exits 0 (a report, not a gate)"; else no "--doc-drift exited $rc, expected 0"; fi
 F="$( cat "$TMP/a" )"
 
 # rows: one <a .../> element per line, so grep can assert on whole rows
@@ -159,7 +167,7 @@ printf '%s' "$F" | grep -q '<unchecked r="not-indexed"[^>]*note="[^"]\+"' \
 # ── 5b) the DATED-RECORD lane: it fires on each dating mark, and abstains on each look-alike ──────────
 # The abstain half matters more than the fire half: a false record hides real rot, which is the one failure
 # this lane must not have. So every negative control below is asserted by NAME, not by a total.
-[ "$T" = "6" ] && ok "dated=6 — one title, one stamp, one block and three line records" || no "dated=$T, expected 6"
+if [ "$T" = "6" ]; then ok "dated=6 — one title, one stamp, one block and three line records"; else no "dated=$T, expected 6"; fi
 
 TOTALROWS="$( rows | grep -c . )"
 [ "$TOTALROWS" = "$(( D + T ))" ] \
@@ -197,11 +205,11 @@ printf '%s' "$F" | grep -q '<dated r="live"' && no "Record::Live emitted a tally
 
 # ── 6) well-formed, minified XML (G4) ─────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/a" 2>/dev/null && ok "XML well-formed" || no "XML malformed"
+    if xmllint --noout "$TMP/a" 2>/dev/null; then ok "XML well-formed"; else no "XML malformed"; fi
 else
     ok "xmllint unavailable — well-formedness skipped"
 fi
-[ "$( grep -c '' "$TMP/a" )" -le 1 ] && ok "output is minified (no stray newlines)" || no "output contains newlines outside CDATA"
+if [ "$( grep -c '' "$TMP/a" )" -le 1 ]; then ok "output is minified (no stray newlines)"; else no "output contains newlines outside CDATA"; fi
 
 # ── 7) --doc-drift=SUBSTR filters the DOCS, and a miss REFUSES rather than reporting a clean zero ──────
 # F-04: docs="0" drift="0" under a typo'd filter used to read as "no rot" (exit 0) — the same trap
@@ -324,7 +332,8 @@ fi
 #    (gitoracle.h kHistoryProbeLegend), present ONLY when --with-history made <history> reachable. The
 #    golden comparison above already proves a PLAIN --doc-drift run pays nothing for it (no clause = no
 #    byte drift on the golden); this checks the --with-history run gains it.
-"$BIN" "$CORPUS" --doc-drift --with-history --no-cache >"$TMP/wh.xml" 2>/dev/null
+# L1 (2026-09-19): L10b reads the FULL legend's prose, so it asks for it.
+"$BIN" "$CORPUS" --doc-drift --with-history --no-cache --legend=full >"$TMP/wh.xml" 2>/dev/null
 grep -q 'history probed="1" means the git-log name-history walk ran' "$TMP/wh.xml" \
     && ok "L10b: --doc-drift --with-history legend now DEFINES the <history> element" \
     || no "L10b: --doc-drift --with-history legend still does not define <history>"
@@ -332,6 +341,104 @@ if command -v xmllint >/dev/null 2>&1; then
     xmllint --noout "$TMP/wh.xml" 2>/dev/null && ok "L10b: --doc-drift --with-history XML well-formed" \
                                                || no "L10b: --doc-drift --with-history XML malformed"
 fi
+
+# ── WALK: an on-disk walk that cannot LIST the root is disclosed, not read as "the file is missing" ──────────
+# collectRepoPaths is the fallback that keeps an existing-but-unindexed file from reading missing-file. A root the
+# walk cannot list used to come back as an EMPTY successful walk (libc++/libstdc++ swallow EACCES on the root under
+# skip_permission_denied, and the one-argument DISCLOSE beside it shipped nothing), so an anchor into such a file
+# flipped to a missing-file row with nothing on the root saying why (CodeRabbit on #295). The plain CLI never gets
+# here — main.cpp's rootIsReadable refuses first — so the door is flagscheck.sh (11)'s: a WARM MCP index, the root
+# chmod'd 0311 (open-by-name works, readdir does not) between two doc_drift calls in one session.
+if [ "$( id -u )" = "0" ] || ! command -v python3 >/dev/null 2>&1; then
+    printf '  NOTE  WALK: running as root or without python3 — chmod 0311 cannot block the walk here, skipping\n'
+else
+    WFIX="$TMP/walkfix"; mkdir -p "$WFIX/data"
+    printf 'int liveFn() { return 2; }\n' > "$WFIX/a.cpp"
+    printf 'row one\nrow two\n' > "$WFIX/data/table.txt"
+    printf '# Notes\n\nThe table lives at `data/table.txt:1` and `liveFn` reads it.\n' > "$WFIX/README.md"
+    trap 'chmod -R u+rwx "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
+    WALK_OUT="$( python3 - "$BIN" "$WFIX" <<'PY'
+import sys, subprocess, json, os
+bin_path, fixture = sys.argv[1], sys.argv[2]
+p = subprocess.Popen( [ bin_path, "--mcp" ], stdin = subprocess.PIPE, stdout = subprocess.PIPE,
+                      stderr = subprocess.DEVNULL, text = True, bufsize = 1 )
+def call( req ):
+    p.stdin.write( json.dumps( req ) + "\n" ); p.stdin.flush()
+    return p.stdout.readline()
+def text( raw ):
+    d = json.loads( raw )
+    return "__ERROR__:%s" % d[ "error" ] if "error" in d else d[ "result" ][ "content" ][ 0 ][ "text" ]
+call( { "jsonrpc": "2.0", "id": 1, "method": "initialize" } )
+args = { "path": fixture }
+r1 = call( { "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "doc_drift", "arguments": args } } )
+os.chmod( fixture, 0o311 )   # x-only: open-by-name still works, readdir (the walk) does not
+try:
+    r2 = call( { "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "doc_drift", "arguments": args } } )
+finally:
+    os.chmod( fixture, 0o755 )
+p.stdin.close(); p.terminate()
+print( "CALL1\t" + text( r1 ).replace( "\n", " " ) )
+print( "CALL2\t" + text( r2 ).replace( "\n", " " ) )
+PY
+)"
+    chmod u+rwx "$WFIX" 2>/dev/null
+    W1="$( printf '%s\n' "$WALK_OUT" | grep '^CALL1' | grep -o '<doc-drift [^>]*>' | head -1 )"
+    W2="$( printf '%s\n' "$WALK_OUT" | grep '^CALL2' )"
+    W2ROOT="$( printf '%s' "$W2" | grep -o '<doc-drift [^>]*>' | head -1 )"
+    if [ -n "$W1" ] && printf '%s' "$WALK_OUT" | grep '^CALL1' | grep -q 'r="not-indexed"' && ! printf '%s' "$W1" | grep -q 'disk_walk_failed'; then
+        ok "WALK control: a listable root reads the unindexed data/table.txt as not-indexed, no disk_walk_failed="
+        if [ -z "$W2ROOT" ]; then
+            no "WALK: the second (0311) call produced no <doc-drift> root — the door moved: $( printf '%s' "$W2" | head -c 200 )"
+        elif printf '%s' "$W2ROOT" | grep -q 'disk_walk_failed="1"'; then
+            ok "WALK: a root the on-disk walk cannot list is disclosed on the root (disk_walk_failed=\"1\")"
+            printf '%s' "$W2" | grep -q 'disk_walk_failed="1" means\|disk_walk_failed=1: the root could not be listed' \
+                && ok "WALK: the clause defining disk_walk_failed= rides with it" || no "WALK: disk_walk_failed= emitted with no clause defining it"
+        else
+            no "WALK: the on-disk walk failed with nothing on the root saying so: $W2ROOT"
+        fi
+    else
+        no "WALK control: the listable-root call did not read not-indexed cleanly: $( printf '%s\n' "$WALK_OUT" | grep '^CALL1' | head -c 300 )"
+    fi
+fi
+
+# ── (FDB) 0.6.6 review: a thousands-grouped number past the digit cap is NO claim, not its prefix ─────────────────
+# `LARGE_LIMIT = 1,099,511,627,776` stopped at the 10-digit cap with a successful PREFIX (1099511627), and the prose
+# terminator accepted the comma after it: a false const-value drift against the code's equal 0x10000000000. A complete
+# group past the cap now rejects the whole claim; a 10-digit grouped number (`1,000,000,000`) still reads whole.
+FDB="$TMP/fdb"; mkdir -p "$FDB/docs" "$FDB/pkg"
+printf 'LARGE_LIMIT = 0x10000000000\nSMALL_LIMIT = 1_000_000_000\n' >"$FDB/pkg/limits.py"
+printf '# Limits\n\n- `LARGE_LIMIT = 1,099,511,627,776` bytes.\n- `SMALL_LIMIT = 1,000,000,000` bytes.\n- `SMALL_LIMIT = 2,000,000,000` in the old release.\n' >"$FDB/docs/LIMITS.md"
+"$BIN" "$FDB" --doc-drift --legend=full --no-cache >"$TMP/fdb.xml" 2>/dev/null; FDBRC=$?
+FDBROWS="$( sed 's/<!--[^>]*-->//g' "$TMP/fdb.xml" | grep -o '<a [^>]*>' )"
+if [ "$FDBRC" -gt 1 ]; then no "(FDB) --doc-drift exited $FDBRC"
+elif printf '%s\n' "$FDBROWS" | grep -q 'ref="LARGE_LIMIT '; then no "(FDB) \`LARGE_LIMIT = 1,099,511,627,776\` read as a prefix: $( printf '%s\n' "$FDBROWS" | grep 'LARGE_LIMIT' )"
+else ok "(FDB) a grouped number past the 10-digit cap is no claim (no const-value row on LARGE_LIMIT)"; fi
+printf '%s\n' "$FDBROWS" | grep 'ref="SMALL_LIMIT ' | grep -q 'want="2000000000"' && ! printf '%s\n' "$FDBROWS" | grep -q 'want="1000000000"' \
+    && ok "(FDB) control: a 10-digit grouped number still reads whole (1,000,000,000 agrees; 2,000,000,000 drifts)" \
+    || no "(FDB) control lost: $FDBROWS"
+
+# ── (FD) 0.6.6 D3: thousands separators, language builtins, a changelog's inherited release date ─────────────
+FD="$TMP/fd"; mkdir -p "$FD/docs" "$FD/pkg"
+printf '_MODULE_CACHE_MAX = 15_000\n\n\ndef helper_lookup(key):\n    return key\n' >"$FD/pkg/cache.py"
+printf '# Features\n\n- **Module cache bound**: `_MODULE_CACHE_MAX = 15,000` with automatic eviction.\n' >"$FD/docs/FEATURES.md"
+printf '# Stale\n\n- The bound was raised: `_MODULE_CACHE_MAX = 16,000` entries.\n' >"$FD/docs/STALE.md"
+printf '# Guide\n\nCalling `helper_lookup` with a missing module raises `NameError` at runtime.\n' >"$FD/docs/GUIDE.md"
+printf '# Changelog\n\n## [1.8.2] - 2026-03-17\n\n### Fixed\n\n- Renamed `c_sharp_parser` to `csharp_parser` so `helper_lookup` finds it.\n' >"$FD/CHANGELOG.md"
+"$BIN" "$FD" --doc-drift --legend=full --no-cache >"$TMP/fd.xml" 2>/dev/null
+FDROOT="$( grep -o '<doc-drift [^>]*>' "$TMP/fd.xml" | head -1 )"
+FDROWS="$( sed 's/<!--[^>]*-->//g' "$TMP/fd.xml" | grep -o '<a [^>]*>' )"
+if printf '%s\n' "$FDROWS" | grep -q 'want="15" got="15000"'; then no "(FD1) \`= 15,000\` still read as 15: $( printf '%s\n' "$FDROWS" | grep 'want="15"' )"
+else ok "(FD1) \`_MODULE_CACHE_MAX = 15,000\` agrees with 15_000 (no const-value row)"; fi
+printf '%s\n' "$FDROWS" | grep -q 'why="const-value" .*want="16000" got="15000"' \
+    && ok "(FD1) control: \`= 16,000\` still drifts, read whole (want=\"16000\" got=\"15000\")" || no "(FD1) control lost: $FDROWS"
+if printf '%s\n' "$FDROWS" | grep -q 'ref="NameError"'; then no "(FD2) the Python builtin NameError is reported as drift"
+else ok "(FD2) NameError is not drift"; fi
+grep -q '<unchecked r="language-builtin" n="1"' "$TMP/fd.xml" && ok "(FD2) it is counted as unchecked r=\"language-builtin\"" \
+    || no "(FD2) no <unchecked r=\"language-builtin\" n=\"1\"> row: $( grep -o '<unchecked [^>]*>' "$TMP/fd.xml" | tr '\n' ' ' | cut -c1-300 )"
+if printf '%s\n' "$FDROWS" | grep -E 'ref="c_?sharp_parser"' | grep -qv 'rec='; then no "(FD3) a dated changelog rename is live drift: $( printf '%s\n' "$FDROWS" | grep sharp_parser )"
+else ok "(FD3) the changelog rename under a dated release heading is not live drift"; fi
+[ "$( printf '%s' "$FDROOT" | grep -o 'drift="[0-9]*"' )" = 'drift="1"' ] && [ "$( printf '%s' "$FDROOT" | grep -o 'dated="[0-9]*"' )" = 'dated="2"' ] \
+    && ok "(FD) root: drift=\"1\" (the 16,000 control) and dated=\"2\" (the changelog rename)" || no "(FD) root counts wrong: $FDROOT"
 
 [ $fail -eq 0 ] && echo "docdriftcheck: ALL PASS" || echo "docdriftcheck: FAILURES"
 exit $fail

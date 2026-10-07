@@ -17,6 +17,7 @@
 // "optimize" this into a hash without a measurement showing one of these tables grew enough to matter.
 
 #include <cstddef>
+#include <iterator>
 #include <string_view>
 
 namespace rw
@@ -24,7 +25,7 @@ namespace rw
 
 // Row is deduced from the MEMBER POINTER, not from the container, so this binds to a C array and to a
 // std::array alike — the two callers happen to use one of each (wrap's kAgentTargets is a plain array,
-// ingest's kLangTable is a std::array<LangEntry, 42>).
+// ingest's kLangTable is a std::array<LangEntry, 46>).
 // The KEY type is deduced too, not fixed to string_view: the third caller (lanes.h::findClaimByKey)
 // matches a std::uint64_t. --quality-delta found that one — it flagged this helper as a clone of it,
 // which is how a two-instance dedup turned out to be a three-instance one.
@@ -39,6 +40,25 @@ constexpr const Row* findByField( const Table& rows, Key Row::*field, const Want
         }
     }
     return nullptr;
+}
+
+// The INDEX-shaped twin, for CONSTANT-evaluated callers only: `findByField( … ) != nullptr` inside a
+// constexpr predicate is rejected by GCC under the sanitizer flags — "'(((const Row*)(& kRows)) != 0)'
+// is not a constant expression" (#347) — where clang accepts it, so the documented honest-degrade GCC
+// ASan path could not build. An integer not-found answer (std::size( rows )) is clean on every front end
+// and keeps the static_assert diagnostics that print the offending ROW INDEX. Runtime callers keep the
+// pointer form above.
+template< typename Table, typename Row, typename Key, typename Wanted >
+constexpr std::size_t findIndexByField( const Table& rows, Key Row::*field, const Wanted& wanted ) noexcept
+{
+    for( std::size_t i = 0; i < std::size( rows ); ++i )
+    {
+        if( rows[i].*field == wanted )
+        {
+            return i;
+        }
+    }
+    return std::size( rows );
 }
 
 }   // namespace rw

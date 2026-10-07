@@ -33,7 +33,7 @@ FIX="$ROOT/test/flagsfix"
 ALIASFIX="$ROOT/test/flagsaliasfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -45,12 +45,12 @@ flip(){ local c="$1" g="$2"; shift 2; "$BIN" "$c" --flags --flip="$g" --no-cache
 # attr XML ELEM ATTR -> the attribute value on the FIRST element of that name ("" if absent)
 attr(){ printf '%s' "$1" | tr '<' '\n' | grep -m1 "^$2 " | sed -n "s/.* $3=\"\([^\"]*\)\".*/\1/p"; }
 want(){ # want LABEL GOT EXPECTED
-    [ "$2" = "$3" ] && ok "$1 ($3)" || no "$1: got '$2', want '$3'"; }
+    if [ "$2" = "$3" ]; then ok "$1 ($3)"; else no "$1: got '$2', want '$3'"; fi; }
 
 # ── 1) determinism — two runs byte-identical (§1) ────────────────────────────────────────────────
 flip "$FIX" FIXTURE_VALUE_ALL >"$TMP/a"
 flip "$FIX" FIXTURE_VALUE_ALL >"$TMP/b"
-cmp -s "$TMP/a" "$TMP/b" && ok "determinism (byte-identical)" || no "--flip is non-deterministic"
+if cmp -s "$TMP/a" "$TMP/b"; then ok "determinism (byte-identical)"; else no "--flip is non-deterministic"; fi
 
 # ── 2) a plain #if gate: regions -> the defs those regions hold ───────────────────────────────────────
 F="$( flip "$FIX" FIXTURE_DARK_FEATURE )"
@@ -62,8 +62,8 @@ want "plain #if: hosts"       "$( attr "$F" flip hosts )"    "2"
 [ "$( attr "$F" flip loc )" -gt 0 ] 2>/dev/null \
     && ok "plain #if: sizes the guarded code (loc=$( attr "$F" flip loc ))" || no "plain #if: loc is 0"
 # the hosts are the two functions that live INSIDE the guarded regions, not the live one beside them
-printf '%s' "$F" | grep -q 'sym="darkOnly"'   && ok "plain #if: darkOnly is a host"   || no "plain #if: darkOnly missing from hosts"
-printf '%s' "$F" | grep -q 'sym="nestedDark"' && ok "plain #if: nestedDark is a host" || no "plain #if: nestedDark missing from hosts"
+if printf '%s' "$F" | grep -q 'sym="darkOnly"'; then ok "plain #if: darkOnly is a host"; else no "plain #if: darkOnly missing from hosts"; fi
+if printf '%s' "$F" | grep -q 'sym="nestedDark"'; then ok "plain #if: nestedDark is a host"; else no "plain #if: nestedDark missing from hosts"; fi
 printf '%s' "$F" | grep -q 'sym="liveEntry"'  && no "plain #if: liveEntry (outside every region) reported as a host" \
                                               || ok "plain #if: unguarded code is NOT a host"
 
@@ -212,7 +212,7 @@ N_DETAIL="$(  flip "$FIX" FIXTURE_VALUE_ALL --detail=1 | tr '<' '\n' | grep -c '
 [ "$N_CAPPED" = "$N_DETAIL" ] && ok "--detail is accepted alongside --flags/--flip" \
                               || no "--detail changed the small-fixture row count ($N_CAPPED vs $N_DETAIL)"
 "$BIN" "$FIX" --flags --flip=FIXTURE_VALUE_ALL --detail=1 --no-cache >/dev/null 2>"$TMP/e"
-[ ! -s "$TMP/e" ] && ok "--detail=N with --flags no longer refuses" || no "--detail refused: $( head -1 "$TMP/e" )"
+if [ ! -s "$TMP/e" ]; then ok "--detail=N with --flags no longer refuses"; else no "--detail refused: $( head -1 "$TMP/e" )"; fi
 
 # ── 9) G4 — well-formed, minified XML on every kind ───────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
@@ -222,7 +222,7 @@ if command -v xmllint >/dev/null 2>&1; then
         xmllint --noout "$TMP/x" 2>/dev/null || { xmlfail=1; echo "      (malformed for $g)"; }
         [ "$( grep -c '' "$TMP/x" )" -le 1 ] || { xmlfail=1; echo "      (newlines outside CDATA for $g)"; }
     done
-    [ $xmlfail -eq 0 ] && ok "XML well-formed + minified for every gate kind" || no "XML/G4 violation"
+    if [ $xmlfail -eq 0 ]; then ok "XML well-formed + minified for every gate kind"; else no "XML/G4 violation"; fi
 else
     ok "xmllint unavailable — well-formedness skipped"
 fi
@@ -233,6 +233,97 @@ flip "$FIX" FIXTURE_DARK_FEATURE | sed -n 's/.*<!--\(.*\)-->.*/\1/p' | grep -q -
 # ── 10) --flags itself is UNCHANGED by all of the above (the behaviour --flip extends) ────────────────
 if bash "$ROOT/test/flagscheck.sh" >/dev/null 2>&1; then ok "test/flagscheck.sh still passes (--flags unchanged)"
 else no "test/flagscheck.sh broke — --flip must not change --flags output"; fi
+
+# ── the binding cap is disclosed, in every build flavour ──────────────────────────────────────────────────────────
+# The value lane keeps at most kMaxBindings (32) constexpr bindings of one gate. With 40, bindings="32" and the 32
+# branch sites reached through them used to read as totals — the legend says the verdict counts are taken over the
+# FULL sets — with only a one-argument DISCLOSE (nothing in Release). The scan's sink now puts <capped what="bindings"
+# at="32"/> in the report, and a clause defining capped= rides with it.
+BC="$TMP/bindcap"; mkdir -p "$BC"
+python3 - "$BC/a.cpp" <<'PYEOF'
+import sys
+s = "#ifndef FEATURE_X\n#define FEATURE_X 0\n#endif\n" + "".join( "constexpr bool kB%d = FEATURE_X;\n" % i for i in range( 40 ) )
+s += "int run( int v )\n{\n" + "".join( "    if constexpr ( kB%d ) { v += %d; }\n" % ( i, i ) for i in range( 40 ) ) + "    return v;\n}\n"
+open( sys.argv[1], "w" ).write( s )
+PYEOF
+flip "$BC" FEATURE_X >"$BC/out.xml"
+grep -q '<flip [^>]* bindings="32"' "$BC/out.xml" \
+    && ok "binding cap (guard): 40 bindings are cut to the 32 the scan keeps" \
+    || no "binding cap (guard): the fixture did not reach the cap — the arm is void: $( grep -o '<flip [^>]*>' "$BC/out.xml" | head -c 200 )"
+grep -q '<capped what="bindings" at="32"/>' "$BC/out.xml" \
+    && ok "binding cap: the report says bindings= is a floor — <capped what=\"bindings\" at=\"32\"/>" \
+    || no "binding cap: bindings=\"32\" reads as the total with no cap row"
+grep -q 'capped what= at=: ' "$BC/out.xml" \
+    && ok "binding cap: capped what= at= is defined in the same document" || no "binding cap: the capped row rides with no definition"
+command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$BC/out.xml" 2>/dev/null \
+    && ok "binding cap: the report is well-formed" || no "binding cap: the report fails xmllint"; }
+
+# ── the alias-chain DEPTH cap is disclosed too, and only when the chain really runs past it ─────────────────────────
+# aliasDescendants descends kMaxChainDepth (8) alias links. Only the fan-out cap (kMaxFamily) set familyCapped, so a
+# chain of ten gates flipped at its root lit nine and dropped the tenth with no <capped> row (CodeRabbit on #295).
+# Control: a chain of exactly nine gates — the walk reaches its end in eight links, so nothing may be claimed capped.
+chain(){ # chain DIR N -> N gates DEEPFIX_L0..L(N-1), each aliasing the previous, the last one guarding a function
+    mkdir -p "$1"; { printf '#ifndef DEEPFIX_L0\n#define DEEPFIX_L0 0\n#endif\n'
+      i=1; while [ $i -lt "$2" ]; do printf '#ifndef DEEPFIX_L%d\n#define DEEPFIX_L%d DEEPFIX_L%d\n#endif\n' $i $i $(( i - 1 )); i=$(( i + 1 )); done
+      printf '#if DEEPFIX_L%d\nint deepFeature() { return 1; }\n#endif\n' $(( $2 - 1 )); } >"$1/chain.h"; }
+chain "$TMP/chain9" 9; chain "$TMP/chain10" 10
+D9="$( flip "$TMP/chain9" DEEPFIX_L0 )"; D10="$( flip "$TMP/chain10" DEEPFIX_L0 )"
+want "depth control: a nine-gate chain is walked to its end (family)" "$( attr "$D9" flip family )" "9"
+printf '%s' "$D9" | grep -q '<capped what="depth"' \
+    && no "depth control: a chain the walk finished claims a depth cut" || ok "depth control: no <capped what=\"depth\"> on a chain the walk finished"
+want "depth: a ten-gate chain stops at the cap (family)" "$( attr "$D10" flip family )" "9"
+printf '%s' "$D10" | grep -q '<capped what="depth" at="8"/>' \
+    && ok "depth: the cut is disclosed (<capped what=\"depth\" at=\"8\"/>)" \
+    || no "depth: a ten-gate chain lost its tenth gate with no <capped what=\"depth\"> row: $( printf '%s' "$D10" | tr '<' '\n' | grep -m1 '^flip ' )"
+printf '%s' "$D10" | grep -q 'what=depth' \
+    && ok "depth: the capped clause defining what=depth rides with the row" || no "depth: <capped what=\"depth\"> emitted with no clause defining it"
+
+# ── 2026-09-25: a next= over 120 B used to be dropped SILENTLY (base), then this lane's
+# first draft replaced a complete, runnable invocation with next_dropped="1" instead — a working follow-up
+# lost either way for no reason but its own length. The ruling: nextAttrXml carries NO length ceiling, so
+# flipNextInvocation's full "--flags --flip=NAME --limit=N" is now always emitted, and it must actually
+# paste and run. RED on origin/main's binary: this fixture's gate name alone pushes the invocation past
+# 120 B, and the pre-fix binary emits no next= at all.
+LONGGATE="FIXTURE_ANSWERSNEXT064_A_VERY_LONG_MACRO_GATE_NAME_THAT_PUSHES_THE_NEXT_INVOCATION_PAST_ONE_HUNDRED_TWENTY_BYTES_XYZ"
+LG="$TMP/longgate"; mkdir -p "$LG"
+{ printf '#pragma once\n#ifndef %s\n#define %s 0\n#endif\n#if %s\n' "$LONGGATE" "$LONGGATE" "$LONGGATE"
+  i=0; while [ $i -lt 30 ]; do printf 'int hostFn%d() { return %d; }\n' $i $i; i=$(( i + 1 )); done
+  printf '#endif\n'; } >"$LG/gate.h"
+NEXTLONG="$( flip "$LG" "$LONGGATE" )"
+[ "$( attr "$NEXTLONG" flip hosts )" = "30" ] && [ "$( attr "$NEXTLONG" hosts hosts_capped )" = "1" ] \
+    && ok "E2 guard: the 30-host fixture really cuts hosts at 25 (hosts_capped=\"1\") — the arms below can fail" \
+    || no "E2 guard: fixture did not cut (hosts=$( attr "$NEXTLONG" flip hosts ) hosts_capped=$( attr "$NEXTLONG" hosts hosts_capped )) — the next= arms below are vacuous"
+NEXTLONGVAL="$( attr "$NEXTLONG" flip next )"
+if [ -z "$NEXTLONGVAL" ]; then
+    no "E2: no next= on the cut, over-120-byte flip report (want the full --flags --flip=$LONGGATE --limit=…)"
+else
+    if [ "${#NEXTLONGVAL}" -gt 120 ]; then ok "E2: the over-120-byte next= is emitted in full (${#NEXTLONGVAL} B), never dropped"
+    else no "E2: fixture next= is only ${#NEXTLONGVAL} B (<=120) — not a real test of the no-ceiling rule"; fi
+    python3 -c 'import shlex, sys; print( "\0".join( shlex.split( sys.argv[1] ) ), end = "" )' "$NEXTLONGVAL" > "$TMP/e2argv.bin"
+    E2RC="$( ( cd "$LG" && xargs -0 "$BIN" . --no-cache < "$TMP/e2argv.bin" >"$TMP/e2.out" 2>"$TMP/e2.err" ); echo $? )"
+    if [ "$E2RC" = 0 ]; then
+        E2RERUN="$( cat "$TMP/e2.out" )"
+        # the SAME 30-host report back, uncapped: an absent <hosts> (or a different flip) has no hosts_capped
+        # either, so "not capped" alone would pass on a re-run that listed nothing
+        E2HOSTS="$( printf '%s' "$E2RERUN" | grep -o '<hosts [^>]*>' | head -1 )"
+        E2ROWS="$( printf '%s' "$E2RERUN" | grep -o '<h sym="hostFn[0-9]*"' | wc -l | tr -d ' ' )"
+        { [ "$( attr "$E2RERUN" flip hosts )" = "30" ] && printf '%s' "$E2HOSTS" | grep -q ' n="30"' \
+            && [ "$( attr "$E2RERUN" hosts hosts_capped )" != "1" ] && [ "$E2ROWS" = 30 ]; } \
+            && ok "E2: the pasted next= re-runs the same flip (hosts=\"30\") and its own --limit= lists all 30 hosts uncapped" \
+            || no "E2: the pasted next=\"$NEXTLONGVAL\" re-ran without all 30 hosts uncapped: flip hosts=\"$( attr "$E2RERUN" flip hosts )\", ${E2HOSTS:-<no hosts element>}, $E2ROWS host rows"
+    else
+        no "E2: the pasted next=\"$NEXTLONGVAL\" exits $E2RC instead of running: $( head -c 160 "$TMP/e2.err" | tr '\n' ' ' )"
+    fi
+fi
+# control: a short gate name that still cuts DOES carry a real, runnable next=
+SHORTLONG="$( flip "$FIX" FIXTURE_DARK_FEATURE --limit=1 )"
+SN="$( attr "$SHORTLONG" flip next )"
+if [ -n "$SN" ]; then
+    [ "${#SN}" -le 120 ] && ok "E2 control: a short-name cut flip's next= is ${#SN} B (<=120), and present" \
+                         || no "E2 control: a short-name cut flip's next= is ${#SN} B (>120)"
+else
+    no "E2 control: FIXTURE_DARK_FEATURE --limit=1 carries no next= at all — the control case is vacuous"
+fi
 
 [ $fail -eq 0 ] && echo "flipcheck: ALL PASS" || echo "flipcheck: FAILURES"
 exit $fail

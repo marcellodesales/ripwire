@@ -23,7 +23,8 @@
 #   (E) K.go      -> `sum([1])`             same-file module-level def    -> edge to own.py::sum stays
 #   (F) free_fn   -> `find( 3 )`            C++ table, no free-symbol evidence -> vetoed (was a split)
 #   (G) uses_decl -> `clamp( 1 )`           declared in the included ext.h -> edge to decl.cpp::clamp stays
-#   (H) header `external=5` exactly, legend-defined; ABSENT on a veto-free corpus (test/lpinfix)
+#   (H) header `external=5` exactly, defined by BOTH legend dialects in their own wording (the default/compact
+#       `external=K: …`, the full `hdr:external=`); ABSENT on a veto-free corpus (test/lpinfix)
 #   (I) --json carries "external":5
 #   (J) determinism x2, xmllint
 #
@@ -37,7 +38,7 @@ CORPUS="$ROOT/test/extvetofix"
 CLEAN="$ROOT/test/lpinfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -102,10 +103,20 @@ printf '%s' "$R" | grep -q 'decl.cpp::clamp' && ! printf '%s' "$R" | grep -q '^e
 HDR="$( printf '%s' "$MAP" | grep -o '<!-- files=[^>]*-->' | head -1 )"
 printf '%s' "$HDR" | grep -q ' external=5 ' && ok "(H) header external=5 (A, B, C, F + mrowalkcheck's L)" \
     || no "(H) header external= is not 5: $( printf '%s' "$HDR" | grep -o 'external=[0-9]*' || echo absent )"
-printf '%s' "$MAP" | head -1 | grep -q 'hdr:external=' && ok "(H) the legend defines hdr:external=" \
-    || no "(H) the legend does not define hdr:external="
+# EACH DIALECT DEFINES external= IN ITS OWN WORDING. Since train 9 the DEFAULT posture is the compact dialect,
+# which reads the gauge as `external=K: …` (src/compactlegend.h kCompactCompletenessTerms, MapHeaderRead::Only);
+# `--legend=full` spells the same definition `hdr:external=`, because the compact dialect strips every `hdr:`
+# clause by contract. This arm used to pin the FULL spelling against the DEFAULT answer above, which is what
+# turned it red in CI on all four legs — the definition was never missing, only spelled the other way. Assert
+# both, so neither dialect can lose the definition without a red.
+printf '%s' "$MAP" | grep -q 'external=K: ' && ok "(H) the DEFAULT legend defines external=K:" \
+    || no "(H) the DEFAULT legend does not define external=K: — $( printf '%s' "$MAP" | grep -o '<!-- ripwire map[^>]*-->' | head -c 400 )"
+"$BIN" "$CORPUS" --no-cache --legend=full >"$TMP/full.xml" 2>/dev/null
+grep -q 'hdr:external=' "$TMP/full.xml" && ok "(H) --legend=full defines hdr:external=" \
+    || no "(H) --legend=full does not define hdr:external="
 "$BIN" "$CLEAN" --no-cache >"$TMP/clean.xml" 2>/dev/null
-# the STATS comment only — the legend line defines `hdr:external=` on every map, so a whole-map grep would false-positive
+# the STATS comment only — the full dialect's legend defines `hdr:external=` on every map (and the compact one
+# reads external=K: on any map that carries the gauge), so a whole-map grep would false-positive
 grep -o '<!-- files=[^>]*-->' "$TMP/clean.xml" | head -1 | grep -q ' external=' && no "(H) external= present on a veto-free corpus ($CLEAN) — must be absent when 0" \
     || ok "(H) external= absent on a veto-free corpus"
 
@@ -122,7 +133,7 @@ grep -q '"external"' "$TMP/clean.json" && no '(I) "external" present in --json o
 cmp -s "$TMP/map.xml" "$TMP/map2.xml" && cmp -s "$TMP/c.tsv" "$TMP/c2.tsv" && ok "(J) map + census byte-identical across two runs" \
     || no "(J) map or census differs between two runs"
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/map.xml" 2>/dev/null && ok "(J) xmllint clean" || no "(J) xmllint rejected the map"
+    if xmllint --noout "$TMP/map.xml" 2>/dev/null; then ok "(J) xmllint clean"; else no "(J) xmllint rejected the map"; fi
 fi
 
 [ "$fail" = 0 ] && echo "externalvetocheck: PASS" || echo "externalvetocheck: FAIL"

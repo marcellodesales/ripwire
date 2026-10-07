@@ -30,16 +30,54 @@
 # Adjacent pairs pin every seam in the chain; the two cross-handler cases pin the chain's endpoints
 # against its neighbours in main()'s handler sequence.
 #
-# Fixture: test/queryfix (shared with querycheck.sh / reachcheck.sh; d1 -> d2 -> d3 -> d4).
+# Fixture: test/queryfix (shared with querycheck.sh / reachcheck.sh; d1 -> d2 -> d3 -> d4), run from a COPY
+# committed into a repository this gate owns — see "the fixture owns its refs" below.
 
 set -u
 
+. "$( cd "$( dirname "$0" )" && pwd )/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-./build/ripwire}}"   # CA4: this gate ignored $1, so a caller passing a binary
-FIX="${FIX:-test/queryfix}"                    # positionally silently measured build/ripwire instead (trap #20)
+SRCFIX="${FIX:-test/queryfix}"                 # positionally silently measured build/ripwire instead (trap #20)
 fails=0
 
 pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; fails=$((fails + 1)); }
+
+# ── the fixture owns its refs ─────────────────────────────────────────────────────────────────────────────
+#
+# The precedence arm below demands byte-identity between two runs, and one of its rows is --whereis=d2. That
+# verb's input is not the fixture's files: it is every refs/heads of the repository ENCLOSING the crawl root.
+# Run on test/queryfix in place, that is the checkout's .git, which every worktree of the clone and every
+# session working in it writes. Nothing in the suite holds it still, and pargates' tree tripwire cannot see a
+# ref write (it is not a `git status` line). One branch created between the solo run and the paired run (a
+# window of seconds: each run lists and reads every branch's tree) turned refs_scanned="317" into "318", moved
+# hits=/total=/<more hits=>, and shifted rows, and the arm reported "--whereis=d2 did NOT answer" about a verb
+# that answered correctly both times. Reproduced on a --shared clone by creating that branch between the two
+# runs; the same pair with the refs held still was byte-identical, cold cache or warm.
+#
+# So every arm runs on a copy committed into a private repository: `main` (HEAD, two commits) and `side`
+# (the first commit), so --whereis still scans one non-HEAD ref. TMPDIR is redirected into the same private
+# dir (the compactlegendcheck/shapingflagcheck idiom): the warm-by-default cache stays ON, so a cold first run
+# is still compared against warm ones, but no sibling gate's blob write can move it and no orphan blob keyed
+# by this per-run root is left in the shared cache dir. Not --no-cache: that would hide a cache-dependent
+# difference instead of ruling one out.
+[ -d "$SRCFIX/src" ] || { echo "dispatchordercheck: no fixture at $SRCFIX"; exit 2; }
+# The GIT_* clearing this gate used to hand-roll here (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE — inherited
+# from a hook running the suite, they would aim every git and ripwire call below at the caller's
+# repository) now lives in test/lib/clean-env.sh, sourced at the top: pagingsweepcheck had independently
+# hand-rolled the same list plus GIT_COMMON_DIR, and neither copy had the object-directory names.
+GATETMP="$( mktemp -d )"; trap 'rm -rf "$GATETMP"' EXIT
+FIX="$GATETMP/queryfix"
+if ! ( fixgit(){ GIT_AUTHOR_DATE="$1" GIT_COMMITTER_DATE="$1" git -C "$FIX" -c user.name=ripwire -c user.email=ripwire@example.invalid \
+                     -c commit.gpgsign=false -c core.hooksPath=/dev/null "${@:2}"; }
+       mkdir -p "$FIX" "$GATETMP/tmp" && cp -R "$SRCFIX/." "$FIX/" \
+       && git -C "$FIX" init -q -b main && git -C "$FIX" add -A \
+       && fixgit "2026-01-01T00:00:00Z" commit -qm fixture \
+       && git -C "$FIX" branch side \
+       && fixgit "2026-01-02T00:00:00Z" commit -q --allow-empty -m head ) >/dev/null 2>&1; then
+    echo "dispatchordercheck: could not build the private fixture repository at $FIX"; exit 2
+fi
+export TMPDIR="$GATETMP/tmp"
 
 # assertWinner NAME EXPECTED_ROOT_TAG ARGS...
 #   runs BIN on the fixture with ARGS (two verb flags), and asserts the FIRST XML element emitted is
@@ -60,6 +98,30 @@ assertWinner()
 }
 
 echo "dispatchordercheck: BIN=$BIN"
+
+# --- the isolation above, asserted rather than assumed ------------------------------------------------------
+# Guard: --whereis=d2 must scan exactly the private repo's one non-HEAD ref. Pointed back at a shared checkout it
+# reads that clone's branch count instead (refs_scanned="317" where this was found, "0" on a CI checkout) and
+# reds. Control: a branch created in the private repo must CHANGE the bytes and deleting it must restore them,
+# so the copy is load-bearing — ref motion reaches the precedence pair, and only this gate can cause it.
+# L1 (2026-09-19): the CLI default legend is compact, whose root also carries schema=; this guard greps the
+# full-default root start-tag byte for byte, so it (and its control twins) ask for --legend=full.
+wh0="$( "$BIN" "$FIX" --whereis=d2 --legend=full 2>/dev/null )"
+if ! printf '%s' "$wh0" | grep -q '<whereis sym="d2" on-head="1" refs_scanned="1" '; then
+    fail "fixture refs: --whereis=d2 is not scanning only the private fixture's one side branch — the arms below would read a ref namespace this gate does not own (got: $( printf '%s' "$wh0" | grep -o '<whereis [^>]*>' | head -c 160 ))"
+else
+    git -C "$FIX" branch -q control side >/dev/null 2>&1
+    wh1="$( "$BIN" "$FIX" --whereis=d2 --legend=full 2>/dev/null )"
+    git -C "$FIX" branch -q -D control >/dev/null 2>&1
+    wh2="$( "$BIN" "$FIX" --whereis=d2 --legend=full 2>/dev/null )"
+    if [ "$wh1" = "$wh0" ]; then
+        fail "fixture refs (control): a branch created in the private fixture repo did not change --whereis=d2 — ref motion cannot reach the pair there, so this isolation proves nothing"
+    elif [ "$wh2" != "$wh0" ]; then
+        fail "fixture refs: deleting the control branch did not restore --whereis=d2 byte for byte"
+    else
+        pass "fixture refs: --whereis=d2 scans only this gate's private repo (refs_scanned=1); a branch created there changes the bytes, deleting it restores them"
+    fi
+fi
 
 # --- the tie INSIDE the first block ------------------------------------------------------------
 # --callers and --callees share one block; wantCallers = !cfg.callers.empty(), so --callers wins.
@@ -102,19 +164,19 @@ assertWinner "affected-beats-situ"        affected         --affected=src/chain.
 # TOTAL silence, exactly like the query family did before M1. They are inserted here at their real dispatch
 # positions, which extends the adjacent-pair coverage over them: --ensemble/--context-ratio (runMaintenance-
 # Views' first two arms, ahead of --hotspots), the six runQualityViews lenses ahead of --dead-code
-# (--readability, --comment-coherence, --nonlocal-state, --quality-panel, --naming-calibration,
+# (--biggest-first, --comment-coherence, --nonlocal-state, --quality-panel, --naming-calibration,
 # --naming-consistency), --handoff (runChangeViews' first arm) and --field-affinity (between --layout and
 # --doc-drift). --index-out is verb-shaped too but WRITES cache blobs, so it stays out of this side-effect-
 # free list and gets its own arm below.
 PREC_VERBS=(
   "--exemplar=chain" "--recall=chain" "--deps" "--ensemble" "--context-ratio" "--clones"
-  "--readability" "--comment-coherence" "--nonlocal-state" "--quality-panel"
+  "--biggest-first" "--comment-coherence" "--nonlocal-state" "--quality-panel"
   "--naming-calibration" "--naming-consistency" "--dead-code" "--edit-check=d2"
   "--callers=d2" "--callees=d1" "--uses=d2" "--external-surface" "--path=d1,d3" "--connect=d1,d2,d3"
   "--impact=d3" "--mentions=d2" "--handoff" "--flags" "--whereis=d2" "--field-affinity" "--doc-drift" "--notes"
   "--communities" "--zoom" "--seams" "--report" "--tree" "--grep=d2" "--lint" "--around=d2"
 )
-PRECTMP="$( mktemp -d )"; trap 'rm -rf "$PRECTMP"' EXIT
+PRECTMP="$( mktemp -d )"; trap 'rm -rf "$GATETMP" "$PRECTMP"' EXIT
 prec_pairs=0
 for (( pi = 0; pi + 1 < ${#PREC_VERBS[@]}; pi++ )); do
     A="${PREC_VERBS[$pi]}"; B="${PREC_VERBS[$((pi+1))]}"
@@ -219,7 +281,7 @@ fi
 # ── F1 — the ELEVEN verb-shaped flags the table never knew about ──────────────────────────────────────
 #
 # The adversarial verifier's F1: --quality-panel, --expand, --pack-signatures, --map-diff, --field-affinity,
-# --naming-consistency and --index-out (plus, once swept properly, --readability, --comment-coherence,
+# --naming-consistency and --index-out (plus, once swept properly, --biggest-first, --comment-coherence,
 # --nonlocal-state, --naming-calibration, --ensemble, --context-ratio and --handoff) were neither table rows
 # nor pure modifiers. Every one of them collided with a real report verb at stderr-EMPTY, exit 0 — the F1
 # reproducer being `--quality-panel --lint` (panel bytes, no signal) and `--expand=SYM --lint` (lint bytes,
@@ -229,8 +291,8 @@ fi
 # against the two verbs that bracket them). The five that shape runDefaultMap are a separate class, below.
 assertCross "--hotspots"           "--quality-panel"
 assertCross "--quality-panel"      "--lint"
-assertCross "--hotspots"           "--readability"
-assertCross "--readability"        "--lint"
+assertCross "--hotspots"           "--biggest-first"
+assertCross "--biggest-first"      "--lint"
 assertCross "--hotspots"           "--naming-consistency"
 assertCross "--naming-consistency" "--lint"
 assertCross "--hotspots"           "--field-affinity"
@@ -245,7 +307,7 @@ assertCross "--handoff"            "--lint"
 # It runs before ingest (it IS the ingest-artifact generator), so it outranks even --for. That made it the
 # one row that can beat a query-family flag, and the reason X9(c) is now gated on the family actually
 # winning: a run where --index-out answered must not also claim "--for takes precedence".
-IOTMP="$( mktemp -d )"; trap 'rm -rf "$PRECTMP" "$IOTMP"' EXIT
+IOTMP="$( mktemp -d )"; trap 'rm -rf "$GATETMP" "$PRECTMP" "$IOTMP"' EXIT
 "$BIN" "$FIX" --index-out="$IOTMP/ix" --lint >"$IOTMP/o" 2>"$IOTMP/e"
 if [ -s "$IOTMP/o" ]; then
     fail "--index-out+--lint: stdout is non-empty — --lint answered instead of --index-out"

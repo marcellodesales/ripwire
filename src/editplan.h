@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mcpedit.h"
+#include "infra/os.h"   // rw::os::realpath / getcwd / lstat — plan-directory confinement and the symlink-target refusal
 #include "nextverb.h"   // E4: nextFlag — the shell-safe spelling of the rollback message's one next:
 
 #include <memory>
@@ -68,7 +69,7 @@ inline std::string planDirAbs( const std::string& planPath )
     const std::size_t slash = planPath.find_last_of( '/' );
     const std::string dir   = slash == std::string::npos ? std::string( "." ) : planPath.substr( 0, slash );
     char              buf[ PATH_MAX ];
-    return ::realpath( dir.empty() ? "/" : dir.c_str(), buf ) != nullptr ? std::string( buf ) : std::string();
+    return os::realpath( dir.empty() ? "/" : dir.c_str(), buf ) != nullptr ? std::string( buf ) : std::string();
 }
 
 // A5: a plan's `payload` names a file whose BYTES are spliced into a source file, so an unconfined payload
@@ -77,11 +78,16 @@ inline std::string planDirAbs( const std::string& planPath )
 // low-severity finding and not a write escape; but a plan arriving from a shared repo, a PR, or another
 // agent could quietly bake a secret into a file the next commit publishes.
 //
-// Payloads must live beside the plan. Both checks run, because each catches what the other cannot: the
-// LEXICAL pass judges a path that does not exist (realpath would simply fail and the refusal would be a
-// misleading "cannot read"), and REALPATH catches a symlink that sits inside the plan directory and points
-// out of it. `resolved` is filled either way, so the refusal can name the path it actually judged rather
-// than the spelling the plan wrote.
+// Payloads must live beside the plan, and the CHECK must judge the SAME path the READ will open. realpath
+// resolves the RAW payload path (every symlink component, in the frame the read uses) and confines that
+// canonical target; the caller then reads through `resolved`, never the raw spelling, so the path that is
+// confined is the path that is opened. The case this covers: a DIRECTORY symlink inside the plan dir
+// followed by `..` (`dirlink/../x`). Folding the text first would cancel `dirlink/..` to nothing and realpath
+// a harmless in-dir spelling, while the kernel — resolving the unfolded path — follows `dirlink` and only
+// then applies `..`. So realpath runs on the UNFOLDED path; the lexical fold is the fallback ONLY when
+// realpath cannot speak (a payload that does not yet exist), where "../../../../etc/nope" must still read as
+// an escape and not a plain read failure. `resolved` is filled either way, so the refusal names the path it
+// actually judged, and parseEdit reads it.
 inline bool payloadWithinPlanDir( const std::string& planPath, const std::string& payloadPath, std::string& resolved )
 {
     const std::string dir = planDirAbs( planPath );
@@ -94,33 +100,36 @@ inline bool payloadWithinPlanDir( const std::string& planPath, const std::string
     // relative to the CWD (not to `dir` — joining it to `dir` a second time would silently un-escape a
     // "../" payload, which is the exact bug this function exists to catch).
     char cwdBuf[ PATH_MAX ];
-    const std::string cwd = ::getcwd( cwdBuf, sizeof( cwdBuf ) ) != nullptr ? std::string( cwdBuf ) : std::string();
+    const std::string cwd = os::getcwd( cwdBuf, sizeof( cwdBuf ) ) != nullptr ? std::string( cwdBuf ) : std::string();
     if( cwd.empty() && payloadPath.front() != '/' )
     {
         resolved = payloadPath;
         return false;   // cannot place a relative path in any frame ⇒ cannot prove containment ⇒ refuse
     }
+    // The absolute spelling the kernel would resolve — NOT folded. realpath below follows every symlink in it
+    // exactly as parseEdit's read will, which is what makes the check and the use agree.
+    const std::string rawAbs = payloadPath.front() == '/' ? payloadPath : cwd + "/" + payloadPath;
+
+    // realpath is the AUTHORITY when the payload exists: `dir` is canonical, so only a canonical candidate is
+    // comparable to it (a symlinked prefix such as /tmp -> /private/tmp otherwise reads as an escape), and
+    // resolving the UNFOLDED raw path is what catches a directory symlink inside the plan dir that a later
+    // `..` walks out of. The caller reads `resolved`, so this canonical path is also the one that is opened.
+    char buf[ PATH_MAX ];
+    if( os::realpath( rawAbs.c_str(), buf ) != nullptr )
+    {
+        resolved = std::string( buf );
+        return pathIsUnder( resolved, dir );
+    }
+    // The payload does not exist / cannot be resolved. realpath cannot speak, so judge it lexically:
     // rw::lexicalNormalize (resolve.h) is the house's segment-stack `.`/`..` folder — the SAME primitive the
-    // include resolver keys every path index through. It returns "" for a relative `..` that escapes above
-    // its own base, which is already the answer this check wants.
-    const std::string lexical = lexicalNormalize( payloadPath.front() == '/' ? payloadPath : cwd + "/" + payloadPath );
+    // include resolver keys every path index through — and it returns "" for a relative `..` that escapes
+    // above its own base, which is already the answer this check wants for "../../../../etc/nope".
+    const std::string lexical = lexicalNormalize( rawAbs );
     if( lexical.empty() )
     {
         resolved = payloadPath;
         return false;
     }
-
-    // realpath is the AUTHORITY when the payload exists: `dir` is canonical, so only a canonical candidate
-    // is comparable to it (a symlinked prefix such as /tmp -> /private/tmp otherwise reads as an escape),
-    // and it is what catches a symlink sitting INSIDE the plan directory that points out of it.
-    char buf[ PATH_MAX ];
-    if( ::realpath( lexical.c_str(), buf ) != nullptr )
-    {
-        resolved = std::string( buf );
-        return pathIsUnder( resolved, dir );
-    }
-    // The payload does not exist. realpath cannot speak, so judge it lexically: "../../../../etc/nope" must
-    // still read as an escape rather than as a merely unreadable payload.
     resolved = lexical;
     return pathIsUnder( lexical, dir );
 }
@@ -202,8 +211,11 @@ inline bool parseEdit( const McpIndex& ix, const std::string& object, const std:
                 "directory; an edit plan may only read payloads that sit beside it";
         return false;
     }
-    bool payloadOk = false;
-    edit.payload = mcpdetail::readFileBytes( payloadPath, payloadOk );
+    // Read EXACTLY the path the confinement check judged (its canonical `resolved`), never the raw spelling,
+    // so the check and the read agree on which file a directory symlink + `..` payload names. The read is a
+    // descriptor chain anchored at the plan's canonical directory with no symlink followed beneath it, so the
+    // file opened is beneath that directory when it is opened; a path no longer beneath it reads as unreadable.
+    const bool payloadOk = rw::pathguard::readWholeBeneathNoFollow( planDirAbs( planPath ), edit.payloadPath, edit.payload );
     if( !payloadOk || edit.payload.empty() ) { error = "cannot read non-empty payload '" + payloadPath + "'"; return false; }
     if( edit.payload.size() > maxBytes ) { error = "payload '" + payloadPath + "' exceeds --max-file-size"; return false; }
     // A1: the plan path does not route through runEditVerb, so it carries the same third payload arm itself.
@@ -223,11 +235,13 @@ inline bool parseEdit( const McpIndex& ix, const std::string& object, const std:
     return true;
 }
 
-inline FileStage* ensureStage( const McpIndex& ix, const Edit& edit, std::vector<FileStage>& files,
-                               const std::string& root, std::string& error )
+// The stage for `edit`'s file — the one already staged, or a fresh one read from disk — as { stage, "" }, or as
+// { nullptr, refusal } when the target is a symlink or its bytes no longer match the index.
+inline std::pair<FileStage*, std::string> ensureStage( const McpIndex& ix, const Edit& edit, std::vector<FileStage>& files,
+                                                       const std::string& root )
 {
     const auto staged = std::find_if( files.begin(), files.end(), [ & ]( const FileStage& file ) { return file.fileId == edit.fileId; } );
-    if( staged != files.end() ) { return &*staged; }
+    if( staged != files.end() ) { return { &*staged, std::string() }; }
     FileStage fresh;
     fresh.fileId = edit.fileId;
     // M12 (capture-audit 2026-09-04, lane L9) applied to the sibling it missed: the single-edit receipt's
@@ -239,16 +253,16 @@ inline FileStage* ensureStage( const McpIndex& ix, const Edit& edit, std::vector
                    ? std::string( rw::sarif::rootRelativeUri( ix.ing.files[edit.fileId], rw::sarif::rootPrefixOf( root ) ) )
                    : ix.ing.files[edit.fileId];
     fresh.disk = diskPath( ix.ing, edit.fileId );
-    struct stat link{};
-    if( ::lstat( fresh.disk.c_str(), &link ) == 0 && S_ISLNK( link.st_mode ) ) { error = "refusing edit plan target symlink '" + fresh.identity + "'"; return nullptr; }
+    os::stat_t link{};
+    if( os::lstat( fresh.disk.c_str(), &link ) == 0 && S_ISLNK( link.st_mode ) ) { return { nullptr, "refusing edit plan target symlink '" + fresh.identity + "'" }; }
     bool readOk = false;
     fresh.original = mcpdetail::readFileBytes( fresh.disk, readOk );
     fresh.baseHash = readOk ? mcpdetail::byteHash( fresh.original.data(), fresh.original.size() ) : 0;
     const std::uint64_t indexedHash = edit.fileId < ix.fileByteHash.size() ? ix.fileByteHash[edit.fileId] : 0;
-    if( !readOk || fresh.baseHash == 0 || fresh.baseHash != indexedHash ) { error = "file '" + fresh.identity + "' changed since index was built"; return nullptr; }
+    if( !readOk || fresh.baseHash == 0 || fresh.baseHash != indexedHash ) { return { nullptr, "file '" + fresh.identity + "' changed since index was built" }; }
     fresh.edited = fresh.original;
     files.push_back( std::move( fresh ) );
-    return &files.back();
+    return { &files.back(), std::string() };
 }
 
 inline bool stageEdits( std::vector<Edit>& edits, std::vector<FileStage>& files, std::string& error )
@@ -290,13 +304,15 @@ inline Outcome prepare( const std::string& root, const std::string& planPath, st
     if( objects.empty() || objects.size() > 64 || !objectOnlyArray( editArray, objects ) ) { out.message = "edit plan needs 1..64 edit objects and no other array values"; return out; }
 
     const McpIndex& ix = getIndex( root );
+    // #350: every target resolves against the index — a memory-guard partial one refuses the whole plan, nothing staged
+    if( ix.ing.memoryStop.isSet() ) { out.message = memguard::verbRefusalLine( ix.ing.memoryStop, "--edit-plan" ); return out; }
     edits.reserve( objects.size() );
     for( const std::string& object : objects )
     {
         Edit edit;
         if( !parseEdit( ix, object, planPath, maxBytes, edit, out.message ) ) { return out; }
-        FileStage* file = ensureStage( ix, edit, files, root, out.message );
-        if( file == nullptr ) { return out; }
+        auto [ file, refusal ] = ensureStage( ix, edit, files, root );
+        if( file == nullptr ) { out.message = std::move( refusal ); return out; }
         if( !( edit.a < edit.b && edit.b <= file->original.size() ) ) { out.message = "invalid definition span for '" + edit.target + "'"; return out; }
         // R1 (V3): parseEdit's third payload arm, moved here — the first point that holds the bytes the edit
         // would replace. Same function, same sentence, same denominators as the single verbs. Still preflight:
@@ -313,8 +329,9 @@ inline Outcome prepare( const std::string& root, const std::string& planPath, st
             const Symbol& target = ix.ing.symbols[ edit.node ];
             edit.symName = target.name;
             edit.line    = target.line;
-            const auto [ callerIds, callerIncompatible ] =
-                editCheckCallers( ix.ing, ix.g, editCheckOverloadSet( ix.ing, ix.g, edit.node ), target.name );
+            const std::vector<NodeId> overloads = editCheckOverloadSet( ix.ing, ix.g, edit.node );
+            EditCheckCalleeTest       callee( ix.ing, target, overloads );
+            const auto [ callerIds, callerIncompatible ] = editCheckCallers( ix.ing, ix.g, overloads, callee );
             (void) callerIncompatible;   // the FLAGS are an after-the-edit question; a dry-run has no edit yet
             edit.callers = callerIds;
         }

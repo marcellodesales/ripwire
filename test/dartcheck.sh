@@ -1,212 +1,183 @@
 #!/usr/bin/env bash
-# dartcheck.sh — Dart grammar + extraction + dependency-resolution gate.
-set -u
-ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
-BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
-[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
-FIX="$ROOT/test/dartfix"
-TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
-fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
-no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
-
-[ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
-command -v python3 >/dev/null 2>&1 || { echo "python3 required for dartcheck.sh"; exit 2; }
-[ -d "$FIX" ] || { echo "no fixture at $FIX"; exit 2; }
-
-echo "dartcheck: BIN=$BIN  FIX=$FIX"
-
-"$BIN" "$FIX" --no-cache >"$TMP/map.xml" 2>"$TMP/map.err"
-MAP_RC=$?
-[ "$MAP_RC" -eq 0 ] && ok "default map exits 0 on the Dart fixture" || no "default map exited $MAP_RC"
-[ ! -s "$TMP/map.err" ] && ok "default map keeps stderr clean" || no "default map wrote stderr: $( cat "$TMP/map.err" )"
-
-command -v xmllint >/dev/null 2>&1 \
-    && { xmllint --noout "$TMP/map.xml" >/dev/null 2>&1 && ok "default map XML is well-formed" || no "default map XML is malformed"; } \
-    || ok "default map XML well-formedness skipped (xmllint absent)"
-
-python3 - "$TMP/map.xml" "$FIX" <<'PY'
+# Dart grammar, definition shapes, call heads, cascades, and deterministic cache round trips.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="${RIPWIRE_BIN:-$ROOT/build/ripwire}"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+mkdir "$TMP/cache"
+export XDG_CACHE_HOME="$TMP/cache"
+cp -R "$ROOT/test/dartfix" "$TMP/fix"
+"$BIN" "$TMP/fix" --no-cache > "$TMP/map.xml"
+python3 - "$TMP/map.xml" <<'PY'
 import sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.argv[1]).getroot()
-files = {f.get('p'): f for f in root.findall('f')}
-assert root.get('root') == sys.argv[2]
-assert len(files) == 11, files.keys()
-assert 'pubspec.yaml' in files
-assert 'packages/support/pubspec.yaml' in files
-assert 'packages/config_only/lib/config_only.dart' in files
-assert 'packages/support/lib/support.dart' in files
-assert '.dart_tool/package_config.json' in files
-main = files['lib/main.dart']
-by_name = files['lib/src/by_name.dart']
-piece = files['lib/src/piece.dart']
-def rows(file_node):
-    return [
-        {
-            'kind': s.get('t'),
-            'name': s.get('n'),
-            'id': s.get('id'),
-            'overloads': s.get('overloads'),
-            'calls': [c.get('n') for c in s.findall('c')],
-        }
-        for s in file_node.findall('s')
-    ]
-def has(rows, *, name, kind=None, sid=None, overloads=None, calls=None):
-    for row in rows:
-        if row['name'] != name:
-            continue
-        if kind is not None and row['kind'] != kind:
-            continue
-        if sid is not None and row['id'] != sid:
-            continue
-        if overloads is not None and row['overloads'] != overloads:
-            continue
-        if calls is not None and set(row['calls']) != set(calls):
-            continue
-        return True
-    return False
-main_rows = rows(main)
-assert has(main_rows, name='Greeter', kind='cls', sid='lib/main.dart::Greeter::Greeter')
-assert has(main_rows, name='Greeter', kind='method', sid='lib/main.dart::Greeter::Greeter', overloads='3')
-assert has(main_rows, name='make', kind='method', sid='lib/main.dart::Greeter::make', calls={'named', 'supportMessage', 'configMessage'})
-assert has(main_rows, name='FancyText', kind='cls')
-assert has(main_rows, name='UserId', kind='cls')
-assert has(main_rows, name='Mode', kind='struct')
-assert has(main_rows, name='answer', kind='fn', overloads='2', calls={'helper'})
-assert has(main_rows, name='total', kind='method', overloads='2')
-piece_rows = rows(piece)
-assert has(piece_rows, name='named', kind='method', sid='lib/src/piece.dart::Piece::named')
-assert has(piece_rows, name='stitch', kind='method', calls={'helper'})
-by_rows = rows(by_name)
-assert has(by_rows, name='NamedPiece', kind='cls')
-assert has(by_rows, name='build', kind='method', calls={'helper'})
-print('  PASS Dart definitions, overload rows, package-config file and call edges')
-PY
-if [ $? -ne 0 ]; then no "default map structure drifted"; fi
+rows = list(root.iter('s'))
+syms = {s.get('n'): s for s in rows}
+def calls(name): return {c.get('n') for c in syms[name].iter('c')}
 
-"$BIN" "$FIX" --deps --no-cache >"$TMP/deps.xml" 2>"$TMP/deps.err"
-[ ! -s "$TMP/deps.err" ] && ok "--deps keeps stderr clean" || no "--deps wrote stderr: $( cat "$TMP/deps.err" )"
-python3 - "$TMP/deps.xml" <<'PY'
-import sys, xml.etree.ElementTree as ET
-root = ET.parse(sys.argv[1]).getroot()
-rows = {f.get('p'): [inc.get('t') for inc in f.findall('inc')] for f in root.findall('f')}
-assert root.find('health').get('dep_langs').endswith(',dart')
-assert rows['lib/main.dart'] == [
-    'src/util.dart',
-    'src/fallback.dart',
-    'src/io_impl.dart',
-    'package:config_only/config_only.dart',
-    'package:support_pkg/support.dart',
-    'src/util.dart',
-    'src/piece.dart',
-    'src/by_name.dart',
-]
-assert rows['lib/src/piece.dart'] == ['../main.dart']
-assert rows['lib/src/by_name.dart'] == ['sample.named']
-print('  PASS Dart deps expose relative/package/part edges and unresolved part-of library names honestly')
-PY
-if [ $? -ne 0 ]; then no "--deps structure drifted"; fi
-
-"$BIN" "$FIX" --callees=make --no-cache >"$TMP/callees.xml" 2>"$TMP/callees.err"
-[ ! -s "$TMP/callees.err" ] && ok "--callees keeps stderr clean" || no "--callees wrote stderr: $( cat "$TMP/callees.err" )"
-python3 - "$TMP/callees.xml" <<'PY'
-import sys, xml.etree.ElementTree as ET
-root = ET.parse(sys.argv[1]).getroot()
-assert root.tag == 'callees'
-assert root.get('count') == '3'
-got = {(s.get('n'), s.get('p')) for s in root.findall('s')}
-want = {
-    ('named', 'lib/main.dart:19'),
-    ('configMessage', 'packages/config_only/lib/config_only.dart:1'),
-    ('supportMessage', 'packages/support/lib/support.dart:1'),
+expected = {
+    # math.dart
+    'square', 'twice', 'secret', 'answer', 'branchy',
+    'Calculator', 'total', 'accumulate', 'untouched',
+    # widgets.dart
+    'IntTransform', 'Mode', 'Loggable', 'log', 'emit', 'Doubling', 'doubled',
+    'Builder', 'add', 'reset', 'build', 'transform',
 }
-assert got == want, (got, want)
-print('  PASS --callees=make sees same-file and package-resolved Dart targets')
-PY
-if [ $? -ne 0 ]; then no "--callees output drifted"; fi
+assert set(syms) == expected, ('missing', expected - set(syms), 'extra', set(syms) - expected)
 
-REL_OUT="$TMP/rel.xml"
-ABS_OUT="$TMP/abs.xml"
-"$BIN" "$FIX" --callees=make --no-cache >"$REL_OUT"
-"$BIN" "$FIX" --cache="$TMP/cache.bin" >/dev/null 2>&1
-"$BIN" "$FIX" --callees=make --cache="$TMP/cache.bin" >"$TMP/warm.xml"
-cmp -s "$REL_OUT" "$TMP/warm.xml" && ok "warm == cold on the Dart caller/callee view" || no "warm cache changed the Dart caller/callee view"
-"$BIN" "$FIX" >"$TMP/a.xml"
-"$BIN" "$FIX" >"$TMP/b.xml"
-cmp -s "$TMP/a.xml" "$TMP/b.xml" && ok "default map is deterministic across two warm runs" || no "default map is non-deterministic"
-"$BIN" "$ROOT/test/dartfix" --callees=make --no-cache >"$ABS_OUT"
-python3 - "$REL_OUT" "$ABS_OUT" <<'PY'
+# Kinds: a class/mixin/extension/enum is not a fn.
+assert syms['Calculator'].get('t') in ('cls', 'class'), syms['Calculator'].attrib
+assert syms['Mode'].get('t') in ('enum', 'cls'), syms['Mode'].attrib
+assert syms['square'].get('t') == 'fn', syms['square'].attrib
+assert syms['accumulate'].get('t') == 'method', syms['accumulate'].attrib
+
+# Call edges.
+assert 'square' in calls('twice')
+assert 'secret' in calls('answer')
+assert 'square' in calls('branchy')
+assert 'square' in calls('accumulate')
+assert 'emit' in calls('log')
+assert 'doubled' in calls('transform')
+# THE CASCADE FLOOR (queries/dart/tags.scm). `this..add(1)..add(2)..reset()` invokes add and reset;
+# the cascade receiver is NOT a call. The upstream grammar's shipped tags.scm over-captures here.
+assert {'add', 'reset'} <= calls('build'), calls('build')
+assert 'this' not in calls('build'), 'cascade receiver became a call edge'
+assert 'items' not in calls('build'), 'cascade target field became a call edge'
+
+# Negatives: a definition head is not a recursive call to itself.
+assert 'untouched' not in calls('untouched'), 'method head became a recursive call'
+assert not list(syms['Calculator'].iter('c')), 'method bodies leaked into the class row'
+print('  PASS Dart definitions, members, call heads, cascades and negatives')
+PY
+for n in a b c; do "$BIN" "$TMP/fix" > "$TMP/$n.xml"; done
+cmp "$TMP/map.xml" "$TMP/a.xml"
+cmp "$TMP/a.xml" "$TMP/b.xml"
+cmp "$TMP/b.xml" "$TMP/c.xml"
+echo '  PASS cold/warm determinism and XML'
+python3 - "$TMP/fix/math.dart" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+assert 'return secret();' in s
+p.write_text(s.replace('return secret();', 'return missing_secret();'))
+PY
+"$BIN" "$TMP/fix" --no-cache > "$TMP/mut.xml"
+python3 - "$TMP/mut.xml" <<'PY'
 import sys, xml.etree.ElementTree as ET
-def shape(path):
+syms = {s.get('n'): s for s in ET.parse(sys.argv[1]).iter('s')}
+assert 'secret' in syms
+assert 'secret' not in {c.get('n') for c in syms['answer'].iter('c')}
+print('  PASS call-site mutation removes the edge')
+PY
+
+"$BIN" "$TMP/fix" --metrics --no-cache > "$TMP/metrics.xml"
+python3 - "$TMP/metrics.xml" <<'PYMET'
+import sys, xml.etree.ElementTree as ET
+syms = {s.get('n'): s for s in ET.parse(sys.argv[1]).iter('s')}
+assert syms['square'].get('params') == '1', syms['square'].attrib
+assert syms['secret'].get('params') == '0', syms['secret'].attrib
+assert syms['branchy'].get('cx') == '2', syms['branchy'].attrib
+print('  PASS Dart parameter counts and branch metrics')
+PYMET
+
+mkdir "$TMP/broken"
+printf 'class {\n  int broken() => 1;\n}\n' > "$TMP/broken/broken.dart"
+"$BIN" "$TMP/broken" --no-cache > "$TMP/broken.xml"
+xmllint --noout "$TMP/broken.xml"
+echo '  PASS malformed unnamed class does not crash'
+
+# ── constructors: the documented floor (queries/dart/tags.scm) ────────────────────────
+# A constructor_signature carries the CLASS identifier first, then the constructor name for the
+# named form. Only the first is captured, so C(), C.seeded() and factory C.fromA() are OVERLOADS
+# of C rather than three distinct names — asserted here so a regression says which rule broke,
+# and so the floor cannot quietly become a silent drop.
+mkdir "$TMP/ctors"
+cat > "$TMP/ctors/ctors.dart" <<'DART'
+int answer() => 42;
+
+class C {
+  int _t = 0;
+  C();
+  C.seeded(int s) : _t = s;
+  factory C.fromA() => C.seeded(answer());
+  int plain() => 1;
+}
+DART
+"$BIN" "$TMP/ctors" --no-cache > "$TMP/ctors.xml"
+python3 - "$TMP/ctors.xml" <<'PYC'
+import sys, xml.etree.ElementTree as ET
+rows = list(ET.parse(sys.argv[1]).iter('s'))
+syms = {s.get('n'): s for s in rows}
+assert {'answer', 'C', 'plain'} == set(syms), set(syms)
+assert 'C.seeded' not in syms and 'fromA' not in syms, 'named constructor escaped the documented floor'
+# The class and its three constructors share the name C, so the row discloses the merge.
+assert syms['C'].get('overloads') is not None, ('C did not disclose overloads', syms['C'].attrib)
+# `C.seeded(answer())` resolves to the MEMBER name `seeded`, which has no definition here, so the
+# call is unresolved — never silently bound to the class that swallowed the constructor's name.
+cCalls = {c.get('n') for c in syms['C'].iter('c')}
+assert 'seeded' not in cCalls, ('a named-constructor call bound to the class', cCalls)
+assert 'C' not in cCalls, ('the class became its own callee', cCalls)
+print('  PASS constructors index under the class name and disclose the merge')
+PYC
+
+# ── the language-registration surface: an indexed language a lens cannot analyse is DISCLOSED ──
+# Appending a Lang is not one table: --nonlocal-state names the indexed languages it does NOT
+# analyse (nonlocalstate.h kUnanalyzedLangs, keyed through lintrules.h langOfPath), and a language
+# missing from either reads as "measured, found nothing" instead of "not measured". Lua is the
+# CONTRAST arm, not decoration: it proves the attribute is emitted at all on this corpus shape, so
+# a silent Dart cannot pass by the whole feature having gone away.
+mkdir "$TMP/mixed_dart" "$TMP/mixed_lua"
+cp "$ROOT/test/dartfix/math.dart" "$TMP/mixed_dart/"
+cp "$ROOT/test/luafix/util.lua"   "$TMP/mixed_lua/"
+for d in mixed_dart mixed_lua; do
+    cp "$ROOT/test/fixture/geometry.cpp" "$ROOT/test/fixture/geometry.h" "$TMP/$d/"
+    "$BIN" "$TMP/$d" --nonlocal-state --no-cache > "$TMP/$d.xml"
+done
+python3 - "$TMP/mixed_dart.xml" "$TMP/mixed_lua.xml" <<'PYNL'
+import sys, xml.etree.ElementTree as ET
+def langs(path):
     root = ET.parse(path).getroot()
-    return root.get('count'), sorted((s.get('n'), s.get('p')) for s in root.findall('s'))
-assert shape(sys.argv[1]) == shape(sys.argv[2])
-print('  PASS relative and absolute roots resolve Dart callees identically')
-PY
-if [ $? -ne 0 ]; then no "relative/absolute root parity failed"; fi
+    node = root if root.tag == 'nonlocal_state' else root.find('.//nonlocal_state')
+    assert node is not None, ('no <nonlocal_state> element in ' + path)
+    return node.get('unanalyzed_langs')
+lua = langs(sys.argv[2])
+assert lua is not None and 'lua' in lua, ('the contrast arm did not fire — unanalyzed_langs is not emitted at all', lua)
+dart = langs(sys.argv[1])
+assert dart is not None and 'dart' in dart, ('a Dart corpus is not disclosed as unanalyzed: unanalyzed_langs=%r' % (dart,))
+print('  PASS an indexed Dart corpus is disclosed as unanalyzed (lua is the live contrast)')
+PYNL
 
-PATH="$( cd "$( dirname "$BIN" )" && pwd ):$PATH" "$BIN" "$FIX" --doctor >"$TMP/doctor.xml"
-python3 - "$TMP/doctor.xml" <<'PY'
+# ── and the SECOND half of that surface: applicable= must not contradict count= ────────────────
+# A rule row's applicable="0" means "NONE of this rule's registered languages are present in this
+# corpus". The naming family is language-agnostic and DOES fire on Dart names, so a Dart-only corpus
+# that is not in the catalog's language vocabulary (lintcatalog.h kCatalogLangs, resolved through
+# lintrules.h langFromToken) prints applicable="0" on a rule that simultaneously reports count="1".
+mkdir "$TMP/lintdart"
+cat > "$TMP/lintdart/n.dart" <<'DART'
+int q(int value) => value;
+
+class Widget {
+  int mixed_caseName() => 1;
+}
+DART
+"$BIN" "$TMP/lintdart" --lint --no-cache > "$TMP/lintdart.xml"
+python3 - "$TMP/lintdart.xml" <<'PYLINT'
 import sys, xml.etree.ElementTree as ET
-rows = {c.get('n'): c for c in ET.parse(sys.argv[1]).iter('c')}
-assert rows['grammars'].get('loaded') == rows['grammars'].get('expected') == '23'
-assert rows['tree-sitter'].get('languages') == '23'
-print('  PASS doctor reports all 23 grammars, including Dart')
-PY
-if [ $? -ne 0 ]; then no "doctor grammar count drifted"; fi
+rules = {r.get('name'): r for r in ET.parse(sys.argv[1]).iter('rule')}
+fired = [n for n, r in rules.items() if n.startswith('naming-') and int(r.get('count', '0')) > 0]
+assert fired, ('no naming rule fired on the Dart fixture — the arm cannot reach a verdict', sorted(rules))
+for n in fired:
+    assert rules[n].get('applicable') != '0', (
+        'rule %s reports count=%s yet applicable="0" — the catalog does not know this corpus is Dart'
+        % (n, rules[n].get('count')))
+print('  PASS the lint catalog knows a Dart corpus (applicable= agrees with count=)')
+PYLINT
 
-INIT='{"jsonrpc":"2.0","id":1,"method":"initialize"}'
-FS='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"find_symbol","arguments":{"path":"'"$FIX"'","symbol":"make"}}}'
-printf '%s\n%s\n' "$INIT" "$FS" | "$BIN" --mcp >"$TMP/mcp_find.json"
-python3 - "$TMP/mcp_find.json" <<'PY' >"$TMP/handle.txt"
-import json, sys
-payload = json.loads(open(sys.argv[1]).read().splitlines()[-1])['result']['content'][0]['text']
-data = json.loads(payload)
-assert data['symbol']['name'] == 'make'
-assert data['symbol']['line'] == 21
-assert data['count'] == 3
-assert {row['name'] for row in data['calls']} == {'named', 'supportMessage', 'configMessage'}
-print(data['symbol']['handle'])
-PY
-if [ $? -eq 0 ]; then ok "MCP find_symbol sees the same Dart callees as CLI --callees"; else no "MCP find_symbol drifted"; fi
-HANDLE="$( cat "$TMP/handle.txt" 2>/dev/null )"
-FB='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fetch_body","arguments":{"path":"'"$FIX"'","handle":"'"$HANDLE"'"}}}'
-printf '%s\n%s\n' "$INIT" "$FB" | "$BIN" --mcp >"$TMP/mcp_body.json"
-python3 - "$TMP/mcp_body.json" <<'PY'
-import json, sys
-payload = json.loads(open(sys.argv[1]).read().splitlines()[-1])['result']['content'][0]['text']
-data = json.loads(payload)
-assert data['name'] == 'make'
-assert data['line'] == 21
-assert data['body'] == 'factory Greeter.make() => Greeter.named( supportMessage() + configMessage() );'
-print('  PASS MCP fetch_body returns the Dart body for the handle find_symbol emitted')
-PY
-if [ $? -ne 0 ]; then no "MCP fetch_body drifted"; fi
-
-MUT="$TMP/mut"
-cp -R "$FIX" "$MUT"
-python3 - "$MUT" <<'PY'
-import json, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-main = root / 'lib' / 'main.dart'
-main.write_text(main.read_text().replace('configMessage()', 'missingConfigMessage()'))
-cfg = root / '.dart_tool' / 'package_config.json'
-data = json.loads(cfg.read_text())
-for pkg in data['packages']:
-    if pkg['name'] == 'config_only':
-        pkg['rootUri'] = '../packages/missing/'
-cfg.write_text(json.dumps(data, indent=2) + '\n')
-PY
-"$BIN" "$MUT" --callees=make --no-cache >"$TMP/mut_callees.xml"
-"$BIN" "$MUT" --deps --no-cache >"$TMP/mut_deps.xml"
-python3 - "$TMP/mut_callees.xml" "$TMP/mut_deps.xml" <<'PY'
+PATH="$(cd "$(dirname "$BIN")" && pwd):$PATH" "$BIN" "$TMP/fix" --doctor > "$TMP/doctor.xml"
+python3 - "$TMP/doctor.xml" <<'PYDOC'
 import sys, xml.etree.ElementTree as ET
-callees = ET.parse(sys.argv[1]).getroot()
-deps = ET.parse(sys.argv[2]).getroot()
-assert callees.get('count') == '2'
-assert {s.get('n') for s in callees.findall('s')} == {'named', 'supportMessage'}
-assert all(f.get('p') != 'packages/config_only/lib/config_only.dart' for f in deps.findall('f'))
-print('  PASS mutation controls: breaking the call and package_config mapping removes the asserted edge/file')
-PY
-if [ $? -ne 0 ]; then no "mutation controls failed"; fi
-
-[ "$fail" -eq 0 ] && echo "ALL PASS" || { echo "SOME CHECKS FAILED"; exit 1; }
+rows = [c for c in ET.parse(sys.argv[1]).iter('c') if c.get('n') == 'grammars']
+assert len(rows) == 1
+assert rows[0].get('loaded') == rows[0].get('expected') == '25', rows[0].attrib
+print('  PASS doctor loads all 25 grammars and queries')
+PYDOC

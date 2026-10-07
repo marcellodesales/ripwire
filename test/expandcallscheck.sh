@@ -17,7 +17,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -27,13 +27,15 @@ echo "expandcallscheck: BIN=$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 
 # ── #1: a large-fanout symbol (ingest) — <calls> carries total=, and total= equals --callees=ingest's count=
-EXP_XML="$( "$BIN" . --top-k=0 --expand=ingest --no-cache 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact and spells `<calls><c n= l=>` inside its comment; the
+# <calls>/<c n= reads count real elements, so the --expand runs ask for the full legend (rows identical).
+EXP_XML="$( "$BIN" . --top-k=0 --expand=ingest --no-cache --legend=full 2>/dev/null )"
 CALLS_TAG="$( printf '%s' "$EXP_XML" | grep -oE '<calls[^>]*>' | head -1 )"
 CALLEES_COUNT="$( "$BIN" . --callees=ingest --no-cache 2>/dev/null | grep -oE 'count="[0-9]+"' | head -1 | grep -oE '[0-9]+' )"
 EXP_TOTAL="$( printf '%s' "$CALLS_TAG" | grep -oE 'total="[0-9]+"' | grep -oE '[0-9]+' )"
 
-[ -n "$CALLS_TAG" ] && ok "--expand=ingest emits a <calls> block ($CALLS_TAG)" || no "--expand=ingest emitted NO <calls> block"
-[ -n "$EXP_TOTAL" ] && ok "<calls> carries total= ($EXP_TOTAL)" || no "<calls> has no total= attribute (the P10.1 bug)"
+if [ -n "$CALLS_TAG" ]; then ok "--expand=ingest emits a <calls> block ($CALLS_TAG)"; else no "--expand=ingest emitted NO <calls> block"; fi
+if [ -n "$EXP_TOTAL" ]; then ok "<calls> carries total= ($EXP_TOTAL)"; else no "<calls> has no total= attribute (the P10.1 bug)"; fi
 if [ -n "$EXP_TOTAL" ] && [ -n "$CALLEES_COUNT" ] && [ "$EXP_TOTAL" = "$CALLEES_COUNT" ]; then
     ok "<calls total=\"$EXP_TOTAL\"> agrees with --callees=ingest's count=\"$CALLEES_COUNT\""
 else
@@ -58,7 +60,7 @@ ACTUAL_C="$( printf '%s' "$EXP_XML" | grep -oE '<c n=' | wc -l | tr -d ' ' )"
     || no "shown=\"$EXP_SHOWN\" does not match the actual emitted <c> row count ($ACTUAL_C)"
 
 # ── #3: a small-fanout symbol shows total==shown with NO capped= (the listing is complete — no phantom cut)
-SMALL_XML="$( "$BIN" . --top-k=0 --expand=isDocExtension --no-cache 2>/dev/null )"
+SMALL_XML="$( "$BIN" . --top-k=0 --expand=isDocExtension --no-cache --legend=full 2>/dev/null )"
 SMALL_TAG="$( printf '%s' "$SMALL_XML" | grep -oE '<calls[^>]*>' | head -1 )"
 SMALL_CALLEES="$( "$BIN" . --callees=isDocExtension --no-cache 2>/dev/null | grep -oE 'count="[0-9]+"' | head -1 | grep -oE '[0-9]+' )"
 SMALL_TOTAL="$( printf '%s' "$SMALL_TAG" | grep -oE 'total="[0-9]+"' | grep -oE '[0-9]+' )"

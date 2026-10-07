@@ -16,10 +16,11 @@
 set -u
 
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 skip(){ printf '  SKIP  %s\n' "$*"; }
 
@@ -275,7 +276,7 @@ if "minimal fix" not in p_base and "ISSUE:" not in p_base:
     ok( "no SWE-bench 'make the minimal fix' framing leaks into a question prompt" )
 else:
     no( "the question prompt still carries patch-task framing" )
-if "ripwire" not in p_base.replace( "Do not use ripwire or ctxpack", "" ):
+if "ripwire" not in p_base.replace( "Do not use ripwire", "" ):
     ok( "baseline question prompt names ripwire only to forbid it" )
 else:
     no( "baseline question prompt leaks ripwire guidance" )

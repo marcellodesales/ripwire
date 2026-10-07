@@ -28,54 +28,400 @@ namespace
 // `receiver:` / `method:` fields, and a receiver-less `m(args)` is the same node kind with no `receiver:`
 // field. So `call` is the member-access node for Ruby and a null receiver is the bare shape — receiverOf's
 // existing null-receiver return already reads that as RecvKind::None (test/rubyscopecheck.sh, Rule 1 arms).
+// DISCLOSED GAP, not an oversight: Kotlin is absent here. `A.f()` parses to a `navigation_expression`
+// (verified against the vendored grammar), which this function does not recognize, so EVERY Kotlin
+// call site — bare `f()` and explicitly-qualified `A.f()` alike — classifies RecvKind::None. The
+// practical cost: an explicit receiver that WOULD narrow a same-name collision (two Kotlin
+// classes/objects each defining `f`, called as `A.f()` vs `B.f()`) currently does not — both stay
+// candidates, same as a genuinely bare call. graph.h's JVM bridge doesn't cause this (it is real and
+// present for Kotlin-only collisions too, no Java involved); adding this is a real feature — a
+// navigation_expression arm here plus a Kotlin case in memberAccessReceiver/memberAccessField below
+// — not a bug fix, and is out of scope for this port.
 inline bool isMemberAccessNode( const char* t, Lang lang ) noexcept
 {
-    if( lang == Lang::Cpp || lang == Lang::ObjC ) { return std::strcmp( t, "field_expression" ) == 0; }
-    if( lang == Lang::Python )                    { return std::strcmp( t, "attribute" ) == 0; }
-    if( lang == Lang::Ruby )                      { return std::strcmp( t, "call" ) == 0; }
+    if( lang == Lang::Cpp || lang == Lang::ObjC ) { return kindIs( t, "field_expression" ); }
+    if( lang == Lang::Python )                    { return kindIs( t, "attribute" ); }
+    if( lang == Lang::Ruby )                      { return kindIs( t, "call" ); }
     return false;
 }
 
 inline TSNode memberAccessReceiver( TSNode access, Lang lang ) noexcept
 {
-    if( lang == Lang::Python ) { return ts_node_child_by_field_name( access, "object",   6 ); }
-    if( lang == Lang::Ruby )   { return ts_node_child_by_field_name( access, "receiver", 8 ); }
-    return ts_node_child_by_field_name( access, "argument", 8 );
+    if( lang == Lang::Python ) { return fieldChild( access, NodeField::Object ); }
+    if( lang == Lang::Ruby )   { return fieldChild( access, NodeField::Receiver ); }
+    return fieldChild( access, NodeField::Argument );
 }
 
 inline TSNode memberAccessField( TSNode access, Lang lang ) noexcept
 {
-    if( lang == Lang::Python ) { return ts_node_child_by_field_name( access, "attribute", 9 ); }
-    if( lang == Lang::Ruby )   { return ts_node_child_by_field_name( access, "method",    6 ); }
-    return ts_node_child_by_field_name( access, "field", 5 );
+    if( lang == Lang::Python ) { return fieldChild( access, NodeField::Attribute ); }
+    if( lang == Lang::Ruby )   { return fieldChild( access, NodeField::Method ); }
+    return fieldChild( access, NodeField::Field );
 }
 
 // The classified receiver of one call site. `var` is set for NamedVar / FieldOfVar, `field` for
-// FieldOfThis / FieldOfVar; both "" for None / ThisObj.
+// FieldOfThis / FieldOfVar; both "" for None / ThisObj. `viaArrow`: the call's own member access was written
+// `->` (C++/ObjC) — set by receiverOf only, which is the one caller that holds that access.
 struct RecvShape
 {
     RecvKind    kind = RecvKind::None;
     std::string var;
     std::string field;
+    bool        viaArrow = false;
+    bool        member = false;   // FE-A: Go/JS/TS/Rust — the callee is a member access's field (model.h Reference::memberCall)
+    std::string root;             // FE-A: that access's receiver-chain root identifier, "" when not an identifier
 };
+
+// FE-A (model.h Reference::memberRoot): the ROOT identifier of a Go/JS/TS/Rust receiver chain — `crypto` for
+// `crypto.subtle`, `this` for `this.a`, the package alias for `pkg.F`. Walks only member accesses (`a.b.c` →
+// `a`); any other receiver node (a call, `new X()`, a subscript, a literal, a parenthesized expression) has no
+// root identifier and answers "". `self` in Rust and `this` in JS answer their own spelling, so a consumer can
+// tell them from a package or a global object. Bounded by the chain's depth, which the tree bounds.
+inline std::string memberChainRoot( TSNode recv, std::string_view src )
+{
+    TSNode node = recv;
+    for( int depth = 0; depth < 64 && !ts_node_is_null( node ); ++depth )
+    {
+        const char* t = ts_node_type( node );
+        if( kindIs( t, "identifier" ) || kindIs( t, "this" ) || kindIs( t, "self" ) || kindIs( t, "package_identifier" ) )
+        {
+            return std::string( pattern::nodeText( node, src ) );
+        }
+        if( kindIs( t, "member_expression" ) )
+        {
+            node = fieldChild( node, NodeField::Object );
+        }
+        else if( kindIs( t, "selector_expression" ) )
+        {
+            node = fieldChild( node, NodeField::Operand );
+        }
+        else if( kindIs( t, "field_expression" ) )
+        {
+            node = fieldChild( node, NodeField::Value );
+        }
+        else
+        {
+            return {};
+        }
+    }
+    return {};
+}
+
+// FE-A: the member-access node kind and its receiver field for the languages whose receiverOf records no shape (Go, JS/TS,
+// Rust; and C, whose only member call is a call through a function-pointer field).
+inline TSNode memberOnlyReceiver( TSNode parent, Lang lang ) noexcept
+{
+    const char* t = ts_node_type( parent );
+    if( ( lang == Lang::TypeScript || lang == Lang::JavaScript ) && kindIs( t, "member_expression" ) )
+    {
+        return fieldChild( parent, NodeField::Object );
+    }
+    if( lang == Lang::Go && kindIs( t, "selector_expression" ) )
+    {
+        return fieldChild( parent, NodeField::Operand );
+    }
+    if( lang == Lang::Rust && kindIs( t, "field_expression" ) )
+    {
+        return fieldChild( parent, NodeField::Value );
+    }
+    if( lang == Lang::Rust && kindIs( t, "scoped_identifier" ) )
+    {
+        // a PATH call: `Type::f()`, `Self::f()`, `<T as Trait>::f()` — never bare, even when rustQualifierOf leaves the
+        // qualifier empty (the UFCS cast form), so FE-A must not read it as a receiverless call
+        return fieldChild( parent, NodeField::Path );
+    }
+    if( lang == Lang::C && kindIs( t, "field_expression" ) )
+    {
+        return fieldChild( parent, NodeField::Argument );   // `ops->open( x )`: a call through a function-pointer FIELD
+    }
+    return TSNode{};
+}
 
 // One receiver NODE → its RecvShape. `allowChain` is the ONE-hop bound: true at the call's immediate
 // receiver (a member-access receiver descends exactly one level, re-asking the same questions of its
 // INNER receiver), false inside that descent — so a depth-3 chain's inner member-access classifies None
 // and the whole chain degrades to the honest §2a split. `test/chainguardcheck.sh` arm (h) pins the
 // bound, and the residual it leaves, as disclosed.
+// Ruby's receiver node kinds that are not an (identifier), #267: `self`, and a class/module CONSTANT.
+// A class/module RECEIVER is its own node kind — `Calc` is (constant), `Outer::Engine` and
+// `::Top` are (scope_resolution) — never an (identifier). Without this helper every `Cls.m(…)` call
+// classified None, receiverOf stamped it FieldOfVar with an empty recvVar, and resolve.h's Rule 2c
+// ("the receiver token IS the type") could not fire on the one Ruby call form that carries a type.
+// The type name is the FINAL constant segment (`Outer::Engine` → `Engine`, `::Top` → `Top`): the same
+// final-segment convention Rule 2's type bindings use (`ns::Foo` → `Foo`), and the one that meets
+// Symbol::scope, which is the IMMEDIATE enclosing name by design (ingest_sidecap.h). A
+// (scope_resolution) whose `name:` child is not a (constant) is not a constant receiver and falls
+// through to the honest ladder. `Outer::run( 1 )` never arrives as a scope_resolution at all —
+// tree-sitter-ruby parses it as an ordinary (call) with a (constant) receiver, exactly like
+// `Outer.run( 1 )`, so both spellings narrow through the (constant) arm. test/rubyrecvnarrowcheck.sh.
+// The FINAL constant segment a (constant) / (scope_resolution) names — `Calc` → `Calc`, `Outer::Engine` → `Engine` —
+// or empty when the node is a (scope_resolution) whose `name:` is not a (constant). Callers have checked the kind.
+inline std::string_view rubyFinalConstant( TSNode node, std::string_view src )
+{
+    if( kindIs( ts_node_type( node ), "constant" ) )
+    {
+        return pattern::nodeText( node, src );
+    }
+    return fieldChildTextOfKind( node, NodeField::Name, "constant", src );
+}
+
+inline bool isRubyConstantNode( TSNode node ) noexcept
+{
+    const char* t = ts_node_type( node );
+    return kindIs( t, "constant" ) || kindIs( t, "scope_resolution" );
+}
+
+// An RSpec EXAMPLE GROUP call: describe/context (and the feature/example_group and x-/f- spellings), called bare or
+// on `RSpec`. 1 = a group, 2 = a SHARED group (shared_examples/_for, shared_context), 0 = neither. A shared group's
+// body runs inside whichever group INCLUDES it, so its described_class is not its lexical parent's.
+inline int rspecGroupKind( TSNode call, std::string_view src )
+{
+    const TSNode recv = fieldChild( call, NodeField::Receiver );
+    if( !ts_node_is_null( recv ) && !( kindIs( ts_node_type( recv ), "constant" ) && pattern::nodeText( recv, src ) == "RSpec" ) )
+    {
+        return 0;
+    }
+    const TSNode method = fieldChild( call, NodeField::Method );
+    if( ts_node_is_null( method ) )
+    {
+        return 0;
+    }
+    static constexpr std::string_view kGroups[] = { "describe", "context", "feature", "example_group",
+                                                    "xdescribe", "fdescribe", "xcontext", "fcontext" };
+    static constexpr std::string_view kShared[] = { "shared_examples", "shared_examples_for", "shared_context" };
+    const std::string_view m = pattern::nodeText( method, src );
+    if( std::ranges::find( kGroups, m ) != std::end( kGroups ) )
+    {
+        return 1;
+    }
+    return std::ranges::find( kShared, m ) != std::end( kShared ) ? 2 : 0;
+}
+
+// One example group's FIRST description argument, as RSpec reads it: nullopt when it is nil or a String (the parent
+// group's described class stands), otherwise the answer — a constant's final segment, or empty for anything else
+// (`describe :sym`, a variable), which names no class this tool can resolve.
+inline std::optional<std::string_view> rspecGroupArgument( TSNode call, std::string_view src )
+{
+    const TSNode args  = fieldChild( call, NodeField::Arguments );
+    const TSNode first = ts_node_is_null( args ) ? args : ts_node_named_child( args, 0 );
+    if( ts_node_is_null( first ) || kindIs( ts_node_type( first ), "string" ) || kindIs( ts_node_type( first ), "nil" ) )
+    {
+        return std::nullopt;
+    }
+    return isRubyConstantNode( first ) ? rubyFinalConstant( first, src ) : std::string_view {};
+}
+
+// True when the file defines a METHOD named described_class — any `:described_class` symbol (`let( :described_class )`,
+// `subject( :described_class )`, `define_method( :described_class )`) or `def described_class` / `def self.described_class`.
+// A method reaches every example in its group, so the file's sites decline (floor (e)). Conservative on purpose, but a
+// whole word: `:described_class_name` and `my_described_class` are other names.
+inline bool rubyDefinesDescribedClassMethod( std::string_view src ) noexcept
+{
+    static constexpr std::string_view kName = "described_class";
+    for( std::size_t at = src.find( kName ); at != std::string_view::npos; at = src.find( kName, at + kName.size() ) )
+    {
+        const std::size_t end = at + kName.size();
+        if( end < src.size() && ( namesplit::isIdentChar( src[ end ] ) || src[ end ] == '?' || src[ end ] == '!' ) )
+        {
+            continue;   // `described_class_name`, `described_class?` — another name
+        }
+        const std::string_view before = src.substr( 0, at );
+        if( before.ends_with( ':' ) || before.ends_with( "def " ) || before.ends_with( "def self." ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// How a Ruby node kind takes part in LOCAL scoping, for rubyDescribedClassIsLocal. A Closure (a block, a lambda) keeps
+// its locals in but sees the enclosing ones; a Wall (a def, a class, a module) sees no outer local; the Binds* kinds
+// bind a local — the `left:` child, the `name:` child (not a parameter's default value), or any child identifier.
+enum class RubyLocalRole : std::uint8_t { Closure, Wall, BindsLeft, BindsName, BindsChildren };
+struct RubyLocalKind
+{
+    std::string_view kind;
+    RubyLocalRole    role;
+};
+inline constexpr RubyLocalKind kRubyLocalKinds[] = {
+    { "block", RubyLocalRole::Closure },                        { "do_block", RubyLocalRole::Closure },
+    { "lambda", RubyLocalRole::Closure },                       { "method", RubyLocalRole::Wall },
+    { "singleton_method", RubyLocalRole::Wall },                { "class", RubyLocalRole::Wall },
+    { "singleton_class", RubyLocalRole::Wall },                 { "module", RubyLocalRole::Wall },
+    { "assignment", RubyLocalRole::BindsLeft },                 { "operator_assignment", RubyLocalRole::BindsLeft },
+    { "optional_parameter", RubyLocalRole::BindsName },         { "keyword_parameter", RubyLocalRole::BindsName },
+    { "block_parameters", RubyLocalRole::BindsChildren },       { "method_parameters", RubyLocalRole::BindsChildren },
+    { "lambda_parameters", RubyLocalRole::BindsChildren },      { "left_assignment_list", RubyLocalRole::BindsChildren },
+    { "destructured_left_assignment", RubyLocalRole::BindsChildren }, { "rest_assignment", RubyLocalRole::BindsChildren },
+    { "destructured_parameter", RubyLocalRole::BindsChildren }, { "splat_parameter", RubyLocalRole::BindsChildren },
+    { "hash_splat_parameter", RubyLocalRole::BindsChildren },   { "block_parameter", RubyLocalRole::BindsChildren },
+    { "exception_variable", RubyLocalRole::BindsChildren },
+};
+
+inline std::optional<RubyLocalRole> rubyLocalRole( const char* t ) noexcept
+{
+    const auto it = std::ranges::find( kRubyLocalKinds, std::string_view( t ), &RubyLocalKind::kind );
+    return it == std::end( kRubyLocalKinds ) ? std::nullopt : std::optional<RubyLocalRole>( it->role );
+}
+
+// True when `n`, whose kind plays `role`, itself BINDS the local described_class.
+inline bool rubyNodeBindsDescribedClass( TSNode n, std::optional<RubyLocalRole> role, std::string_view src )
+{
+    const auto named = [ & ]( TSNode c ) { return !ts_node_is_null( c ) && kindIs( ts_node_type( c ), "identifier" ) && pattern::nodeText( c, src ) == "described_class"; };
+    if( role == RubyLocalRole::BindsLeft || role == RubyLocalRole::BindsName )
+    {
+        return named( fieldChild( n, role == RubyLocalRole::BindsLeft ? NodeField::Left : NodeField::Name ) );
+    }
+    if( role != RubyLocalRole::BindsChildren )
+    {
+        return false;
+    }
+    const std::uint32_t cc = ts_node_named_child_count( n );
+    for( std::uint32_t i = 0; i < cc; ++i )
+    {
+        if( named( ts_node_named_child( n, i ) ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when a child of `n` that ENDS before byte `at` — an earlier statement, a block's or a def's parameters — binds
+// described_class, searched without entering a nested block, lambda, def, class or module, whose locals never reach
+// past it. `stack` is the caller's scratch, so a hostile nesting depth costs heap, not stack.
+inline bool rubyEarlierChildBindsDescribedClass( TSNode n, std::uint32_t at, std::string_view src, std::vector<TSNode>& stack )
+{
+    stack.clear();
+    const std::uint32_t cc = ts_node_named_child_count( n );
+    for( std::uint32_t i = 0; i < cc && ts_node_end_byte( ts_node_named_child( n, i ) ) <= at; ++i )
+    {
+        stack.push_back( ts_node_named_child( n, i ) );
+    }
+    while( !stack.empty() )
+    {
+        const TSNode cur = stack.back();
+        stack.pop_back();
+        const std::optional<RubyLocalRole> role = rubyLocalRole( ts_node_type( cur ) );
+        if( rubyNodeBindsDescribedClass( cur, role, src ) )
+        {
+            return true;
+        }
+        if( role == RubyLocalRole::Closure || role == RubyLocalRole::Wall )
+        {
+            continue;   // a nested scope's locals never reach the site
+        }
+        const std::uint32_t kids = ts_node_named_child_count( cur );
+        for( std::uint32_t i = 0; i < kids; ++i )
+        {
+            stack.push_back( ts_node_named_child( cur, i ) );
+        }
+    }
+    return false;
+}
+
+// True when the (identifier) `site` reads a LOCAL named described_class, not RSpec's method — Ruby's own rule: a local
+// is visible after its binding, in its own scope and in the blocks nested inside it. So the walk climbs from the site,
+// searching each enclosing node's earlier children, and stops after the first def, class or module. An enclosing
+// assignment counts too: in `described_class = described_class.m` the right side already reads the local. Floor (e).
+inline bool rubyDescribedClassIsLocal( TSNode site, std::string_view src )
+{
+    const std::uint32_t at = ts_node_start_byte( site );
+    std::vector<TSNode> stack;
+    for( TSNode n = ts_node_parent( site ); !ts_node_is_null( n ); n = ts_node_parent( n ) )
+    {
+        const std::optional<RubyLocalRole> role = rubyLocalRole( ts_node_type( n ) );
+        if( rubyNodeBindsDescribedClass( n, role, src ) || rubyEarlierChildBindsDescribedClass( n, at, src, stack ) )
+        {
+            return true;
+        }
+        if( role == RubyLocalRole::Wall )
+        {
+            break;   // a def, class or module: no outer local reaches in
+        }
+    }
+    return false;
+}
+
+// RSpec's `described_class` — a bare (identifier) receiver no binding names — read as the constant it IS. RSpec's
+// own rule (rspec-core 3.13, Metadata::ExampleGroupHash#described_class): a group's described class is its FIRST
+// description argument unless that is nil or a String; otherwise it is the parent group's. So the walk climbs the
+// enclosing calls whose BLOCK holds the site (the child it came from is a do_block/block), and the innermost example
+// group with a constant first argument answers. A string or absent argument passes outward; any other argument
+// (`describe :sym`, a variable) and a shared group stop the walk with no answer, and the site is left exactly as it
+// was. test/rubydescribedclasscheck.sh.
+inline std::string_view rspecDescribedClass( TSNode node, std::string_view src )
+{
+    TSNode prev = node;
+    for( TSNode n = ts_node_parent( node ); !ts_node_is_null( n ); prev = n, n = ts_node_parent( n ) )
+    {
+        const char* pt = ts_node_type( prev );
+        if( !kindIs( ts_node_type( n ), "call" ) || !( kindIs( pt, "do_block" ) || kindIs( pt, "block" ) ) )
+        {
+            continue;   // not a call, or the site is in its receiver/arguments rather than its block
+        }
+        const int group = rspecGroupKind( n, src );
+        if( group == 2 )
+        {
+            return {};  // a shared group: its body runs in whichever group includes it
+        }
+        if( group == 1 )
+        {
+            if( const std::optional<std::string_view> arg = rspecGroupArgument( n, src ) )
+            {
+                return *arg;
+            }
+        }
+    }
+    return {};
+}
+
+// nullopt when the node is neither (classifyReceiver's shared arms decide it); otherwise the answer, which is empty for a
+// (scope_resolution) whose `name:` is not a (constant).
+inline std::optional<RecvShape> classifyRubyReceiver( TSNode node, std::string_view src )
+{
+    const char* rt = ts_node_type( node );
+    if( kindIs( rt, "self" ) )
+    {
+        return RecvShape { RecvKind::ThisObj, {}, {} }; // Ruby `self` — its own node kind, not an identifier
+    }
+    if( kindIs( rt, "identifier" ) && pattern::nodeText( node, src ) == "described_class" )
+    {
+        const bool             redefined = rubyDefinesDescribedClassMethod( src ) || rubyDescribedClassIsLocal( node, src );
+        const std::string_view cls       = redefined ? std::string_view {} : rspecDescribedClass( node, src );
+        if( cls.empty() )
+        {
+            return std::nullopt;   // redefined, or no constant-described group encloses it: the identifier arm answers as before
+        }
+        return RecvShape { RecvKind::NamedVar, std::string( cls ), {} };             // the group's constant — Rule 2c fuel
+    }
+    if( !isRubyConstantNode( node ) )
+    {
+        return std::nullopt;
+    }
+    const std::string_view v = rubyFinalConstant( node, src );
+    if( v.empty() )
+    {
+        return RecvShape {};
+    }
+    return RecvShape { RecvKind::NamedVar, std::string( v ), {} };                  // Rule 2c fuel
+}
+
 inline RecvShape classifyReceiver( TSNode node, Lang lang, std::string_view src, bool allowChain )
 {
     const char* rt = ts_node_type( node );
-    if( std::strcmp( rt, "this" ) == 0 )
+    if( kindIs( rt, "this" ) )
     {
         return { RecvKind::ThisObj, {}, {} }; // C++ `this`
     }
-    if( lang == Lang::Ruby && std::strcmp( rt, "self" ) == 0 )
+    if( lang == Lang::Ruby )
     {
-        return { RecvKind::ThisObj, {}, {} }; // Ruby `self` — its own node kind, not an identifier
+        if( std::optional<RecvShape> ruby = classifyRubyReceiver( node, src ) )
+        {
+            return std::move( *ruby );   // `self`, or a class/module constant receiver (classifyRubyReceiver)
+        }
     }
-    if( std::strcmp( rt, "identifier" ) == 0 )
+    if( kindIs( rt, "identifier" ) )
     {
         const std::string_view v = pattern::nodeText( node, src );
         if( v.empty() )
@@ -88,10 +434,10 @@ inline RecvShape classifyReceiver( TSNode node, Lang lang, std::string_view src,
         }
         return { RecvKind::NamedVar, std::string( v ), {} };                          // `x` — Rule 2 fuel
     }
-    if( lang == Lang::Python && std::strcmp( rt, "call" ) == 0 )
+    if( lang == Lang::Python && kindIs( rt, "call" ) )
     { // Phase 5: `super().m()` / `super(C, self).m()` — the receiver is a CALL of the identifier `super`
-        const TSNode fn = ts_node_child_by_field_name( node, "function", 8 );
-        if( !ts_node_is_null( fn ) && std::strcmp( ts_node_type( fn ), "identifier" ) == 0 && pattern::nodeText( fn, src ) == "super" )
+        const TSNode fn = fieldChild( node, NodeField::Function );
+        if( !ts_node_is_null( fn ) && kindIs( ts_node_type( fn ), "identifier" ) && pattern::nodeText( fn, src ) == "super" )
         {
             return { RecvKind::SuperObj, {}, {} };
         }
@@ -107,7 +453,7 @@ inline RecvShape classifyReceiver( TSNode node, Lang lang, std::string_view src,
         }
         // the intermediate must be a plain NAME — a template/computed/parenthesized form is not a field
         const char* ift = ts_node_type( innerField );
-        if( std::strcmp( ift, "field_identifier" ) != 0 && std::strcmp( ift, "identifier" ) != 0 )
+        if( !kindIs( ift, "field_identifier" ) && !kindIs( ift, "identifier" ) )
         {
             return {};
         }
@@ -128,6 +474,189 @@ inline RecvShape classifyReceiver( TSNode node, Lang lang, std::string_view src,
         return {};   // depth-3 or richer base → not decidable in one hop; degrade to §2a
     }
     return {};   // parenthesized / subscripted / call receiver → not one-hop
+}
+
+// TS/JS literal-receiver kinds (issue #163). A member call whose receiver type the syntax already
+// proves is a built-in; it must not take the bare-name ladder. Object literals, identifier
+// receivers, this, casts, and element-returning links stay RecvKind::None. Do NOT widen
+// isMemberAccessNode — every recv==None guard would then see every TS/JS member call.
+inline RecvKind jsLiteralKindOf( const char* t ) noexcept
+{
+    if( kindIs( t, "string" ) || kindIs( t, "template_string" ) )
+    {
+        return RecvKind::LitString;
+    }
+    if( kindIs( t, "array" ) )
+    {
+        return RecvKind::LitArray;
+    }
+    if( kindIs( t, "regex" ) )
+    {
+        return RecvKind::LitRegex;
+    }
+    if( kindIs( t, "number" ) )
+    {
+        return RecvKind::LitNumber;
+    }
+    if( kindIs( t, "true" ) || kindIs( t, "false" ) )
+    {
+        return RecvKind::LitBoolean;
+    }
+    return RecvKind::None;
+}
+
+struct JsLitChainRow
+{
+    RecvKind    from;
+    const char* method;
+    RecvKind    to;
+};
+
+// Certain (from, method) → result kind. Anything not listed ends certainty (find/at/pop/shift/reduce,
+// subscript, non-null !, casts). Keep this table the single place a chain link is decided.
+inline RecvKind jsLitChainResult( RecvKind from, std::string_view method ) noexcept
+{
+    static constexpr JsLitChainRow kRows[] = {
+        { RecvKind::LitString,  "charAt",             RecvKind::LitString  },
+        { RecvKind::LitString,  "concat",             RecvKind::LitString  },
+        { RecvKind::LitString,  "normalize",          RecvKind::LitString  },
+        { RecvKind::LitString,  "padEnd",             RecvKind::LitString  },
+        { RecvKind::LitString,  "padStart",           RecvKind::LitString  },
+        { RecvKind::LitString,  "repeat",             RecvKind::LitString  },
+        { RecvKind::LitString,  "replace",            RecvKind::LitString  },
+        { RecvKind::LitString,  "replaceAll",         RecvKind::LitString  },
+        { RecvKind::LitString,  "slice",              RecvKind::LitString  },
+        { RecvKind::LitString,  "split",              RecvKind::LitArray   },
+        { RecvKind::LitString,  "substr",             RecvKind::LitString  },
+        { RecvKind::LitString,  "substring",          RecvKind::LitString  },
+        { RecvKind::LitString,  "toLocaleLowerCase",  RecvKind::LitString  },
+        { RecvKind::LitString,  "toLocaleUpperCase",  RecvKind::LitString  },
+        { RecvKind::LitString,  "toLowerCase",        RecvKind::LitString  },
+        { RecvKind::LitString,  "toString",           RecvKind::LitString  },
+        { RecvKind::LitString,  "toUpperCase",        RecvKind::LitString  },
+        { RecvKind::LitString,  "trim",               RecvKind::LitString  },
+        { RecvKind::LitString,  "trimEnd",            RecvKind::LitString  },
+        { RecvKind::LitString,  "trimLeft",           RecvKind::LitString  },
+        { RecvKind::LitString,  "trimRight",          RecvKind::LitString  },
+        { RecvKind::LitString,  "trimStart",          RecvKind::LitString  },
+        { RecvKind::LitString,  "valueOf",            RecvKind::LitString  },
+        { RecvKind::LitArray,   "concat",             RecvKind::LitArray   },
+        { RecvKind::LitArray,   "copyWithin",         RecvKind::LitArray   },
+        { RecvKind::LitArray,   "fill",               RecvKind::LitArray   },
+        { RecvKind::LitArray,   "filter",             RecvKind::LitArray   },
+        { RecvKind::LitArray,   "flat",               RecvKind::LitArray   },
+        { RecvKind::LitArray,   "flatMap",            RecvKind::LitArray   },
+        { RecvKind::LitArray,   "join",               RecvKind::LitString  },
+        { RecvKind::LitArray,   "map",                RecvKind::LitArray   },
+        { RecvKind::LitArray,   "reverse",            RecvKind::LitArray   },
+        { RecvKind::LitArray,   "slice",              RecvKind::LitArray   },
+        { RecvKind::LitArray,   "sort",               RecvKind::LitArray   },
+        { RecvKind::LitArray,   "toLocaleString",     RecvKind::LitString  },
+        { RecvKind::LitArray,   "toReversed",         RecvKind::LitArray   },
+        { RecvKind::LitArray,   "toSorted",           RecvKind::LitArray   },
+        { RecvKind::LitArray,   "toSpliced",          RecvKind::LitArray   },
+        { RecvKind::LitArray,   "toString",           RecvKind::LitString  },
+        { RecvKind::LitArray,   "with",               RecvKind::LitArray   },
+        { RecvKind::LitRegex,   "test",               RecvKind::LitBoolean },
+        { RecvKind::LitNumber,  "toExponential",      RecvKind::LitString  },
+        { RecvKind::LitNumber,  "toFixed",            RecvKind::LitString  },
+        { RecvKind::LitNumber,  "toPrecision",        RecvKind::LitString  },
+        { RecvKind::LitNumber,  "toString",           RecvKind::LitString  },
+        { RecvKind::LitBoolean, "toString",           RecvKind::LitString  },
+    };
+    for( const JsLitChainRow& row : kRows )
+    {
+        if( row.from == from && method == row.method )
+        {
+            return row.to;
+        }
+    }
+    return RecvKind::None;
+}
+
+inline RecvKind classifyJsTsLiteralRecv( TSNode node, std::string_view src, int depth ) noexcept
+{
+    if( depth > 16 || ts_node_is_null( node ) )
+    {
+        return RecvKind::None;
+    }
+    const char* t = ts_node_type( node );
+    if( kindIs( t, "parenthesized_expression" ) )
+    {
+        return classifyJsTsLiteralRecv( ts_node_named_child( node, 0 ), src, depth + 1 );
+    }
+    // A SIGNED numeric literal — (-1).toFixed(), (+2).toFixed() — is a number receiver: the grammar spells the sign as a
+    // unary operator over a `number` node, so without this it classified as no literal at all and the call could bind an
+    // unrelated in-repo toFixed. Only + and - over a number: `!1`, `typeof 1` and `-x` are not number literals.
+    if( kindIs( t, "unary_expression" ) )
+    {
+        const TSNode sign = fieldChild( node, NodeField::Operator );
+        const TSNode arg  = fieldChild( node, NodeField::Argument );
+        if( !ts_node_is_null( sign ) && !ts_node_is_null( arg ) && kindIs( ts_node_type( arg ), "number" ) )
+        {
+            const std::string_view op = pattern::nodeText( sign, src );
+            if( op == "-" || op == "+" )
+            {
+                return RecvKind::LitNumber;
+            }
+        }
+        return RecvKind::None;
+    }
+    if( kindIs( t, "as_expression" ) || kindIs( t, "satisfies_expression" )
+        || kindIs( t, "type_assertion" ) || kindIs( t, "non_null_expression" )
+        || kindIs( t, "subscript_expression" ) )
+    {
+        return RecvKind::None;
+    }
+    const RecvKind lit = jsLiteralKindOf( t );
+    if( lit != RecvKind::None )
+    {
+        return lit;
+    }
+    if( !kindIs( t, "call_expression" ) )
+    {
+        return RecvKind::None;
+    }
+    const TSNode fn = fieldChild( node, NodeField::Function );
+    if( ts_node_is_null( fn ) || !kindIs( ts_node_type( fn ), "member_expression" ) )
+    {
+        return RecvKind::None;
+    }
+    const TSNode prop = fieldChild( fn, NodeField::Property );
+    const TSNode obj  = fieldChild( fn, NodeField::Object );
+    if( ts_node_is_null( prop ) || ts_node_is_null( obj ) )
+    {
+        return RecvKind::None;
+    }
+    const RecvKind inner = classifyJsTsLiteralRecv( obj, src, depth + 1 );
+    if( inner == RecvKind::None )
+    {
+        return RecvKind::None;
+    }
+    return jsLitChainResult( inner, pattern::nodeText( prop, src ) );
+}
+
+// The node a call's @name hangs under once the C++ template-argument wrappers are stepped over. For
+// `x.m()` that is the name's own parent. `x.m<T>()` puts ONE wrapper between them — field_expression
+// field: (template_method name: m arguments: …) — and the disambiguated `x.template m<T>()` a second —
+// field: (dependent_name (template_method …)) — so the climb steps over exactly those two kinds, in that
+// order, and a name under any other parent keeps the parent it had. Both kinds are tree-sitter-cpp's (the
+// CUDA grammar is generated from it); no other grammar names either, so the climb is inert everywhere else.
+// A template_method that is not a member callee (a qualified definition's declarator) climbs to a parent
+// that is no member access, which every caller already reads as "not a member call".
+inline TSNode calleeAccessParent( TSNode nameNode ) noexcept
+{
+    TSNode parent = ts_node_parent( nameNode );
+    if( ts_node_is_null( parent ) || !kindIs( ts_node_type( parent ), "template_method" ) )
+    {
+        return parent;
+    }
+    parent = ts_node_parent( parent );
+    if( !ts_node_is_null( parent ) && kindIs( ts_node_type( parent ), "dependent_name" ) )
+    {
+        parent = ts_node_parent( parent );
+    }
+    return parent;
 }
 
 // P2-D RECEIVER capture: classify the call-site receiver of `recv.method()` / `recv->method()` so
@@ -152,12 +681,35 @@ inline RecvShape classifyReceiver( TSNode node, Lang lang, std::string_view src,
 //     bound: the depth-3 call now takes the honest ladder, never Rule 1's enclosing-class pin.
 // Pure-syntactic, deterministic, allocation-light: at most two short identifier copies, and none at all
 // for the None/ThisObj shapes that dominate.
+// TS/JS: a member_expression whose object is a certain literal (or a chain that stays certain) returns
+// LitString/LitArray/LitRegex/LitNumber/LitBoolean instead of None. isMemberAccessNode stays false for
+// TS/JS so every other member call is still RecvKind::None.
+//
+// The parent it inspects is calleeAccessParent's, not the raw parent: a C++ member call with explicit
+// template arguments puts a template_method (and, behind `template`, a dependent_name) between the name and
+// its field_expression. Read through the raw parent, `other.f<T>()` classified None — a BARE call — and the
+// enclosing-class rule pinned it to the caller's own same-named method (test/cppqualcheck.sh §12 (d)).
 inline RecvShape receiverOf( TSNode nameNode, Lang lang, std::string_view src )
 {
-    const TSNode parent = ts_node_parent( nameNode );
+    const TSNode parent = calleeAccessParent( nameNode );
     if( ts_node_is_null( parent ) )
     {
         return {};
+    }
+    if( const TSNode obj = memberOnlyReceiver( parent, lang ); !ts_node_is_null( obj ) )
+    {
+        if( lang == Lang::TypeScript || lang == Lang::JavaScript )
+        {
+            const RecvKind lit = classifyJsTsLiteralRecv( obj, src, 0 );
+            if( lit != RecvKind::None )
+            {
+                return { lit, {}, {} };
+            }
+        }
+        RecvShape member;   // recv stays None (non-literal TS/JS, every Go/Rust member call); FE-A marks the shape
+        member.member = true;
+        member.root   = memberChainRoot( obj, src );
+        return member;
     }
     if( !isMemberAccessNode( ts_node_type( parent ), lang ) )
     {
@@ -170,6 +722,8 @@ inline RecvShape receiverOf( TSNode nameNode, Lang lang, std::string_view src )
         return {};
     }
     RecvShape rs = classifyReceiver( recvNode, lang, src, /*allowChain=*/ true );
+    // `p->m()` against `p.m()`: on a std smart pointer member only `->` reaches the pointee (Rule 2b, fieldnarrowcheck arm p)
+    rs.viaArrow  = ( lang == Lang::Cpp || lang == Lang::ObjC ) && nodeFieldText( parent, NodeField::Operator, src ) == "->";
     if( rs.kind == RecvKind::None )
     {
         // Phase 5 (docs/EVALS.md "Phase 5", kParserVer 77): a member access whose receiver is too rich to
@@ -184,13 +738,45 @@ inline RecvShape receiverOf( TSNode nameNode, Lang lang, std::string_view src )
     return rs;
 }
 
+// Java method references are not ordinary member-access nodes. The pinned grammar's first named
+// child is the receiver and deliberately uses the SAME `identifier` node for a simple type and a
+// variable. Preserve that uncertainty for graph.h: simple and dotted type candidates are retained
+// as JavaTypeCandidate with the receiver text (`Widget`, `Outer.Inner`, `com.example.Widget`);
+// `this`, `super`, arbitrary expressions, and `Type::new` remain unresolved here. The resolver
+// proves a type receiver from indexed class names and lexical shadowing at the site — it does
+// not require every dotted segment to be a class (package prefixes are not classes).
+// The member-name query already excludes `new`.
+inline RecvShape javaMethodReferenceReceiver( TSNode roleNode, std::string_view src )
+{
+    RecvShape out;
+    if( ts_node_is_null( roleNode ) || !kindIs( ts_node_type( roleNode ), "method_reference" ) )
+    {
+        return out;
+    }
+    out.kind = RecvKind::JavaTypeCandidate;
+    if( ts_node_named_child_count( roleNode ) == 0 )
+    {
+        return out;
+    }
+    const TSNode receiver = ts_node_named_child( roleNode, 0 );
+    if( kindIs( ts_node_type( receiver ), "identifier" ) )
+    {
+        out.var = std::string( nodeTextOf( receiver, src ) );
+    }
+    else if( kindIs( ts_node_type( receiver ), "field_access" ) )
+    {
+        out.var = std::string( nodeTextOf( receiver, src ) );
+    }
+    return out;
+}
+
 // ── P2-D Rule 2 LOCAL-VARIABLE TYPE BINDING capture (`Foo x;` → x:Foo) ───────────────────────────────
 // Walk a node subtree and emit one RawBind per local variable whose TYPE is syntactically decidable, so a
 // later `x.m()`/`x->m()` can narrow to `typeName::m`. Pure-syntactic, deterministic, allocation-light:
 // it reads exactly the declaration/assignment shapes ground-truthed from the grammars (see the gate fixtures).
-//   * The recorded typeName is the WRITTEN type's final segment (`ns::Foo` → `Foo`). It is matched against
-//     class/struct symbol NAMES in buildGraph, which is the conservative safety net: an inferred type from a
-//     constructor-call (`auto x = Foo()`) only narrows if `Foo` actually names a class — else it drops.
+//   * The recorded typeName is the WRITTEN type's final segment (`ns::Foo` → `Foo`). Rule 2 matches it as the scope
+//     of the called method, so an inferred type from a constructor-call (`auto x = Foo()`) only narrows if `Foo`
+//     defines the method; an ASSIGNMENT's inferred type is dropped in buildGraph unless a class of that name exists.
 //   * Only the named-receiver shape is useful downstream, so only bare-identifier targets are recorded
 //     (member targets `self.x`/`obj.f` are not — `receiverOf` doesn't capture those as recvVar either).
 
@@ -201,13 +787,13 @@ inline std::string_view declaratorVarName( TSNode decl, std::string_view src )
     for( int guard = 0; guard < 8 && !ts_node_is_null( decl ); ++guard )
     {
         const char* dt = ts_node_type( decl );
-        if( std::strcmp( dt, "identifier" ) == 0 )
+        if( kindIs( dt, "identifier" ) )
         {
             const std::uint32_t a = ts_node_start_byte( decl ), b = ts_node_end_byte( decl );
             return ( a <= b && b <= src.size() ) ? src.substr( a, b - a ) : std::string_view{};
         }
         // unwrap a pointer/reference/parenthesized declarator to its inner `declarator` child
-        const TSNode inner = ts_node_child_by_field_name( decl, "declarator", 10 );
+        const TSNode inner = fieldChild( decl, NodeField::Declarator );
         if( ts_node_is_null( inner ) )
         {
             return {};
@@ -221,52 +807,88 @@ inline std::string_view declaratorVarName( TSNode decl, std::string_view src )
 // answer plus one shape it refuses on purpose: a reference_declarator holds its inner declarator as an UNNAMED
 // child (`Counter& c` — the `&` is the only anonymous sibling), so the `declarator` field probe is null there.
 // Unwrapped HERE, for the ParamType record alone — widening declaratorVarName itself would mint Rule-2 Type
-// records for `Foo& x = …` locals too and move call edges outside this round's gate.
+// records for `Foo& x = …` locals too, which Rule 2's flat per-function table would leak past their scope
+// (ParamType records reach Rule 2 only through the lexical lookup, resolve.h buildScopedRecvDecls).
 inline std::string_view paramDeclaratorVarName( TSNode decl, std::string_view src )
 {
-    if( !ts_node_is_null( decl ) && std::strcmp( ts_node_type( decl ), "reference_declarator" ) == 0
-        && ts_node_is_null( ts_node_child_by_field_name( decl, "declarator", 10 ) ) && ts_node_named_child_count( decl ) > 0 )
+    if( !ts_node_is_null( decl ) && kindIs( ts_node_type( decl ), "reference_declarator" )
+        && ts_node_is_null( fieldChild( decl, NodeField::Declarator ) ) && ts_node_named_child_count( decl ) > 0 )
     {
         decl = ts_node_named_child( decl, 0 );
     }
     return declaratorVarName( decl, src );
 }
 
+// the node a C++ type or constructor NAME ends in, read through the grammar's own fields — a qualified name's `name`,
+// then a template-id's `name`: `Vec<Decl *>` and `ll::Vec<Decl *>` end in `Vec`, `Outer<int>::Inner` in `Inner`. The
+// spelling is never cut as text: finalSegment() truncates at the FIRST `<`, which read `Outer<int>::Inner` as `Outer`
+// (test/narrowcheck.sh arm 41). Every other kind is its own last name. Each step moves to a child, so the walk ends; a
+// missing `name` field (error recovery) reads as a null node, whose text is "".
+inline TSNode lastNameNode( TSNode n ) noexcept
+{
+    while( !ts_node_is_null( n ) )
+    {
+        const char* t = ts_node_type( n );
+        if( !kindIs( t, "qualified_identifier" ) && !kindIs( t, "template_type" ) && !kindIs( t, "template_function" ) )
+        {
+            break;
+        }
+        n = fieldChild( n, NodeField::Name );
+    }
+    return n;
+}
+
 // the type NAME of a constructor-style RHS value node: `Foo()` (call_expression) or `new Foo()`
-// (new_expression). Final segment of the callee/constructor identifier. "" if the value isn't a
-// plain constructor call (so `auto x = makeFoo()` infers nothing here unless `makeFoo` names a class —
-// and the class-name filter in buildGraph is what makes that safe).
-inline std::string ctorTypeOf( TSNode value, std::string_view src )
+// (new_expression). Last name of the callee/constructor identifier. "" if the value isn't a
+// plain constructor call. A plain FUNCTION call is not told apart: `auto x = makeFoo()` records `makeFoo`, which names
+// no class and never narrows (graph.h's varType note) — but it still conflicts with the variable's other declarations
+// in Rule 2's flat table, and a conflict tombstones the variable. The assignment `x = makeFoo()` records it too;
+// assignedTypeOf marks that one, and buildGraph keeps it only when a class names it (resolve.h assignmentNamesNoClass).
+inline TSNode ctorNameNode( TSNode value )
 {
     if( ts_node_is_null( value ) )
     {
-        return {};
+        return TSNode{};
     }
     const char* vt = ts_node_type( value );
     TSNode      idn {};
-    if( std::strcmp( vt, "call_expression" ) == 0 )
+    if( kindIs( vt, "call_expression" ) )
     { // C++/TS `Foo()`
-        idn = ts_node_child_by_field_name( value, "function", 8 );
+        idn = fieldChild( value, NodeField::Function );
     }
-    else if( std::strcmp( vt, "new_expression" ) == 0 )
+    else if( kindIs( vt, "new_expression" ) )
     { // C++/TS `new Foo()`
-        idn = ts_node_child_by_field_name( value, "constructor", 11 );
+        idn = fieldChild( value, NodeField::Constructor );
     }
     if( ts_node_is_null( idn ) )
     {
-        return {};
+        return TSNode{};
     }
     const char* it = ts_node_type( idn );
-    if( std::strcmp( it, "identifier" ) != 0 && std::strcmp( it, "type_identifier" ) != 0 && std::strcmp( it, "qualified_identifier" ) != 0 && std::strcmp( it, "scoped_identifier" ) != 0 )
+    // An unqualified template-id callee (`Vec<T>()`) is refused, a STATED FLOOR (test/narrowcheck.sh arm 39d): the same
+    // spelling is every cast helper, and accepting it records `dyn_cast` / `cast` as the type of `auto *CI =
+    // dyn_cast<CallInst>( I )` — a name that conflicts with the declaration's written type (`const ConstantInt *CI =
+    // dyn_cast<ConstantInt>( V )`) or with a second declaration of the variable, and the conflict tombstones it. Measured on
+    // integration/train-3 (llvm-project 4d5358b1d, 2026-09-17): accepting it moves 463 call sites, 324 of them edges lost
+    // and 2 gained; rocksdb moves none. (On main, before #278 dropped an ASSIGNMENT's callee name, `Spec =
+    // cast<FunctionDecl>( F )` tombstoned too: 994 moved, 779 lost.) The class a cast names
+    // is its template ARGUMENT, which a name-only record cannot tell from a constructor's. The QUALIFIED spelling
+    // (`llvm::cast<T>( x )`) still records its last name the same way, as it did before this floor was written.
+    if( !kindIs( it, "identifier" ) && !kindIs( it, "type_identifier" ) && !kindIs( it, "qualified_identifier" ) && !kindIs( it, "scoped_identifier" ) )
     {
-        return {};
+        return TSNode{};
     }
-    const std::uint32_t a = ts_node_start_byte( idn ), b = ts_node_end_byte( idn );
-    return ( a <= b && b <= src.size() ) ? finalSegment( src.substr( a, b - a ) ) : std::string{};
+    return idn;
 }
 
-// the written type name of a `type:`-field type node (`type_identifier`, or a qualified/scoped one). "" for
-// `auto`/`placeholder_type_specifier`/templated/decltype types — those fall back to constructor inference.
+inline std::string ctorTypeOf( TSNode value, std::string_view src )
+{
+    return finalSegment( nodeTextOf( lastNameNode( ctorNameNode( value ) ), src ) );   // a null node reads "", and "" splits to ""
+}
+
+// the written type name of a `type:`-field type node — a `type_identifier`, a qualified one or a template-id — as its
+// last name (lastNameNode: `Vec<Decl *>` → `Vec`, `Outer<int>::Inner` → `Inner`). "" for `auto`/decltype/dependent
+// types — those fall back to constructor inference.
 inline std::string writtenTypeOf( TSNode typeNode, std::string_view src )
 {
     if( ts_node_is_null( typeNode ) )
@@ -274,13 +896,74 @@ inline std::string writtenTypeOf( TSNode typeNode, std::string_view src )
         return {};
     }
     const char* tt = ts_node_type( typeNode );
-    if( std::strcmp( tt, "type_identifier" ) == 0 || std::strcmp( tt, "qualified_identifier" ) == 0
-        || std::strcmp( tt, "scoped_type_identifier" ) == 0 )
+    if( kindIs( tt, "type_identifier" ) || kindIs( tt, "qualified_identifier" ) || kindIs( tt, "template_type" ) )
     {
-        const std::uint32_t a = ts_node_start_byte( typeNode ), b = ts_node_end_byte( typeNode );
-        return ( a <= b && b <= src.size() ) ? finalSegment( src.substr( a, b - a ) ) : std::string{};
+        return finalSegment( nodeTextOf( lastNameNode( typeNode ), src ) );
     }
-    return {};   // auto / template / decltype — type not directly written → try the initializer
+    return {};   // auto / decltype / dependent — type not directly written → try the initializer
+}
+
+// Rule 2's qualifier guard (2026-09-16, test/narrowcheck.sh arms 17-24): the text of a type or constructor NAME node
+// when it is QUALIFIED — a qualified name on its way to the last name has a scope (`std::map<K, V>`, `ext::Widget`,
+// `Outer<int>::Inner`; a leading global `::` alone has none) — else "". writtenTypeOf/ctorTypeOf keep the last name
+// alone, and Rule 2 matches it against class names that carry no namespace, so `const std::map<K, V>& ref` read as
+// `map` and narrowed to an unrelated in-repo `map` (measured on a private C++ corpus). The whole text rides the
+// Type/ParamType record in RawBind::importedName; Rule 2 refuses to narrow on a `std::` one (resolve.h namesStdType)
+// and keeps every other. A template ARGUMENT's `::` qualifies nothing: `Vec<std::string>` is unqualified (arm 40).
+inline std::string qualifiedNameText( TSNode nameNode, std::string_view src )
+{
+    bool scoped = false;
+    for( TSNode n = nameNode; !scoped && !ts_node_is_null( n ) && kindIs( ts_node_type( n ), "qualified_identifier" ); n = fieldChild( n, NodeField::Name ) )
+    {
+        scoped = !ts_node_is_null( fieldChild( n, NodeField::Scope ) );
+    }
+    if( !scoped )
+    {
+        return {};
+    }
+    std::string_view text = nodeTextOf( nameNode, src );
+    while( !text.empty() && ( text.front() == ' ' || text.front() == ':' ) )
+    {
+        text.remove_prefix( 1 );   // a leading `::` names the global namespace — not a qualifier
+    }
+    return std::string( text );
+}
+
+// one declaration's recorded type: the name Rule 2 matches (the final segment) and, when the type was written
+// QUALIFIED, its whole text — carried together so no emitter can record one without the other — and whether an
+// ASSIGNMENT's callee supplied it rather than a declaration (assignedTypeOf).
+struct DeclType
+{
+    std::string name;
+    std::string qualified;
+    bool        isFromAssignment = false;
+};
+
+// a type or constructor NAME node's DeclType
+inline DeclType declTypeOfName( TSNode typeNode, std::string_view src )
+{
+    return DeclType{ writtenTypeOf( typeNode, src ), qualifiedNameText( typeNode, src ) };
+}
+
+// a declarator's recorded type: the declaration's WRITTEN type when it has one, else the type of the constructor its
+// initializer calls (`auto x = Foo()`, `auto x = ns::Foo()`)
+inline DeclType declaredTypeOf( const DeclType& written, TSNode value, std::string_view src )
+{
+    if( !written.name.empty() )
+    {
+        return written;
+    }
+    return DeclType{ ctorTypeOf( value, src ), qualifiedNameText( ctorNameNode( value ), src ) };
+}
+
+// a C++ ASSIGNMENT's recorded type (`x = Foo()`, `x = new Foo()`): the callee's, marked as an assignment's. The grammar
+// cannot tell a constructor from a function here — `t = llvm::cast<Target>( y )` reads `cast` — and an assignment
+// declares nothing, so graph.h keeps the record only when a class of that name exists (resolve.h assignmentNamesNoClass).
+inline DeclType assignedTypeOf( TSNode value, std::string_view src )
+{
+    DeclType type = declaredTypeOf( DeclType{}, value, src );
+    type.isFromAssignment = true;
+    return type;
 }
 
 // ── L3 fn-pointer/callback binding capture helpers ───────────────────────────────────────────────────
@@ -299,21 +982,21 @@ inline std::string fnBindTargetOf( TSNode value, std::string_view src, bool& was
         return {};
     }
     const char* vt = ts_node_type( value );
-    if( std::strcmp( vt, "lambda_expression" ) == 0 )
+    if( kindIs( vt, "lambda_expression" ) )
     {
         return std::string( kFnBindLambdaTarget );
     }
     TSNode idn       = value;
     bool   addressOf = false;
-    if( std::strcmp( vt, "pointer_expression" ) == 0 )
+    if( kindIs( vt, "pointer_expression" ) )
     {
         // only the ADDRESS-OF form — `*p` is also a pointer_expression, and a dereference names no function.
         const TSNode op = ts_node_child( value, 0 );
-        if( ts_node_is_null( op ) || std::strcmp( ts_node_type( op ), "&" ) != 0 )
+        if( ts_node_is_null( op ) || !kindIs( ts_node_type( op ), "&" ) )
         {
             return {};
         }
-        idn = ts_node_child_by_field_name( value, "argument", 8 );
+        idn = fieldChild( value, NodeField::Argument );
         if( ts_node_is_null( idn ) )
         {
             return {};
@@ -321,7 +1004,7 @@ inline std::string fnBindTargetOf( TSNode value, std::string_view src, bool& was
         addressOf = true;
     }
     const char* it = ts_node_type( idn );
-    if( std::strcmp( it, "identifier" ) != 0 && std::strcmp( it, "qualified_identifier" ) != 0 )
+    if( !kindIs( it, "identifier" ) && !kindIs( it, "qualified_identifier" ) )
     {
         return {};
     }
@@ -330,7 +1013,7 @@ inline std::string fnBindTargetOf( TSNode value, std::string_view src, bool& was
     {
         return {};
     }
-    wasBareIdent = !addressOf && std::strcmp( it, "identifier" ) == 0;
+    wasBareIdent = !addressOf && kindIs( it, "identifier" );
     return std::string( src.substr( a, b - a ) );
 }
 
@@ -359,22 +1042,22 @@ inline FnBindDeclShape fnDeclaratorShape( TSNode decl, std::string_view src )
     for( int guard = 0; guard < 10 && !ts_node_is_null( decl ); ++guard )
     {
         const char* dt = ts_node_type( decl );
-        if( std::strcmp( dt, "identifier" ) == 0 )
+        if( kindIs( dt, "identifier" ) )
         {
             const std::uint32_t a = ts_node_start_byte( decl ), b = ts_node_end_byte( decl );
             shape.name = ( a <= b && b <= src.size() ) ? src.substr( a, b - a ) : std::string_view{};
             return shape;
         }
-        if( std::strcmp( dt, "array_declarator" ) == 0 )
+        if( kindIs( dt, "array_declarator" ) )
         {
             return shape;
         }
-        const bool isRef = ( std::strcmp( dt, "reference_declarator" ) == 0 );
-        shape.sawFn  = shape.sawFn  || std::strcmp( dt, "function_declarator" ) == 0;
-        shape.sawPtr = shape.sawPtr || std::strcmp( dt, "pointer_declarator" ) == 0;
+        const bool isRef = ( kindIs( dt, "reference_declarator" ) );
+        shape.sawFn  = shape.sawFn  || kindIs( dt, "function_declarator" );
+        shape.sawPtr = shape.sawPtr || kindIs( dt, "pointer_declarator" );
         shape.sawRef = shape.sawRef || isRef;
-        TSNode inner = ts_node_child_by_field_name( decl, "declarator", 10 );
-        if( ts_node_is_null( inner ) && ( isRef || std::strcmp( dt, "parenthesized_declarator" ) == 0 ) )
+        TSNode inner = fieldChild( decl, NodeField::Declarator );
+        if( ts_node_is_null( inner ) && ( isRef || kindIs( dt, "parenthesized_declarator" ) ) )
         {
             // the parenthesized/reference inner declarator is an UNNAMED child — take the first named one
             if( ts_node_named_child_count( decl ) > 0 )
@@ -401,37 +1084,37 @@ inline FnBindDeclShape fnDeclaratorShape( TSNode decl, std::string_view src )
 // `foo(*p)() = x;` assigning through a call result) stays undecoded — conservative, no false binding.
 inline std::string_view misparsedFnPtrDeclVar( TSNode lhs, std::string_view src )
 {
-    if( ts_node_is_null( lhs ) || std::strcmp( ts_node_type( lhs ), "call_expression" ) != 0 )
+    if( ts_node_is_null( lhs ) || !kindIs( ts_node_type( lhs ), "call_expression" ) )
     {
         return {};
     }
-    const TSNode inner = ts_node_child_by_field_name( lhs, "function", 8 );
-    if( ts_node_is_null( inner ) || std::strcmp( ts_node_type( inner ), "call_expression" ) != 0 )
+    const TSNode inner = fieldChild( lhs, NodeField::Function );
+    if( ts_node_is_null( inner ) || !kindIs( ts_node_type( inner ), "call_expression" ) )
     {
         return {};
     }
-    const TSNode ty = ts_node_child_by_field_name( inner, "function", 8 );
-    if( ts_node_is_null( ty ) || std::strcmp( ts_node_type( ty ), "primitive_type" ) != 0 )
+    const TSNode ty = fieldChild( inner, NodeField::Function );
+    if( ts_node_is_null( ty ) || !kindIs( ts_node_type( ty ), "primitive_type" ) )
     {
         return {};
     }
-    const TSNode args = ts_node_child_by_field_name( inner, "arguments", 9 );
+    const TSNode args = fieldChild( inner, NodeField::Arguments );
     if( ts_node_is_null( args ) || ts_node_named_child_count( args ) != 1 )
     {
         return {};
     }
     const TSNode pe = ts_node_named_child( args, 0 );
-    if( std::strcmp( ts_node_type( pe ), "pointer_expression" ) != 0 )
+    if( !kindIs( ts_node_type( pe ), "pointer_expression" ) )
     {
         return {};
     }
     const TSNode op = ts_node_child( pe, 0 );
-    if( ts_node_is_null( op ) || std::strcmp( ts_node_type( op ), "*" ) != 0 )
+    if( ts_node_is_null( op ) || !kindIs( ts_node_type( op ), "*" ) )
     {
         return {};
     }
-    const TSNode idn = ts_node_child_by_field_name( pe, "argument", 8 );
-    if( ts_node_is_null( idn ) || std::strcmp( ts_node_type( idn ), "identifier" ) != 0 )
+    const TSNode idn = fieldChild( pe, NodeField::Argument );
+    if( ts_node_is_null( idn ) || !kindIs( ts_node_type( idn ), "identifier" ) )
     {
         return {};
     }
@@ -530,14 +1213,14 @@ inline bool concreteWrittenType( TSNode typeNode, std::string_view src, std::str
         return false;
     }
     const char* tt = ts_node_type( typeNode );
-    if( std::strcmp( tt, "primitive_type" ) == 0 || std::strcmp( tt, "sized_type_specifier" ) == 0
-        || std::strcmp( tt, "struct_specifier" ) == 0 || std::strcmp( tt, "class_specifier" ) == 0
-        || std::strcmp( tt, "union_specifier" ) == 0 || std::strcmp( tt, "enum_specifier" ) == 0 )
+    if( kindIs( tt, "primitive_type" ) || kindIs( tt, "sized_type_specifier" )
+        || kindIs( tt, "struct_specifier" ) || kindIs( tt, "class_specifier" )
+        || kindIs( tt, "union_specifier" ) || kindIs( tt, "enum_specifier" ) )
     {
         return true;
     }
-    if( std::strcmp( tt, "type_identifier" ) != 0 && std::strcmp( tt, "qualified_identifier" ) != 0
-        && std::strcmp( tt, "scoped_type_identifier" ) != 0 )
+    if( !kindIs( tt, "type_identifier" ) && !kindIs( tt, "qualified_identifier" )
+        && !kindIs( tt, "scoped_type_identifier" ) )
     {
         return false;
     }
@@ -557,55 +1240,62 @@ inline bool concreteWrittenType( TSNode typeNode, std::string_view src, std::str
 // is invisible to a per-file parse, so a variable of that type stays UNKNOWN — and unknown still mints.
 inline std::string_view fnPtrAliasName( TSNode n, const char* t, std::string_view src )
 {
-    if( std::strcmp( t, "alias_declaration" ) == 0 )
+    if( kindIs( t, "alias_declaration" ) )
     {
-        const TSNode desc = ts_node_child_by_field_name( n, "type", 4 );
+        const TSNode desc = fieldChild( n, NodeField::Type );
         if( ts_node_is_null( desc ) )
         {
             return {};
         }
-        const TSNode abst = ts_node_child_by_field_name( desc, "declarator", 10 );
-        if( ts_node_is_null( abst ) || std::strcmp( ts_node_type( abst ), "abstract_function_declarator" ) != 0 )
+        const TSNode abst = fieldChild( desc, NodeField::Declarator );
+        if( ts_node_is_null( abst ) || !kindIs( ts_node_type( abst ), "abstract_function_declarator" ) )
         {
             return {};
         }
-        const TSNode nm = ts_node_child_by_field_name( n, "name", 4 );
+        const TSNode nm = fieldChild( n, NodeField::Name );
         return ts_node_is_null( nm ) ? std::string_view{} : nodeTextOf( nm, src );
     }
-    if( std::strcmp( t, "type_definition" ) != 0 )
+    if( !kindIs( t, "type_definition" ) )
     {
         return {};
     }
-    const std::uint32_t cc = ts_node_child_count( n );
-    for( std::uint32_t i = 0; i < cc; ++i )
+    // O(children): the declarator-field scan rides the cursor's own O(1) field name instead of
+    // `ts_node_field_name_for_child( n, i )`, which restarts the child iterator (src/infra/tschildren.h).
+    // A typedef's width is input-controlled — a comment sits between `typedef` and the declarator as a
+    // direct child like any other extra (test/childwalkscalecheck.sh, arm B7).
+    std::string_view found;
+    ChildCursor      cursor( n );
+    forEachChild( n, cursor.cur, [ & ]( TSNode c )
     {
-        const char* fname = ts_node_field_name_for_child( n, i );
-        if( fname == nullptr || std::strcmp( fname, "declarator" ) != 0 )
+        const char* fname = ts_tree_cursor_current_field_name( &cursor.cur );
+        if( fname == nullptr || !kindIs( fname, "declarator" ) )
         {
-            continue;
+            return true;
         }
-        TSNode d       = ts_node_child( n, i );
+        TSNode d       = c;
         bool   crossed = false;
         for( int guard = 0; guard < 10 && !ts_node_is_null( d ); ++guard )
         {
             const char* dt = ts_node_type( d );
-            if( std::strcmp( dt, "type_identifier" ) == 0 )
+            if( kindIs( dt, "type_identifier" ) )
             {
-                return crossed ? nodeTextOf( d, src ) : std::string_view{};
+                found = crossed ? nodeTextOf( d, src ) : std::string_view{};
+                return false;   // the indexed loop returned from here
             }
-            if( std::strcmp( dt, "function_declarator" ) == 0 )
+            if( kindIs( dt, "function_declarator" ) )
             {
                 crossed = true;
             }
-            TSNode inner = ts_node_child_by_field_name( d, "declarator", 10 );
+            TSNode inner = fieldChild( d, NodeField::Declarator );
             if( ts_node_is_null( inner ) && ts_node_named_child_count( d ) > 0 )
             {
                 inner = ts_node_named_child( d, 0 );
             }
             d = inner;
         }
-    }
-    return {};
+        return true;
+    } );
+    return found;
 }
 
 // the byte span of the DEFINITION a node sits inside — a function body or a lambda, whichever encloses it
@@ -617,7 +1307,7 @@ inline std::pair<std::uint32_t, std::uint32_t> enclosingDefSpan( TSNode n )
     for( int guard = 0; guard < 128 && !ts_node_is_null( p ); ++guard )
     {
         const char* pt = ts_node_type( p );
-        if( std::strcmp( pt, "function_definition" ) == 0 || std::strcmp( pt, "lambda_expression" ) == 0 )
+        if( kindIs( pt, "function_definition" ) || kindIs( pt, "lambda_expression" ) )
         {
             return { ts_node_start_byte( p ), ts_node_end_byte( p ) };
         }
@@ -631,34 +1321,36 @@ inline std::pair<std::uint32_t, std::uint32_t> enclosingDefSpan( TSNode n )
 // (a value parameter reassigned from another parameter is the same copy), and a `field_declaration`.
 inline void collectFnBindTypeFacts( TSNode n, const char* t, std::string_view src, std::vector<FnBindVarTypeFact>& facts )
 {
-    if( std::strcmp( t, "declaration" ) != 0 && std::strcmp( t, "parameter_declaration" ) != 0
-        && std::strcmp( t, "optional_parameter_declaration" ) != 0 && std::strcmp( t, "field_declaration" ) != 0 )
+    if( !kindIs( t, "declaration" ) && !kindIs( t, "parameter_declaration" )
+        && !kindIs( t, "optional_parameter_declaration" ) && !kindIs( t, "field_declaration" ) )
     {
         return;
     }
     std::string typeName;
-    const bool  concrete           = concreteWrittenType( ts_node_child_by_field_name( n, "type", 4 ), src, typeName );
+    const bool  concrete           = concreteWrittenType( fieldChild( n, NodeField::Type ), src, typeName );
     const auto [ scopeStart, scopeEnd ] = enclosingDefSpan( n );
-    const std::uint32_t cc = ts_node_child_count( n );
-    for( std::uint32_t i = 0; i < cc; ++i )
+    // O(children), on the cursor's O(1) field name — see fnPtrAliasName above and arm B7.
+    ChildCursor cursor( n );
+    forEachChild( n, cursor.cur, [ & ]( TSNode c )
     {
-        const char* fname = ts_node_field_name_for_child( n, i );
-        if( fname == nullptr || std::strcmp( fname, "declarator" ) != 0 )
+        const char* fname = ts_tree_cursor_current_field_name( &cursor.cur );
+        if( fname == nullptr || !kindIs( fname, "declarator" ) )
         {
-            continue;
+            return true;
         }
-        TSNode d = ts_node_child( n, i );
-        if( std::strcmp( ts_node_type( d ), "init_declarator" ) == 0 )
+        TSNode d = c;
+        if( kindIs( ts_node_type( d ), "init_declarator" ) )
         {
-            d = ts_node_child_by_field_name( d, "declarator", 10 );
+            d = fieldChild( d, NodeField::Declarator );
         }
         const FnBindDeclShape shape = fnDeclaratorShape( d, src );
         if( shape.name.empty() || ( shape.sawFn && !shape.sawPtr ) )
         {
-            continue;   // nameless, an array of pointers, or a plain function DECLARATION — no variable here
+            return true;   // nameless, an array of pointers, or a plain function DECLARATION — no variable here
         }
         facts.push_back( { std::string( shape.name ), typeName, scopeStart, scopeEnd, concrete, shape.sawFn && shape.sawPtr } );
-    }
+        return true;
+    } );
 }
 
 // the gate's whole per-node collection: a declaration's variable type facts AND, from the same node, any
@@ -720,24 +1412,34 @@ struct BindSite
 // the ONE bind-record emitter. A nameless declarator records nothing. kind=VarDecl is the r9 shadow-
 // evidence record: typeName stays EMPTY on it (shadow evidence, not narrowing fuel — nothing downstream
 // ever reads a type off it), so the empty-typeName refusal applies to every OTHER kind, where it is
-// load-bearing for Rule 2 (an undecidable type must degrade to §2a, not mint a half-record).
-inline void pushRawBind( std::uint32_t fileId, Lang lang, std::string_view var, std::string typeName,
-                         BindSite site, LocalBindKind kind, std::vector<RawBind>& binds )
+// load-bearing for Rule 2 (an undecidable type must degrade to §2a, not mint a half-record). The DeclType's
+// qualified text rides importedName (see qualifiedNameText) — non-empty only on a declaration's Type/ParamType record.
+inline void pushTypedBind( std::uint32_t fileId, Lang lang, std::string_view var, DeclType type, BindSite site, LocalBindKind kind,
+                           std::vector<RawBind>& binds )
 {
-    if( var.empty() || ( typeName.empty() && kind != LocalBindKind::VarDecl ) )
+    if( var.empty() || ( type.name.empty() && kind != LocalBindKind::VarDecl ) )
     {
         return;
     }
     RawBind b;
-    b.fileId    = fileId;
-    b.startByte = site.startByte;
-    b.lang      = lang;
-    b.kind      = kind;
-    b.spanStart = site.spanStart;
-    b.spanEnd   = site.spanEnd;
+    b.fileId       = fileId;
+    b.startByte    = site.startByte;
+    b.lang         = lang;
+    b.kind         = kind;
+    b.spanStart    = site.spanStart;
+    b.spanEnd      = site.spanEnd;
     b.var.assign( var );
-    b.typeName  = std::move( typeName );
+    b.typeName     = std::move( type.name );
+    b.importedName = std::move( type.qualified );
+    b.isFromAssignment = type.isFromAssignment;
     binds.push_back( std::move( b ) );
+}
+
+// the same record with no qualified text — every emitter but a declaration's Type/ParamType
+inline void pushRawBind( std::uint32_t fileId, Lang lang, std::string_view var, std::string typeName,
+                         BindSite site, LocalBindKind kind, std::vector<RawBind>& binds )
+{
+    pushTypedBind( fileId, lang, var, DeclType{ std::move( typeName ), std::string{} }, site, kind, binds );
 }
 
 // emit a Rule-2 binding from one declared variable: prefer the WRITTEN type; else infer from a
@@ -773,13 +1475,31 @@ inline ShadowScope enclosingShadowScope( TSNode n )
     for( int guard = 0; guard < 128 && !ts_node_is_null( p ); ++guard )
     {
         const char* pt = ts_node_type( p );
-        if( std::strcmp( pt, "compound_statement" ) == 0 )
+        if( kindIs( pt, "compound_statement" ) )
         {
             return { ts_node_start_byte( p ), ts_node_end_byte( p ), true };
         }
-        if(    std::strcmp( pt, "for_statement" ) == 0 || std::strcmp( pt, "for_range_loop" ) == 0
-            || std::strcmp( pt, "if_statement" ) == 0  || std::strcmp( pt, "while_statement" ) == 0
-            || std::strcmp( pt, "switch_statement" ) == 0 )
+        // Java (and Go/Rust) spell a plain brace block `block`. C++ hits compound_statement
+        // first, so this arm is inert there. Checked before lambda/method so a body local
+        // stays in its block rather than the whole callable.
+        if( kindIs( pt, "block" ) )
+        {
+            return { ts_node_start_byte( p ), ts_node_end_byte( p ), true };
+        }
+        if(    kindIs( pt, "for_statement" ) || kindIs( pt, "for_range_loop" )
+            || kindIs( pt, "if_statement" )  || kindIs( pt, "while_statement" )
+            || kindIs( pt, "switch_statement" )
+            || kindIs( pt, "enhanced_for_statement" ) || kindIs( pt, "catch_clause" )
+            || kindIs( pt, "switch_block" ) || kindIs( pt, "try_with_resources_statement" ) )
+        {
+            return { ts_node_start_byte( p ), ts_node_end_byte( p ), false };
+        }
+        // Java parameters and inferred lambda names: the callable is the scope when no
+        // block sits between the declaration and it. C++ lambda bodies are
+        // compound_statement, so a C++ local still hits that first.
+        if(    kindIs( pt, "lambda_expression" )
+            || kindIs( pt, "method_declaration" )
+            || kindIs( pt, "constructor_declaration" ) )
         {
             return { ts_node_start_byte( p ), ts_node_end_byte( p ), false };
         }
@@ -816,12 +1536,28 @@ inline std::uint32_t shadowSpanStart( const ShadowScope& scope, TSNode completeD
     return point > scope.start ? point : scope.start;
 }
 
+// the declarator one wrapping declarator holds: its `declarator` field, or, for the three kinds whose grammar rule
+// names no field — reference_declarator (`& d`), parenthesized_declarator (`( d )`) and attributed_declarator
+// (`d [[maybe_unused]]`) — its first named child. Null for a leaf (an identifier, a qualified name).
+inline TSNode innerDeclaratorOf( TSNode decl )
+{
+    const TSNode inner = fieldChild( decl, NodeField::Declarator );
+    if( !ts_node_is_null( inner ) )
+    {
+        return inner;
+    }
+    const char* dt = ts_node_type( decl );
+    const bool  holdsUnnamed = kindIs( dt, "reference_declarator" ) || kindIs( dt, "parenthesized_declarator" ) || kindIs( dt, "attributed_declarator" );
+    return ( holdsUnnamed && ts_node_named_child_count( decl ) > 0 ) ? ts_node_named_child( decl, 0 ) : TSNode{};
+}
+
 // r9 shadow fix round (A5): every VARIABLE name a declarator declares → one VarDecl record each, carrying
 // the declaring block's span. Handles the shapes the verifier refuted the first landing on:
 //   * reference_declarator / parenthesized_declarator hold their inner declarator as an UNNAMED child
 //     (no `declarator` field — same grammar fact fnDeclaratorVarName already works around), so a
 //     field-only unwrap missed `const T& key` entirely — pass-by-const-ref, the most idiomatic C++
-//     parameter shape;
+//     parameter shape; attributed_declarator (`int run [[maybe_unused]] = 0;`) is the same fact and
+//     recorded nothing until 2026-09-17 (test/shadowcheck.sh arm q8) — all three unwrap in innerDeclaratorOf;
 //   * structured_binding_declarator (`auto& [key, w]`) declares SEVERAL names — one record per identifier;
 //   * a plain function declarator still yields NOTHING (`void helper();` in a body and the most-vexing-
 //     parse `Foo x();` declare a FUNCTION, whose calls must never be suppressed), while a
@@ -834,36 +1570,30 @@ inline void emitShadowVarDecls( std::uint32_t fileId, Lang lang, TSNode decl, st
     for( int guard = 0; guard < 8 && !ts_node_is_null( decl ); ++guard )
     {
         const char* dt = ts_node_type( decl );
-        if( std::strcmp( dt, "identifier" ) == 0 )
+        if( kindIs( dt, "identifier" ) )
         {
             pushRawBind( fileId, lang, nodeTextOf( decl, src ), std::string{}, site, LocalBindKind::VarDecl, binds );
             return;
         }
-        if( std::strcmp( dt, "structured_binding_declarator" ) == 0 )
+        if( kindIs( dt, "structured_binding_declarator" ) )
         {
             const std::uint32_t cc = ts_node_named_child_count( decl );
             for( std::uint32_t i = 0; i < cc; ++i )
             {
                 const TSNode c = ts_node_named_child( decl, i );
-                if( std::strcmp( ts_node_type( c ), "identifier" ) == 0 )
+                if( kindIs( ts_node_type( c ), "identifier" ) )
                 {
                     pushRawBind( fileId, lang, nodeTextOf( c, src ), std::string{}, site, LocalBindKind::VarDecl, binds );
                 }
             }
             return;
         }
-        TSNode inner = ts_node_child_by_field_name( decl, "declarator", 10 );
-        if( ts_node_is_null( inner )
-            && ( std::strcmp( dt, "reference_declarator" ) == 0 || std::strcmp( dt, "parenthesized_declarator" ) == 0 )
-            && ts_node_named_child_count( decl ) > 0 )
-        {
-            inner = ts_node_named_child( decl, 0 );   // the inner declarator is an UNNAMED child here
-        }
+        const TSNode inner = innerDeclaratorOf( decl );
         if( ts_node_is_null( inner ) )
         {
             return;
         }
-        if( std::strcmp( dt, "function_declarator" ) == 0 && std::strcmp( ts_node_type( inner ), "parenthesized_declarator" ) != 0 )
+        if( kindIs( dt, "function_declarator" ) && !kindIs( ts_node_type( inner ), "parenthesized_declarator" ) )
         {
             return;   // a FUNCTION's name, not a variable's
         }
@@ -874,21 +1604,21 @@ inline void emitShadowVarDecls( std::uint32_t fileId, Lang lang, TSNode decl, st
 // one DECLARATOR → both records: the Rule-2 var→type binding and the r9 VarDecl shadow record(s). The two
 // name reads stay separate on purpose — declaratorVarName descends into a function declarator (harmless
 // for narrowing), emitShadowVarDecls refuses it (load-bearing for suppression).
-inline void emitDeclBinds( std::uint32_t fileId, Lang lang, TSNode declNode, std::string_view src, std::string type,
+inline void emitDeclBinds( std::uint32_t fileId, Lang lang, TSNode declNode, std::string_view src, DeclType type,
                            BindSite site, std::vector<RawBind>& binds )
 {
     const std::string_view var = declaratorVarName( declNode, src );
-    if( var.empty() && !type.empty() )
+    if( var.empty() && !type.name.empty() )
     {
         // member-variable round (card A3): a REFERENCE local (`const Symbol& s = ing.symbols[ i ];`) is the one
-        // typed declaration Rule 2 refuses (declaratorVarName cannot see through the unnamed reference child).
-        // Recorded as a ParamType fact — the field use-site index's own kind — so `s.name` resolves there while
-        // Rule 2's call narrowing (kind == Type) stays byte-identical.
-        pushRawBind( fileId, lang, paramDeclaratorVarName( declNode, src ), std::move( type ), BindSite{ site.startByte, 0u, 0u }, LocalBindKind::ParamType, binds );
+        // typed declaration Rule 2's flat table refuses (declaratorVarName cannot see through the unnamed reference
+        // child). Recorded as a ParamType fact, so `s.name` resolves in the field use-site index and `s.m()` narrows
+        // through Rule 2's LEXICAL lookup (resolve.h buildScopedRecvDecls) — only where this declaration is in scope.
+        pushTypedBind( fileId, lang, paramDeclaratorVarName( declNode, src ), std::move( type ), BindSite{ site.startByte, 0u, 0u }, LocalBindKind::ParamType, binds );
     }
     else
     {
-        emitBind( fileId, lang, var, std::move( type ), site.startByte, binds );
+        pushTypedBind( fileId, lang, var, std::move( type ), BindSite{ site.startByte, 0u, 0u }, LocalBindKind::Type, binds );
     }
     emitShadowVarDecls( fileId, lang, declNode, src, site, binds );
 }
@@ -904,18 +1634,18 @@ inline void emitShadowParamDecls( TSNode params, std::uint32_t fileId, Lang lang
     {
         const TSNode p  = ts_node_child( params, i );
         const char*  pt = ts_node_type( p );
-        if( std::strcmp( pt, "parameter_declaration" ) != 0 && std::strcmp( pt, "optional_parameter_declaration" ) != 0 )
+        if( !kindIs( pt, "parameter_declaration" ) && !kindIs( pt, "optional_parameter_declaration" ) )
         {
             continue;   // commas, `...`, attribute nodes — nothing declared
         }
         bodySite.startByte = ts_node_start_byte( p );
-        const TSNode declarator = ts_node_child_by_field_name( p, "declarator", 10 );
+        const TSNode declarator = fieldChild( p, NodeField::Declarator );
         emitShadowVarDecls( fileId, lang, declarator, src, bodySite, binds );
         // member-variable round (card A3): the parameter's WRITTEN type as a ParamType record (`Counter& c` →
-        // c:Counter), read by the field use-site index alone — see LocalBindKind::ParamType. `auto`, templated
+        // c:Counter), read by the field use-site index and Rule 2's lexical lookup — see LocalBindKind::ParamType. `auto`, templated
         // and decltype types write nothing (writtenTypeOf's own refusal), and pushRawBind drops the record.
-        pushRawBind( fileId, lang, paramDeclaratorVarName( declarator, src ), writtenTypeOf( ts_node_child_by_field_name( p, "type", 4 ), src ),
-                     BindSite{ ts_node_start_byte( p ), 0u, 0u }, LocalBindKind::ParamType, binds );
+        pushTypedBind( fileId, lang, paramDeclaratorVarName( declarator, src ), declTypeOfName( fieldChild( p, NodeField::Type ), src ),
+                       BindSite{ ts_node_start_byte( p ), 0u, 0u }, LocalBindKind::ParamType, binds );
     }
 }
 
@@ -928,30 +1658,36 @@ inline void emitShadowParamDecls( TSNode params, std::uint32_t fileId, Lang lang
 inline void captureLambdaShadowDecls( TSNode n, std::uint32_t fileId, Lang lang, std::string_view src,
                                       BindSite bodySite, std::vector<RawBind>& binds )
 {
-    const TSNode d = ts_node_child_by_field_name( n, "declarator", 10 );   // abstract_function_declarator
+    const TSNode d = fieldChild( n, NodeField::Declarator );   // abstract_function_declarator
     if( !ts_node_is_null( d ) )
     {
-        const TSNode params = ts_node_child_by_field_name( d, "parameters", 10 );
+        const TSNode params = fieldChild( d, NodeField::Parameters );
         if( !ts_node_is_null( params ) )
         {
             emitShadowParamDecls( params, fileId, lang, src, bodySite, binds );
         }
     }
-    const TSNode caps = ts_node_child_by_field_name( n, "captures", 8 );   // lambda_capture_specifier
-    const std::uint32_t cc = ts_node_is_null( caps ) ? 0u : ts_node_named_child_count( caps );
-    for( std::uint32_t i = 0; i < cc; ++i )
+    const TSNode caps = fieldChild( n, NodeField::Captures );   // lambda_capture_specifier
+    if( ts_node_is_null( caps ) )
     {
-        const TSNode c  = ts_node_named_child( caps, i );
-        const char*  ct = ts_node_type( c );
-        TSNode ident {};
-        if( std::strcmp( ct, "identifier" ) == 0 )
+        return;
+    }
+    // O(captures): a capture list's width is input-set like every other list — a comment run between two
+    // captures is spliced into its child array (src/infra/tschildren.h), and 16 000 of them measured
+    // 1.25 s of plain map on a one-line file before this became a cursor (arm B12).
+    ChildCursor capsCursor( caps );
+    forEachNamedChild( caps, capsCursor.cur, [ & ]( TSNode c )
+    {
+        const char* ct = ts_node_type( c );
+        TSNode      ident {};
+        if( kindIs( ct, "identifier" ) )
         {
             ident = c;   // simple capture `[run]` / `[&run]` (the `&` is an anonymous sibling)
         }
-        else if( std::strcmp( ct, "lambda_capture_initializer" ) == 0 && ts_node_named_child_count( c ) > 0 )
+        else if( kindIs( ct, "lambda_capture_initializer" ) && ts_node_named_child_count( c ) > 0 )
         {
             const TSNode nm = ts_node_named_child( c, 0 );   // `[trim = expr]` — the FIRST named child is the introduced name
-            if( std::strcmp( ts_node_type( nm ), "identifier" ) == 0 )
+            if( kindIs( ts_node_type( nm ), "identifier" ) )
             {
                 ident = nm;
             }
@@ -961,25 +1697,29 @@ inline void captureLambdaShadowDecls( TSNode n, std::uint32_t fileId, Lang lang,
             bodySite.startByte = ts_node_start_byte( c );
             pushRawBind( fileId, lang, nodeTextOf( ident, src ), std::string{}, bodySite, LocalBindKind::VarDecl, binds );
         }
-    }
+        return true;
+    } );
 }
 
 // a function DEFINITION's parameter_list, reached through its own declarator chain (`char* f(...)` /
 // `T& f(...)` unwrap to the function_declarator). Null when the shape isn't a plain definition —
 // walking only THIS chain (never bare parameter_declaration nodes) is what keeps a PROTOTYPE's
-// parameters and a fn-pointer TYPE's parameter list out of shadow evidence.
+// parameters and a fn-pointer TYPE's parameter list out of shadow evidence. The `T&` / `T&&` step goes
+// through innerDeclaratorOf: a reference_declarator holds the function declarator by no field, and a
+// field-only walk stopped there, so every definition returning a reference recorded no parameter at all
+// (2026-09-17, test/narrowcheck.sh arms 61-63, test/shadowcheck.sh arm am).
 inline TSNode fnDefParameterList( TSNode fnDef )
 {
-    TSNode decl = ts_node_child_by_field_name( fnDef, "declarator", 10 );
-    for( int guard = 0; guard < 8 && !ts_node_is_null( decl ) && std::strcmp( ts_node_type( decl ), "function_declarator" ) != 0; ++guard )
+    TSNode decl = fieldChild( fnDef, NodeField::Declarator );
+    for( int guard = 0; guard < 8 && !ts_node_is_null( decl ) && !kindIs( ts_node_type( decl ), "function_declarator" ); ++guard )
     {
-        decl = ts_node_child_by_field_name( decl, "declarator", 10 );
+        decl = innerDeclaratorOf( decl );
     }
-    if( ts_node_is_null( decl ) || std::strcmp( ts_node_type( decl ), "function_declarator" ) != 0 )
+    if( ts_node_is_null( decl ) || !kindIs( ts_node_type( decl ), "function_declarator" ) )
     {
         return TSNode{};
     }
-    return ts_node_child_by_field_name( decl, "parameters", 10 );
+    return fieldChild( decl, NodeField::Parameters );
 }
 
 // r9 shadow suppression (A5 fix round): the local-declaring shapes that live OUTSIDE `declaration` nodes
@@ -1002,9 +1742,338 @@ inline TSNode fnDefParameterList( TSNode fnDef )
 // registered and measured for C++/ObjC only, so the Python call graph moves through Rule 2c alone. `self`
 // and `cls` are recorded like any other name (no class is spelled that way; a special case would be a
 // second rule to keep in step). Plain, typed, defaulted and splat parameters; tuple patterns bind nothing.
+
+// Java issue #74: a parameter or local named like a class is a value receiver for
+// Identifier::method, but only where Java lexical scope makes that binding active.
+// Class fields keep empty spans and are copied onto contained methods in graph.h.
+// Locals start at the declarator (plain block) or the enclosing statement; parameters
+// and inferred lambda names cover the callable body.
+inline bool javaKindIsFieldDecl( const char* t ) noexcept
+{
+    return kindIs( t, "field_declaration" ) || kindIs( t, "constant_declaration" );
+}
+
+inline bool javaKindIsCallable( const char* t ) noexcept
+{
+    return kindIs( t, "method_declaration" ) || kindIs( t, "constructor_declaration" )
+        || kindIs( t, "lambda_expression" );
+}
+
+inline BindSite javaShadowSite( TSNode declNode, TSNode nameNode ) noexcept
+{
+    const std::uint32_t start = ts_node_start_byte( nameNode );
+    TSNode p = ts_node_parent( declNode );
+    for( int guard = 0; guard < 128 && !ts_node_is_null( p ); ++guard )
+    {
+        const char* pt = ts_node_type( p );
+        if( javaKindIsFieldDecl( pt ) )
+        {
+            return { start, 0u, 0u };
+        }
+        if(    kindIs( pt, "block" ) || kindIs( pt, "for_statement" )
+            || kindIs( pt, "enhanced_for_statement" ) || kindIs( pt, "switch_block" )
+            || kindIs( pt, "catch_clause" ) || kindIs( pt, "try_with_resources_statement" ) )
+        {
+            break;
+        }
+        if( javaKindIsCallable( pt ) )
+        {
+            const TSNode body = fieldChild( p, NodeField::Body );
+            if( ts_node_is_null( body ) )
+            {
+                return { start, ts_node_start_byte( p ), ts_node_end_byte( p ) };
+            }
+            return { start, ts_node_start_byte( body ), ts_node_end_byte( body ) };
+        }
+        p = ts_node_parent( p );
+    }
+    const ShadowScope scope = enclosingShadowScope( declNode );
+    return { start, shadowSpanStart( scope, declNode ), scope.end };
+}
+
+inline void emitJavaShadowName( std::uint32_t fileId, Lang lang, TSNode declNode, TSNode nameNode,
+                               std::string_view src, std::vector<RawBind>& binds )
+{
+    if( ts_node_is_null( nameNode ) || !kindIs( ts_node_type( nameNode ), "identifier" ) )
+    {
+        return;
+    }
+    pushRawBind( fileId, lang, nodeTextOf( nameNode, src ), std::string{},
+                 javaShadowSite( declNode, nameNode ), LocalBindKind::VarDecl, binds );
+}
+
+inline void captureJavaShadowDecls( TSNode n, const char* t, std::uint32_t fileId, Lang lang,
+                                   std::string_view src, std::vector<RawBind>& binds )
+{
+    // A catch parameter and a try-with-resources `resource` declare a name the same way (a `name:` field; a resource
+    // that only NAMES an existing variable has none, and emits nothing). Their scope is the catch clause or the whole
+    // try-with-resources statement, which javaShadowSite reaches through enclosingShadowScope.
+    if( kindIs( t, "formal_parameter" ) || kindIs( t, "spread_parameter" ) || kindIs( t, "variable_declarator" )
+        || kindIs( t, "catch_formal_parameter" ) || kindIs( t, "resource" ) )
+    {
+        emitJavaShadowName( fileId, lang, n, fieldChild( n, NodeField::Name ), src, binds );
+        return;
+    }
+    // `for ( T x : xs )` — the loop itself declares x, so the NAME is passed as the declaration node: its parent is the
+    // loop, whose span is x's scope. Passing the statement would start the walk at the enclosing block and widen the
+    // veto to every reference after the loop (test/javamethodrefcheck.sh forEachAfterFn).
+    if( kindIs( t, "enhanced_for_statement" ) )
+    {
+        const TSNode name = fieldChild( n, NodeField::Name );
+        emitJavaShadowName( fileId, lang, name, name, src, binds );
+        return;
+    }
+    // `Widget -> ...` — the inferred parameter is the `parameters:` identifier of the lambda.
+    if( kindIs( t, "lambda_expression" ) )
+    {
+        const TSNode params = fieldChild( n, NodeField::Parameters );
+        if( !ts_node_is_null( params ) && kindIs( ts_node_type( params ), "identifier" ) )
+        {
+            emitJavaShadowName( fileId, lang, params, params, src, binds );
+        }
+        return;
+    }
+    // `(Widget) -> ...` / `(a, b) -> ...` — inferred_parameters holds identifier children.
+    if( kindIs( t, "inferred_parameters" ) )
+    {
+        const std::uint32_t cc = ts_node_named_child_count( n );
+        for( std::uint32_t i = 0; i < cc; ++i )
+        {
+            const TSNode c = ts_node_named_child( n, i );
+            if( kindIs( ts_node_type( c ), "identifier" ) )
+            {
+                emitJavaShadowName( fileId, lang, c, c, src, binds );
+            }
+        }
+    }
+}
+
+// issue #287 round 2 (Rule 2d soundness, review rv-p6.md HIGH finding): collect every bare NAME a Python
+// assignment-target-shaped node binds, at any depth through tuple/list unpacking and a starred target —
+// NEVER through an attribute or subscript target (`obj.tm = x` / `d["tm"] = x` mutate an object; they do
+// not rebind a NAME). `target` and every node reached through it come straight from the parse tree — a
+// shape this function does not recognise (an attribute, a subscript, a malformed unpacking) is refused by
+// simply not collecting it, the same graceful skip every sibling capture in this file already uses for an
+// unexpected grammar shape, not a promise this function makes about what parsed source contains.
+inline void collectPythonNameTargets( TSNode target, std::vector<TSNode>& out )
+{
+    if( ts_node_is_null( target ) )
+    {
+        return;
+    }
+    const char* tt = ts_node_type( target );
+    if( kindIs( tt, "identifier" ) )
+    {
+        out.push_back( target );
+        return;
+    }
+    if( kindIs( tt, "pattern_list" ) || kindIs( tt, "tuple_pattern" ) || kindIs( tt, "list_pattern" ) || kindIs( tt, "expression_list" ) )
+    {
+        const std::uint32_t cc = ts_node_named_child_count( target );
+        for( std::uint32_t i = 0; i < cc; ++i )
+        {
+            collectPythonNameTargets( ts_node_named_child( target, i ), out );
+        }
+        return;
+    }
+    if( kindIs( tt, "list_splat_pattern" ) || kindIs( tt, "dictionary_splat_pattern" ) )
+    {
+        if( ts_node_named_child_count( target ) > 0 )
+        {
+            collectPythonNameTargets( ts_node_named_child( target, 0 ), out );   // `*rest` / `**rest` — unwrap to the bound name
+        }
+        return;
+    }
+    // attribute / subscript / anything else this shape doesn't recognise — not a bare-name rebind.
+}
+
+// issue #287 round 2 (Rule 2d soundness, review rv-p6.md HIGH finding). Rule 2d's `hasLocal` guard
+// (graph.h ExternalVeto::hasLocal) only sees evidence from a Binding, and Python previously recorded
+// NONE for a plain reassignment — only Import (file scope) and a parameter's VarDecl
+// (capturePythonParamShadowDecls, just below) ever reached it. So `import target_mod as tm` followed by
+// `tm = {"run": …}` inside the SAME function left the reassignment invisible: Rule 2d saw no local
+// evidence for `tm` and confidently bound `tm.run(1)` to the import's module after the name had stopped
+// meaning that. This closes the gap: every Python name-REBINDING form emits a `LocalBindKind::VarDecl`
+// RawBind — the exact "veto evidence only, empty span" shape `capturePythonParamShadowDecls` already
+// uses — so a reassignment and a parameter shadow read as the identical fact to Rule 2d's guard.
+//
+// SCOPE, and why `startByte` alone decides it. `fromSymbol = bindSweep.find( fileId, startByte )`
+// (ingest_model.h emitBindings) is the SAME byte-to-enclosing-def sweep every other bind kind already
+// rides — nothing new to plumb. A form physically INSIDE a function attributes to that function, so
+// `hasLocal` refuses only THAT function's uses of the name — sound, because a plain Python assignment
+// with no `global`/`nonlocal` is function-local. A form at true module top level gets NO enclosing def
+// (`fromSymbol==kNoNode`) — `buildFieldNarrowTables` already skips `fromSymbol==kNoNode` bindings for
+// `hasLocal` on purpose, so these never reach it; `graph.h`'s `pythonModuleRebind` table (built in
+// `buildExternalVetoTables`) reads them instead and vetoes the WHOLE FILE's use of the name, because a
+// module-global rebind can reach every function that reads it. `global NAME` / `nonlocal NAME` get that
+// SAME file-wide treatment ON PURPOSE even when the statement sits inside a function — such a statement
+// can rewrite the file's own module global — so it is deliberately recorded at `startByte=0` (guaranteed
+// to resolve to no enclosing def) rather than at its own position, which would otherwise only veto the
+// one function that happens to declare it.
+//
+// NEVER GUESS, never over-claim either: comprehension-scoped targets (`[x for x in …]` is a
+// `for_in_clause`, not the `for_statement` this function matches) do NOT leak into the enclosing scope in
+// Python 3 and are correctly never visited here. A nested `def NAME` / `class NAME` shadows NAME in its
+// ENCLOSING scope for the rest of that scope (Python binds the def statement's own name where the def
+// STATEMENT sits, not inside the function it defines) — attributed one byte BEFORE the nested def/class's
+// own span starts, so the fact lands on the enclosing scope rather than inside the newly-declared one
+// (verified empirically with `--match`, not merely reasoned about: a byte at the def/class node's own
+// start resolves INSIDE that new symbol's own span, one byte earlier does not).
+// Is `name` declared `global`/`nonlocal` anywhere in the function that encloses `n` — searched over that
+// function's OWN body only, never crossing into a nested def/class/lambda's body (a nested scope's
+// global/nonlocal statements bind there, not here)? Python's `global`/`nonlocal` statement scopes the
+// WHOLE enclosing function regardless of where in the function body it textually sits, so a reassignment
+// anywhere in that function to a name the function has declared global/nonlocal never creates a local
+// shadow — it rewrites the OUTER binding, same as the declaration statement itself (see the SCOPE doc
+// above capturePythonRebindShadowDecls). `n` with no enclosing function_definition is module scope, where
+// `global`/`nonlocal` cannot appear — always false there.
+inline bool pythonNameIsGlobalOrNonlocalHere( TSNode n, std::string_view name, std::string_view src )
+{
+    const bool nGiven = !ts_node_is_null( n );
+    EXPECTS( nGiven, "n is the rebind/for/named_expression/as_pattern node the caller is currently visiting — "
+                      "the tree walker never dispatches on a null node" );
+    TSNode fn = ts_node_parent( n );
+    while( !ts_node_is_null( fn ) && !kindIs( ts_node_type( fn ), "function_definition" ) )
+    {
+        fn = ts_node_parent( fn );
+    }
+    const bool fnIsNullOrFnDef = ts_node_is_null( fn ) || kindIs( ts_node_type( fn ), "function_definition" );
+    ASSUME( fnIsNullOrFnDef, "the loop above exits only when fn is null (walked off the tree) or a function_definition" );
+    if( ts_node_is_null( fn ) )
+    {
+        return false;   // module scope — global/nonlocal cannot appear there
+    }
+    const TSNode body = fieldChild( fn, NodeField::Body );
+    if( ts_node_is_null( body ) )
+    {
+        return false;
+    }
+    std::vector<TSNode> stack{ body };
+    while( !stack.empty() )
+    {
+        const TSNode cur = stack.back();
+        stack.pop_back();
+        const char* ct = ts_node_type( cur );
+        if( kindIs( ct, "global_statement" ) || kindIs( ct, "nonlocal_statement" ) )
+        {
+            const std::uint32_t cc = ts_node_named_child_count( cur );
+            for( std::uint32_t i = 0; i < cc; ++i )
+            {
+                const TSNode id = ts_node_named_child( cur, i );
+                if( kindIs( ts_node_type( id ), "identifier" ) && nodeTextOf( id, src ) == name )
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+        if( kindIs( ct, "function_definition" ) || kindIs( ct, "class_definition" ) || kindIs( ct, "lambda" ) )
+        {
+            continue;   // nested scope — never crossed
+        }
+        const std::uint32_t cc = ts_node_named_child_count( cur );
+        for( std::uint32_t i = 0; i < cc; ++i )
+        {
+            stack.push_back( ts_node_named_child( cur, i ) );
+        }
+    }
+    return false;
+}
+
+inline void capturePythonRebindShadowDecls( TSNode n, const char* t, std::uint32_t fileId, Lang lang, std::string_view src, std::vector<RawBind>& binds )
+{
+    std::vector<TSNode> targets;   // reused scratch, cleared before each shape below
+    // `ownStart` is the fallback attribution (this statement's own position, function-local veto evidence);
+    // a name this function has declared global/nonlocal gets the SAME file-wide startByte=0 treatment the
+    // declaration statement itself uses below, because the reassignment rewrites the outer binding, not a
+    // local one — see pythonNameIsGlobalOrNonlocalHere.
+    const auto emitAll = [ & ]( TSNode site, std::uint32_t ownStart )
+    {
+        for( const TSNode& id : targets )
+        {
+            const std::uint32_t at = pythonNameIsGlobalOrNonlocalHere( site, nodeTextOf( id, src ), src ) ? 0u : ownStart;
+            pushRawBind( fileId, lang, nodeTextOf( id, src ), std::string{}, BindSite{ at, 0u, 0u }, LocalBindKind::VarDecl, binds );
+        }
+    };
+
+    if( kindIs( t, "assignment" ) || kindIs( t, "augmented_assignment" ) )
+    {
+        targets.clear();
+        collectPythonNameTargets( fieldChild( n, NodeField::Left ), targets );
+        emitAll( n, ts_node_start_byte( n ) );
+        return;
+    }
+    if( kindIs( t, "for_statement" ) )
+    {
+        targets.clear();
+        collectPythonNameTargets( fieldChild( n, NodeField::Left ), targets );
+        emitAll( n, ts_node_start_byte( n ) );
+        return;
+    }
+    if( kindIs( t, "named_expression" ) )   // walrus `(tm := …)` — the grammar allows only a bare name here
+    {
+        const TSNode nm = fieldChild( n, NodeField::Name );
+        if( !ts_node_is_null( nm ) && kindIs( ts_node_type( nm ), "identifier" ) )
+        {
+            const std::uint32_t ownStart = ts_node_start_byte( n );
+            const std::uint32_t at       = pythonNameIsGlobalOrNonlocalHere( n, nodeTextOf( nm, src ), src ) ? 0u : ownStart;
+            pushRawBind( fileId, lang, nodeTextOf( nm, src ), std::string{}, BindSite{ at, 0u, 0u }, LocalBindKind::VarDecl, binds );
+        }
+        return;
+    }
+    if( kindIs( t, "as_pattern" ) )   // `with X as tm:` AND `except X as tm:` share this ONE grammar node
+    {
+        const TSNode alias  = fieldChild( n, NodeField::Alias );
+        const bool   hasTgt = !ts_node_is_null( alias ) && kindIs( ts_node_type( alias ), "as_pattern_target" ) && ts_node_named_child_count( alias ) > 0;
+        const TSNode target = hasTgt ? ts_node_named_child( alias, 0 ) : alias;   // grammar wraps the alias in `as_pattern_target`
+        if( !ts_node_is_null( target ) && kindIs( ts_node_type( target ), "identifier" ) )
+        {
+            const std::uint32_t ownStart = ts_node_start_byte( n );
+            const std::uint32_t at       = pythonNameIsGlobalOrNonlocalHere( n, nodeTextOf( target, src ), src ) ? 0u : ownStart;
+            pushRawBind( fileId, lang, nodeTextOf( target, src ), std::string{}, BindSite{ at, 0u, 0u }, LocalBindKind::VarDecl, binds );
+        }
+        return;
+    }
+    if( kindIs( t, "delete_statement" ) )   // `del tm` (single target) / `del tm, other` (wrapped in expression_list)
+    {
+        targets.clear();
+        const std::uint32_t cc = ts_node_named_child_count( n );
+        for( std::uint32_t i = 0; i < cc; ++i )
+        {
+            collectPythonNameTargets( ts_node_named_child( n, i ), targets );
+        }
+        emitAll( n, ts_node_start_byte( n ) );
+        return;
+    }
+    if( kindIs( t, "global_statement" ) || kindIs( t, "nonlocal_statement" ) )
+    {
+        const std::uint32_t cc = ts_node_named_child_count( n );
+        for( std::uint32_t i = 0; i < cc; ++i )
+        {
+            const TSNode id = ts_node_named_child( n, i );
+            if( kindIs( ts_node_type( id ), "identifier" ) )
+            {
+                // deliberate startByte=0 — file-wide, regardless of physical nesting; see the doc above.
+                pushRawBind( fileId, lang, nodeTextOf( id, src ), std::string{}, BindSite{ 0u, 0u, 0u }, LocalBindKind::VarDecl, binds );
+            }
+        }
+        return;
+    }
+    if( kindIs( t, "function_definition" ) || kindIs( t, "class_definition" ) )
+    {
+        const TSNode nm = fieldChild( n, NodeField::Name );
+        if( !ts_node_is_null( nm ) && kindIs( ts_node_type( nm ), "identifier" ) )
+        {
+            const std::uint32_t at = ts_node_start_byte( n );   // the def/class node's OWN start — see the doc above
+            pushRawBind( fileId, lang, nodeTextOf( nm, src ), std::string{}, BindSite{ at > 0 ? at - 1 : 0, 0u, 0u }, LocalBindKind::VarDecl, binds );
+        }
+        return;
+    }
+}
+
 inline void capturePythonParamShadowDecls( TSNode n, std::uint32_t fileId, Lang lang, std::string_view src, std::vector<RawBind>& binds )
 {
-    const TSNode params = ts_node_child_by_field_name( n, "parameters", 10 );
+    const TSNode params = fieldChild( n, NodeField::Parameters );
     if( ts_node_is_null( params ) )
     {
         return;
@@ -1015,19 +2084,19 @@ inline void capturePythonParamShadowDecls( TSNode n, std::uint32_t fileId, Lang 
         const TSNode p  = ts_node_child( params, i );
         const char*  pt = ts_node_type( p );
         TSNode       ident{};
-        if( std::strcmp( pt, "identifier" ) == 0 )
+        if( kindIs( pt, "identifier" ) )
         {
             ident = p;
         }
-        else if( std::strcmp( pt, "default_parameter" ) == 0 || std::strcmp( pt, "typed_default_parameter" ) == 0 )
+        else if( kindIs( pt, "default_parameter" ) || kindIs( pt, "typed_default_parameter" ) )
         {
-            ident = ts_node_child_by_field_name( p, "name", 4 );
+            ident = fieldChild( p, NodeField::Name );
         }
-        else if( std::strcmp( pt, "typed_parameter" ) == 0 || std::strcmp( pt, "list_splat_pattern" ) == 0 || std::strcmp( pt, "dictionary_splat_pattern" ) == 0 )
+        else if( kindIs( pt, "typed_parameter" ) || kindIs( pt, "list_splat_pattern" ) || kindIs( pt, "dictionary_splat_pattern" ) )
         {
             ident = ts_node_named_child( p, 0 );
         }
-        if( ts_node_is_null( ident ) || std::strcmp( ts_node_type( ident ), "identifier" ) != 0 )
+        if( ts_node_is_null( ident ) || !kindIs( ts_node_type( ident ), "identifier" ) )
         {
             continue;   // commas, separators, tuple patterns — nothing this veto can name
         }
@@ -1039,25 +2108,26 @@ inline void captureShadowScopeDecls( TSNode n, const char* t, std::uint32_t file
 {
     if( lang == Lang::Python )
     {
-        if( std::strcmp( t, "function_definition" ) == 0 )
+        if( kindIs( t, "function_definition" ) )
         {
             capturePythonParamShadowDecls( n, fileId, lang, src, binds );   // Phase 4b: veto evidence only (empty span)
         }
+        capturePythonRebindShadowDecls( n, t, fileId, lang, src, binds );   // issue #287 round 2: rebind veto evidence
         return;
     }
     if( lang != Lang::Cpp && lang != Lang::ObjC )
     {
         return;
     }
-    const bool isRangeFor = std::strcmp( t, "for_range_loop" ) == 0;
-    const bool isLambda   = !isRangeFor && std::strcmp( t, "lambda_expression" ) == 0;
-    const bool isCatch    = !isRangeFor && !isLambda && std::strcmp( t, "catch_clause" ) == 0;
-    const bool isFnDef    = !isRangeFor && !isLambda && !isCatch && std::strcmp( t, "function_definition" ) == 0;
+    const bool isRangeFor = kindIs( t, "for_range_loop" );
+    const bool isLambda   = !isRangeFor && kindIs( t, "lambda_expression" );
+    const bool isCatch    = !isRangeFor && !isLambda && kindIs( t, "catch_clause" );
+    const bool isFnDef    = !isRangeFor && !isLambda && !isCatch && kindIs( t, "function_definition" );
     if( !isRangeFor && !isLambda && !isCatch && !isFnDef )
     {
         return;   // every other node type declares nothing this capture owns
     }
-    const TSNode body = ts_node_child_by_field_name( n, "body", 4 );
+    const TSNode body = fieldChild( n, NodeField::Body );
     if( ts_node_is_null( body ) )
     {
         return;   // a body-less shape scopes nothing (declaration-only lambda/definition never parses so)
@@ -1068,13 +2138,14 @@ inline void captureShadowScopeDecls( TSNode n, const char* t, std::uint32_t file
         // iteration 3, unified with enclosingShadowScope's control-statement rule: the loop variable scopes
         // to the WHOLE for_range_loop statement (its own span), not merely the body.
         const BindSite loopSite{ ts_node_start_byte( n ), ts_node_start_byte( n ), ts_node_end_byte( n ) };
-        const TSNode   loopDeclarator = ts_node_child_by_field_name( n, "declarator", 10 );
+        const TSNode   loopDeclarator = fieldChild( n, NodeField::Declarator );
         emitShadowVarDecls( fileId, lang, loopDeclarator, src, loopSite, binds );
         // member-variable round (card A3): the loop variable's WRITTEN type (`for( const Symbol& s : v )` →
-        // s:Symbol) as a ParamType record for the field use-site index — the single most common typed
-        // receiver shape in this repo's own source (`s.name`), and `auto` writes nothing, as for parameters.
-        pushRawBind( fileId, lang, paramDeclaratorVarName( loopDeclarator, src ), writtenTypeOf( ts_node_child_by_field_name( n, "type", 4 ), src ),
-                     BindSite{ ts_node_start_byte( n ), 0u, 0u }, LocalBindKind::ParamType, binds );
+        // s:Symbol) as a ParamType record for the field use-site index and Rule 2's lexical lookup — the single
+        // most common typed receiver shape in this repo's own source (`s.name`), and `auto` writes nothing, as for
+        // parameters.
+        pushTypedBind( fileId, lang, paramDeclaratorVarName( loopDeclarator, src ), declTypeOfName( fieldChild( n, NodeField::Type ), src ),
+                       BindSite{ ts_node_start_byte( n ), 0u, 0u }, LocalBindKind::ParamType, binds );
         return;
     }
     if( isLambda )
@@ -1085,7 +2156,7 @@ inline void captureShadowScopeDecls( TSNode n, const char* t, std::uint32_t file
     // a catch parameter is a local of its HANDLER block (iteration 3, the noted 3b gap) — its
     // parameter_list is a direct field; a definition's sits behind the declarator chain
     // (fnDefParameterList above), which is what keeps prototypes and fn-pointer TYPE params out.
-    const TSNode params = isCatch ? ts_node_child_by_field_name( n, "parameters", 10 ) : fnDefParameterList( n );
+    const TSNode params = isCatch ? fieldChild( n, NodeField::Parameters ) : fnDefParameterList( n );
     if( !ts_node_is_null( params ) )
     {
         emitShadowParamDecls( params, fileId, lang, src, bodySite, binds );
@@ -1115,30 +2186,30 @@ inline void captureFnBindDecl( TSNode n, std::uint32_t fileId, Lang lang, std::s
                                std::vector<RawBind>& fnPos, std::vector<FnBindClobber>& fnUnk,
                                std::vector<PendingFnBindDecl>& pending )
 {
-    const TSNode typeNode = ts_node_child_by_field_name( n, "type", 4 );
+    const TSNode typeNode = fieldChild( n, NodeField::Type );
     std::string  writtenType;
     const bool   concrete = concreteWrittenType( typeNode, src, writtenType );
-    const std::uint32_t cc = ts_node_child_count( n );
-    for( std::uint32_t i = 0; i < cc; ++i )
+    // O(children), on the cursor's O(1) field name — see fnPtrAliasName above and arm B7.
+    ChildCursor cursor( n );
+    forEachChild( n, cursor.cur, [ & ]( TSNode c )
     {
-        const char* fname = ts_node_field_name_for_child( n, i );
-        if( fname == nullptr || std::strcmp( fname, "declarator" ) != 0 )
+        const char* fname = ts_tree_cursor_current_field_name( &cursor.cur );
+        if( fname == nullptr || !kindIs( fname, "declarator" ) )
         {
-            continue;
+            return true;
         }
-        const TSNode c = ts_node_child( n, i );
-        if( std::strcmp( ts_node_type( c ), "init_declarator" ) != 0 )
+        if( !kindIs( ts_node_type( c ), "init_declarator" ) )
         {
-            continue;   // no initializer → no binding fact here (a later assignment carries its own)
+            return true;   // no initializer → no binding fact here (a later assignment carries its own)
         }
-        const auto [ var, sawFnDecl, sawPtrDecl, sawRef ] = fnDeclaratorShape( ts_node_child_by_field_name( c, "declarator", 10 ), src );
-        const TSNode valueNode = ts_node_child_by_field_name( c, "value", 5 );
+        const auto [ var, sawFnDecl, sawPtrDecl, sawRef ] = fnDeclaratorShape( fieldChild( c, NodeField::Declarator ), src );
+        const TSNode valueNode = fieldChild( c, NodeField::Value );
         if( sawRef )
         {
             // A5 escape guard: `H& r = fn;` / `auto& r = fn;` ALIASES fn — a write through r retargets fn
             // invisibly, so the bound-to variable is clobbered (toward tombstone, never toward resolve) and
             // the alias itself gets NO positive (its target can change under it the same way).
-            if( !ts_node_is_null( valueNode ) && std::strcmp( ts_node_type( valueNode ), "identifier" ) == 0 )
+            if( !ts_node_is_null( valueNode ) && kindIs( ts_node_type( valueNode ), "identifier" ) )
             {
                 const std::string_view aliased = nodeTextOf( valueNode, src );
                 if( !aliased.empty() )
@@ -1146,7 +2217,7 @@ inline void captureFnBindDecl( TSNode n, std::uint32_t fileId, Lang lang, std::s
                     fnUnk.push_back( { std::string( aliased ), ts_node_start_byte( n ) } );
                 }
             }
-            continue;
+            return true;
         }
         bool bareIdent = false;
         std::string target = fnBindTargetOf( valueNode, src, bareIdent );
@@ -1155,10 +2226,11 @@ inline void captureFnBindDecl( TSNode n, std::uint32_t fileId, Lang lang, std::s
             // the declarator does not itself spell a fn pointer, so only the WRITTEN TYPE can tell a bind
             // from a copy — and that answer needs the file's complete alias table. Hold it.
             pending.push_back( { std::string( var ), std::move( target ), writtenType, ts_node_start_byte( n ), concrete } );
-            continue;
+            return true;
         }
         emitFnBind( fileId, lang, var, std::move( target ), ts_node_start_byte( n ), LocalBindKind::FnDecl, fnPos );
-    }
+        return true;
+    } );
 }
 
 // A5 escape guard over one `pointer_expression`: `&fn` ANYWHERE makes the variable mutable through the
@@ -1171,12 +2243,12 @@ inline void captureFnBindDecl( TSNode n, std::uint32_t fileId, Lang lang, std::s
 inline void captureFnBindEscape( TSNode n, std::string_view src, std::vector<FnBindClobber>& fnUnk )
 {
     const TSNode op = ts_node_child( n, 0 );
-    if( ts_node_is_null( op ) || std::strcmp( ts_node_type( op ), "&" ) != 0 )
+    if( ts_node_is_null( op ) || !kindIs( ts_node_type( op ), "&" ) )
     {
         return;
     }
-    const TSNode idn = ts_node_child_by_field_name( n, "argument", 8 );
-    if( ts_node_is_null( idn ) || std::strcmp( ts_node_type( idn ), "identifier" ) != 0 )
+    const TSNode idn = fieldChild( n, NodeField::Argument );
+    if( ts_node_is_null( idn ) || !kindIs( ts_node_type( idn ), "identifier" ) )
     {
         return;
     }
@@ -1200,9 +2272,9 @@ inline void captureFnBindAssign( TSNode n, std::uint32_t fileId, Lang lang, std:
                                  std::vector<RawBind>& fnPos, std::vector<FnBindClobber>& fnUnk,
                                  std::vector<PendingFnBindAssign>& pending )
 {
-    const TSNode lhs = ts_node_child_by_field_name( n, "left",  4 );
-    const TSNode rhs = ts_node_child_by_field_name( n, "right", 5 );
-    if( !ts_node_is_null( lhs ) && std::strcmp( ts_node_type( lhs ), "identifier" ) == 0 )
+    const TSNode lhs = fieldChild( n, NodeField::Left );
+    const TSNode rhs = fieldChild( n, NodeField::Right );
+    if( !ts_node_is_null( lhs ) && kindIs( ts_node_type( lhs ), "identifier" ) )
     {
         const std::uint32_t a = ts_node_start_byte( lhs ), b = ts_node_end_byte( lhs );
         if( a <= b && b <= src.size() )
@@ -1327,77 +2399,78 @@ void bindsVisitNode( BindCtx& cx, TSNode n, const char* t )
     const bool                  cFamilyFn = cx.cFamilyFn;
 
     // C++/ObjC: `Foo x;` · `Foo* x;` · `Foo x = Foo();` · `auto x = Foo();`
-    if( ( lang == Lang::Cpp || lang == Lang::ObjC ) && std::strcmp( t, "declaration" ) == 0 )
+    if( ( lang == Lang::Cpp || lang == Lang::ObjC ) && kindIs( t, "declaration" ) )
     {
-        const TSNode typeNode = ts_node_child_by_field_name( n, "type", 4 );
-        std::string  written  = writtenTypeOf( typeNode, src );
+        const DeclType written = declTypeOfName( fieldChild( n, NodeField::Type ), src );
         // A5 fix round: the declared names shadow within their enclosing block (or, for a control-statement
         // header declaration, that whole statement) — one parent walk per declaration node, shared by every
         // declarator child below; each declarator then contributes its own declaration POINT as the span's
         // start (shadowSpanStart).
         const ShadowScope scope = enclosingShadowScope( n );
         // a `declaration` can declare several variables (`Foo a, b;`) → one binding per declarator child.
-        const std::uint32_t cc = ts_node_child_count( n );
-        for( std::uint32_t i = 0; i < cc; ++i )
+        // O(children), not O(children³): this loop used to ask for `ts_node_child( n, i )` AND
+        // `ts_node_field_name_for_child( n, i )` twice, and all three restart tree-sitter's child iterator at
+        // the first child (src/infra/tschildren.h). A declaration's width is input-set — every comment between
+        // the type and the declarator is a direct child — and 16 000 of them measured 77x the identical flood
+        // beside the declaration (test/childwalkscalecheck.sh, arm B7, which also records why the cursor's
+        // O(1) `ts_tree_cursor_current_field_name` is the same answer: node.c:689 vs tree_cursor.c:657).
+        ChildCursor cursor( n );
+        forEachChild( n, cursor.cur, [ & ]( TSNode c )
         {
-            const TSNode c  = ts_node_child( n, i );
-            if( ts_node_field_name_for_child( n, i ) == nullptr )
-            {
-                continue;
-            }
-            if( std::strcmp( ts_node_field_name_for_child( n, i ), "declarator" ) != 0 )
-            {
-                continue;
-            }
+            const char* field = ts_tree_cursor_current_field_name( &cursor.cur );
+            if( field == nullptr || !kindIs( field, "declarator" ) ) { return true; }
             const char* ct = ts_node_type( c );
             // `init_declarator`: name lives in its `declarator`, the RHS in its `value` (for auto inference).
             // emitDeclBinds also records the r9 VarDecl shadow fact for the declared NAME regardless of type
             // resolvability (`int run = 0;` binds no type — writtenTypeOf refuses primitives — yet the local
             // exists and shadows).
-            if( std::strcmp( ct, "init_declarator" ) == 0 )
+            if( kindIs( ct, "init_declarator" ) )
             {
-                const TSNode declarator = ts_node_child_by_field_name( c, "declarator", 10 );
-                std::string  type       = written.empty() ? ctorTypeOf( ts_node_child_by_field_name( c, "value", 5 ), src ) : written;
-                emitDeclBinds( fileId, lang, declarator, src, std::move( type ),
+                const TSNode declarator = fieldChild( c, NodeField::Declarator );
+                emitDeclBinds( fileId, lang, declarator, src, declaredTypeOf( written, fieldChild( c, NodeField::Value ), src ),
                                BindSite{ ts_node_start_byte( n ), shadowSpanStart( scope, declarator ), scope.end }, binds );
             }
             else   // plain declarator (identifier / pointer_declarator / reference_declarator), no initializer
             {
-                emitDeclBinds( fileId, lang, c, src, std::string( written ),
+                emitDeclBinds( fileId, lang, c, src, written,
                                BindSite{ ts_node_start_byte( n ), shadowSpanStart( scope, c ), scope.end }, binds );
             }
-        }
+            return true;
+        } );
     }
-    // C++ `x = Foo();` (re-assignment to a constructor) — assignment_expression inside an expression_statement.
-    else if( ( lang == Lang::Cpp || lang == Lang::ObjC ) && std::strcmp( t, "assignment_expression" ) == 0 )
+    // C++ `x = Foo();` (re-assignment to a constructor) — assignment_expression inside an expression_statement. The
+    // record carries the constructor's qualified text like a declaration's does (`x = std::map<K, V>()`, kParserVer 98),
+    // and is marked an assignment's: its callee may be a function (`x = makeFoo()`), kParserVer 104.
+    else if( ( lang == Lang::Cpp || lang == Lang::ObjC ) && kindIs( t, "assignment_expression" ) )
     {
-        const TSNode lhs = ts_node_child_by_field_name( n, "left",  4 );
-        const TSNode rhs = ts_node_child_by_field_name( n, "right", 5 );
-        if( !ts_node_is_null( lhs ) && std::strcmp( ts_node_type( lhs ), "identifier" ) == 0 )
+        const TSNode lhs = fieldChild( n, NodeField::Left );
+        const TSNode rhs = fieldChild( n, NodeField::Right );
+        if( !ts_node_is_null( lhs ) && kindIs( ts_node_type( lhs ), "identifier" ) )
         {
             const std::uint32_t a = ts_node_start_byte( lhs ), b = ts_node_end_byte( lhs );
             if( a <= b && b <= src.size() )
             {
-                emitBind( fileId, lang, src.substr( a, b - a ), ctorTypeOf( rhs, src ), ts_node_start_byte( n ), binds );
+                pushTypedBind( fileId, lang, src.substr( a, b - a ), assignedTypeOf( rhs, src ), BindSite{ ts_node_start_byte( n ), 0u, 0u },
+                               LocalBindKind::Type, binds );
             }
         }
     }
     // Python `x = Foo()` — assignment with a bare-identifier LHS and a constructor-call RHS.
-    else if( lang == Lang::Python && std::strcmp( t, "assignment" ) == 0 )
+    else if( lang == Lang::Python && kindIs( t, "assignment" ) )
     {
-        const TSNode lhs = ts_node_child_by_field_name( n, "left",  4 );
-        const TSNode rhs = ts_node_child_by_field_name( n, "right", 5 );
-        if( !ts_node_is_null( lhs ) && std::strcmp( ts_node_type( lhs ), "identifier" ) == 0 )
+        const TSNode lhs = fieldChild( n, NodeField::Left );
+        const TSNode rhs = fieldChild( n, NodeField::Right );
+        if( !ts_node_is_null( lhs ) && kindIs( ts_node_type( lhs ), "identifier" ) )
         {
             const std::uint32_t a = ts_node_start_byte( lhs ), b = ts_node_end_byte( lhs );
             if( a <= b && b <= src.size() )
             {
                 // Python RHS constructor is a `call` node (not `call_expression`); reuse finalSegment on its callee.
                 std::string type;
-                if( !ts_node_is_null( rhs ) && std::strcmp( ts_node_type( rhs ), "call" ) == 0 )
+                if( !ts_node_is_null( rhs ) && kindIs( ts_node_type( rhs ), "call" ) )
                 {
-                    const TSNode fn = ts_node_child_by_field_name( rhs, "function", 8 );
-                    if( !ts_node_is_null( fn ) && std::strcmp( ts_node_type( fn ), "identifier" ) == 0 )
+                    const TSNode fn = fieldChild( rhs, NodeField::Function );
+                    if( !ts_node_is_null( fn ) && kindIs( ts_node_type( fn ), "identifier" ) )
                     {
                         const std::uint32_t fa = ts_node_start_byte( fn ), fb = ts_node_end_byte( fn );
                         if( fa <= fb && fb <= src.size() )
@@ -1410,32 +2483,39 @@ void bindsVisitNode( BindCtx& cx, TSNode n, const char* t )
             }
         }
     }
-    // TypeScript `const x = new Foo();` · `let y: Bar = ...;` — variable_declarator.
-    else if( lang == Lang::TypeScript && std::strcmp( t, "variable_declarator" ) == 0 )
+    // Java declarations are resolver veto evidence for `Identifier::method`. Tree-sitter cannot
+    // distinguish a type receiver from a value receiver, so a parameter/local/field with the same
+    // spelling must prevent the class-name proof — but only where that binding is in scope.
+    else if( lang == Lang::Java )
     {
-        const TSNode nameNode = ts_node_child_by_field_name( n, "name", 4 );
-        if( !ts_node_is_null( nameNode ) && std::strcmp( ts_node_type( nameNode ), "identifier" ) == 0 )
+        captureJavaShadowDecls( n, t, fileId, lang, src, binds );
+    }
+    // TypeScript `const x = new Foo();` · `let y: Bar = ...;` — variable_declarator.
+    else if( lang == Lang::TypeScript && kindIs( t, "variable_declarator" ) )
+    {
+        const TSNode nameNode = fieldChild( n, NodeField::Name );
+        if( !ts_node_is_null( nameNode ) && kindIs( ts_node_type( nameNode ), "identifier" ) )
         {
             const std::uint32_t a = ts_node_start_byte( nameNode ), b = ts_node_end_byte( nameNode );
             if( a <= b && b <= src.size() )
             {
                 // prefer the `: Type` annotation; else infer from a `new Foo()` / `Foo()` initializer.
                 std::string type;
-                const TSNode ann = ts_node_child_by_field_name( n, "type", 4 );   // type_annotation
+                const TSNode ann = fieldChild( n, NodeField::Type );   // type_annotation
                 if( !ts_node_is_null( ann ) )
                 {
-                    const std::uint32_t cc = ts_node_child_count( ann );
-                    for( std::uint32_t i = 0; i < cc; ++i )
-                    {
-                        const TSNode c = ts_node_child( ann, i );
-                        if( std::strcmp( ts_node_type( c ), "type_identifier" ) == 0 )
-                        { const std::uint32_t ta = ts_node_start_byte( c ), tb = ts_node_end_byte( c );
-                          if( ta <= tb && tb <= src.size() ) { type = finalSegment( src.substr( ta, tb - ta ) ); } break; }
-                    }
+                    // O(children): the scan stops at the first type_identifier, but nothing bounds how many
+                    // comments precede one — `let x: /* … */ Foo` splices each into the annotation's child list.
+                    ChildCursor annCursor( ann );
+                    forEachChild( ann, annCursor.cur, [ & ]( TSNode c )
+                    {   if( !kindIs( ts_node_type( c ), "type_identifier" ) ) { return true; }
+                        const std::uint32_t ta = ts_node_start_byte( c ), tb = ts_node_end_byte( c );
+                        if( ta <= tb && tb <= src.size() ) { type = finalSegment( src.substr( ta, tb - ta ) ); }
+                        return false; } );   // the indexed loop's `break`: the FIRST type_identifier wins
                 }
                 if( type.empty() )
                 {
-                    type = ctorTypeOf( ts_node_child_by_field_name( n, "value", 5 ), src );
+                    type = ctorTypeOf( fieldChild( n, NodeField::Value ), src );
                 }
                 emitBind( fileId, lang, src.substr( a, b - a ), std::move( type ), ts_node_start_byte( n ), binds );
             }
@@ -1450,15 +2530,15 @@ void bindsVisitNode( BindCtx& cx, TSNode n, const char* t )
     // ── L3 fn-pointer/callback capture (C/C++/ObjC) — a SEPARATE if (not part of the Rule-2 chain above):
     // the same `declaration` node can carry BOTH a Rule-2 var→type fact and a var→function fact
     // (`H fnPtr = beta;` emits fnPtr:H for receiver narrowing AND fnPtr→beta for call resolution). ──
-    if( cFamilyFn && std::strcmp( t, "declaration" ) == 0 )
+    if( cFamilyFn && kindIs( t, "declaration" ) )
     {
         captureFnBindDecl( n, fileId, lang, src, fnPos, fnUnk, fnGate.pendingDecl );
     }
-    else if( cFamilyFn && std::strcmp( t, "assignment_expression" ) == 0 )
+    else if( cFamilyFn && kindIs( t, "assignment_expression" ) )
     {
         captureFnBindAssign( n, fileId, lang, src, fnPos, fnUnk, fnGate.pending );
     }
-    else if( cFamilyFn && std::strcmp( t, "pointer_expression" ) == 0 )
+    else if( cFamilyFn && kindIs( t, "pointer_expression" ) )
     {
         captureFnBindEscape( n, src, fnUnk );   // A5: `&fn` anywhere clobbers the variable (escape guard)
     }

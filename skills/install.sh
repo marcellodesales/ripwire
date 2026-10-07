@@ -2,7 +2,11 @@
 # Install ripwire's agent skills (symlinks back to this repo's skills/, so they stay version-controlled and
 # edits here take effect immediately). Default: Claude. Codex: skills/install.sh --codex installs to the
 # current cross-agent ~/.agents/skills discovery root; --codex-legacy retains the older CODEX_HOME/skills
-# destination. An explicit path remains supported for CI and other clients: skills/install.sh PATH.
+# destination. Hermes: skills/install.sh --hermes installs to ${HERMES_HOME:-~/.hermes}/skills (the same
+# Agent-Skills-standard SKILL.md files Hermes loads natively, plus the Hermes-native skills under
+# skills/hermes/; no `--hook` support there yet — Hermes exposes hooks: pre_tool_call in config.yaml
+# but hooks/ripwire-nudge.sh still switches on Claude tool names, so the port has not landed). An explicit path remains supported for CI and other clients:
+# skills/install.sh PATH.
 # Add --hook explicitly to install the advisory PreToolUse + SessionStart hook for the selected client:
 # skills/install.sh --hook (Claude) or skills/install.sh --codex --hook (Codex). --openclaw installs to
 # that same cross-agent root (openclaw's own "compatibility skill root"); it has no hook slot.
@@ -131,7 +135,7 @@ install_claude_route()
 # once per session per pattern. Idempotent — re-running does not duplicate the settings.json entry.
 install_claude_hook()
 {
-    settings="$HOME/.claude/settings.json"
+    settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
     hookScript="$( dirname "$src" )/hooks/ripwire-nudge.sh"
     chmod +x "$hookScript" 2>/dev/null || true
 
@@ -265,6 +269,7 @@ for arg in "$@"; do
         --openclaw) mode="openclaw"; explicitMode=1 ;;
         --codex-legacy) mode="codex-legacy"; explicitMode=1 ;;
         --claude) mode="claude"; explicitMode=1 ;;
+        --hermes) mode="hermes"; explicitMode=1 ;;
         --*) echo "skills/install.sh: unknown option $arg" >&2; exit 2 ;;
         *) [ -z "$explicitPath" ] || { echo "skills/install.sh: only one destination path is allowed" >&2; exit 2; }
            explicitPath="$arg"; mode="path"; explicitMode=1 ;;
@@ -296,10 +301,89 @@ case "$mode" in
                   echo "  Installing there anyway; openclaw will not discover these skills until that is unset." >&2
               fi ;;
     codex-legacy) dst="${CODEX_HOME:-$HOME/.codex}/skills" ;;
-    claude) dst="$HOME/.claude/skills" ;;
+    claude) dst="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" ;;
+    hermes) dst="${HERMES_HOME:-$HOME/.hermes}/skills" ;;
     path) dst="$explicitPath" ;;
 esac
 mkdir -p "$dst"
+
+# ── WHAT COUNTS AS OURS, AND WHY A LINK IS VERIFIED (issue #334, 2026-09-25). On Windows without symlink
+#    privilege (Developer Mode off), Git Bash's `ln -sfn DIR DEST` EXITS 0 and leaves an EMPTY DIRECTORY, even
+#    under MSYS=winsymlinks:nativestrict. This installer used to trust that exit status: it printed `installed`
+#    sixteen times, wrote all sixteen names to the manifest and announced "16 ripwire skills active" over sixteen
+#    empty directories. So a link is now checked by its RESULT (a symlink whose SKILL.md reads back); when it
+#    did not take, the skill is COPIED (`cp -R`) and reported as `copied`; when the copy fails too, it is
+#    reported as `FAILED`, left out of the count and the manifest, and the run exits 1.
+#    A copy is a real directory, so the prune/install paths below must recognise it as ours without ever
+#    touching a user's own directory that happens to share a shipped ripwire-* name.
+#
+#    CODERABBIT C4 (train 20, reproduced 2026-09-25): the first cut of this clause trusted the PREVIOUS
+#    MANIFEST alone — any name that installer had once written was "ours" forever after, even once the user
+#    had deleted the link and dropped their own directory of files there. `rm -rf`, no message, rc 0. A
+#    manifest entry records what THIS installer once put at a path; it is not evidence about what is at that
+#    path NOW, so it must never by itself justify removing a real directory.
+#
+#    A real directory is ours ONLY when it is provably ours, checked in this order:
+#    1. MARKED: it carries the copy marker this installer writes at copy time, and the marker NAMES THIS
+#       DIRECTORY (B2, train 20 review). The marker holds the skill name it was copied as, so a marked copy the
+#       user renamed to another ripwire-* name to keep their edits (the marker then names a different skill) is
+#       theirs and is kept; before, an empty marker proved "some ripwire copy", not "this path", and the renamed
+#       copy was pruned as stale with the edits in it. The contract: a copied skill is ours (edits made inside it
+#       are replaced on re-run); edit your own copy under a different name.
+#       A NAMELESS (empty) marker, written by 0.6.4 candidates before B2, proves nothing about the path: such a
+#       directory is ours only when its name is a shipped skill and its contents, the marker aside, are
+#       byte-identical to that skill. Otherwise it is kept.
+#    2. EMPTY TREE: it holds no non-directory entry at ANY depth (B1). This is #334's actual shape. On Windows
+#       without symlink privilege every 0.6.0-0.6.3 installer's unverified `ln -sfn DIR DEST` left an empty
+#       directory, and on the SECOND run DEST was already a real directory, so coreutils/MSYS `ln` resolved the
+#       target to DEST/basename(DIR) and left an empty ripwire-x/ripwire-x inside it. A tree of empty
+#       directories holds no user bytes. `find` failing anywhere (an unreadable subdirectory, no find at all)
+#       means the tree is NOT provably empty, so its errors are handled explicitly and never read as "empty".
+#    3. BYTE-IDENTICAL: its contents are identical (`diff -rq`) to the skill this checkout ships under that name
+#       right now: an unmarked deep copy holding nothing but ripwire's own bytes. Residual gap, deliberately on
+#       the safe side: an unmarked copy of a skill whose bytes have changed since is kept as the user's.
+#    Byte comparison needs no extra bookkeeping and degrades safely (no shipped skill left under that name =>
+#    no match => left alone). Anything that fails every check is left untouched, reported with a one-line
+#    `kept` note, and never added to the manifest's ours set: the manifest is written from what this run
+#    itself verified, never from what a past run once claimed.
+#    test/skillinstallcheck.sh sections (F)-(I) drive all of it with an `ln` that behaves like that Git Bash.
+copyMarker=".ripwire-installed-copy"
+# shipped_src_for NAME — the skill directory this checkout would install under NAME right now, or nothing if
+# this checkout ships no such skill (a stale/renamed name, or a Hermes-native one outside non-hermes modes).
+shipped_src_for()
+{
+    if [ -d "$src/$1" ]; then
+        printf '%s\n' "$src/$1"
+    elif [ "$mode" = "hermes" ] && [ -d "$src/hermes/$1" ]; then
+        printf '%s\n' "$src/hermes/$1"
+    fi
+}
+# tree_holds_no_files DIR: true only when `find` read the WHOLE tree cleanly and found no non-directory entry
+# in it. find's own failure (rc != 0: an unreadable subdirectory, find missing) returns false: not provably
+# empty, so the directory is kept rather than removed.
+tree_holds_no_files()
+{
+    _files="$( find "$1" ! -type d 2>/dev/null )" || return 1
+    [ -z "$_files" ]
+}
+dir_is_ours()
+{
+    # $1 = the real directory found at the destination; $2 = the shipped skill dir to byte-compare it
+    # against, or "" when this checkout ships nothing under that name.
+    if [ -f "$1/$copyMarker" ]; then
+        _marked="$( cat "$1/$copyMarker" 2>/dev/null )" || return 1
+        [ "$_marked" = "$( basename "$1" )" ] && return 0           # our copy, of this very skill
+        [ -z "$_marked" ] || return 1                                 # a copy of ANOTHER skill: the user's
+        # a nameless marker (pre-B2 candidate): ours only if byte-identical to the skill shipped under this name
+        [ -n "${2:-}" ] && [ -d "$2" ] && diff -rq -x "$copyMarker" "$2" "$1" >/dev/null 2>&1
+        return
+    fi
+    tree_holds_no_files "$1" \
+        || { [ -n "${2:-}" ] && [ -d "$2" ] && diff -rq "$2" "$1" >/dev/null 2>&1; }
+}
+# a real directory this installer cannot prove it created — the one shape it must never remove
+foreign_dir() { [ -d "$1" ] && [ ! -L "$1" ] && ! dir_is_ours "$1" "${2:-}"; }
+remove_ours() { if [ -d "$1" ] && [ ! -L "$1" ]; then rm -rf "$1"; else rm -f "$1"; fi; }
 
 # PRUNE first: remove any installed ripwire-* skill that this repo no longer ships (deleted or renamed) —
 # otherwise a dangling symlink (e.g. a skill removed in a consolidation) lingers forever and an agent
@@ -315,21 +399,76 @@ is_contributor_skill() { grep -q '^audience: contributor' "$1/SKILL.md" 2>/dev/n
 wanted_skill() { [ "$wantContributor" -eq 1 ] || ! is_contributor_skill "$1"; }
 
 pruned=0
+kept=0
 for existing in "$dst"/ripwire-*; do
     [ -e "$existing" ] || [ -L "$existing" ] || continue      # skip the literal glob when nothing matches
     name="$( basename "$existing" )"
+    why=""
     if [ ! -d "$src/$name" ]; then
-        rm -f "$existing"
-        echo "pruned stale $name (no longer shipped)"
-        pruned=$(( pruned + 1 ))
+        # Hermes-native skills live at skills/hermes/<name>, not skills/<name>: a linked one is still
+        # shipped, so it is kept — unless it stopped being wanted (contributor-only without
+        # --contributor), in which case it is pruned like any other.
+        if [ "$mode" = "hermes" ] && [ -d "$src/hermes/$name" ] && wanted_skill "$src/hermes/$name"; then
+            continue
+        fi
+        why="stale $name (no longer shipped)"
     elif ! wanted_skill "$src/$name"; then
-        rm -f "$existing"
-        echo "pruned $name (contributor-only; pass --contributor to activate it)"
-        pruned=$(( pruned + 1 ))
+        why="$name (contributor-only; pass --contributor to activate it)"
     fi
+    [ -n "$why" ] || continue
+    if foreign_dir "$existing" "$( shipped_src_for "$name" )"; then
+        # Before #334 this was `rm -f` on a directory, which failed and aborted the whole install under set -e.
+        # C4: a name this run once wrote to the manifest is not by itself proof this directory is still ours —
+        # it may now be the user's own, so it is kept, never removed, on a manifest entry alone.
+        echo "kept $name: not installed by ripwire (your own directory) — remove it yourself if it is stale"
+        kept=$(( kept + 1 ))
+        continue
+    fi
+    remove_ours "$existing"
+    echo "pruned $why"
+    pruned=$(( pruned + 1 ))
 done
 
+# install_skill SRC NAME [NOTE] — link SRC into $dst/NAME, verify the link by its result, fall back to a
+# copy, and say which of the three happened. Returns 1 only when the skill is not usable at all.
 count=0
+copied=0
+failed=0
+installedNames=""
+install_skill()
+{
+    target="$dst/$2"
+    if foreign_dir "$target" "$1"; then
+        # `ln -sfn` onto a real directory links INSIDE it and reports success, so this is checked before
+        # attempting either. It is not a FAILURE (nothing this run was asked to do went wrong) — it is the
+        # user's own directory (C4), so it is left exactly as it is and not counted as installed.
+        echo "kept $2: not installed by ripwire (your own directory)"
+        kept=$(( kept + 1 ))
+        return 0
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        remove_ours "$target"
+    fi
+    if ln -sfn "$1" "$target" 2>/dev/null && [ -L "$target" ] && [ -f "$target/SKILL.md" ]; then
+        echo "installed $2 -> $target${3:-}"
+    else
+        [ -e "$target" ] || [ -L "$target" ] && remove_ours "$target"
+        if cp -R "${1%/}" "$target" 2>/dev/null && cmp -s "$1/SKILL.md" "$target/SKILL.md" \
+           && printf '%s\n' "$2" >"$target/$copyMarker" 2>/dev/null; then
+            echo "copied $2 -> $target${3:-} (a symlink did not take here, e.g. Windows without Developer Mode; re-run after updating ripwire to refresh the copy)"
+            copied=$(( copied + 1 ))
+        else
+            [ -e "$target" ] || [ -L "$target" ] && remove_ours "$target"
+            echo "FAILED $2: neither a symlink nor a copy produced a readable $target/SKILL.md" >&2
+            failed=$(( failed + 1 ))
+            return 1
+        fi
+    fi
+    count=$(( count + 1 ))
+    installedNames="$installedNames$2
+"
+}
+
 skipped=0
 for d in "$src"/ripwire-*/; do
     name="$( basename "$d" )"
@@ -338,31 +477,59 @@ for d in "$src"/ripwire-*/; do
         skipped=$(( skipped + 1 ))
         continue
     fi
-    ln -sfn "$d" "$dst/$name"
-    echo "installed $name -> $dst/$name"
-    count=$(( count + 1 ))
+    install_skill "$d" "$name" || true
 done
 
-# The active skill directory is an agent-facing API surface, not a bag of best-effort links. Record the
-# exact shipped set only after every link succeeds so `ripwire --doctor --agent=codex` can distinguish a
-# complete install from a stale/missing/extra skill without trusting the checkout it came from.
+# Hermes loads the flat Agent-Skills-standard set AND Hermes-native skills (skills/hermes/ripwire-*, e.g.
+# the ripwire-repo-map skill purpose-built for Hermes) side by side out of one directory — verified live:
+# both formats index together, so --hermes deploys both and no prefer/fallback logic is needed.
+# The ripwire-* glob is the SAME name scope the flat install loop and the prune loop above use, and it is
+# load-bearing: this loop `ln -sfn`s each entry into the user's skill home under its own name, `ln -sfn`
+# unlinks an existing regular file first, and the prune loop only ever looks at ripwire-*. A hermes/ entry
+# without the prefix would therefore delete a same-named USER skill and then be impossible to prune. Only
+# ripwire-repo-map lives there today, so this is the asymmetry being closed, not a bug being observed.
+# Gate: test/hermesinstallcheck.sh arm 7.
+if [ "$mode" = "hermes" ]; then
+    for nd in "$src"/hermes/ripwire-*/; do
+        [ -d "$nd" ] || continue                                  # skip the literal glob when nothing matches
+        [ -f "$nd/SKILL.md" ] || continue                        # a Hermes-native skill is a dir with SKILL.md
+        nname="$( basename "$nd" )"
+        [ -d "$src/$nname" ] && continue                         # flat set already linked it above; one link wins
+        if ! wanted_skill "$nd"; then
+            echo "skipped $nname (contributor-only: about working on ripwire itself; pass --contributor to activate it)"
+            skipped=$(( skipped + 1 ))
+            continue
+        fi
+        install_skill "$nd" "$nname" " (Hermes-native skill)" || true
+    done
+fi
+
+# The active skill directory is an agent-facing API surface, not a bag of best-effort links. The manifest
+# records exactly the skills that were VERIFIED usable above (linked or copied), so `ripwire --doctor
+# --agent=codex` can distinguish a complete install from a stale/missing/extra skill without trusting the
+# checkout it came from. A skill that FAILED is not in it: listing it is the #334 lie in another file.
 manifestTmp="$( mktemp "$dst/.ripwire-manifest-v1.tmp.XXXXXX" )"
 {
     echo 'version=1'
-    for d in "$src"/ripwire-*/; do
-        wanted_skill "$d" && echo "skill=$( basename "$d" )"
-    done
+    printf '%s' "$installedNames" | while IFS= read -r n; do echo "skill=$n"; done
 } >"$manifestTmp"
 mv "$manifestTmp" "$dst/.ripwire-manifest-v1"
-echo "done. $count ripwire skills active in every session (${pruned} pruned, ${skipped} contributor-only skipped) — every ripwire-* installed above."
+if [ "$failed" -gt 0 ]; then
+    # Not `exit 1` here: a requested --hook is still registered below, and the status is set at the very end.
+    echo "skills/install.sh: $failed ripwire skill(s) FAILED to install into $dst (listed above); $count usable, ${copied} of them copied, ${kept} kept as yours." >&2
+else
+    echo "done. $count ripwire skills active in every session (${copied} copied, ${pruned} pruned, ${skipped} contributor-only skipped, ${kept} kept as yours) — every ripwire-* installed above."
+fi
 
 if [ "$wantHook" -eq 1 ]; then
     case "$mode" in
         codex|codex-legacy) install_codex_hook ;;
         claude) install_claude_hook ;;
-        # Refuse rather than silently installing the Codex hook into a slot we have not verified. An
-        # agent that gets a hook it did not ask for is worse off than one that gets an honest no.
-        openclaw) echo "skills/install.sh: --hook is not supported for openclaw — it has a before_tool_call PLUGIN API, but no shell-command hook slot for this script to write into." >&2; exit 2 ;;
+                hermes) echo "skills/install.sh: --hook is not ported to the Hermes target yet (Hermes exposes hooks: pre_tool_call in config.yaml, but hooks/ripwire-nudge.sh still switches on Claude tool names); ripwire works via the CLI/MCP server there." >&2; exit 2 ;;
+        openclaw) echo "skills/install.sh: --hook is not supported for the openclaw target (openclaw's before_tool_call is a plugin API, not a shell hook slot); ripwire works via the CLI/MCP server there." >&2; exit 2 ;;
         path) echo "skills/install.sh: --hook needs --claude or --codex, not an explicit skill path" >&2; exit 2 ;;
     esac
 fi
+
+# A skill that FAILED above makes the whole run fail, after everything else it was asked to do (#334).
+[ "$failed" -eq 0 ] || exit 1

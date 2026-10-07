@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // mergescout.h — L1: --merge-scout=REF[,REF...], the read-only
 // cross-branch overlap oracle. Evidence: a 2026-07-14 round hand-computed a landing order for 5
@@ -72,7 +75,7 @@
 // working tree or any ref, and never mutates repo state. An unresolvable REF is a loud refusal (the
 // caller exits non-zero, naming the ref) decided BEFORE any archive work starts — never a silently-empty
 // arm buried in otherwise-good output. A non-git root / repo with no HEAD commit degrades to an empty
-// result (DEGRADED_PATH_ALERT), matching quality.h's own non-git convention.
+// result (DISCLOSE), matching quality.h's own non-git convention.
 
 #include "model.h"
 #include "ingest.h"
@@ -83,7 +86,7 @@
 #include "infra/jsonesc.h"      // shSingleQuote
 #include "serialize.h"          // escapeXml
 #include "workspace.h"          // wsdetail::segmentsOf — the shared delimiter-split primitive (also splits the CSV ref list)
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT
+#include "infra/Diagnostics.h"  // DISCLOSE
 
 #include "btree.hpp"      // gtl::btree_map — sorted iteration, cache-friendly (house rule: never std::map)
 
@@ -134,6 +137,35 @@ struct Arm
     // HEAD. A subset of `changed`, key-sorted, and empty by construction for an arm that forked off current
     // HEAD (baseSha == headSha) or for the working-tree arm.
     std::vector<ChangedSym> headConflicts;
+    // false ⇒ the head-conflict lane could not diff this arm's base against HEAD (a side's tree unavailable):
+    // headConflicts is then UNKNOWN, not empty — the row says head_conflicts_ok="0". `changed` is unaffected.
+    bool                    headLaneOk = true;
+    enum class DisclosureWhy : std::uint8_t
+    {
+        NoMergeBase,
+        TreeUnavailable,       // a side's tree could not be materialized or ingested: arm ok="0", empty changed set
+        HeadTreeUnavailable,   // the head-conflict lane's base-vs-HEAD diff had no tree: head_conflicts_ok="0"
+    };
+    // The refusal cause, meaningful only when ok==false (set alongside it in the same disclose() call) — the
+    // row's `reason=` (writeScoutArm) reads this, never the debug trace text disclose() also emits, so the
+    // cause survives a Release build exactly like `ok=` itself already does (the DISCLOSE sink write is
+    // unconditional in every build; only the trace string is NDEBUG'd out). Default value is never read: it
+    // is overwritten by every call that can set ok=false before anything prints it.
+    DisclosureWhy           why = DisclosureWhy::NoMergeBase;
+    void disclose( DisclosureWhy w ) noexcept
+    {
+        switch( w )
+        {
+            case DisclosureWhy::NoMergeBase:
+            case DisclosureWhy::TreeUnavailable:     ok = false; why = w; break;
+            case DisclosureWhy::HeadTreeUnavailable: headLaneOk = false; break;
+        }
+        // ENSURES, not ASSUME: this is the postcondition every caller of disclose() relies on without
+        // re-checking — writeScoutArm reads arm.ok and arm.why together, never one without the other, so the
+        // two must never be able to drift apart (an ok==false row with a stale/default `why` would print the
+        // wrong reason=).
+        ENSURES( ( w == DisclosureWhy::HeadTreeUnavailable ) || ( !ok && why == w ) );
+    }
 };
 
 // key -> body hash, and key -> identity, for one materialized tree. Overloads sharing a canonical id
@@ -143,6 +175,9 @@ struct SymTreeIndex
 {
     gtl::btree_map<std::uint64_t, std::uint64_t> bodyHash;
     gtl::btree_map<std::uint64_t, ChangedSym>     identity;
+    // false ⇒ the committish's tree could not be materialized or ingested: this is NOT an empty tree, and an arm diffed
+    // against it must not read every symbol as changed (computeNamedArm refuses it through the arm's sink).
+    bool                                          isIndexed = false;
 };
 
 // The file-level fallback lane (see this file's FILE-LEVEL FALLBACK header comment): fold a whole-file
@@ -154,7 +189,6 @@ struct SymTreeIndex
 // bodyHashesBySym already skipped — no file is ever double-counted between the two lanes.
 inline void injectFileLevelFallback( SymTreeIndex& out, const IngestResult& ing, std::string_view root, const SymbolsByFile& realBodySyms )
 {
-    std::string bytes;
     for( std::uint32_t f = 0; f < ing.files.size(); ++f )
     {
         if( f < realBodySyms.size() && !realBodySyms[f].empty() )
@@ -166,7 +200,8 @@ inline void injectFileLevelFallback( SymTreeIndex& out, const IngestResult& ing,
         // --quality-delta reported the two as a 320-token clone the moment the quality-side copy was
         // extracted. Unreadable or empty degrades the same way in both: contributes nothing, never crashes,
         // and nothing is hidden because there is no content to hide.
-        if( !docparse::detail::readWholeFile( ing.files[f], bytes ) || bytes.empty() )
+        const std::string bytes = docparse::detail::readWholeFile( ing.files[f] ).value_or( std::string() );
+        if( bytes.empty() )
         {
             continue;
         }
@@ -190,7 +225,7 @@ inline SymTreeIndex buildTreeIndex( const IngestResult& ing, std::string_view ro
         }
         const std::string    relFile( relForHash( ing.files[ s.fileId ], root ) );
         const std::string    canon = canonicalId( relFile, s.scope, s.name );          // DISPLAY id (may be a bare name)
-        const std::uint64_t  key   = quality::pathQualifiedKey( relFile, s.scope, s.name );   // COMPARISON key — the one body-hash key space
+        const std::uint64_t  key   = quality::pathQualifiedKey( relFile, s );   // COMPARISON key — the one body-hash key space (the Symbol overload: one keying rule per language)
         out.identity.try_emplace( key, ChangedSym{ key, relFile, canon } );   // first writer wins — overloads share one id
     }
     const SymbolsByFile realBodySyms = symbolsByFileInIdOrder( ing, []( const Symbol& s ) { return s.endByte > s.sigStartByte; } );
@@ -199,7 +234,7 @@ inline SymTreeIndex buildTreeIndex( const IngestResult& ing, std::string_view ro
 }
 
 // Y1 (P1) — the per-sha committish INGEST cache family. `committish` is always a fully-resolved
-// commit sha by the time it reaches here (resolveCommittish / merge-base already peeled any symbolic
+// commit sha by the time it reaches here (resolveAllRefs / merge-base already peeled any symbolic
 // ref), so its tree is immutable — the SAME per-sha cache convention quality.h uses for its own
 // qheadsnap/qbody families (shaKeyedCachePath + a real cacheFile handed to ingest()), but its OWN "qms"
 // family so a multi-arm scout run's ~2*refCount+1 distinct trees don't thrash quality.h's own 2-slot
@@ -219,14 +254,30 @@ inline std::string msCachePath( const std::string& repoHex, const std::string& e
 }
 
 // Materialize + ingest one committish (git-archive, read-only, TEMP copy) into a SymTreeIndex. Empty
-// committish, a failed archive, or an empty ingest degrades to an empty (still valid) index — never
-// throws, never crashes (mirrors quality.h's own archive/ingest degrade contract).
+// committish or a failed materialize degrades to an empty, UNINDEXED index (isIndexed stays false — never
+// throws, never crashes, mirrors quality.h's own archive/ingest degrade contract).
 //
 // Previously this handed ingest() an EMPTY cacheFile, forcing a full cold tree-sitter PARSE of every
 // arm's tree on EVERY run despite the header comment above claiming cache reuse — the audited 9.15 s /
 // 967 MB, 6-cold-ingest finding (mergescout.h:115). `repoHex`/`exclHex` are computed once by the caller
 // (TreeIndexMemo) and threaded through so this per-committish call is a single hash-format + lookup, not
 // a repeated realpath/hash-config cost per tree.
+//
+// MATERIALIZE FAILURE vs. A REAL BUT EMPTY INGEST — this distinction used to be made HERE, indirectly, by
+// asking git whether committish's tree object equals the empty-tree hash (the removed commitTreeIsEmpty):
+// that answered "is the git TREE itself empty", which is a different question from "did this run's excludes
+// or unsupported-file filter leave nothing to ingest" — a base whose only file is excluded, or whose only
+// file has no supported extension, has a NON-empty git tree, so that check answered "not verified empty" and
+// this function refused it exactly like a real archive failure (CodeRabbit review, src/mergescout.h:245-267,
+// queued as its own lane 2026-09-18). The fix is upstream, not a second local heuristic:
+// quality::materializeCommitTree now checks `git archive`'s own exit status separately from `tar -x`'s (its
+// own comment says why the piped form could not tell a masked archive failure from a genuinely empty
+// stream), so `tmpRoot.empty()` here is now a TRUSTWORTHY signal of "the tree could not be read" and nothing
+// else. Once materialize has verifiably succeeded, an ingest that comes back with zero files/symbols is
+// simply what THIS tree, under THESE excludes, contains — a real, indexed, empty SymTreeIndex — for any of
+// three legal causes (a fresh root commit, every path excluded, or no file with a supported extension), and
+// there is no reason left to tell them apart: diffTreeIndex against it correctly reads every symbol on the
+// OTHER side as added, the right answer for a genuinely empty base in all three cases.
 inline SymTreeIndex indexCommittish( const std::string& root, const std::string& committish,
                                      const std::vector<std::string>& excludes, std::size_t maxFileBytes,
                                      const std::string& repoHex, const std::string& exclHex )
@@ -235,19 +286,19 @@ inline SymTreeIndex indexCommittish( const std::string& root, const std::string&
     {
         return {};
     }
-    const std::string tmpRoot = quality::materializeCommitTree( root, committish, "qms" );
+    const std::string tmpRoot = quality::materializeCommitTree( root, committish, "qms", /*pruneCrawlSkipDirs=*/true );   // index only: skip what the crawl prunes
     if( tmpRoot.empty() )
     {
-        return {};
+        return {};   // materialize genuinely failed (git archive / tar extract / temp dir / revision) — isIndexed stays false, the arm refuses (below)
     }
     quality::TmpTreeGuard guard{ tmpRoot };
     const std::string cachePath = msCachePath( repoHex, exclHex, committish );
     IngestResult ing = ingest( tmpRoot.c_str(), excludes, std::string_view( cachePath ), maxFileBytes, /*captureValueUses=*/false );
-    if( ing.symbols.empty() && ing.files.empty() )
-    {
-        return {};
-    }
-    return buildTreeIndex( ing, tmpRoot );
+    // buildTreeIndex on an empty IngestResult already produces an empty-but-valid SymTreeIndex — see the
+    // function comment above for why an empty `ing` here is trusted rather than re-checked.
+    SymTreeIndex index = buildTreeIndex( ing, tmpRoot );
+    index.isIndexed    = true;
+    return index;
 }
 
 // Diff `ref` against `base`: every key present in either with a DIFFERENT (or one-sided) body hash —
@@ -287,14 +338,6 @@ inline std::vector<ChangedSym> diffTreeIndex( const SymTreeIndex& base, const Sy
         // both from the same symbol pass) — degrade by simply not naming it, never crash.
     }
     return out;   // already key-sorted (built from the sorted `keys` vector)
-}
-
-// Resolve REF to a commit sha via `git rev-parse --verify --quiet REF^{commit}` (the ^{commit} peel
-// rejects anything that isn't a committish — a blob/tree hash, a malformed ref). "" ⇒ unresolvable, the
-// caller's loud-refusal gate. Mirrors gitmine.h's resolveSinceScope rev probe.
-inline std::string resolveCommittish( const std::string& root, std::string_view ref )
-{
-    return quality::gitOneLine( root, "rev-parse --verify --quiet " + shSingleQuote( std::string( ref ) + "^{commit}" ) + " 2>/dev/null" );
 }
 
 // Split "A,B,C" on commas, dropping empty tokens — the same primitive workspace.h's segmentsOf uses for
@@ -341,7 +384,7 @@ class TreeIndexMemo
 public:
     TreeIndexMemo( const std::string& root, const std::vector<std::string>& excludes, std::size_t maxFileBytes )
         : root_( root ), excludes_( excludes ), maxFileBytes_( maxFileBytes ),
-          repoHex_( quality::headSnapRepoHex( root ) ), exclHex_( msExclHex( excludes ) ) {}
+          repoHex_( quality::cacheRootKeyHex( root ) ), exclHex_( msExclHex( excludes ) ) {}
 
     // Register one future get(sha) BEFORE the diff loop runs — see the class comment above.
     void reserve( const std::string& sha ) { ++pending_[ sha ]; }
@@ -374,6 +417,12 @@ private:
 
 // Resolve + validate EVERY ref BEFORE any archive work — a bad ref is a loud refusal, never a partial/
 // empty arm silently buried in otherwise-good output. Empty `badRef` (2nd of the pair) on success.
+//
+// Every ref resolves through quality::gitResolveCommitSha, the one resolver a user-supplied revision goes through: a
+// ref beginning with '-' never reaches git, and rev-parse's answer counts only when it is a bare object name. The
+// second half is not hypothetical here — `rev-parse --verify --quiet '^REF^{commit}'` answers `^<sha>` at rc 0, and
+// the raw read this replaced took that as resolved and handed the negation to `git merge-base`, so the verb printed
+// an empty ok="0" arm at exit 0 where this refusal belongs (test/mergescoutcheck.sh, the `nonbare` rows).
 inline std::pair<std::vector<std::string>, std::string> resolveAllRefs( const std::string& root, const std::vector<std::string_view>& refs )
 {
     std::vector<std::string> shas( refs.size() );
@@ -383,7 +432,7 @@ inline std::pair<std::vector<std::string>, std::string> resolveAllRefs( const st
         {
             return { {}, std::string( refs[i] ) }; // reserved — collides with the implicit arm
         }
-        shas[i] = resolveCommittish( root, refs[i] );
+        shas[i] = quality::gitResolveCommitSha( root, std::string( refs[i] ) );
         if( shas[i].empty() )
         {
             return { {}, std::string( refs[i] ) };
@@ -407,11 +456,19 @@ inline Arm computeNamedArm( std::string_view ref, const std::string& refSha, con
     Arm arm; arm.ref = std::string( ref ); arm.baseSha = baseSha;
     if( arm.baseSha.empty() )
     {
-        arm.ok = false;   // unrelated histories / merge-base failed — degrade, never crash
-        DEGRADED_PATH_ALERT( "merge-scout: no merge-base for ref (unrelated history?) — reporting an empty arm" );
+        // unrelated histories / merge-base failed — degrade, never crash: the arm reports ok="0" with an empty changed set
+        DISCLOSE( arm, Arm::DisclosureWhy::NoMergeBase, "merge-scout: no merge-base for ref (unrelated history?) — reporting an empty arm" );
         return arm;
     }
-    arm.changed = diffTreeIndex( memo.get( arm.baseSha ), memo.get( refSha ) );
+    const SymTreeIndex base = memo.get( arm.baseSha );
+    const SymTreeIndex tip  = memo.get( refSha );
+    if( !base.isIndexed || !tip.isIndexed )
+    {
+        // an unavailable tree is not an empty one: diffing against it would report every symbol as this arm's work
+        DISCLOSE( arm, Arm::DisclosureWhy::TreeUnavailable, "merge-scout: a side's tree could not be materialized or ingested — reporting an empty arm" );
+        return arm;
+    }
+    arm.changed = diffTreeIndex( base, tip );
     return arm;
 }
 
@@ -421,21 +478,38 @@ inline Arm computeNamedArm( std::string_view ref, const std::string& refSha, con
 // sat unmerged. Key-sorted (diffTreeIndex's own contract), so the intersection below can binary-search it.
 // Empty — and, crucially, costing NO tree at all — when the arm forked off current HEAD (baseSha == headSha,
 // the common case) or when its merge-base never resolved.
-inline std::vector<std::uint64_t> headChangedKeysSince( const std::string& baseSha, const std::string& headSha, TreeIndexMemo& memo )
+// `isAvailable` false ⇒ one of the two trees could not be materialized or ingested (SymTreeIndex::isIndexed): the
+// keys are then UNKNOWN, and diffing the unavailable side as an empty tree would report every symbol of the other
+// as landed work — the same contract computeNamedArm refuses on.
+struct HeadChanged
 {
     std::vector<std::uint64_t> keys;
+    bool                       isAvailable = true;
+};
+
+inline HeadChanged headChangedKeysSince( const std::string& baseSha, const std::string& headSha, TreeIndexMemo& memo )
+{
+    HeadChanged out;
     if( baseSha.empty() || baseSha == headSha )
     {
-        return keys;
+        return out;
     }
 
-    const std::vector<ChangedSym> headChanged = diffTreeIndex( memo.get( baseSha ), memo.get( headSha ) );
-    keys.reserve( headChanged.size() );
+    const SymTreeIndex base = memo.get( baseSha );
+    const SymTreeIndex head = memo.get( headSha );
+    if( !base.isIndexed || !head.isIndexed )
+    {
+        out.isAvailable = false;
+        return out;
+    }
+    const std::vector<ChangedSym> headChanged = diffTreeIndex( base, head );
+    out.keys.reserve( headChanged.size() );
     for( const ChangedSym& s : headChanged )
     {
-        keys.push_back( s.key );
+        out.keys.push_back( s.key );
     }
-    return keys;   // already key-sorted (diffTreeIndex emits in key order)
+    ENSURES( std::is_sorted( out.keys.begin(), out.keys.end() ) );   // diffTreeIndex emits in key order; intersect binary-searches it
+    return out;
 }
 
 // The arm's own changed symbols that the live line ALSO changed since the arm forked. A subset of
@@ -460,7 +534,7 @@ inline std::vector<ChangedSym> intersectHeadChanged( const std::vector<ChangedSy
 
 // The lane's plan: merge-base sha -> the live line's changed keys since it, one entry per DISTINCT base that
 // is not HEAD's own sha (an arm forked off current HEAD cannot collide with landed work — there is none).
-using HeadChangedByBase = gtl::btree_map<std::string, std::vector<std::uint64_t>>;
+using HeadChangedByBase = gtl::btree_map<std::string, HeadChanged>;
 
 // Which bases the lane will actually diff. Empty on the common "everything forked off current HEAD" shape,
 // so that shape pays nothing: no extra tree, no extra diff, no extra memo reservation.
@@ -477,13 +551,30 @@ inline HeadChangedByBase planHeadConflictLane( const std::vector<std::string>& b
     return plan;
 }
 
+// The arm's head conflicts from the lane's plan: none when its base is HEAD (not in the plan), the intersection when the
+// lane ran, and UNKNOWN — disclosed on the arm as head_conflicts_ok="0" — when the lane had no tree to diff.
+inline void attachHeadConflicts( Arm& arm, const HeadChangedByBase& plan )
+{
+    const auto it = plan.find( arm.baseSha );
+    if( it == plan.end() )
+    {
+        return;
+    }
+    if( !it->second.isAvailable )
+    {
+        DISCLOSE( arm, Arm::DisclosureWhy::HeadTreeUnavailable, "merge-scout: the base or HEAD tree could not be materialized or ingested — head conflicts unknown for this arm" );
+        return;
+    }
+    arm.headConflicts = intersectHeadChanged( arm.changed, it->second.keys );
+}
+
 // Register the lane's future memo.get() calls — one extra use of each side per distinct base — BEFORE any
 // tree is materialized, so TreeIndexMemo still frees a tree right after its true LAST consumer (Y1).
 inline void reserveHeadConflictLane( const HeadChangedByBase& plan, const std::string& headSha, TreeIndexMemo& memo )
 {
-    for( const auto& [ baseSha, keys ] : plan )
+    for( const auto& [ baseSha, lane ] : plan )
     {
-        (void)keys;
+        (void)lane;
         memo.reserve( baseSha );
         memo.reserve( headSha );
     }
@@ -497,7 +588,14 @@ inline Arm computeWorkingTreeArm( const std::string& root, const std::string& he
     Arm arm;
     arm.ref     = kWorkingTreeRef;
     arm.baseSha = headSha;
-    arm.changed = diffTreeIndex( memo.get( headSha ), buildTreeIndex( workingIng, root ) );
+    const SymTreeIndex head = memo.get( headSha );
+    if( !head.isIndexed )
+    {
+        // an unavailable HEAD tree is not an empty one: diffing against it would report every working-tree symbol as new work
+        DISCLOSE( arm, Arm::DisclosureWhy::TreeUnavailable, "merge-scout: HEAD's tree could not be materialized or ingested — reporting an empty working-tree arm" );
+        return arm;
+    }
+    arm.changed = diffTreeIndex( head, buildTreeIndex( workingIng, root ) );
     return arm;
 }
 
@@ -561,18 +659,15 @@ inline ScoutResult computeMergeScout( const std::string& root, std::string_view 
 
     // The head-conflict diffs run FIRST: their reserves are already counted above, so a base tree they touch
     // stays memoized for the arm loop below instead of being materialized twice.
-    for( auto& [ baseSha, keys ] : headChangedByBase )
+    for( auto& [ baseSha, lane ] : headChangedByBase )
     {
-        keys = headChangedKeysSince( baseSha, result.headSha, memo );
+        lane = headChangedKeysSince( baseSha, result.headSha, memo );
     }
 
     for( std::size_t i = 0; i < refs.size(); ++i )
     {
         Arm arm = computeNamedArm( refs[i], refShas[i], baseShas[i], memo );
-        if( const auto it = headChangedByBase.find( arm.baseSha ); it != headChangedByBase.end() )
-        {
-            arm.headConflicts = intersectHeadChanged( arm.changed, it->second );
-        }
+        attachHeadConflicts( arm, headChangedByBase );
         result.arms.push_back( std::move( arm ) );
     }
 
@@ -716,11 +811,11 @@ inline void writeSymRows( std::FILE* out, const char* tag, const std::vector<Cha
         // whole-file content diff, not a symbol attribution. Ordinary rows are byte-identical to before.
         if( s.fileLevel )
         {
-            std::fprintf( out, "<%s p=\"%s\" id=\"%s\" anchoring=\"file-level\"/>", tag, ex( s.file ).c_str(), ex( s.id ).c_str() );
+            rw::emitTo( out, "<{} p=\"{}\" id=\"{}\" anchoring=\"file-level\"/>", tag, ex( s.file ).c_str(), ex( s.id ).c_str() );
         }
         else
         {
-            std::fprintf( out, "<%s p=\"%s\" id=\"%s\"/>", tag, ex( s.file ).c_str(), ex( s.id ).c_str() );
+            rw::emitTo( out, "<{} p=\"{}\" id=\"{}\"/>", tag, ex( s.file ).c_str(), ex( s.id ).c_str() );
         }
     }
 }
@@ -730,8 +825,16 @@ inline void writeScoutArm( std::FILE* out, const Arm& arm, const XmlEscaper& ex 
     // §A10.4: base= is display-only here — 9-hex-char width, matching the at=/head= convention
     // (gitstamp.h) every other sha-bearing attribute in the tool uses. arm.baseSha itself stays full-length
     // (it is still used as a TreeIndexMemo key elsewhere); only the printed attribute is truncated.
-    std::fprintf( out, "<arm ref=\"%s\" base=\"%s\" ok=\"%d\" changed=\"%zu\" head_conflicts=\"%zu\">",
-                  ex( arm.ref ).c_str(), ex( arm.baseSha.substr( 0, 9 ) ).c_str(), arm.ok ? 1 : 0, arm.changed.size(), arm.headConflicts.size() );
+    //
+    // reason= — present only when ok="0" (absent otherwise, the same convention head_conflicts_ok= and
+    // landingplan.h/crossref.h's refs_dropped= already use): the arm's own DisclosureWhy, set on `arm.why` by
+    // Arm::disclose() in EVERY build (never only the debug trace disclose() also emits, which NDEBUG strips) —
+    // so a Release binary's reader is told WHY, not just THAT, an arm was refused.
+    const std::string reasonAttr = arm.ok ? std::string()
+        : ( std::string( " reason=\"" ) + ( arm.why == Arm::DisclosureWhy::NoMergeBase ? "no_merge_base" : "tree_unavailable" ) + "\"" );
+    rw::emitTo( out, "<arm ref=\"{}\" base=\"{}\" ok=\"{}\"{} changed=\"{}\" head_conflicts=\"{}\"{}>",
+                  ex( arm.ref ).c_str(), ex( arm.baseSha.substr( 0, 9 ) ).c_str(), arm.ok ? 1 : 0, reasonAttr.c_str(), arm.changed.size(), arm.headConflicts.size(),
+                  arm.headLaneOk ? "" : " head_conflicts_ok=\"0\"" );
     // §P11.13: a changed="0" arm has no divergent work to LAND — it used to get a landing slot anyway
     // (landingOrder() below drops it now, see there), with nothing on this row saying why it's absent from
     // the list an agent would otherwise expect it in. A meaningfully-named child element carrying a `note=`
@@ -742,31 +845,31 @@ inline void writeScoutArm( std::FILE* out, const Arm& arm, const XmlEscaper& ex 
     // §L10: <no-work> is a claim about a COMPARISON that ran and found nothing — it must not fire when
     // ok="0", where changed="0" means the comparison never happened at all (no merge-base, unrelated
     // histories). Printing it there read as "compared, nothing divergent" on an arm this verb never
-    // compared; DEGRADED_PATH_ALERT already says so on stderr, but nothing said so in-band before this.
+    // compared; DISCLOSE already says so on stderr, but nothing said so in-band before this.
     if( arm.changed.empty() && arm.ok )
     {
-        std::fprintf( out, "<no-work note=\"no divergent work vs merge-base — see --stray-content\"/>" );
+        rw::emitRaw( out, "<no-work note=\"no divergent work vs merge-base — see --stray-content\"/>" );
     }
     writeSymRows( out, "sym", arm.changed, ex );
 
     // r26: the live line changed these too, while this arm sat unmerged — a merge fight no pairwise ARM
     // comparison can see (HEAD is not an arm). Listed after the <sym> rows, never mixed into them.
     writeSymRows( out, "head-conflict", arm.headConflicts, ex );
-    std::fprintf( out, "</arm>" );
+    rw::emitRaw( out, "</arm>" );
 }
 
 inline void writeScoutPair( std::FILE* out, const std::vector<Arm>& arms, const PairOverlap& p, const XmlEscaper& ex )
 {
-    std::fprintf( out, "<pair a=\"%s\" b=\"%s\" conflicts=\"%zu\" risks=\"%zu\"",
+    rw::emitTo( out, "<pair a=\"{}\" b=\"{}\" conflicts=\"{}\" risks=\"{}\"",
                   ex( arms[ p.a ].ref ).c_str(), ex( arms[ p.b ].ref ).c_str(), p.conflicts.size(), p.risks.size() );
-    if( p.conflicts.empty() && p.risks.empty() ) { std::fprintf( out, "/>" ); return; }
-    std::fprintf( out, ">" );
+    if( p.conflicts.empty() && p.risks.empty() ) { rw::emitRaw( out, "/>" ); return; }
+    rw::emitRaw( out, ">" );
     writeSymRows( out, "conflict", p.conflicts, ex );
     for( const RiskPair& r : p.risks )
     {
-        std::fprintf( out, "<risk p=\"%s\" a=\"%s\" b=\"%s\"/>", ex( r.a.file ).c_str(), ex( r.a.id ).c_str(), ex( r.b.id ).c_str() );
+        rw::emitTo( out, "<risk p=\"{}\" a=\"{}\" b=\"{}\"/>", ex( r.a.file ).c_str(), ex( r.a.id ).c_str(), ex( r.b.id ).c_str() );
     }
-    std::fprintf( out, "</pair>" );
+    rw::emitRaw( out, "</pair>" );
 }
 
 inline void writeScoutLanding( std::FILE* out, const std::vector<Arm>& arms, const std::vector<PairOverlap>& pairs, const XmlEscaper& ex )
@@ -785,7 +888,7 @@ inline void writeScoutLanding( std::FILE* out, const std::vector<Arm>& arms, con
         }
         joined += arms[order[idx]].ref;
     }
-    std::fprintf( out, "<landing order=\"%s\"/>", ex( joined ).c_str() );
+    rw::emitTo( out, "<landing order=\"{}\"/>", ex( joined ).c_str() );
 }
 
 inline void writeMergeScout( std::FILE* out, const ScoutResult& result )
@@ -795,20 +898,31 @@ inline void writeMergeScout( std::FILE* out, const ScoutResult& result )
 
     // G4: an XML comment may not contain a double hyphen, so this text names flags and attributes WITHOUT
     // their leading dashes (the same constraint crossref.h's own comments call out). Keep it that way.
-    std::fprintf( out, "<!-- ripwire merge-scout: read-only cross-branch overlap for %zu arm(s) — same-symbol change "
+    rw::emitTo( out, "<!-- ripwire merge-scout: read-only cross-branch overlap for {} arm(s) — same-symbol change "
                        "on two arms = conflict, same-file/different-symbol = textual risk. landing = "
-                       "fewest-conflicts-first greedy (ties: ref name asc). Every tree is a git-archive TEMP COPY "
+                       "fewest-conflicts-first greedy (ties: ref name asc). ok=\"1\" on an arm row means the "
+                       "comparison actually ran, so changed=/head_conflicts= are real counts and may legitimately "
+                       "be zero (a materialized tree holding no supported files, or whose paths were all "
+                       "excluded, is still a real empty index, not a refusal); ok=\"0\" means it did not run at "
+                       "all, and reason= (present only then) says why: reason=\"no_merge_base\" (no merge base "
+                       "with HEAD, e.g. unrelated histories) or reason=\"tree_unavailable\" (a side's tree could "
+                       "not be materialized or ingested, a real git-archive/tar failure). Every tree is a git-archive TEMP COPY "
                        "(read-only); the real working tree/refs are never touched. ANCHORING: every arm is diffed "
                        "against its OWN merge base with HEAD (the working tree arm against HEAD itself), never "
                        "against live HEAD — so a file an arm never opened can never appear here just because the "
                        "live line moved. head_conflicts= is the one thing that anchor hides, kept as its own row "
                        "class: symbols this arm changed that the LIVE LINE also changed since the arm forked, a "
-                       "merge fight no pairwise ARM comparison can see because HEAD is not an arm. A row carrying "
+                       "merge fight no pairwise ARM comparison can see because HEAD is not an arm; head_conflicts_ok=\"0\" "
+                       "(absent otherwise) means that lane could not run for the arm (its base or HEAD tree was unavailable), "
+                       "so head_conflicts= there is unknown, not zero. A row carrying "
                        "anchoring=file-level is a whole-file fallback for a file with zero real-body symbols (no "
                        "tree-sitter symbol spans it) — counted and conflict-checked like any other row, just not "
                        "attributed to a symbol inside it. at= is the git commit these numbers were computed at; a "
                        "trailing +shallow means the clone's history is truncated (a depth-limited clone: churn counts only the commits present), and a trailing +dirty means the working tree differed from that commit (head= is the same commit, "
-                       "bare sha, kept for compatibility). -->", result.arms.size() );
+                       "bare sha, kept for compatibility). Below the arms, a <pair a= b=> compares two of them "
+                       "pairwise (one row per pair with any overlap at all): conflicts= is the same-symbol-on-both "
+                       "count landing= would have to resolve, risks= is the weaker same-file/different-symbol count "
+                       "— the two kinds this legend's opening sentence names. -->", result.arms.size() );
     // §P8: head= was a FULL 40 here vs 9 hex in <abi>/<stray-content>/<landing-plan>/<history> — one name,
     // two widths. Aligned to the majority; nothing reads this one. (`base=` on the <arm> rows is still full
     // against <stray-content>'s 9-char base= — a second split, documented, not widened into this change.)
@@ -816,7 +930,7 @@ inline void writeMergeScout( std::FILE* out, const ScoutResult& result )
     // elsewhere in this family) — at= is the NEW attribute, carrying the +dirty bit this verb already
     // computes (the `dirty` local above) but never disclosed.
     const std::string atAttrStr = result.atStamp.empty() ? std::string() : ( " at=\"" + result.atStamp + "\"" );
-    std::fprintf( out, "<merge-scout arms=\"%zu\" head=\"%.9s\"%s>", result.arms.size(), ex( result.headSha ).c_str(), atAttrStr.c_str() );
+    rw::emitTo( out, "<merge-scout arms=\"{}\" head=\"{:.9}\"{}>", result.arms.size(), ex( result.headSha ).c_str(), atAttrStr.c_str() );
 
     for( const Arm& arm : result.arms )
     {
@@ -831,7 +945,7 @@ inline void writeMergeScout( std::FILE* out, const ScoutResult& result )
 
     writeScoutLanding( out, result.arms, pairs, ex );
 
-    std::fprintf( out, "</merge-scout>" );
+    rw::emitRaw( out, "</merge-scout>" );
 }
 
 }}   // namespace rw::mergescout

@@ -17,7 +17,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 FIX="$ROOT/test/duprowfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -26,17 +26,19 @@ cd "$ROOT"
 
 echo "duprowcheck: BIN=$BIN  CORPUS=test/duprowfix"
 
-OUT="$( "$BIN" test/duprowfix --no-cache 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact; arms 8/9 read the FULL legend (its overloads= clause, and
+# real <s rows the compact legend also spells), and arm 7 compares to a golden recorded from the full default.
+OUT="$( "$BIN" test/duprowfix --no-cache --legend=full 2>/dev/null )"
 [ -n "$OUT" ] || { echo "no output — binary or fixture broken"; exit 2; }
 
 # ── 1) exactly one row carries id="...Box::data" — the const/non-const pair is collapsed ──────────────
-n_rows="$( printf '%s' "$OUT" | grep -o 'id="box.h::Box::data"' | wc -l | tr -d ' ' )"
+n_rows="$( printf '%s' "$OUT" | grep -o 'n="data" sc="Box"' | wc -l | tr -d ' ' )"
 [ "$n_rows" = 1 ] \
     && ok "the Box::data overload pair collapses to exactly one <s> row (was 2, byte-identical, pre-fix)" \
     || no "expected exactly 1 row for id=\"...Box::data\", got $n_rows"
 
 # ── 2) the surviving row discloses the multiplicity via overloads="2" ──────────────────────────────────
-printf '%s' "$OUT" | grep -q 'id="box.h::Box::data"[^>]*overloads="2"' \
+printf '%s' "$OUT" | grep -q 'n="data" sc="Box"[^>]*overloads="2"' \
     && ok "the collapsed row carries overloads=\"2\" (the id is the same, so 2 rows carried zero extra info)" \
     || no "collapsed row is missing overloads=\"2\": $( printf '%s' "$OUT" | grep -o '<s[^>]*Box::data[^>]*>' )"
 
@@ -52,14 +54,14 @@ printf '%s' "$OUT" | grep -o '<s[^>]*n="touch"[^>]*>[^<]*<c[^/]*/>' | grep -q 'n
 
 # ── 5) xml well-formed (G4) ─────────────────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    printf '%s' "$OUT" | xmllint --noout - 2>/dev/null && ok "xml well-formed" || no "xml malformed"
+    if printf '%s' "$OUT" | xmllint --noout - 2>/dev/null; then ok "xml well-formed"; else no "xml malformed"; fi
 else
     printf '  SKIP  xml well-formed (no xmllint)\n'
 fi
 
 # ── 6) determinism — two runs byte-identical ────────────────────────────────────────────────────────────
-OUT2="$( "$BIN" test/duprowfix --no-cache 2>/dev/null )"
-[ "$OUT" = "$OUT2" ] && ok "deterministic (byte-identical run-to-run)" || no "non-deterministic output"
+OUT2="$( "$BIN" test/duprowfix --no-cache --legend=full 2>/dev/null )"
+if [ "$OUT" = "$OUT2" ]; then ok "deterministic (byte-identical run-to-run)"; else no "non-deterministic output"; fi
 
 # ── 8) §A8.7: the v1 legend closes the shown=/overloads= arithmetic — the ONE clause a reader needs to
 # know rows + Σ(overloads-1) == shown, which was previously true but undocumented.
@@ -82,7 +84,7 @@ done
 
 # ── 7) golden-neutral — the default map on test/fixture (no overload collisions there) is unaffected ──
 if [ -f "$ROOT/test/golden.xml" ]; then
-    "$BIN" test/fixture --no-cache 2>/dev/null | diff -q - "$ROOT/test/golden.xml" >/dev/null \
+    "$BIN" test/fixture --no-cache --legend=full 2>/dev/null | diff -q - "$ROOT/test/golden.xml" >/dev/null \
         && ok "golden-neutral: test/fixture default map byte-identical to test/golden.xml" \
         || no "default map drifted on the golden fixture (no overload collision expected there)"
 else

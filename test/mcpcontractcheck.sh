@@ -32,10 +32,17 @@ TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
 echo "mcpcontractcheck: BIN=$BIN"
 
-python3 - "$BIN" "$ROOT" "$TMP" <<'PY'
-import hashlib, json, os, re, shutil, socket, subprocess, sys, time
+# Arm (E)'s HTTP client is the one the --listen gates share (test/lib/gatehttp.sh): it waits until the listener
+# ANSWERS, and a request that gets no answer is a FAIL of its own rather than a body to compare.
+. "$ROOT/test/lib/gatehttp.sh"
+GATEHTTP="$( gatehttp_install "$TMP" )" || { echo "could not write the shared HTTP client into $TMP"; exit 2; }
 
-BIN, ROOT, TMP = sys.argv[1], sys.argv[2], sys.argv[3]
+python3 - "$BIN" "$ROOT" "$TMP" "$GATEHTTP" <<'PY'
+import hashlib, json, os, re, shutil, subprocess, sys
+
+BIN, ROOT, TMP, GATEHTTP = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sys.path.insert( 0, os.path.dirname( GATEHTTP ) )
+import gatehttp                    # waitServing / post / NoAnswer: see test/lib/gatehttp.sh
 fails = 0
 def check( cond, msg ):
     global fails
@@ -99,14 +106,14 @@ def parseSingleRoot():
 verbFields  = parseVerbFields()
 universal   = parseUniversal()
 singleRoot  = parseSingleRoot()
-check( len( verbFields ) == 31, "kMcpVerbFields parsed: %d verbs" % len( verbFields ) )
+check( len( verbFields ) == 33, "kMcpVerbFields parsed: %d verbs" % len( verbFields ) )
 check( universal == [ "path", "paths" ], "kMcpUniversalFields parsed: %s" % universal )
 check( len( singleRoot ) >= 6, "kMcpSingleRootVerbs parsed: %d rows (%s)" % ( len( singleRoot ), ",".join( singleRoot ) ) )
 
 # ═══ (A) DECLARED == ENFORCED — the schema vs the unknown-field guard (M2) ═════════════════════════════════
 srv   = Stdio()
 tools = srv.call( "tools/list" )[ "result" ][ "tools" ]
-check( len( tools ) == 31, "(A) tools/list advertises 31 verbs" )
+check( len( tools ) == 33, "(A) tools/list advertises 33 verbs" )
 
 mismatch, missingPaths, noDesc = [], [], []
 for t in tools:
@@ -122,19 +129,19 @@ for t in tools:
 
 for n, got, want in mismatch[ :5 ]:
     print( "  FAIL  (A) %s schema=%s enforced=%s" % ( n, got, want ) )
-check( not mismatch,     "(A) all 31 inputSchemas == declaredFieldsFor (schema and unknown-field guard are ONE list)" )
+check( not mismatch,     "(A) all 33 inputSchemas == declaredFieldsFor (schema and unknown-field guard are ONE list)" )
 # M2 stated as its own assertion so a regression names the finding, not just the invariant.
-check( not missingPaths, "(A/M2) `paths` declared on all 31 verbs (was 18; %d missing)" % len( missingPaths ) )
+check( not missingPaths, "(A/M2) `paths` declared on all 33 verbs (was 18; %d missing)" % len( missingPaths ) )
 # M12
 check( not noDesc,       "(A/M12) every declared property carries a description (%d missing)" % len( noDesc ) )
 totalProps = sum( len( t[ "inputSchema" ][ "properties" ] ) for t in tools )
-print( "  INFO  (A) %d declared properties across 31 verbs" % totalProps )
+print( "  INFO  (A) %d declared properties across 33 verbs" % totalProps )
 
 # ═══ (B) M4 — `path` is required exactly when this server cannot supply a root ═════════════════════════════
 # R2a (the 2026-08-12 usage mine) changed WHICH servers can: a bare `--mcp` launched inside a workspace
 # now supplies its own launch cwd (assumedRoot), so the shipped install's schema stops demanding `path`.
 # The M4 principle is unchanged; the truly root-less server is one launched from "/" (the startup guard
-# refuses to assume "/" or $HOME), and THAT schema must still require `path` on all 31 verbs.
+# refuses to assume "/" or $HOME), and THAT schema must still require `path` on all 33 verbs.
 stillReq0 = [ t[ "name" ] for t in tools if "path" in t[ "inputSchema" ].get( "required", [] ) ]
 check( not stillReq0, "(B/M4+R2a) bare `--mcp` launched in a workspace cwd: `path` NOT required (%d wrongly required)" % len( stillReq0 ) )
 rootless = Stdio( cwd = "/" )
@@ -266,43 +273,48 @@ check( "result" in unknownVer,
 
 # ═══ (E) stdio == HTTP, byte for byte, on the arms this gate added ═════════════════════════════════════════
 # Wave 1 established that HTTP inherits the shared dispatchMcpLine. That is asserted here, not assumed.
+#
+# READY MEANS ANSWERED, and a request with no answer is not a body. This arm used to sleep a fixed 2 s and then post
+# through its own client, whose 5 s recv timeout nothing caught: a listener still warming its index handed the rest
+# of the warm-up to the first frame, and when that ran out Python died with "TimeoutError: timed out", taking every
+# arm after this one with it and failing the gate for a transport that was fine. gatehttp.waitServing polls until the
+# listener ANSWERS (30 s ceiling); gatehttp.post raises NoAnswer, which is reported per frame and never compared.
+FRAMES = ( '{"jsonrpc":"2.0","id":7,"method":"tools/list"}',
+           '{"jsonrpc":"2.0","id":7,"method":"ping"}',
+           '{"jsonrpc":"2.0","id":true,"method":"ping"}',
+           '{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":5}}',
+           '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"analyze","arguments":{"kind":"x"}}}' )
 port  = 24000 + ( os.getpid() % 6000 )
 token = "mc-%d" % os.getpid()
 http  = subprocess.Popen( [ BIN, rA, "--listen=127.0.0.1:%d" % port, "--mcp-token=" + token ],
                           stdout = subprocess.PIPE, stderr = subprocess.STDOUT )
-time.sleep( 2.0 )
-if http.poll() is not None:
-    check( False, "(E) the HTTP listener did not start: %s" % http.stdout.read()[ :180 ].decode( "utf-8", "replace" ) )
-else:
-    def post( line ):
-        body = line.encode()
-        req  = ( b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
-                 b"Authorization: Bearer " + token.encode() +
-                 b"\r\nAccept: application/json, text/event-stream\r\nContent-Length: "
-                 + str( len( body ) ).encode() + b"\r\n\r\n" + body )
-        s = socket.create_connection( ( "127.0.0.1", port ), 5 ); s.sendall( req )
-        chunks = b""
-        while True:
-            c = s.recv( 65536 )
-            if not c: break
-            chunks += c
-            head, sep, tail = chunks.partition( b"\r\n\r\n" )
-            if sep and tail.strip().endswith( b"}" ): break
-        s.close()
-        return chunks.partition( b"\r\n\r\n" )[ 2 ].decode( "utf-8", "replace" ).strip()
-
-    stdio  = Stdio( rA )
-    differ = []
-    for line in ( '{"jsonrpc":"2.0","id":7,"method":"tools/list"}',
-                  '{"jsonrpc":"2.0","id":7,"method":"ping"}',
-                  '{"jsonrpc":"2.0","id":true,"method":"ping"}',
-                  '{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":5}}',
-                  '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"analyze","arguments":{"kind":"x"}}}' ):
-        s, h = stdio.raw( line ), post( line )
-        if s != h: differ.append( ( line[ :60 ], s[ :70 ], h[ :70 ] ) )
-    stdio.close()
-    for l, s, h in differ: print( "  FAIL  (E) %s\n           stdio=%s\n           http =%s" % ( l, s, h ) )
-    check( not differ, "(E) stdio == HTTP byte-for-byte on all 5 contract frames (asserted, not assumed)" )
+try:
+    whyNotServing = gatehttp.waitServing( port, lambda: http.poll() is None )
+    if http.poll() is not None:
+        check( False, "(E) the HTTP listener did not start: %s" % http.stdout.read()[ :180 ].decode( "utf-8", "replace" ) )
+    elif whyNotServing:
+        check( False, "(E) " + whyNotServing )
+    else:
+        auth   = b"Authorization: Bearer " + token.encode() + b"\r\n"
+        stdio  = Stdio( rA )
+        differ, noAnswer = [], []
+        try:
+            for line in FRAMES:
+                s = stdio.raw( line )
+                try:
+                    h = gatehttp.post( port, line.encode(), auth ).strip()
+                except gatehttp.NoAnswer as e:     # no body is not a DIFFERENT body: name it, never compare it
+                    noAnswer.append( ( line[ :60 ], str( e ) ) )
+                    continue
+                if s != h: differ.append( ( line[ :60 ], s[ :70 ], h[ :70 ] ) )
+        finally:
+            stdio.close()
+        for l, why in noAnswer: print( "  FAIL  (E) %s\n           no HTTP answer: %s — not a transport difference" % ( l, why ) )
+        for l, s, h in differ:  print( "  FAIL  (E) %s\n           stdio=%s\n           http =%s" % ( l, s, h ) )
+        check( not noAnswer, "(E) all %d contract frames got an HTTP answer (%d did not)" % ( len( FRAMES ), len( noAnswer ) ) )
+        check( not differ,   "(E) stdio == HTTP byte-for-byte on all %d answered contract frames (asserted, not assumed)"
+                             % ( len( FRAMES ) - len( noAnswer ) ) )
+finally:                                   # every path, an escaping exception included, stops the listener
     http.terminate()
     try:    http.wait( 10 )
     except Exception: http.kill()
@@ -335,10 +347,27 @@ TWIN = {
     "--lint": "", "--hotspots": "", "--tree": "", "--deps": "", "--clones": "", "--communities": "",
     "--community": "", "--match": "", "--pattern": "", "--exercises": "", "--seams": "", "--zoom": "",
     "--external-surface": "", "--dead-code": "", "--graph-query": "", "--test-gate": "",
-    "--readability": "", "--ensemble": "", "--quality-panel": "", "--context-ratio": "",
+    "--biggest-first": "", "--ensemble": "", "--quality-panel": "", "--context-ratio": "",
     "--nonlocal-state": "", "--comment-coherence": "", "--naming-consistency": "", "--safe-delete": "",
     # P4 (L7): --pr-context joined the paging set for its changed-file window (--offset=N); CLI-only report verb.
     "--pr-context": "",
+    # 2026-09-10: --edit-check joined the paging set (it windows its unflagged caller rows) and its twin
+    # honors limit/offset through the same mcpPageArgs, so it is a MAPPED verb, not a CLI-only one.
+    "--edit-check": "edit_check",
+    # 2026-09-10 (C1 F-07/F-10): --flags (with its --flip mode) and --situ joined the paging set when their
+    # row listings became windowable. Both have twins, and both twins honour limit/offset through the same
+    # mcpPageArgs — so they are MAPPED, not CLI-only. Note the situational twin's DEFAULT is unbounded while
+    # the CLI report's is 8: the payload is machine-read and has always served every row, so limit there is
+    # relief for a caller who wants less, never a new cut.
+    "--flags": "flags", "--situ": "situational_awareness",
+    # 2026-09-12 (C1-b): --in=DIR joined the paging set for its <recent scope=DIR> page (--offset=N). lane/t10-mcp-coverage
+    # (2026-09-19) added an MCP `rank_by` tool (pagerank/authority/hub/rrf), but it still exposes no churn ranker —
+    # churn/churn-decay mine git history through a CLI-only path (rankByText's own comment) — so --in=DIR, which only
+    # ever scopes churn-decay's <recent> page, still has nothing to twin: CLI-only.
+    "--in": "",
+    # L-W (2026-09-12, forpage.h): --for joined the paging set for its FILE PAGE (--limit/--offset select the
+    # one-row-per-file widening document); its twin takes the same limit/offset through mcpPageArgs.
+    "--for": "for",
 }
 unmapped = sorted( v for v in pagingCli if v not in TWIN )
 check( not unmapped, "(G) every paging CLI verb is classified twin-or-not (%s)" % ( ",".join( unmapped ) or "none unmapped" ) )
@@ -392,6 +421,56 @@ for verb, args, arrayKey in ( ( "find_referencing_symbols", { "path": ROOT, "sym
     check( len( rows1 ) <= 2 and rows1 != rows2 and p1.get( "next_offset" ) == 2,
            "(G) %s: limit=2 serves %d rows, offset=2 serves different rows, next_offset=%s"
            % ( verb, len( rows1 ), p1.get( "next_offset" ) ) )
+
+# (G/#127-3985249704) A CUT ARRAY MUST SAY SO. situational_awareness windows TWO independent arrays —
+# blast_radius and forgotten — with the same limit/offset, and emitted neither a row count nor a total for
+# either: a caller could not tell that rows were dropped, and could not build a next request. The CLI twin
+# has disclosed its blast-radius cut in prose all along (situ.h's situShowingNote, "showing N of M files —
+# shown=N total=M capped=1"), so this was the two dialects disagreeing about the same run.
+#
+# The shape is --test-gate's (pageview.h rule 6 + rule 1's noun-prefixed exception): a shown_/_capped pair
+# per LISTING, plus the paging half for the PRIMARY one. Both halves are asserted DERIVED — shown must
+# equal the rows actually served, capped must equal shown < total — so a hand-written constant cannot
+# satisfy this arm.
+try:
+    # Named files, not the working tree's git diff: on a CLEAN checkout (CI, or an integrator's tree) the
+    # bare form has zero changed files, zero blast radius, total=0 — and every assertion below reads that
+    # zero as a red about paging. The fixture must not be the live repo's dirty state (the same trap
+    # gate-fixture-is-the-live-repo names); src/graph.h + src/verbs_for.h reach well over two files.
+    SITU_FILES = "src/graph.h,src/verbs_for.h"
+    bare = json.loads( srvG.tool( "situational_awareness", { "path": ROOT, "files": SITU_FILES } )[ "result" ][ "content" ][ 0 ][ "text" ] )
+    cut  = json.loads( srvG.tool( "situational_awareness",
+                                  { "path": ROOT, "files": SITU_FILES, "limit": 2, "offset": 0 } )[ "result" ][ "content" ][ 0 ][ "text" ] )
+except Exception as e:
+    check( False, "(G) situational_awareness paging probe failed: %s" % e )
+    bare = cut = None
+if bare is not None:
+    check( len( bare.get( "blast_radius", [] ) ) > 2,
+           "(G) presence guard: the named files reach %d blast-radius rows (> the 2-row window; a zero here would make every arm below vacuous)"
+           % len( bare.get( "blast_radius", [] ) ) )
+    for doc, label in ( ( bare, "bare" ), ( cut, "limit=2" ) ):
+        for arr, shownKey, cappedKey in ( ( "blast_radius", "shown_blast_radius", "blast_radius_capped" ),
+                                          ( "forgotten",    "shown_forgotten",    "forgotten_capped"    ) ):
+            check( doc.get( shownKey ) == len( doc.get( arr, [] ) ),
+                   "(G) situational_awareness %s: %s=%s matches the %d %s rows served"
+                   % ( label, shownKey, doc.get( shownKey ), len( doc.get( arr, [] ) ), arr ) )
+            check( isinstance( doc.get( cappedKey ), bool ),
+                   "(G) situational_awareness %s: %s is present and boolean (rule 1 pairs it with shown)"
+                   % ( label, cappedKey ) )
+    # the second listing's own row population, so `forgotten_capped` is checkable by the caller
+    check( bare.get( "forgotten_total" ) == len( bare.get( "forgotten", [] ) ),
+           "(G) situational_awareness bare: forgotten_total=%s is the whole forgotten population"
+           % bare.get( "forgotten_total" ) )
+    # …and the CUT run carries the continuation for the primary listing, with total unchanged by the window
+    check( cut.get( "has_more" ) is True and cut.get( "next_offset" ) == 2
+           and cut.get( "limit" ) == 2 and cut.get( "offset" ) == 0
+           and cut.get( "total" ) == len( bare.get( "blast_radius", [] ) ),
+           "(G) situational_awareness limit=2: total=%s has_more=%s next_offset=%s offset=%s limit=%s"
+           % ( cut.get( "total" ), cut.get( "has_more" ), cut.get( "next_offset" ),
+               cut.get( "offset" ), cut.get( "limit" ) ) )
+    check( cut.get( "blast_radius_capped" ) is ( len( cut.get( "blast_radius", [] ) ) < cut.get( "total", 0 ) )
+           and cut.get( "forgotten_capped" ) is ( len( cut.get( "forgotten", [] ) ) < cut.get( "forgotten_total", 0 ) ),
+           "(G) situational_awareness limit=2: both _capped bits are DERIVED from shown < total, not asserted" )
 srvG.close()
 
 # ═══ (F) the edit verbs' file identity behind a refusal — these verbs delete code when they are wrong ══════

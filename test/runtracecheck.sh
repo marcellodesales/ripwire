@@ -38,7 +38,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -110,7 +110,8 @@ grep -q 'timeout_s="' "$WORK/out/fail.xml" \
     || no "(B) timeout_s= missing from the failure document"
 
 # ── (C) the passing command: minimal record, NO bundle ─────────────────────────────────────────────────
-"$BIN" "$WORK" --run-trace="echo alpha; echo beta" >"$WORK/out/pass.xml" 2>"$WORK/out/pass.err"
+# L1 (2026-09-19): the CLI default legend is compact; (C) reads the FULL legend's "nothing to map" statement, so it asks for it.
+"$BIN" "$WORK" --run-trace="echo alpha; echo beta" --legend=full >"$WORK/out/pass.xml" 2>"$WORK/out/pass.err"
 rcC=$?
 [ "$rcC" = 0 ] && ok "(C) passing command: ripwire exits 0" \
               || no "(C) passing command: expected exit 0, got $rcC"
@@ -128,6 +129,18 @@ grep -qi 'nothing to map' "$WORK/out/pass.xml" \
 grep -q '<lines view="tail"' "$WORK/out/pass.xml" && grep -q 'beta' "$WORK/out/pass.xml" \
     && ok "(C) the disclosed tail carries the output's last lines" \
     || no "(C) <lines view=\"tail\"> with the last output lines missing"
+
+# cut-fix E: the success tail keeps the last 10 lines; a longer capture is a cut, so capped="1" rides <lines> beside
+# shown= < total=, and a short one stays uncapped. RED on 9936ba4e (shown="10" total="15" and no capped=).
+if grep -q '<lines view="tail" shown="2" total="2">' "$WORK/out/pass.xml"; then
+    ok "(C) an uncut tail carries no capped="
+else
+    no "(C) the 2-line tail is not <lines view=\"tail\" shown=\"2\" total=\"2\">"
+fi
+"$BIN" "$WORK" --run-trace="seq 1 15" >"$WORK/out/pass15.xml" 2>/dev/null
+grep -q '<lines view="tail" shown="10" total="15" capped="1">' "$WORK/out/pass15.xml" \
+    && ok "(C) a cut tail (10 of 15 lines) carries capped=\"1\"" \
+    || no "(C) the cut tail is silent: $( grep -o '<lines [^>]*>' "$WORK/out/pass15.xml" )"
 
 # ── (D) timeout: a tiny cap, a long sleep — TIMEOUT reported honestly ──────────────────────────────────
 "$BIN" "$WORK" --run-trace="sleep 30" --run-timeout=1 >"$WORK/out/tmo.xml" 2>"$WORK/out/tmo.err"
@@ -240,7 +253,9 @@ if diff -q "$WORK/out/padnorm0" "$WORK/out/padnorm3" >/dev/null && diff -q "$WOR
 else
     no "(G2) the three runs differ beyond duration_ms: $( cmp "$WORK/out/padnorm0" "$WORK/out/padnorm4" 2>&1 | head -c 200 )"
 fi
-grep -q 'fixed width' "$WORK/out/pad0.xml" \
+# L1 (2026-09-19): this arm reads the FULL legend's pricing clause, so it reads a full-legend twin of pad0.
+RTW_PAD=0    "$BIN" "$WORK" --run-trace="$PADCMD" --legend=full >"$WORK/out/pad0full.xml" 2>/dev/null
+grep -q 'fixed width' "$WORK/out/pad0full.xml" \
     && ok "(G2) the legend states that est_tokens= prices duration_ms at a fixed width" \
     || no "(G2) the legend does not say how the MEASURED duration_ms is priced"
 

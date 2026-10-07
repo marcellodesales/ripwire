@@ -14,12 +14,17 @@
 // not thread-safe, so multithreading would need one parser per worker (deferred).
 
 #include "model.h"
+#include "infra/os.h"   // rw::os::realpath — canonicalCrawlRoot and the containment check
 
 #include <atomic>       // AstQueryGroup::ellipsisCappedOut — a summed counter across the parallel file walk
 #include <cctype>
+#include <climits>       // PATH_MAX — the crawl-boundary realpath buffer below
+#include <cstdlib>       // realpath  — likewise
 #include <cstring>
+#include <mutex>         // AstRegexUndecided — the rare undecided-predicate path records its first site under a lock
 #include <span>          // spanTiersOfFiles takes a VIEW of paths — the caller owns the storage
 #include <string_view>
+#include <tuple>         // AstRegexUndecided orders its first site by (fileId, byte, cause, pattern)
 
 // GLOBAL-scope forward declaration, deliberately OUTSIDE namespace rw — the hazard the pattern-surface
 // note below records is a `struct TSLanguage;` INSIDE namespace rw (it would declare rw::TSLanguage and
@@ -115,6 +120,18 @@ constexpr std::uint32_t kMaxYamlNestDepth = 64u;
 // ~25% under the 255-slot cliff and far above real prose: a thematic break is 3 markers, the
 // deepest real nesting in this repo's own docs is 4.
 constexpr std::uint32_t kMaxMdBlockDepth = 200u;
+
+// Kotlin-lane string-template nesting ceiling (companion prescan: kotlinStringsNestTooDeep in ingest_crawl.h) —
+// PROCESS-SURVIVAL load-bearing, the yaml/markdown posture on a different upstream defect. tree-sitter-kotlin's external
+// scanner keeps one 2-byte stack entry per OPEN string literal (a string nests inside another only through a `${ … }`
+// interpolation), and upstream bounded that stack with abort(): measured on the vendored 1852ea17 with
+// `"a${"a${ … "leaf" … }"}"`, 512 open strings parse and 513 end the process (SIGABRT, rc=134) — so one such .kt file
+// silently killed the index of every tree that contained it, with no output at all. The vendored scanner now refuses
+// the push instead (third_party/patches/kotlin/001-stack-push-no-abort.patch; vendorpatchcheck arms B and J),
+// and this prescan refuses the FILE before any parse and rows it in --skipped (why="nest-refused") — two independent
+// layers, the yaml pair's shape. 128 is 4x under the cliff and ~60x over real code: across the 2 741 .kt files of
+// nowinandroid, ktor and retrofit the deepest nesting is 2 (61 files; every other file is at 0 or 1).
+constexpr std::uint32_t kMaxKotlinStringNestDepth = 128u;
 
 // ── §L1 skip taxonomy / parse health ────────────────────────────────────────────────────────────────
 // How many ROWS --skipped will itemize per drop class before it stops collecting them. The COUNTS
@@ -250,6 +267,81 @@ inline bool isSkippedCrawlDir( std::string_view dirName ) noexcept
     return dirName.size() > 5 && dirName.compare( dirName.size() - 5, 5, ".dSYM" ) == 0;
 }
 
+// ── §SEC1: THE CRAWL BOUNDARY ────────────────────────────────────────────────────────────────────────────
+//
+// ONE RULE, STATED ONCE, FOR EVERY WALK THIS BINARY OWNS: a path a crawl collected must resolve, AFTER LINK
+// RESOLUTION, to somewhere inside the root it was crawled under. Shared for the same reason kCrawlSkipDirs
+// above is shared — there is a second walker (darkflags.h's CMake harvest) and a boundary two walkers
+// disagreed about is not a boundary.
+//
+// WHY THIS EXISTS (v0.5.0 and main). The crawl accepted a
+// file symlink whose LEXICAL path was inside the root while its TARGET was outside it: `directory_entry`'s
+// `is_regular_file()` and `file_size()` both FOLLOW the link, so a repository-controlled tracked symlink made
+// ripwire open and serve any text file the invoking user could read — through --expand, --recall, --grep's
+// unindexed aux scan, --flags, and MCP memory_recall, i.e. straight into a connected model. And it emitted
+// those bytes under the IN-ROOT link path, so the map ATTRIBUTED out-of-root content to a path inside the
+// repository: a disclosure defect layered on a disclosure.
+//
+// THE LEXICAL TEST IS THE BUG, so do not write another one. Both sides are canonicalized:
+//
+//   * the ROOT, because a root reached through a link is ordinary (`/tmp` is a link to `/private/tmp` on
+//     macOS; every worktree this project's own gates build lives under one). Compare a resolved target
+//     against an unresolved root and every file under a symlinked root reads as an escape — the corpus
+//     silently empties on a correct tree.
+//   * the FILE, because the whole point is that its lexical spelling lies.
+//
+// …and the comparison is at a COMPONENT BOUNDARY, never a raw string prefix: `<root>-evil/f.c` shares a byte
+// prefix with `<root>` and is not inside it.
+//
+// FAIL CLOSED. An unresolvable path is refused, not admitted. A root that will not canonicalize keeps its
+// literal spelling, which can only make the test stricter.
+//
+// COST. `realpath()` is a syscall per call, so the walk must not pay it per FILE. It does not: the caller
+// tests `is_symlink()` first — a cached readdir `d_type` on every platform this builds for — and only a
+// symlink reaches here. A tree with no symlinks pays nothing measurable (llvm-project, 10 034 files: cold
+// crawl within run-to-run noise of the unfixed binary).
+//
+// WHAT IT DOES NOT COVER, said plainly: a HARD link to an out-of-root file is indistinguishable from an
+// ordinary file — same inode, no link to resolve — so no path-based rule can see it. A `--bind` mount or a
+// firmlink is the same shape. This bounds the SYMLINK channel, which is the one a git repository can carry.
+//
+// `real` and `rootReal` must both already be canonical absolute paths.
+inline bool withinCanonicalRoot( std::string_view real, std::string_view rootReal ) noexcept
+{
+    if( rootReal.empty() || real.size() < rootReal.size() || real.compare( 0, rootReal.size(), rootReal ) != 0 )
+    {
+        return false;
+    }
+    if( real.size() == rootReal.size() )
+    {
+        return true;   // the root itself — a single-file root is its own boundary
+    }
+    // "/" already ends in the separator; every other root needs the next byte to BE one, or this is a sibling
+    // whose name merely starts with the root's ("/x/repo" vs "/x/repo-evil").
+    return rootReal.back() == '/' || real[ rootReal.size() ] == '/';
+}
+
+// The canonical spelling of a crawl root, computed ONCE per walk. Falls back to the literal argument when the
+// root will not resolve (fail closed: an unresolved root matches fewer targets, never more).
+inline std::string canonicalCrawlRoot( std::string_view rootDir )
+{
+    const std::string dir( rootDir.empty() ? std::string_view( "." ) : rootDir );
+    char              resolved[ PATH_MAX ];
+    return os::realpath( dir.c_str(), resolved ) != nullptr ? std::string( resolved ) : dir;
+}
+
+// Does `path` (as the walk spelled it) still live inside `rootReal` once every link on it is resolved?
+// Call ONLY for entries that are symlinks — see the cost note above.
+inline bool crawlPathStaysInRoot( const std::string& path, const std::string& rootReal ) noexcept
+{
+    char resolved[ PATH_MAX ];
+    if( os::realpath( path.c_str(), resolved ) == nullptr )
+    {
+        return false;   // fail closed
+    }
+    return withinCanonicalRoot( resolved, rootReal );
+}
+
 // Crawl + parse rootDir into the symbol/reference model. Never throws: a bad file, missing
 // grammar, or ABI mismatch degrades (skipped + stderr note), never aborts ingestion.
 // excludeSubstr: drop any path containing one of these substrings (and prune matching dirs)
@@ -271,17 +363,33 @@ inline bool isSkippedCrawlDir( std::string_view dirName ) noexcept
 // ignored subtree all keep TODAY'S FULL WALK and say which (CrawlSkips::ignoreMode). Default true: the
 // HEAD-snapshot and edit-preview callers re-ingest a `git archive` extraction, which holds tracked files
 // only, so the two sides of a --quality-delta compare the same population either way.
+//
+// THE LAYOUT LINK STAMP (the trailing IngestLayout argument, which every caller defaults). CLAUDE.md records builds that
+// linked objects compiled against two different struct layouts and reported success: sizeof( Symbol ) 96 in one object
+// and 104 in another gave a real ASan report of a fake bug, and an "impossible" std::length_error. The empty tag type
+// carries both sizes in its template arguments, so they enter ingest()'s MANGLED NAME: an object compiled against a
+// stale layout references an ingest() that no fresh object defines, and the link fails instead.
+// MEASURED 2026-09-16 on this tree, with the dev build's own flags and link line: main.o compiled with the stamp at
+// sizeof( Symbol ) 112, ingest.o at 120 (one u64 added) -> ld: undefined symbol
+// rw::ingest(…, IngestLayoutStamp<112, 848>) against a defined …<120, 848>. The same mixed pair WITHOUT the stamp linked
+// at exit 0, and the binary died with SIGBUS (exit 138) on test/fixture. The consistent stamped pair links and prints
+// byte-identical output. Symbol is named separately because sizeof( IngestResult ) does not move when an element type
+// held in one of its vectors grows (848 on both sides above). An empty class argument: at most one ignored register,
+// on a function called once per run.
+template<std::size_t kSymbolBytes, std::size_t kIngestResultBytes> struct IngestLayoutStamp {};
+using IngestLayout = IngestLayoutStamp<sizeof( Symbol ), sizeof( IngestResult )>;
+
 IngestResult ingest( const char* rootDir, const std::vector<std::string>& excludeSubstr = {},
                      std::string_view cacheFile = {}, std::size_t maxFileBytes = kDefaultMaxFileBytes,
                      bool captureValueUses = true, std::string_view excludeLabel = {},
-                     bool respectGitignore = true );
+                     bool respectGitignore = true, IngestLayout = {} );
 
 // ---- index-identity disclosure (the two functions behind --doctor's index-cache row) ----
 //
 // WHY THIS IS PUBLIC API AND NOT A SECOND COPY OF THE GUARD. `kCacheVersion`, `kParserVer` and
 // `kArtifactArch` decide whether ANY committed `--index-out` artifact is reusable, and until this pair
 // existed they had no user-visible surface at all: `--doctor`, `--help` and the map header named none of
-// them, and every refusal reached the user only through DEGRADED_PATH_ALERT, which NDEBUG (i.e. every
+// them, and every refusal reached the user only through DISCLOSE, which NDEBUG (i.e. every
 // installed binary — install.sh configures Release) compiles out. So `ripwire DIR --cache=/gone.bin`
 // exited 0, printed nothing on either stream, and emitted bytes identical to a valid-artifact run.
 // Gate: test/cacheidentitycheck.sh. The definitions live in ingest.cpp because the guard they wrap
@@ -372,7 +480,22 @@ enum class AstWalk : std::uint8_t
     // is the read, the parse and the newline index — the whole point of riding this walk instead of
     // opening the corpus a second time. Its programs come from AstQueryGroup::patternPrograms.
     Pattern,
+
+    // ---- --quality-delta's structural shapes (src/handlershape.h) ----
+    // The widened error-masking shapes (log-only, rethrow-only) and the placeholder shapes (stub, todo).
+    // A WALK for the reason the other two are: "every statement of this handler is a log call" and "the
+    // caught name is never read below here" are questions about ALL of a node's children, which no
+    // tree-sitter pattern can ask. Each hit's tag is the shape name; the group is per-FILE-language, so the
+    // walk is handed the file's Lang alongside its tree.
+    HandlerShapes,
 };
+
+// The tags an AstWalk::HandlerShapes group's rows carry: src/handlershape.h emits them, lintrules.h routes the
+// first two to the error-masking kind and the last two to the placeholder kind.
+inline constexpr std::string_view kShapeLogOnly     = "log-only";
+inline constexpr std::string_view kShapeRethrowOnly = "rethrow-only";
+inline constexpr std::string_view kShapeStub        = "stub";
+inline constexpr std::string_view kShapeTodo        = "todo";
 
 // src/pattern.h owns the compiled form; ingest.h only ever holds a BORROWED pointer to it, so this
 // header stays free of tree-sitter. main.cpp includes pattern.h to build the set and read the
@@ -413,6 +536,76 @@ PatternFileCensus eligiblePatternFiles( const IngestResult& ing, const pattern::
 // The unreachable-code rule's own budget, named so every caller spends the same one.
 inline constexpr std::size_t kUnreachableMaxHits = 5000;
 
+// ---- a user's #match? / #not-match? predicate that could not be DECIDED, by cause ----
+// Four different facts that used to share one counter and one sentence — "the regex engine abandoned the match" —
+// which was false for three of them and sent the reader to the wrong fix:
+//   TextScreened     — a capture-typed argument's per-match TEXT was refused by the structural screen (e.g. a captured
+//                      string literal spelling a catastrophic-backtracking construct). Nothing was matched.
+//   TextUncompilable — that per-match text does not parse as a regular expression (e.g. "foo(").
+//   Abandoned        — a pattern compiled and the engine gave up part-way through the match (RegexVerdict::Exhausted).
+//   Skipped          — the captured text was too long to hand the engine at all on this thread (RegexVerdict::Skipped,
+//                      F-B4 — never tried, never abandoned mid-match; the same bound `--regex` uses on a long line).
+enum class AstRegexUndecidedCause : std::uint8_t { TextScreened, TextUncompilable, Abandoned, Skipped };
+
+// What a finished walk hands the verb: a count per cause and the FIRST undecided evaluation — lowest fileId, then
+// byte, then cause, then pattern — so the refusal names one concrete site, and the same one on every run whatever the
+// thread interleaving. Plain and copyable, unlike the sink below.
+struct AstRegexUndecidedReport
+{
+    std::uint64_t          textScreened     = 0;
+    std::uint64_t          textUncompilable = 0;
+    std::uint64_t          abandoned        = 0;
+    std::uint64_t          skipped          = 0;
+    bool                   hasFirst         = false;
+    std::uint32_t          firstFileId      = 0;
+    std::uint32_t          firstByte        = 0;
+    std::uint32_t          firstLine        = 0;
+    AstRegexUndecidedCause firstCause       = AstRegexUndecidedCause::Abandoned;
+    std::string            firstPattern;     // the per-match text (Text*) or the pattern that was running (Abandoned/Skipped)
+    std::string            firstReason;      // the guard's refusal, or kRegexAbandonedReason / kRegexOversizeReason
+
+    std::uint64_t total() const noexcept { return textScreened + textUncompilable + abandoned + skipped; }
+};
+
+// The sink the walk's workers write into. Only the undecided path ever touches it, which is why a mutex is the whole
+// synchronisation: a query whose predicates all decide never takes the lock.
+class AstRegexUndecided
+{
+public:
+    void note( AstRegexUndecidedCause cause, std::uint32_t fileId, std::uint32_t byte, std::uint32_t line, std::string_view pattern, std::string_view reason )
+    {
+        const std::lock_guard<std::mutex> lock( mutex );
+        std::uint64_t& count = ( cause == AstRegexUndecidedCause::TextScreened )     ? state.textScreened
+                              : ( cause == AstRegexUndecidedCause::TextUncompilable ) ? state.textUncompilable
+                              : ( cause == AstRegexUndecidedCause::Skipped )          ? state.skipped
+                                                                                       : state.abandoned;
+        ++count;
+        const auto key      = std::make_tuple( fileId, byte, std::uint8_t( cause ), pattern );
+        const auto firstKey = std::make_tuple( state.firstFileId, state.firstByte, std::uint8_t( state.firstCause ), std::string_view( state.firstPattern ) );
+        if( state.hasFirst && !( key < firstKey ) )
+        {
+            return;
+        }
+        state.hasFirst     = true;
+        state.firstFileId  = fileId;
+        state.firstByte    = byte;
+        state.firstLine    = line;
+        state.firstCause   = cause;
+        state.firstPattern = std::string( pattern );
+        state.firstReason  = std::string( reason );
+    }
+
+    AstRegexUndecidedReport report() const
+    {
+        const std::lock_guard<std::mutex> lock( mutex );
+        return state;
+    }
+
+private:
+    mutable std::mutex      mutex;
+    AstRegexUndecidedReport state;
+};
+
 struct AstQueryGroup
 {
     const std::vector<AstQuerySpec>* specs         = nullptr;   // borrowed — the caller owns the spec table
@@ -431,6 +624,9 @@ struct AstQueryGroup
     // claim; the emitter turns a non-zero into ellipsis_capped="1" + ellipsis_skipped=N and labels hits= a
     // floor, which is the disclosure V-2 found missing.
     std::atomic<std::uint64_t>*       ellipsisCappedOut = nullptr;
+    // AstWalk::Pattern only, optional: calls only a QUALIFIED spelling of a pattern leaf would have matched
+    // (pattern.h MatchStats::qualifiedUnmatchedCount) — never hits; the emitter discloses unmatched_qualified=.
+    std::atomic<std::uint64_t>*       qualifiedUnmatchedOut = nullptr;
 
     // §L3: a query that DID compile (for at least one grammar) still tells the caller nothing about WHICH
     // grammars accepted it, or how much of the corpus could even ask it the question. `(interface_declaration)
@@ -462,6 +658,18 @@ struct AstQueryGroup
     std::vector<std::string>*        nearestGrammarOut = nullptr;   // optional: the grammar (kLangTable's
                                                                      // querySub name) that nearestKindOut's
                                                                      // entry belongs to, "" alongside a "" kind
+
+    // USER-AUTHORED #match? / #not-match? patterns (src/regexguard.h). Both opt-in, both null for the built-in
+    // rule packs, whose patterns are constants of this binary: a caller that passes them is saying "these
+    // predicates are the user's, and a predicate that could not be decided must not quietly keep or drop a row".
+    //   regexRefusedOut   — one "'PATTERN' refused: REASON" per distinct constant pattern of this group's specs the
+    //                       guard REFUSED (malformed, non-portable, or catastrophic backtracking), sorted. Decided
+    //                       when the query is compiled, before any file is walked, so the verdict is the pattern's.
+    //   regexUndecidedOut — every predicate evaluation that could not be decided during the walk, BY CAUSE (see
+    //                       AstRegexUndecidedCause), with the first site named deterministically.
+    // Without them the legacy contract holds for that group: a refused or undecided predicate filters NOTHING.
+    std::vector<std::string>*        regexRefusedOut   = nullptr;
+    AstRegexUndecided*               regexUndecidedOut = nullptr;
 };
 
 // keptBytesOut (optional): the walk is where the corpus gets READ, so a pass that runs after it and needs
@@ -491,9 +699,15 @@ std::vector<std::vector<AstMatch>> astQueryGrouped( const IngestResult& ing, con
 //
 // What it is FOR: classifying a byte offset that some other pass already found. A --grep hit inside a
 // comment or a string literal is a mention, not a use, and 22-42% of a --grep answer's rows were such
-// mentions (2026-08-15 harvest, report-ugrep §F3). Nothing here is cached or serialized — these spans are
-// a property of the file's bytes at query time, so no cache version moves when this changes.
+// mentions (2026-08-15 harvest, report-ugrep §F3). The spans are a property of the file's bytes at query
+// time, so the ingest cache never carries them and no kCacheVersion moves when this changes — but they ARE
+// persisted since: the span-tier memo (ingest_astquery.h spanTierMemoLoad, its own kSpanTierMemoVersion)
+// writes one tier byte per span to disk, and reads each one back as external input.
 enum class SpanTier : std::uint8_t { Code = 0, Comment = 1, String = 2 };
+// The number of SpanTier values — the bound spanTierMemoLoad validates every memo tier byte against. A byte at
+// or past it used to reach search.h's grepApplySpanTiers, which counts hits into a per-tier array indexed by it.
+inline constexpr std::size_t kSpanTierCount = static_cast<std::size_t>( SpanTier::String ) + 1;
+static_assert( enumCountIsExact<SpanTier, kSpanTierCount>(), "kSpanTierCount must name the LAST SpanTier value — move it with the append" );
 
 // One file's comment/string spans. SoA, not an array of {start,end,tier} structs: the classify path binary-
 // searches `startByte` alone and touches the other two arrays at most once per lookup, so the search walks
@@ -572,7 +786,14 @@ struct AstQueryShape
     bool hasCapture       = false;   // an @capture appears outside any string literal
     bool isSingleTopLevel = false;   // exactly one top-level (…) or […] group, with nothing beside it
     bool hasComment = false;         // a `;` line comment — an appended capture could land inside it
+    std::size_t maxDepth = 0;        // the deepest ( / [ nesting outside strings and comments
 };
+
+// The deepest ( / [ nesting a tree-sitter query may carry before ripwire hands it to ts_query_new. The query
+// compiler recurses once per level, and it runs on worker threads with a small stack: a --match query nested
+// 4,000 levels deep died with SIGBUS (exit 138), and 2,000 levels ran for over a minute. A structural query a
+// person or an agent writes nests a few dozen levels; deeper is refused by name before any compile.
+inline constexpr std::size_t kMaxAstQueryNesting = 256;
 
 inline AstQueryShape astQueryShape( std::string_view query )
 {
@@ -615,6 +836,7 @@ inline AstQueryShape astQueryShape( std::string_view query )
                 ++topLevelGroupCount;
             }
             ++depth;
+            shape.maxDepth = std::max( shape.maxDepth, static_cast<std::size_t>( depth ) );
             continue;
         }
         if( c == ')' || c == ']' )
@@ -637,6 +859,11 @@ inline AstQueryShape astQueryShape( std::string_view query )
 
     shape.isSingleTopLevel = ( topLevelGroupCount == 1 ) && ( depth == 0 ) && !inString && !sawContentAfterTopLevelGroup;
     return shape;
+}
+
+inline bool astQueryNestsTooDeep( std::string_view query )
+{
+    return astQueryShape( query ).maxDepth > kMaxAstQueryNesting;
 }
 
 // ---- local-variable-indexing plan, Phase 2 (docs/LOCALS_INDEXING.md) ----

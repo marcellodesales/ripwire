@@ -25,7 +25,7 @@ cmake -S . -B build && cmake --build build -j
 ```
 
 **Never configure a local dev tree with `-DCMAKE_BUILD_TYPE=Release`.** Release defines `NDEBUG`,
-which compiles `DEGRADED_PATH_ALERT` out. A gate that asserts a degrade path then goes blind and
+which compiles the `DISCLOSE( msg )` trace out. A gate that asserts a degrade path then goes blind and
 passes for the wrong reason. See §5 for why CI builds both flavours.
 
 ### Sanitizer build (the G1 stack — required before you open a PR)
@@ -34,6 +34,71 @@ passes for the wrong reason. See §5 for why CI builds both flavours.
 cmake -S . -B asan -DRIPWIRE_ASAN=ON && cmake --build asan -j
 LSAN_OPTIONS=suppressions=lsan_suppressions.txt ./asan/ripwire <dir> >/dev/null
 ```
+
+**macOS 26 with the Command Line Tools' AppleClang 17: ASan hangs before `main`.** Every
+`-fsanitize=address` binary, even an empty `main`, hangs in ASan's start-up (shadow-memory set-up
+walking the dyld shared cache), so each ASan gate just times out. CI's Xcode 26.6 AppleClang 21 is
+not affected, and CMake warns when it sees the affected pair. Configure the sanitizer tree with
+Homebrew LLVM 22 instead, linking its own libc++ so the headers and the dylib are one release
+(Homebrew clang otherwise links the system libc++ against its libc++ 22 headers):
+
+```bash
+brew install llvm@22     # keg-only; nothing goes on PATH and /usr/bin/clang stays AppleClang
+L=$(brew --prefix llvm@22)
+cmake --fresh -S . -B asan -DRIPWIRE_ASAN=ON \
+  -DCMAKE_C_COMPILER="$L/bin/clang" -DCMAKE_CXX_COMPILER="$L/bin/clang++" \
+  -DCMAKE_EXE_LINKER_FLAGS="-L$L/lib/c++ -L$L/lib/unwind -lunwind -Wl,-rpath,$L/lib/c++ -Wl,-rpath,$L/lib/unwind"
+cmake --build asan -j
+otool -L asan/ripwire    # expect llvm@22's libc++, libunwind and libclang_rt.asan_osx_dynamic.dylib
+```
+
+Name `llvm@22`, not `llvm`: the unversioned keg moves to a new major on `brew upgrade`, and an older
+one may still be installed. `--fresh` makes the switch explicit when `asan/` was first configured with
+AppleClang; without it CMake sees the compiler change, warns, and discards the old cache on its own. The
+directory stays `asan/`, because the gates and `test/regression.sh` look for `asan/ripwire`. Gates that
+compile their own sanitizer harness take the compiler from `CXX` (strkerncheck's CMake leg also reads `CC`
+and `LDFLAGS`), so export
+`CC="$L/bin/clang" CXX="$L/bin/clang++" LDFLAGS="<the linker flags above>"` before running them.
+Keep that environment to the ASan gates: a gate that checks `$CXX` against the compiler that built
+`build/ripwire` (noaliascheck) goes red under it, so run the plain gates from a shell without it.
+With libc++ 22, oswin32logiccheck arm (B) stops on an `-fsanitize=integer` report inside libc++'s own
+`<string>` (`__grow_by` stores `-1` into `size_type` on purpose). That is the toolchain, not ripwire.
+
+### Stale objects — the build that reports success and is wrong
+
+Make decides what to recompile by comparing timestamps, and header tracking in this tree is correct
+and complete. But a timestamp only means something if the sources hold still. Edit `src/model.h` — or
+`git checkout` a branch that does — **while a build is in flight**, and that build writes object
+files whose mtime is newer than the header but whose content predates it. Make then correctly
+concludes "up to date" and never recompiles them again. `cmake --build build -j` reports success,
+exit 0, no warnings, for as long as you keep trying.
+
+So: **never edit the tree while a build is running, and never background a build you then edit
+around.** After a branch switch, or whenever you are unsure, do not trust an incremental rebuild:
+
+```bash
+cmake --build build --clean-first -j          # and the same for asan/, if that tree is in play
+```
+
+Three ways this has been hit, so you can recognise the symptom instead of debugging the wrong bug:
+
+- **A sanitizer report of a bug that does not exist.** Half the objects had `sizeof(Symbol)==96` and
+  half `104`, and ASan reported a heap-buffer-overflow in `ingest`. The tell was the region size:
+  1344 bytes = 14 × 96, an exact multiple of the *previous* struct size. If a report's region
+  divides evenly by an old `sizeof`, stop debugging and rebuild.
+- **A mirrored constant that would not update.** `src/quality.h`'s `kIngestParserVerMirror` was
+  edited while a clean rebuild ran. The binary kept emitting the old value through repeated
+  successful rebuilds, and `qextractionkeycheck` failed as though the mirror update had been missed.
+  `touch`ing the header fixed it — which is the diagnosis, not the fix: the object was newer than
+  the source it disagreed with.
+- **An impossible `std::length_error`.** SIGABRT out of a `resize( symbols.size() )`, where `.size()`
+  came from a vector whose element size half the objects disagree on. Zero repro in 38 runs on a
+  clean rebuild of the same commit.
+
+`test/g1freshcheck.sh` catches the ordinary stale binary — one older than its sources — and is worth
+believing when it fires. It cannot catch this variant, because here the binary is *newer* than the
+source and only its contents are stale. Nothing in CMake can repair a source that changed
+mid-compile; the discipline is the fix.
 
 ### Building on Linux
 
@@ -73,15 +138,19 @@ Please keep it that way.
 **No kqueue.** The long-lived MCP server's FS-event watcher is a macOS/BSD optimisation. On Linux it
 is compiled out and freshness comes from the per-request stat sweep — that is the designed path, not
 a degradation, so it is silent and the staleness contract is unchanged. You can build and run that
-path on a Mac with `cmake -S . -B build-nokqueue -DCMAKE_CXX_FLAGS=-DRIPWIRE_HAS_KQUEUE=0`.
+path on a Mac with `cmake -S . -B build-nokqueue -DCMAKE_CXX_FLAGS=-DRW_OS_HAS_KQUEUE=0` (the seam lives in
+`src/infra/os.h`, which may not name the project, so it is spelled `RW_OS_`).
 
 ### Determinism gate
 
 Output is a sorted top-K. A sort has no tolerance band, so the contract is byte-identity:
 
 ```bash
-./build/ripwire <dir> >a; ./build/ripwire <dir> >b; diff -q a b
+t=$(mktemp -d); ./build/ripwire <dir> >"$t/a"; ./build/ripwire <dir> >"$t/b"; diff -q "$t/a" "$t/b"
 ```
+
+Write the two outputs OUTSIDE `<dir>`. Written inside it, the second run crawls the first run's output
+file, a new unindexed text file, and the `unindexed=` histogram can change between the two runs (#334).
 
 Run it three times — scheduling-dependent nondeterminism does not show up reliably in one pair.
 Warm (cached) output must equal cold output exactly.
@@ -105,6 +174,50 @@ in the same commit that adds the gate**.
 
 Run your gates in the foreground. A suite left running in the background at the end of a work
 session is a suite nobody read.
+
+Gates share one checkout. **Never write into it**, not even for a moment: every stamped verb reads
+`git status --porcelain` from any crawl root inside the checkout for its `at="…+dirty"` bit, so a
+transient untracked file flips every determinism arm running beside you under `-j N`. Work in a
+`mktemp` dir; if a copy genuinely has to sit beside a real gate, give it a name `.gitignore` hides
+(`.gateprobe.*`). `test/pargates.py` samples that command while the suite runs and fails the run
+naming the gate in flight. It is a sampler, so a clean run there is "none found", never "none exists".
+
+### Selecting which gates to run for a change smaller than the full suite
+
+A lane or PR does not run the full suite locally — but "which subset" is not "grep for the verb you
+changed". Gate selection by VERB NAME under-covers; four classes of gate are invisible to it (found the
+hard way, across several trains, each time by a gate the verb-grep never reached):
+
+1. **Language-fixture gates.** A change to extraction, ingest or the call graph can move a fixture's
+   count without the gate naming any verb you touched. Do not enumerate fixtures by name — ask the
+   binary which ones your change can move, then run the gate that owns each:
+   ```bash
+   for d in test/*fix; do "$BIN" "$d" --no-cache '--graph-query=<the property you changed>' \
+       | grep -q 'count="[1-9]' && echo "$d"; done
+   # each hit's gate is test/<basename-minus-fix>check.sh, plus the cross-language gates that own no
+   # fixture of their own: langcensuscheck qualnewcheck callformcheck
+   ```
+2. **Source- and docs-grepping gates.** A gate that reads a header's text directly (an enum's member
+   list, a constant, a hardcoded roster meant to track one) has no verb and no fixture — it has a
+   filename. Run every gate that names a file your change touched, over the FULL merge/PR diff, not
+   just the files the last fix round happened to edit:
+   ```bash
+   git diff --name-only <base>...HEAD -- 'src/*' | while read f; do grep -l "$(basename "$f")" test/*.sh; done | sort -u
+   ```
+   A gate keyed on an enum (a shape roster indexed by `SymKind`, say) is this class, not a fifth one:
+   the header that declares the enum has a name, and the sweep above finds any gate that greps it.
+3. **Shard-placed gates.** A gate's CI shard says where it runs, never what it covers — do not let
+   "that runs on a shard I don't usually watch" stand in for "out of scope". `portablebuildcheck` is
+   the standing example: a whole-`src/` sweep with no fixture, no verb and no per-language list, so it
+   is invisible to every selection method except clause 2's file sweep above (it greps `src/`
+   wholesale). Run clause 2's sweep and trust it over a mental model of "what usually catches this".
+4. **Run the sweep, don't just write it down.** Writing the rule is not running it: clause 2's command
+   has been reasoned about and then skipped in the same round it was proposed, because it was run over
+   the files edited in the latest fix rather than over the whole change. Run it over the FULL base...HEAD
+   (or merge) file list before calling a round done — on a change that touches a widely-`#include`d
+   header this can be most of the suite (hundreds of gates), and that size is the honest answer, not a
+   sign to narrow the query: run the local intersection this sweep names and let CI carry the rest, but
+   never conclude "no gate covers this" without having actually run the command.
 
 ### The formatting gate — and the rule for when it disagrees with you
 
@@ -138,12 +251,30 @@ releases and an unpinned checker reports drift on a tree that was formatted corr
 `RIPWIRE_FORMAT_ANY_VERSION=1` to run anyway, and `CLANG_FORMAT=/path/to/clang-format` to point at a
 binary that is not on `PATH` (Homebrew's LLVM is not, on macOS, by default).
 
-**clang-tidy is advisory only, and must stay that way.** `.clang-tidy` carries an empty
-`WarningsAsErrors`, CI runs it with `continue-on-error`, and the config is curated down to
-`bugprone-*` / `clang-analyzer-*` / `performance-*` / `misc-dangling-*`. Its default catalogue argues
-for a different C++ than the data-oriented one §3 and G2 mandate — POD and SoA, C arrays, 32-bit
-handles, `VERIFY` instead of exceptions — so read its output as a to-triage list, never as a queue of
-defects.
+**clang-tidy's broad report is advisory, and must stay that way; one narrow subset gates.**
+`.clang-tidy` carries an empty `WarningsAsErrors`, CI runs it with `continue-on-error`, and the config
+is curated down to `bugprone-*` / `clang-analyzer-*` / `performance-*` / `misc-dangling-*` /
+`misc-redundant-expression`. Its default catalogue argues for a different C++ than the data-oriented one
+§3 and G2 mandate — POD and SoA, C arrays, 32-bit handles, `ASSUME` instead of exceptions — so read its
+output as a to-triage list, never as a queue of defects.
+
+The exception is `scripts/tidycheck.sh`, a separate CI step with `--warnings-as-errors='*'`. It runs
+only checks whose every finding is a silently wrong answer and that sat at **zero rows** on the five CI
+TUs when admitted (0.6.3, clang-tidy 22; `bugprone-use-after-move` had one row, brought to zero by a
+behaviour-neutral fix that `.clang-tidy` describes): `bugprone-use-after-move`, `bugprone-dangling-handle`,
+`bugprone-sizeof-expression`, `bugprone-integer-division`, `bugprone-infinite-loop` and
+`clang-analyzer-core.*`. It is a ratchet, not a style gate: a new row is a
+bug to fix, never a `NOLINT`, and a gated check that proves noisy leaves the list with its count, the way
+it came in (`.clang-tidy`'s header has the counts, and the candidates that stayed out or left). Run it
+before a PR that touches C++: `scripts/tidycheck.sh` finds clang-tidy 22 on `PATH` or, on macOS, at
+Homebrew's keg-only `/opt/homebrew/opt/llvm@22/bin/clang-tidy` — pin that path, not
+`/opt/homebrew/opt/llvm`, which may be another major — and prints a `SKIP` line (not a pass) when it
+finds neither.
+
+The compiler holds the same line for the UB class: CMakeLists.txt's compile-time fence block makes
+`return-type`, `uninitialized`, `format`/`format-security`, returning a local's address, and on Clang
+`-Wdangling` and constant `array-bounds`, errors on our own targets, per compiler, with the cl.exe
+`/we####` equivalents — each measured at zero hits on AppleClang 17, clang 22 and GCC 13/14/16 first.
 
 ---
 
@@ -211,6 +342,11 @@ already knew about the others, several while fixing one. So the rule is mechanic
    is not the thing that runs.
 4. **Prefer an arm that has been observed RED.** An arm that has only ever been green has not been
    shown to have a failing state at all.
+5. **When you fix an instance, remove the shape that produced it.** `test/prbudgetcheck.sh`'s Wave-45
+   fix moved its diff into a scratch repo and left `ROOT` rebound to that fixture, so a line reading
+   `( cd "$ROOT" && git checkout -- src/mod4.cpp )` stayed correct while looking exactly like the one
+   that would revert a developer's working tree; two readers later took it for a writer (issue #71).
+   A fix that leaves the shape leaves the next instance free.
 
 ---
 
@@ -230,17 +366,76 @@ already knew about the others, several while fixing one. So the rule is mechanic
 
 ### Self-check, don't throw
 
-- `VERIFY( cond )` at every precondition and invariant. It is free in release (`-DNDEBUG` lowers it
-  to `__builtin_assume`: zero cost, plus an optimizer hint).
-- A **recoverable** runtime error — an unreadable file, a full pool, a missing grammar — is a
-  **degrade**, not a failure: return `nullptr` / `false` / empty / a clamped value, emit
-  `DEGRADED_PATH_ALERT( "msg" )`, and keep going. The whole pipeline must survive a malformed repo.
+Self-checking is this codebase's primary correctness mechanism, ahead of tests: a check at an invariant runs on
+every input the tool ever sees, costs nothing in release, and tells the optimizer a fact. **Add them freely.**
+`test/selfcheckcheck.sh` objects only to:
+- a side effect inside a check;
+- a call it has never seen inside a promise (one line in its ALLOW table, once);
+- `ASSUME( false )`;
+- external input handed to anything but `VALIDATE`;
+- a new one-argument `DISCLOSE`;
+- an `answerUnchanged` without a reason.
+
+| word | promises | release | use for | never for |
+| --- | --- | --- | --- | --- |
+| `ASSUME( e[, "why"] )` | e holds because THIS code makes it hold | not evaluated; the optimizer may rely on it | invariants, indices you bounded, sizes you set | argv, files, git, sockets, the environment |
+| `EXPECTS( e[, "why"] )` | the caller met this function's contract | as ASSUME | preconditions; the report blames the caller | a boundary whose callers you do not control (VALIDATE) |
+| `ENSURES( e[, "why"] )` | this function met its own contract | as ASSUME | postconditions before a return | anything the caller can still change |
+| `DASSERT( e[, "why"] )` | nothing: debug-only check | nothing, not evaluated | expensive or floating-point checks; corruptible structure (`verifyCsr`) | facts the optimizer should have |
+| `ASSUME_NO_ALIAS( a, b )` / `3` / `_BUF` | separate allocations | separate_storage fact | out-params and read/write pairs of one type | views; members of one struct; elements of one array |
+| `ASSUME_SAME_THREAD()` | this SITE runs on one thread | nothing | process singletons (the MCP index) | a body pool workers reach on different objects |
+| `ASSUME_SAME_THREAD_AS( obj )` | obj is touched only by its owner (`release()` hands it on) | nothing, no storage | worker result slots, prefetch results | lock-protected state; per-node records |
+| `UNREACHABLE( ["why"] )` | control never arrives here | `__builtin_unreachable()` | exhaustive `switch` defaults | a path bad input can reach |
+| `VALIDATE( e[, "why"] )` | nothing: e is external input | evaluated, one compare | the condition of the refusing or degrading `if` | invariants |
+| `DISCLOSE( sink, why[, "msg"] )` | the answer carries its incompleteness | `sink.disclose( why )` runs | every degrade: the sink is the struct whose field the emitter reads; `why` is its own scoped enum | — |
+| `DISCLOSE( Diagnostics::answerUnchanged, "reason" )` | this degrade changes cost, never content | nothing, but the reason is listed by the gate | a rejected or unwritable cache, a same-bytes fallback, a lock skipped under a re-check | dropped/truncated/guessed rows, stored partial facts, refusals, unreachable guards |
+| `DISCLOSE( Diagnostics::answerRefused, "reason" )` | this degrade refuses the answer by name | nothing, but the reason is listed by the gate | a path that, in every build, prints no answer and says why (non-zero exit + stderr, an MCP error, a query's named failure) | anything that still prints part of an answer |
+| `DISCLOSE( "msg" )` | **nothing to the user**: a debug trace | nothing | existing sites only, until converted (ratchet) | any new degrade |
+| `PANIC( "why" )` | we cannot continue | report and abort | a corrupt state | anything recoverable |
+
+**The error ladder:**
+- A **recoverable** runtime error (an unreadable file, a full pool, a missing grammar) is a **degrade**, not a
+  failure. Return `nullptr` / `false` / empty / a clamped value, **tell the reader in the document**, and keep
+  going. The whole pipeline must survive a malformed repo.
+  - Write `DISCLOSE( sink, Sink::DisclosureWhy::Reason[, "subsystem: condition — consequence"] )`. The sink is the
+    object whose field the emitter already reads (`complete=`, `ok="0"`, `why=`, `*_capped="1"`, `counts_floor="1"`,
+    an omitted `est_tokens=`); give it a scoped `DisclosureWhy` and a `noexcept` `disclose()` that sets that field.
+    The compiler checks the contract.
+  - `docs/ARCHITECTURE.md`: "A disclosure that lives only in an assertion is a disclosure that does not ship."
+  - If the degrade genuinely cannot change this answer (a cache rejected and rebuilt, a cache write that only
+    makes the next run cold), write `DISCLOSE( Diagnostics::answerUnchanged, "why this answer is unchanged" )`.
+    If it REFUSES the answer — no document at all, and the cause named where the caller reads it (stderr with a
+    non-zero exit, an MCP error, a query's named failure) — write `DISCLOSE( Diagnostics::answerRefused, "how" )`.
+    The gate prints both kinds of reason on every run. Neither is for a path that still prints an answer: if any
+    answer goes out, it needs a real sink, and if the document has no field for the fact yet, ADD one (absent on the
+    happy path, defined in the same document's legend and in `compactlegend.h`) — never leave the degrade to the trace.
+  - The one-argument `DISCLOSE( msg )` is a debug trace that ships nothing. It remains only on sites not yet
+    converted, and `test/selfcheckcheck.sh` refuses a new one (arm R: the count may only go down), and arm S proves
+    the sink form still records in an `-O2 -DNDEBUG` build — the flavour users run.
+- **External input** is checked with `VALIDATE` in the condition of the refusal, never `ASSUME`d.
 - A **corrupt invariant** is a `PANIC`.
-- **Never write `VERIFY( false )` on a degrade path.** In release the assert compiles away and the
-  optimizer deletes the fallback behind it — that is a real shipped-bug shape, not a hypothetical.
-  Guard, don't assert.
+- **Never `ASSUME( false )` (or an `EXPECTS`/`ENSURES` of false) on a degrade path.** In release the assert
+  compiles away and the optimizer deletes the fallback behind it — that is a real shipped-bug shape, not a
+  hypothetical. Guard, don't assert.
 - Throw only at the `operator new` seam. A throw escaping a worker thread is `std::terminate`, so
   wrap thread bodies in `try { … } catch( ... ) { … }`.
+- **Avoid exception handling. Where a throw is unavoidable, RAII is what makes the code exception-safe:
+  cleanup belongs in a destructor, never in a `catch`.** A handler that releases a resource has to know
+  which resources are live at the point the throw happened, so such handlers multiply — two throw sites
+  in one function own different things and need different teardown, and the handler is only correct
+  until someone adds an early `return` above it. One owner whose destructor releases what it holds
+  collapses that to a single handler whose only job is the conversion this codebase actually wants: a
+  recoverable error becomes a degrade, returned, never propagated. Measured on `216802ad`, 2026-09-14:
+  of 27 `catch` blocks under `src/`, exactly one released a resource by hand — `infra/emit.h`'s
+  `renderToString`, which `fclose`d a memstream and `free`d its buffer. Re-derived after that buffer
+  moved into `rw::MemoryStream` (2026-09-16, `lane/compile-time-checks`): **26 `catch` blocks, and none
+  releases a resource by hand** — `renderToString`'s two handlers now leave the stream and its buffer to
+  the owner's destructor. Every handler converts a throw into a degrade, sets a flag, returns a message,
+  or `continue`s; they own nothing, which is why they are one line each. Re-derive rather than trust: a
+  bare `grep -cE '\bcatch[[:space:]]*\('` over `src/` reports **34** there, and 8 of those hits are the
+  word inside a `//` comment or inside a tree-sitter query string — most of them in `lintrules.h`, whose
+  subject is *detecting* empty catch blocks in other people's code. Exclude comment and string context, then read each surviving handler's first body
+  line, because the resource question is answered by reading it and not by counting.
 
 ### Naming encodes what the type cannot
 
@@ -277,6 +472,24 @@ already knew about the others, several while fixing one. So the rule is mechanic
   ordered container); and `unordered_dense` invalidates references on insert (values live in one
   vector), so never hold a `T&` into it across an insert.
 
+### Adding a language: common stays common
+
+A new language is **data plus, at most, small per-language pieces for semantics that genuinely differ** —
+never a copy of another language's mechanism. The step-by-step path is `prompts/add-a-language.md`; the
+rules it enforces:
+
+- **Data, not branches.** A `kLangTable` row, a `queries/<lang>/tags.scm` in the shared capture
+  vocabulary, and a row in each exhaustive `switch( Lang )` table. No language-named capture kinds.
+- **Reuse the shared mechanism.** Scope walks, shadowing (`VarDecl` bindings with spans) and imports
+  (`Binding`/`Include`) each exist once. Extend them; a second copy under a new language's name is a
+  review finding, and `--clones` shows it. No language-neutral qualified-call resolver exists yet
+  (`src/elixir_resolve.h` is Elixir-specific); raise generalising it in your PR.
+- **Refuse, don't guess.** A call whose qualifier (`Mod.f`, `ns/f`) cannot be resolved is counted as
+  unresolved, never laddered to every definition of that short name.
+- **Known gap.** Tags-pass predicates (`#eq?`/`#any-of?`) do not run yet, so keyword-headed definitions
+  (Elixir today; a Lisp-style `defn` if one is added) keep a small keyword table in C++. That table belongs in `tags.scm` once the
+  mechanism lands; it is not a pattern to extend.
+
 ### Interfaces
 
 - **Structured-binding returns** over out-params: `auto [ nodes, edges ] = build( … );`.
@@ -284,8 +497,119 @@ already knew about the others, several while fixing one. So the rule is mechanic
   a caller-owned arena.
 - **Symmetric bare scopes** for deterministic RAII teardown.
 
+### Operating-system calls: call sites never ask which OS they are on
+
+**Call sites never ask which OS they are on; they call the `rw::os` function that says what they need.**
+`src/infra/os.h` is the one file in `src/` that tests an operating system: every `#if` naming one, every feature
+macro that is really an OS test (`MSG_NOSIGNAL`, `SO_NOSIGPIPE`, the kqueue seam), every POSIX or Windows system
+header, and every call whose behaviour differs by platform. A call site reads like Unix code with a prefix —
+`os::lstat( path, &st )`, `os::rename( tmp, dst )`, `os::flock( fd, LOCK_EX )`, `os::stat_t` — with POSIX names,
+POSIX signatures and the POSIX errno contract, and it asks nothing about the platform: no `#if`, and no platform
+fact (`os::kWindows`, `os::kApple`) in a plain `if` either — those are for `os.h`'s own use. Each POSIX body is the
+libc call itself, `[[gnu::always_inline]]`, over the call's own raw types (no copy, no errno translation, no extra
+syscall), so a release binary carries no out-of-line `rw::os` symbol; where no POSIX call says what a site needs
+(`os::exepath`, `os::dirwatch_open`), the helper is lowercase and C-shaped, its POSIX body is the code that used to
+sit at the site, and its shape keeps that code's evaluation order — a read stays on its side of a `fork` — so the
+caller compiles to the same instructions. Check that with a release build of the base commit and `objdump -d`, not
+by reading. Inside `os.h`, `#if` is kept for what does not exist on the other platform — a header, an
+API or type, a field spelled differently (`st_mtimespec`/`st_mtim`) — while pure logic selects on the facts with
+`if constexpr`, so both branches are type-checked on every CI leg and the non-native one cannot rot. **The naming
+gotcha:** a POSIX name that some libc defines as a *function-like macro* cannot be wrapped by its own name, because
+the declaration and every `os::name(` call expand before the compiler sees a function — `S_ISREG( m )`,
+`S_ISLNK( m )` and the other mode predicates everywhere, and `htons` under glibc at `-O2`. Those stay bare at call
+sites, like the `O_*`/`X_OK`/`PATH_MAX` constants, and `os.h`'s Windows branch defines them. `test/osswitchcheck.sh`
+refuses all of the above outside `os.h`; its allowlisted files are `src/infra/profilePmc.h`, the profiler's
+undocumented-ABI counter backends, and `src/infra/os_win32.cpp`.
+
+**Windows bodies live out of line.** `os.h`'s Windows branch only *declares* — the same names, POSIX constants,
+types and `stat` fields its POSIX branch uses — so `<windows.h>` never reaches a call site. The definitions are in
+`src/infra/os_win32.cpp`, which CMake compiles only for a Windows target (`cmake/Windows.cmake`), and they keep the
+POSIX contract their callers read: errno, `-1`, `struct stat` fields (`st_dev`/`st_ino` identify a file; `lstat`
+reports `S_IFLNK` for a symlink or junction; `O_NOFOLLOW` judges the final component). Every kernel object there
+has one RAII owner, and nothing throws. Anything in that port that is not a Win32 call — the Win32→errno table,
+UTF-8/UTF-16 conversion, path spelling, `CreateProcessW` quoting, reparse-tag and wait-status decoding — belongs in
+`src/infra/os_win32_logic.h`, a header with no `<windows.h>` and no platform test, so that every CI leg compiles
+it and `test/oswin32logiccheck.sh` tests it. Paths are `/`-separated inside the program: Windows spells them once
+where they enter (`os::init_process` for argv and the environment, `os::normalize_path_arg` for a path-valued
+flag or MCP argument), never at a comparison. The three questions whose answer depends on drives existing have
+`os::` names of their own — `os::path_is_absolute`, `os::path_is_root`, and `os::program_path( fs::path )` for a
+path the program generated itself (the crawl) — and each POSIX body is the expression the call site used to hold.
+
+**Platforms.** Unix, Linux and macOS come first; native Windows is second, with clang-cl the primary compiler and
+MSVC `cl.exe` also required to build. A `cl.exe` portability problem is worth fixing, but it does not block a change
+to a POSIX-only code path. **Both now build and both gate**: the `windows` CI job builds with clang-cl and with
+cl.exe on every full matrix, and each leg runs the binary, runs `ctest`, and checks the two-run byte-identical
+contract and well-formedness. The GCC/Clang language extensions this tree uses go through the seam in
+`src/infra/platform.h` (and, for the layer below it, `src/infra/Diagnostics.h` §1c); `test/osswitchcheck.sh` arm H
+refuses a new `__builtin_*`, inline asm or `__attribute__` outside that pair, so a Windows break is caught on every
+POSIX leg rather than discovered on Windows.
+
+A green Windows matrix is **not** the same as a validated platform. The 660-gate suite does not run there — it needs
+the harness on #44 — and the ASan flavour is compiled on Windows but never executed.
+
+The **windows-x64 release zip** (a preview from 0.6.3) is built by `.github/workflows/windows-package.yml`, which
+`release.yml` and `ci.yml` both call, so every full-matrix run uploads the zip a tag would publish. Its header lists
+the design choices (clang-cl, Release, static CRT `/MT`, no PGO) and the checks on the unzipped exe; `xplat-diff`
+then compares `scripts/ci-xplat-outputs.sh`'s verb set between that exe and the Linux binary under the rules
+`scripts/ci-xplat-diff.sh` names. A change that makes the two differ is a Windows bug until shown otherwise.
+
+### Aliasing: spelling, placement, contract
+
+- **Spelling: `__restrict__` only, never `__restrict`.** On macOS, `<sys/cdefs.h>` does
+  `#if __STDC_VERSION__ < 199901` / `#define __restrict` (empty), and `__STDC_VERSION__` is
+  undefined in C++, so every `__restrict` that follows any libc/libc++ include is silently deleted.
+  `__restrict__` is a keyword, not a macro, and survives.
+- **Prefer `ASSUME_NO_ALIAS( a, b )` (objects) or `ASSUME_NO_ALIAS_BUF( a, b )` (OWNING containers only: `std::vector`, `std::string`, `std::array`) in
+  the body over a qualifier on the signature.** For a container, the promise has to land on
+  `.data()` — on the objects themselves it is inert for the loop, because the optimizer reaches the
+  heap buffer through a pointer loaded from the header, not through the header's own address. Never a
+  view: two `std::span` or `std::string_view` objects can look into ONE allocation, and the promise is per
+  allocation, so the macro refuses them at compile time — promise the owners they came from. Place
+  the macro at the top of the function, before the first load or store through either argument; if the
+  function already has a "nothing to do" early return on empty input, put it after that return, so the
+  promise is never made on a null `.data()` (measured: same loop effect, plus only the emptiness test the
+  function paid for anyway). Do not add an early return for the macro's sake — the one line is the full
+  effect, and two empty containers are a vacuous promise, not a broken one.
+  Three reasons, one each: it is checked in debug and is the same optimizer fact in release
+  (`__builtin_assume_separate_storage`) on compilers that consume it — clang 18+ by default, LLVM 17 /
+  AppleClang 16 only with the `-mllvm -basic-aa-separate-storage` that CMake adds when the compiler
+  accepts it (and there only for scalar accesses, not the loop vectorizer), GCC and clang before 17
+  not at all, where the release expansion is `( (void)0 )` and only the debug check runs; it does not
+  change the API; `__builtin_assume( &a != &b )` is NOT that fact — alias analysis never reads it.
+- **The contract is different complete allocations, not different addresses.** Verbatim from
+  clang's `LanguageExtensions.rst`: the arguments "are assumed to point into separately allocated
+  storage (either different variable definitions or different dynamic storage allocations) …
+  'storage' here refers to the outermost enclosing allocation of any particular object (so for
+  example, it's never correct to call this function passing the addresses of fields in the same
+  struct, elements of the same array, etc.)". Two elements of one array or two members of one
+  struct are undefined behaviour, not a stricter case of the promise. Locals allocated inside the
+  function are already known-distinct to the optimizer; the macro is for parameters and members —
+  and only for parameters/members of the *same element type*, since different types are already
+  separated by TBAA.
+
 ### Output: `std::print`, feature-tested and disclosed — never a new printf-family site
 
+- **Pick the primitive by what you actually have.** All three live in `src/infra/emit.h`; a same-shaped
+  wrapper such as `lintPrintOut` / `lintPrintErr` in `src/verbs_lint.h` is fine too.
+
+  | You have | Use |
+  | --- | --- |
+  | A format string **with arguments**, going to a stream | `rw::emitTo( stream, "…{}…", args )` |
+  | **Literal text, no arguments** | `rw::emitRaw( stream, "…" )` |
+  | A **caller-owned char buffer** | `rw::formatTo( buf, cap, "…{}…", args )` |
+
+  `emitRaw` is not a stylistic alternative to `emitTo`: `std::format_string` is **consteval**, so literal
+  text routed through `emitTo` pays compile-time format parsing for formatting that never happens — and
+  the `--help` table, one 114,985-character literal, does not compile at all that way ("call to consteval
+  function … is not a constant expression"). 353 sites in this tree pass a string and no arguments.
+  `formatTo` exists for the same reason in the other direction: `std::format` into a `std::string` puts an
+  allocation on `serialize.h`'s per-symbol path, which is a G2 regression, so buffer-targeted sites keep
+  their stack buffer via `std::format_to_n`.
+- **`rw::formatTo` reproduces `snprintf`'s contract exactly — do not hand-roll it with `format_to_n`.**
+  `snprintf( p, S, … )` writes at most `S-1` characters **plus a NUL**; `std::format_to_n( p, S, … )` writes
+  up to `S` and terminates nothing. Substituting one for the other buys a byte of buffer and drops the
+  terminator. Measured 2026-09-09: that substitution made a symbol row emit `amp="1"` where every previous
+  build truncated it away, with the whole parity fence green — the fixture never reaches the buffer.
 - **Emit through `rw::emitTo` (`src/infra/emit.h`)**, or a same-shaped wrapper such as `lintPrintOut` /
   `lintPrintErr` in `src/verbs_lint.h`. That header is the ONE place the emitter is chosen: `std::print`
   where the standard library defines `__cpp_lib_print`, `std::format` rendered and written with
@@ -298,7 +622,7 @@ already knew about the others, several while fixing one. So the rule is mechanic
   it (measured 2026-09-08). Testing the macro means every toolchain BUILDS — which is why the choice is
   DISCLOSED: `--version` prints `emit=std::print` or `emit=std::format+fputs` (`test/versioncheck.sh` #6),
   every CI and release leg asserts `std::print` (gcc-14 on the ubuntu legs, gcc-toolset-14 on RHEL and the
-  manylinux containers, Xcode 16.2 on macOS), and the `fallback-emitter` job builds the fallback arm with
+  manylinux containers, Xcode 26.6 on macOS), and the `fallback-emitter` job builds the fallback arm with
   the stock ubuntu g++ 13 on purpose and proves it emits the same bytes. A silent fallback is the failure
   this whole arrangement exists to make impossible.
 - **A conversion is byte-parity-fenced, not reviewed by eye.** `test/printffmtparitycheck.sh` hashes
@@ -306,10 +630,32 @@ already knew about the others, several while fixing one. So the rule is mechanic
   and the stream. The trap it exists for is float rendering — `%g` prints six significant digits, `{}`
   prints the shortest round-trip (`0.3` versus `0.30000000000000004`) — so a per-specifier swap is never
   mechanical. Every emitted byte feeds G4, the determinism gate, and the stored captures.
+- **The specifier mapping is measured. Use the measured one; do not extend it from memory.** 218 checks
+  against printf on this toolchain found exactly ONE unsafe mapping, the bare `%g`/`%f` above:
+
+  ```
+  %s %u %d %zu %zd %lu %ld %llu %lld %i  ->  {}          %10s -> {:>10}   %-11s -> {:<11}
+  %.*s (precision, pointer)              ->  {} with std::string_view( ptr, len )
+  %016llx -> {:016x}   %llx -> {:x}   %llX -> {:X}   %o -> {:o}   %.9s -> {:.9}
+  %.3f -> {:.3f}       %6.1f -> {:6.1f}   %.6g -> {:.6g}          (explicit precision ONLY)
+  ```
+- **A green fence is not coverage, and the fence cannot cover everything.** Two facts to hold together.
+  First: `printffmtparitycheck` proves nothing about a verb it has no label for — add the label and pin it
+  BEFORE converting, and note that pinning refuses any verb whose output embeds the git stamp (`at="<sha>"`),
+  because such a verb's bytes move on the very commit that carries the pin. Second: even a covered verb
+  reaches only the branches the fixture reaches — a coverage build measured 25% of one batch's call sites
+  ever executed. For anything unfenceable or under-covered, **differential-test**: build the base commit
+  into a scratch worktree and diff both binaries' bytes over `src/`, `test/`, `docs/` and the repo root,
+  normalising only the stamp. A toy fixture cannot reach a truncation branch; a real tree does it by
+  accident, which is how the `format_to_n` byte above was caught.
 - **`std::print` throws on a failed write where `fputs` returns EOF.** `emitTo` catches that one
   `std::system_error` so both arms keep the contract every emitting site always had — a failed write is
   silent — rather than a `std::terminate` the fallback arm could never produce (§3 "Self-check, don't
   throw": a recoverable runtime error is a degrade, never a throw that escapes).
+- **`%%` and braces invert in OPPOSITE directions when you convert.** A printf format spells a literal
+  percent `%%`; text handed to `emitRaw` is no longer a format, so `%%` there prints TWO characters and must
+  collapse to one `%`. Braces are the mirror image: `emitTo` needs `{{`/`}}` for a literal brace where
+  `emitRaw` needs a bare `{`/`}`. JSON emitters are where the brace half bites.
 - **Until a string is converted it is a printf FORMAT, not text.** The `--help` table in `src/cli.h` is one:
   a literal `%` in a help line is a conversion (`% /`, `% o` and `% c` all parse), and the generated
   `docs/COMMANDS.md` then carries garbage where the number was. Write `%%` there, and treat the regeneration
@@ -350,9 +696,13 @@ review discipline.
   core and grammars compiled from source and linked statically, no host-installed dependencies, no
   OpenMP. The goal is "self-contained", **not** "static": a fully static binary is impossible on
   macOS (`libSystem.dylib` is the syscall interface), so never pass `-static` to the linker.
-- **G4 — maximum token density.** Minified XML, no inter-tag whitespace, terse attributes
-  (`t="fn"`), one schema legend at the top. The gate: output pipes clean through `xmllint --noout`
-  and contains no newline outside CDATA.
+- **G4 — maximum token density.** Minified XML, no inter-tag whitespace, terse attributes. The legend is emitted
+  once per answer on the CLI (`--legend=full|compact`) or once per session on agent surfaces (`--legend=ref`,
+  served only after the session dictionary was delivered in that process; the answer then ends with
+  `<about … legend="ref" dict= dictv=/>`). Every attribute a default answer emits is defined in that answer's own
+  legend — gates `legendcoveragecheck` (G) and `compactlegendcheck` (UG); a ref answer carries the same attributes
+  as its inline twin, and every definition it leans on is bytes that session was already sent or that the answer
+  carries itself — gate `legendrefcheck`. Output pipes clean through `xmllint --noout`; no newline outside CDATA.
 - **G5 — modular zero-dependency CLI.** Hand-rolled argument parser. A default run with no flags is
   the core map; every flag is purely additive and gated by a `Config` field.
 
@@ -367,13 +717,73 @@ Both are load-bearing, and the reason is a real regression this project shipped:
 
 - **Release catches optimizer-only bugs** — code that is correct at `-O0` and wrong once
   `__builtin_assume` and inlining are in play, including the "assert it, then defend against it"
-  trap where a `VERIFY` lets the optimizer delete the defensive branch that follows.
-- **The plain build catches degrade paths** — `DEGRADED_PATH_ALERT` is compiled out under `NDEBUG`,
+  trap where an `ASSUME` lets the optimizer delete the defensive branch that follows.
+- **The plain build catches degrade paths** — the `DISCLOSE( msg )` trace is compiled out under `NDEBUG`,
   so a Release-only suite cannot observe the alert that a degrade-path gate asserts. For three
   development cycles, every degrade-path gate in CI passed for exactly that reason.
 
 **If you add a degrade path, it is the plain-flavour run that proves it.** Do not assume a green
 Release CI job covered it.
+
+### Light set vs. full matrix
+
+`.github/workflows/ci.yml` does not run the full 31-job matrix on every event. A `plan` job computes one
+`full` output from the event name, the pull request's labels and the ref, and every heavy job reads that
+output (fallback-emitter/rhel/asan through `if:`, `release` through the matrix `plan` itself computes,
+since a job-level `if:` cannot see the matrix context).
+
+- **Push to `main`**, and **pull requests carrying the `train-member` label** (maintainer-only — a fork
+  PR cannot label its own PR), run the **light set**: the `style` job plus the single
+  `ubuntu-24.04`/`Release`/`clang` release leg (all 4 gate shards), which already includes the
+  determinism and G4 XML checks.
+- **Every other pull request** (`integration/*` train PRs, direct-land PRs, contributor PRs),
+  **`workflow_dispatch`**, and a nightly **`schedule`** (05:41 UTC — off `:00`, and a different minute
+  from `nightly.yml`'s own 07:17 TSan run) all run the **full matrix**. Always dispatch a full run against
+  the exact commit you are about to tag; a green light-set push or an earlier nightly does not stand in
+  for it.
+
+A failure on the scheduled full-matrix run opens or updates `ci.yml`'s OWN tracking issue, titled "Nightly
+checks failing on main (full matrix)". It is a separate issue from `nightly.yml`'s TSan one, on purpose:
+every tracking issue carries the shared `nightly-failure` label (so "every nightly-scale failure" is one
+query) plus a workflow-specific second label — `nightly-full-matrix` here, `nightly-tsan` in
+`nightly.yml` — and every open/comment/close filters on BOTH labels together. Before this split the two
+workflows shared one issue and each had its own green-schedule job closing it on its OWN verdict alone;
+a green TSan night could close an issue the full matrix had opened while the matrix was still red, and
+the reverse. With two labels and two issues, a green run in one workflow can only ever touch the issue
+carrying its own second label, so it can no longer close the other workflow's still-open failure.
+
+### What runs nightly instead of on every pull request
+
+`.github/workflows/nightly.yml` runs the slower checks once a day, at 07:17 UTC, against `main`. Today
+that is a ThreadSanitizer build (`-DRIPWIRE_TSAN=ON`) and the gates that drive ripwire's threads: the
+MCP prefetch worker, the edit lock, a long-lived server's re-ingest, concurrent `--quality-ack` writers, the parallel
+ingest and `--match` fan-out, `--grep`'s prefetch thread, the `--doc-drift` workers and the git-spawn
+pool. Each gate runs through a wrapper that fails on a non-zero exit or on any TSan report file, and the
+job first proves that check can fail: a planted race must be reported and its race-free twin must not.
+
+It is not a per-PR leg on purpose. TSan builds already run often on contributors' and maintainers' own
+machines, and every PR already waits on the macOS runners, so a TSan leg on each push would cost more
+CI than it adds coverage. What a local run cannot promise is that someone ran it on what is actually on
+`main` before a tag, and once a day covers that. A scheduled run skips the heavy jobs when `main` has
+not moved since the last green scheduled run and no open issue carries BOTH `nightly-failure` and
+`nightly-tsan` — this workflow's own tracking issue, not `ci.yml`'s full-matrix one; while it is open,
+every scheduled run checks again.
+
+**Where failures appear:** the workflow's run in the Actions tab, and one issue titled "Nightly checks
+failing on main (TSan)" (labels `nightly-failure` and `nightly-tsan`). A failing night on `main` opens
+it, or comments on it if it is already open, with the failing jobs and steps, the commit, the run link
+and the head of the first TSan report. The next green scheduled run comments "green again at <sha>" and
+closes it — and only it: `ci.yml`'s full-matrix schedule keeps its own separate issue (see "Light set vs.
+full matrix" above), so this job never closes that one, and a green TSan night is never mistaken for a
+green full-matrix night. A pull request that edits the workflow runs it too, without the issue reporting.
+To reproduce a TSan failure locally, route the reports to files the way the job does, because many gates
+discard the server's stderr:
+
+```bash
+cmake -S . -B tsan -DRIPWIRE_TSAN=ON && cmake --build tsan -j
+TSAN_OPTIONS=halt_on_error=1:log_path=/tmp/tsanlog RIPWIRE_BIN=tsan/ripwire bash test/qsnapprefetchcheck.sh
+ls /tmp/tsanlog.*     # one file per process that raced; none means no report
+```
 
 ---
 
@@ -382,12 +792,152 @@ Release CI job covered it.
 1. Write the gate, then the code.
 2. Build both flavours locally; run `python3 test/pargates.py . ./build/ripwire -j 6` green.
 3. Run the sanitizer build clean, and the determinism gate three times.
-4. Add any new `test/*check.sh` to `test/regression.sh` in the same commit.
-5. If your change alters emitted output, regenerate the goldens as their **own** commit with the
+4. Add any new `test/*check.sh` to `test/regression.sh` in the same commit — but first check
+   whether a gate already owns the subject and can take another arm. A new gate file forces a
+   `docs/gatecount_build.py` regeneration that collides with every other open lane; a new arm
+   in an existing gate costs nothing outside its own file.
+5. **Never edit the published gate count by hand.** After adding a gate — and again after any rebase
+   or merge that moved the `for _g in …; do` loop — run `python3 docs/gatecount_build.py`. See below.
+6. If your change alters emitted output, regenerate the goldens as their **own** commit with the
    diff reviewed by eye — never bundled with logic.
-6. Keep formatting churn out of logic commits.
+7. Keep formatting churn out of logic commits.
+8. **Cutting a release:** bump the version in `CMakeLists.txt`'s `project()` call, rename
+   `CHANGELOG.md`'s `## [Unreleased]` section to the new version, and add the release's blurb to
+   README.md's `## Release notes` section (newest first, with a `Thanks to` line where one applies) —
+   never to a `## What's new` section, which no longer exists (moved 2026-09-25; see git history if
+   you are looking for it). Update the one-line **Latest: 0.6.x** pointer near the top of README.md to
+   match.
+
+**Before you ask for review.** These are the findings that most often send a change back for a second
+round. Each takes minutes to check; each miss costs a review round.
+
+1. **Negative arms that can fail.** For every new positive arm, add near-miss negatives the *new* code could
+   plausibly mishandle — not trivially unrelated inputs — and comment out your guard once to watch one go
+   red. See [an arm that cannot fail](#the-failure-mode-that-keeps-coming-back-an-arm-that-cannot-fail).
+2. **Probe the siblings of what you fixed.** Fixed unary? Try binary and optional-chain. Fixed `struct`? Try
+   `union`, `enum`, `class`. Fix each sibling, or name it as a disclosed floor.
+3. **Wording matches the mechanism.** For each new attribute, legend sentence, doc line and CHANGELOG entry:
+   by name or by resolution? a subset or all of it? "may" or "does"? a floor or a total? Write one sentence
+   saying what it does *not* mean and run a counterexample against it.
+4. **Sanitizer build at your final commit.** Rebuild `asan/` at the sha you push and run the gates you
+   touched there ([sanitizer build](#sanitizer-build-the-g1-stack--required-before-you-open-a-pr)).
+5. **A "pre-existing" failure fails on `main` too.** Run it on a `main` binary and quote the result; until
+   then it is yours.
+6. **The full gate suite at your final commit** — including after fixes made in response to review. A fix
+   round is a new change and has broken a gate the first round passed.
+7. **Byte identity outside the change's scope.** Run 30 or more argvs the change should not touch against a
+   base and a head binary: the diff is empty, or each difference is explained as intended.
+8. **Legend and dictionary figures come from the binary.** Quote `ripwire --legend-dict` for any `dictv=` or
+   entries number; never hand arithmetic.
+9. **Bump on an extraction change.** If extraction output moves, bump `kParserVer` in `src/ingest_cache.h`
+   and its mirror `kIngestParserVerMirror` in `src/quality.h`, so old caches are refused rather than
+   served; `qschemetripcheck` says when a quality snapshot's meaning moved too.
+10. **Name each deferral and give its reason** — out of scope and harmless, or blocking. A reviewer will
+    judge each one, so make that cheap.
+11. **No test process outlives its gate.** `pgrep` after the suite, and kill what you started.
+12. **Comparing binaries? Use `--no-cache`**, or a fresh `--cache` directory per binary, so one binary is
+    never measured through the other's cache.
+13. **The recurring review catches:** every root of a multi-root call gets the same check and limit, not
+    just the first; on a partial or stopped index, "none found" is disclosed or refused, never a zero
+    claim; a dedup or merge of findings keeps the most severe row, not the first; a substring match on a
+    name is whole-word or bounded (probe `catalog` and `dialog` for `log`); a per-tag or per-file cap
+    cannot make the result depend on file order.
+
+**The gate count is a build product.** It is stated in `README.md`, `docs/EVALS.md` and
+`present/deck5_ripwire_build.js` — eight sites — and every one of them is written by
+`docs/gatecount_build.py` from the single absorb loop in `test/regression.sh`, then gated by
+`test/gatecountcheck.sh`. Hand-writing it is not a style preference. Two lanes that each add one gate
+both write N+1, and git auto-merges that **identical** text clean in all three files — only the
+`for _g in …` loop conflicts, so the loop is the only place anyone is forced to look. That collided
+seven times in one night on 2026-09-10. The merge recipe is therefore: **union the `for _g in …` sets,
+run the generator (no `--check`, so it WRITES), then `--check` it. Never hand-write the number and
+never trust the clean auto-merge of the three published files.**
+
+WHAT CATCHES A BOTCHED RESOLUTION, measured on this tree 2026-09-13 rather than assumed, because the two
+ways to botch it are caught by *different* gates and neither is caught by both:
+
+| botched how | the tree then has | red on |
+| --- | --- | --- |
+| loop unioned, generator not re-run | loop N+2, the eight sites N+1 | `gatecountcheck` (B), `manifestcheck`, `readmedriftcheck` (F2) — `deckclaimcheck` passes, but the deck's three sites are three of the eight `gatecountcheck` owns |
+| one side of the loop taken instead of the union | loop N+1 and self-consistent, but a gate FILE present that the loop never names | `manifestcheck` only (`gatecountcheck` passes: the count really is consistent, and the generator has nothing to say) |
+
+So the count is fail-closed **provided the full suite runs** — which is why the suite before every push
+is not negotiable. An earlier revision of this paragraph claimed the first row went green on every
+existing check; that was true when it was written and is not true now, and a stale claim that a defect
+is ungated costs more than the defect, because it sends people to build process around something three
+gates already cover.
+
+**An advertised count is an enumeration, not a sentence.** Every number this project prints about
+itself — flags, gates, skills, folded repositories, orchestrator prompts — is derived from something
+countable in the tree and pinned by an arm in `test/readmedriftcheck.sh`. Before writing a number
+into prose, ask which command produces it. And **if a set can be counted more than one way, the
+prose must say which set it counts**: `skills/` is 17 routable skills (`skills/*/SKILL.md`), 18
+`SKILL.md` files in all (`skills/hermes/` holds a Hermes-native one), and 16 activated for every
+agent (`ripwire-opt-remarks` is `audience: contributor`). All three are correct answers to "how many
+skills are there", which is precisely why README.md carried two of them at once, unlabelled, until
+arm (J) was written.
+
+Each published site carries a marker comment the generator owns — `<!-- gatecount -->` in markdown and
+HTML (invisible when rendered), `// gatecount` in the deck's JavaScript. A count claim on a line
+*without* that marker is a hand-written count, and the generator refuses the tree instead of leaving it
+behind. Do not spell the marker inside a site file except at a real site.
 
 Scope each commit. A commit that touches one concern is a commit a reviewer can actually check.
+
+## 7. How we write
+
+This applies to commit subjects, PR descriptions, issues, gate comments, `README.md` and the docs. It is
+here because tone drifts every time someone rewrites a page, and drift in either direction costs us
+contributors: too warm and vague reads as not competent, too cold and dense reads as a project nobody
+wants to spend a Saturday on.
+
+**Competence carries the fun.** The humour in this repo is not decoration laid on top of the engineering —
+it comes from being unusually exact about something and then being light about it. Get the precision right
+and the tone follows.
+
+The reference for the voice is the commit log, not the front page:
+
+> ``#if 0`` stopped serving calls and went on serving every other role
+> twelve flag rows sat one indent too deep, so `--help` did not list every row
+> `graph_unindexed=` shipped a number the document never defined
+
+**Commit subjects say what was WRONG, not what you did.** "fix(help): twelve flag rows sat one indent too
+deep" tells a reader in the log five months from now what the world was like before the commit.
+"fix(help): change indentation" tells them nothing they cannot get from the diff.
+
+**Let the number be the punchline.** `182,555 files. 194 s → 156 s.` An adjective on a strong number makes
+it weaker — "blazingly fast" reads as though the writer does not trust the measurement. Declining to
+embellish *is* the confidence.
+
+**Deadpan the failures, especially ours.** "The gate that guards H2 reports PASS on H2." That sentence is
+funny and damning at once, and it signals more competence than any claim of quality could: a project that
+roasts its own bugs precisely is obviously run by people who find them. Never write a defect up as though
+it were someone else's fault or a surprise.
+
+**Rhythm, not exclamation marks.** Long sentence, then a short one. "Declined calls, derailed parses and
+cut answers now say so. A zero means none found." The energy is in the cut.
+
+**Attitude in the names, precision in the bodies.** "Rip'n Fast. Fewer Tokens. Better Code." earns its
+swagger because every claim underneath it is measured and linked. Swagger plus receipts is fun; swagger
+alone is marketing, receipts alone is a paper.
+
+**Respect the reader rather than welcoming them.** "The research is done, the pointers are in the prompt,
+and the prompt writes a plan and stops" recruits better than "we'd love your help!" — it says *your time is
+worth something and we spent ours first*. Warmth that costs the writer nothing reads as filler; warmth that
+shows up as prepared work reads as real.
+
+Cut on sight: hedges (`we think maybe`, `a bit`, `somewhat`, `basically`), mission statements
+("on a mission to revolutionize…"), exclamation marks after a claim, emoji standing in for a point of view,
+and apologising for the age of the project. "Twelve weeks old and there is a lot worth doing" is confident;
+"it's still early days, sorry!" is the same fact, badly told.
+
+**The test.** Read a paragraph as two people: a skeptical staff engineer scanning for overclaim, and a
+curious newcomer deciding whether this looks like a good weekend. Warm-and-vague loses the first;
+cold-and-dense loses the second. A line like *"a zero means none found, never none exists"* wins both — it
+is a precise contract and it has a point of view.
+
+None of this licenses inaccuracy. Where this section and §2's honesty rules could ever disagree, the
+honesty rules win and the sentence gets rewritten until it is both.
 
 By contributing you agree that your contributions are licensed under the project's `LICENSE`, and
 that you will follow `CODE_OF_CONDUCT.md`. Security issues go through `SECURITY.md`, not the public

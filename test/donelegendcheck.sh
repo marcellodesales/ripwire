@@ -36,10 +36,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){   printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){   printf '  FAIL  %s\n' "$*"; fail=1; }
 info(){ printf '  INFO  %s\n' "$*"; }
 
@@ -140,7 +141,8 @@ echo "=== (a) THE RATCHET — absolute legend bytes per shape ==================
 # for one honest future addition, and no more; the pre-fix column is what the ratchet is holding back)
 run_budget(){
     local name="$1" budget="$2" pre="$3"; shift 3
-    "$BIN" "$@" >"$WORK/$name.xml" 2>/dev/null
+    # L1 (2026-09-19): the CLI default legend is compact; this gate budgets and reads the FULL legend (the ratchet was set on it), so every probe asks for it.
+    "$BIN" "$@" --legend=full >"$WORK/$name.xml" 2>/dev/null
     [ -s "$WORK/$name.xml" ] || { no "(a) $name produced NO output — the probe is broken, fix it before trusting any row"; return; }
     read -r total legend payload <<EOF
 $( split "$WORK/$name.xml" )
@@ -153,9 +155,25 @@ EOF
     printf '%s' "$total $legend $payload" >"$WORK/$name.split"
 }
 
-run_budget qd_clean       2300  8574  "$FX"  --quality-delta
+# qd_clean 2300 -> 2600 (2026-09-20, issue #228 part 1): the CLEAN form gained ONE conditional sentence, and
+# it is the one form that always earns it. head_basis="identity" says WHICH git-HEAD floor answered — this
+# tree's own snapshot (the tracked files already were HEAD) or the archived commit — and a clean tree is
+# exactly when the first is taken. The two are different claims about the same zero, which a review proved is
+# not academic: a skip-worktree path made an archived comparison and a self-comparison print byte-identical
+# roots while one had seen a real regression and the other could not. METHODOLOGY §9.4 puts the honesty in the
+# attribute (24 B on the root); this is the price of the law that no emitted name is undefined. Measured on
+# this fixture against the pre-change binary: clean 2282 -> 2542, and the other three forms do not move (the
+# attribute rides only the auto-HEAD basis, and dirty/scope/refpair here do not take it). The pin is the next
+# multiple of 100 over the measured total, as every anchor in this file is.
+run_budget qd_clean       2600  8574  "$FX"  --quality-delta
 printf '%s' "$DIRT" >> "$FX/src/base.cpp"
-run_budget qd_dirty       3800  8574  "$FX"  --quality-delta
+# qd_dirty 3800 -> 3900 (2026-09-10, the string/perf round): the --quality-delta legend gained two facts a reader
+# needs to act on a row — the api-new-surface= count (one sentence, +105 B in every form, "printed even at zero"
+# is emittertruthcheck's roster phrase) and the churn facets' gating rule (one clause). Measured on this fixture
+# against the pre-round binary: clean 2177 -> 2282, dirty 3642 -> 3855, scope 4916 -> 5129, refpair 4058 -> 4271.
+# Three forms still clear their ceilings; the dirty form's 3800 had 158 B of headroom and the two sentences cost
+# 213 there, so the ceiling moves by less than the growth (45 B of headroom left) — a ratchet, not an allowance.
+run_budget qd_dirty       3900  8574  "$FX"  --quality-delta
 run_budget qd_dirty_scope 5200 10512  "$FX"  --quality-delta "--scope=src/*"
 run_budget sd_uses        3800  4112  "$FX"  --safe-delete=classifyWidth
 run_budget sd_none        3800  4112  "$FX"  --safe-delete=tangle
@@ -168,7 +186,11 @@ run_budget sd_none        3800  4112  "$FX"  --safe-delete=tangle
 # tg_empty 1400 -> 1510 (2026-09-05, capture-audit wave-3, lane L7 P3): that one addition arrived — next= on the
 # root (106 B, unconditional: an empty gate still names its follow-up, --situ). Measured 1403 B; 1510 is the same
 # ~8% headroom rule applied once more.
-run_budget tg_empty       1510  1332  "$FXC" --test-gate
+# tg_empty 1510 -> 1590 (2026-09-24, CodeRabbit on #331): the root has carried untested_modscope="0" since the
+# TS/JS runner round, with its defining clause gated on N>0, so this zero-row document printed an attribute it never
+# defined (a gap that had been ADDED to legendcoverage_baseline.txt). The shortest honest definition at N=0 is 75 B.
+# Measured 1500 -> 1575 B on this fixture; the ceiling becomes that measured total plus 15 B (a move of 80, not 90), a ratchet, not an allowance.
+run_budget tg_empty       1590  1332  "$FXC" --test-gate
 # The ref-pair form — the only shape that lights the ref-pair marker, omits at= and reports churn as
 # unavailable. Measured on the FIXTURE, with the same edit committed as a second commit, NOT on this repo's
 # own HEAD~1..HEAD: that range means a different diff after every landing, so a budget on it would be a
@@ -207,7 +229,7 @@ present qd_dirty_scope 'SCOPE, present only when the scope flag was given'
 absent  qd_dirty_scope 'foreign-acks= is a SEPARATE axis'
 # test-gate's row contract governs rows; the empty-obligation case has none.
 absent  tg_empty 'REPEAT VERBATIM'
-"$BIN" "$ROOT" --test-gate=src/model.h >"$WORK/tg_rows.xml" 2>/dev/null
+"$BIN" "$ROOT" --test-gate=src/model.h --legend=full >"$WORK/tg_rows.xml" 2>/dev/null
 present tg_rows 'REPEAT VERBATIM'
 # the ref-pair form lights its own marker, omits at=, and omits the four working-tree markers.
 present qd_refpair 'baseline="ref-pair" means neither a sidecar nor the working tree'
@@ -264,12 +286,12 @@ echo
 echo "=== (e) still well-formed and still deterministic after a prose-only edit =========================="
 for n in qd_clean qd_dirty qd_dirty_scope qd_refpair sd_uses sd_none tg_empty; do
     if command -v xmllint >/dev/null 2>&1; then
-        xmllint --noout "$WORK/$n.xml" 2>/dev/null && ok "(e) $n is well-formed XML" || no "(e) $n fails xmllint"
+        if xmllint --noout "$WORK/$n.xml" 2>/dev/null; then ok "(e) $n is well-formed XML"; else no "(e) $n fails xmllint"; fi
     fi
 done
 # The ref-pair form is the one re-run that is safe HERE: the fixture's working tree was committed above
 # for the qd_refpair probe, so a working-tree shape would legitimately report something else now.
-"$BIN" "$FX" --quality-delta=HEAD~1..HEAD >"$WORK/qd_twice.xml" 2>/dev/null
+"$BIN" "$FX" --quality-delta=HEAD~1..HEAD --legend=full >"$WORK/qd_twice.xml" 2>/dev/null
 diff -q "$WORK/qd_refpair.xml" "$WORK/qd_twice.xml" >/dev/null \
     && ok "(e) quality-delta deterministic (byte-identical twice on the same fixture state)" \
     || no "(e) quality-delta differs across two runs on an unchanged fixture"

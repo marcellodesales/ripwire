@@ -51,7 +51,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -118,7 +118,9 @@ run c8k   "--token-budget=8000"
 grep -q 'anchors: ' "$TMP/def" \
     && no "presence: the query routed name-exact — re-author it, the rank-first body walk is unobservable" \
     || ok "presence: conceptual route (no anchor), the rank-first body walk is live"
-grep -qE '<sigs [^>]*capped="1">' "$TMP/def" \
+# cut-fix lane A (2026-09-23): capped="1" is no longer always the tag's LAST attribute — docs_dropped="N" follows it when a
+# shown row lost its doc comment (this fixture's does) — so the presence test reads the attribute, not the tag's end.
+grep -qE '<sigs [^>]*capped="1"[ >]' "$TMP/def" \
     && ok "presence: the default regime trims the sig section (capped=\"1\") — the ladder is engaged" \
     || no "presence: default <sigs> not capped — the fixture's sig bulk no longer exceeds the default sig budget"
 DATTR=$( bodiesattr "$TMP/def" )
@@ -189,7 +191,7 @@ lint=1
 for F in def tb8k tb12k topn cdef c8k; do
     xmllint --noout "$TMP/$F" 2>/dev/null || { echo "    malformed: $F"; lint=0; }
 done
-[ "$lint" = 1 ] && ok "#4 all arms well-formed XML (G4)" || no "#4 malformed XML"
+if [ "$lint" = 1 ]; then ok "#4 all arms well-formed XML (G4)"; else no "#4 malformed XML"; fi
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

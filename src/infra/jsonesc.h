@@ -1,4 +1,6 @@
 #pragma once
+#include "emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // jsonesc.h — A4-F27: the ONE canonical JSON string-escaping core, unifying three near-clone
 // escapers (mcp.h's mcpdetail::jsonEscape, ccjson.h's ccJsonEscape, htmlexport.h's jsonEscape;
@@ -33,6 +35,12 @@
 // rw::jsonEscape, rw::ccJsonEscape) — only their bodies now forward into escapeInto() here, so
 // this header is a pure internal refactor: verified byte-identical against the pre-unification
 // implementations.
+
+#include "shquote.h"        // rw::shSingleQuote — the one POSIX shell-literal quoter (standard library only)
+#include "strkern.h"        // S5: appendCleanRun — the run-copy skip that replaces escapeInto's per-byte switch.
+                        // Still zero includes ABOVE src/infra (strkern.h itself pulls only <cstddef>/<cstdint>/
+                        // <cstring>/<string_view> plus the ISA intrinsic header), so the no-cycle property this
+                        // header was factored out for is intact.
 
 #include <cstdint>
 #include <cstdio>
@@ -122,13 +130,49 @@ inline int utf8SeqLen( const char* s, std::size_t i, std::size_t n ) noexcept
 // original from. The honest fix is a TELL on the XML side (the lossy side discloses that it substituted),
 // which lives in serialize.h and belongs to the lane that owns it; recorded here so the next reader of THIS
 // file knows the asymmetry is a decision rather than an oversight, and does not "fix" it by degrading JSON.
+// S5 — THE BYTE SET IS THE CONTRACT, and here it depends on the two dialect flags. A byte NOT in the
+// set reaches `out += char( c )` unchanged, so the run loop may memcpy it in bulk; a byte that IS in the
+// set still goes through the SAME switch below, one at a time. Derived from that switch and re-derived
+// with it: `"` and `\` always (JSON's mandatory pair), the whole C0 range always (short forms plus
+// \u00XX), `<` `>` `&` only when escapeAngleAmp hardens them, and every byte >= 0x80 only when
+// validateUtf8 makes utf8SeqLen decide. With validateUtf8 off, a byte >= 0x80 is a raw passthrough —
+// exactly a clean-run byte — which is why the set must not contain it in that posture.
+inline constexpr strkern::Byteset256 jsonEscapeByteset( bool escapeAngleAmp, bool validateUtf8 ) noexcept
+{
+    strkern::Byteset256 set;
+    set.addRange( 0x00, 0x1F );
+    set.add( '"' );
+    set.add( '\\' );
+    if( escapeAngleAmp )
+    {
+        set.add( '<' );  set.add( '>' );  set.add( '&' );
+    }
+    if( validateUtf8 )
+    {
+        set.addRange( 0x80, 0xFF );
+    }
+    return set;
+}
+
+// The four postures, resolved at compile time and indexed by the two flags — no per-call set building.
+inline constexpr strkern::Byteset256 kJsonEscapeBytesets[ 4 ] = {
+    jsonEscapeByteset( false, false ),
+    jsonEscapeByteset( true,  false ),
+    jsonEscapeByteset( false, true  ),
+    jsonEscapeByteset( true,  true  ),
+};
+
 inline void escapeInto( std::string_view s, std::string& out,
                          bool escapeAngleAmp, bool validateUtf8, bool replacementAsTextEscape )
 {
     const char*       d = s.data();
     const std::size_t n = s.size();
-    std::size_t       i = 0;
-    while( i < n )
+    const strkern::Byteset256& set = kJsonEscapeBytesets[ ( escapeAngleAmp ? 1u : 0u ) | ( validateUtf8 ? 2u : 0u ) ];
+    // Init and increment skip to the next byte this posture has an opinion about, appending the clean
+    // run in one go. The increment also runs on `continue`, which is what lets every arm below keep its
+    // own `continue` unchanged.
+    for( std::size_t i = strkern::appendCleanRun( d, 0, n, set, out ); i < n;
+         i = strkern::appendCleanRun( d, i, n, set, out ) )
     {
         const unsigned char c = static_cast<unsigned char>( d[i] );
 
@@ -147,7 +191,7 @@ inline void escapeInto( std::string_view s, std::string& out,
                 default: break;
             }
             if( c < 0x20 )
-            { char b[ 8 ]; std::snprintf( b, sizeof( b ), "\\u%04x", unsigned( c ) ); out += b; }
+            { char b[ 8 ]; rw::formatTo( b, sizeof( b ), "\\u{:04x}", unsigned( c ) ); out += b; }
             else
             {
                 out += char( c );
@@ -257,27 +301,11 @@ inline bool isJsonWs( char c ) noexcept
 //
 // Was duplicated as rw::shSingleQuote (gitmine.h) and docparse::detail::shellQuote (docparse.h) —
 // byte-identical bodies (0.87-similar per --clones), security-relevant duplication: a quoting-bug
-// fix in one wouldn't reach the other. Homed here, not in gitmine.h or docparse.h, because jsonesc.h
-// is the lightest header both can include without a coupling cost: gitmine.h already pulls model.h +
-// graph.h + Diagnostics.h (heavy, ingest-graph dependency chain), while docparse.h is deliberately
-// STL-only (Diagnostics.h) so ingest.cpp's doc-parsing path stays decoupled from the graph. jsonesc.h
-// has zero project includes beyond <cstdint>/<cstdio>/<string>/<string_view>, so either side can pull
-// it in for free. gitmine.h's rw::shSingleQuote is the more widely used name (main.cpp, prcontext.h,
-// quality.h, mcp server) — kept as the canonical spelling; docparse.h's detail::shellQuote now
-// forwards here instead of carrying its own copy.
-inline std::string shSingleQuote( const std::string& s )
-{
-    std::string out = "'";
-    for( char c : s )
-    {
-        if( c == '\'' ) { out += "'\\''"; }
-        else
-        {
-            out += c;
-        }
-    }
-    out += "'";
-    return out;
-}
+// fix in one wouldn't reach the other. gitmine.h's rw::shSingleQuote is the more widely used name
+// (main.cpp, prcontext.h, quality.h, mcp server) — kept as the canonical spelling; docparse.h's
+// detail::shellQuote forwards to it instead of carrying its own copy. Every caller reaches it through
+// this header, as before; the ONE definition lives in shquote.h (included at the top), which is
+// standard-library only so that os.h — which emit.h, and so this header, already includes — can use
+// it too without an include cycle or a declaration that outruns its definition.
 
 }   // namespace rw

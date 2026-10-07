@@ -1,4 +1,8 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // gitmine.h — git-history mining shared by the CLI (main.cpp) and the MCP server (mcp.h): shell-quoting,
 // per-commit changed-file sets, and the co-change (logical-coupling) core. popen-based; no git library.
@@ -9,7 +13,7 @@
 #include "lintrules.h"           // §A9.3: langOfPath / dependencyCapable — the SAME predicate <health dep_files=> uses
 #include "workspace.h"          // WorkspaceRoot — mineChurnPerFile's per-root merge (promoted from main.cpp, 2026-08-29 split)
 #include "infra/profileScope.h"  // PROFILE_SCOPE self-profiling — gated by PROFILE_ENABLED (off unless -DRIPWIRE_PROFILE=ON)
-#include "infra/Diagnostics.h"   // DEGRADED_PATH_ALERT — graceful-degrade on a bad/unresolvable --since value
+#include "infra/Diagnostics.h"   // DISCLOSE — graceful-degrade on a bad/unresolvable --since value
 #include "infra/stdinline.h"     // readByteSafeLine — THE line reader (R4); no fixed buffer to split a long path on
 #include "infra/jsonesc.h"       // A4-F27 residual: rw::shSingleQuote lives here (lightest shared header) —
                                  // gitmine.h no longer carries its own copy; see jsonesc.h for the dedup rationale
@@ -30,7 +34,7 @@
 #include <vector>
 
 #include <limits.h>    // PATH_MAX (hasEnclosingGitRepo realpath buffer)
-#include <sys/stat.h>  // stat() — the zero-popen .git walk-up pre-check
+#include "infra/os.h"  // rw::os::stat — the zero-popen .git walk-up pre-check; popen/pclose/realpath/localtime_r
 
 namespace rw
 {
@@ -43,8 +47,8 @@ namespace rw
 
 // ── time-window scope for the churn/co-change miners (--since=REV|DATE) ──────────────────────────
 
-// The resolved form of a --since value: EITHER a revision boundary (git log REV.. — deterministic,
-// used by the det-gate) OR a date passed straight through to `git log --since=DATE` (a git
+// The resolved form of a --since value: EITHER a revision boundary (git log <sha>.., the revision resolved to its
+// commit — deterministic, used by the det-gate) OR a date passed straight through to `git log --since=DATE` (a git
 // approxidate like "2 weeks ago" — NOT deterministic across wall-clock days, by construction; that
 // is inherent to a relative-date window, not a bug here). `active=false` means "no scoping" — either
 // the caller passed no --since at all, or the value didn't resolve to anything git accepts, in which
@@ -53,16 +57,33 @@ namespace rw
 struct SinceScope
 {
     bool        active = false;   // false → caller uses its existing default window (degrade / no --since)
-    bool        isRev  = true;    // true → `revBoundary` is a commit-ish; false → `sinceDate` is a git approxidate
-    std::string revBoundary;      // e.g. "HEAD~20" or a tag — used as `git log <revBoundary>..`
+    bool        isRev  = true;    // true → `baselineSha` is the commit the window starts after; false → `sinceDate` is a git approxidate
     std::string sinceDate;        // e.g. "2 weeks ago" — used as `git log --since=<sinceDate>`
     // N4 (capture-audit verify-wave1 2026-09-04): the BASELINE COMMIT this value names — a revision is its own
     // sha, a date is the newest commit at or before it — EMPTY when the history never reaches it (a date before
-    // the first commit). The window hosts (--hotspots/--cochange/--rank-by=churn) never read it: 1999.. is all
-    // of history and an honest window. The baseline host (--slice compares against a commit) needs it, and the
-    // decision that it is missing is made ONCE, in main.cpp beside the M8 validation, from this field — so a
-    // fifth consumer cannot resolve the same value by a different rule (slicediff.h used to resolve it itself).
+    // the first commit). A window host walking a DATE never reads it: 1999.. is all of history and an honest
+    // window. The baseline host (--slice compares against a commit) needs it, and the decision that it is missing
+    // is made ONCE, in main.cpp beside the M8 validation, from this field — so a fifth consumer cannot resolve the
+    // same value by a different rule (slicediff.h used to resolve it itself).
+    // For a REVISION it is also the only spelling of the boundary git is ever handed (`git log <sha>..`, see
+    // sinceLogArgs). A `revBoundary` beside it used to keep the caller's RAW string, and that is what reached git
+    // log as a positional argv entry — shell-quoted, but git reads a leading '-' as an option whatever the quoting.
+    // Nothing displayed it (window= and <since rev=> print cfg.since), so it is gone rather than left for a future
+    // caller to hand git by mistake. Invariant: active && isRev ⇒ isBareCommitSha( baselineSha ).
     std::string baselineSha;
+    // The DISCLOSE sink for a baseline git answered with something that is not a commit object name: the value is
+    // DROPPED (never handed back to git), so a host that needs a baseline refuses and says why
+    // (sinceNoBaselineRefusal names it), and a window host keeps its --since window. Absent ⇒ nothing was refused.
+    bool        baselineRefused = false;
+    enum class DisclosureWhy : std::uint8_t
+    {
+        BaselineNotObjectName,
+    };
+    void disclose( DisclosureWhy ) noexcept
+    {
+        baselineRefused = true;
+        baselineSha.clear();
+    }
 };
 
 // A --since value "looks like a date" only if EVERY alphabetic run in it is a date word (or an ISO
@@ -186,32 +207,33 @@ inline bool looksLikeDate( std::string_view s )
 // N4: THE ONE no-baseline refusal — a --since that is a real window but names no commit at or before it, on a
 // host that compares against a commit. Spelled here alone (sincecheck.sh's N4 source arm counts the files);
 // main.cpp decides it beside the M8 validation, slicediff.h prints the same sentence on its own degrade path.
-inline std::string sinceNoBaselineRefusal( std::string_view value, const std::string& root )
+// 0.6.7: `shallowHint` is gitstamp::shallowRefHint's sentence (or "" on a full clone, byte-identical): on a depth-limited clone
+// the commit at or before the window usually exists upstream and was simply not fetched, which "resolves to no commit" alone
+// does not say. The hint is a parameter because gitstamp.h sits above this header; every host passes the one helper's answer.
+inline std::string sinceNoBaselineRefusal( std::string_view value, const std::string& root, bool isBaselineRefused = false,
+                                           std::string_view shallowHint = {} )
 {
-    return "ripwire: --since=" + std::string( value ) + " resolves to no commit in '" + root
+    return "ripwire: --since=" + std::string( value ) + ( isBaselineRefused ? " resolved to an answer from git that is not a commit object name in '"
+                                                                             : " resolves to no commit in '" ) + root
          + "' — beside --slice it names the revision to compare this variable's def-use slice against "
-           "(e.g. --since=HEAD~1, --since=<sha>, --since=\"2 weeks ago\")";
+           "(e.g. --since=HEAD~1, --since=<sha>, --since=\"2 weeks ago\")" + std::string( shallowHint );
 }
 
 // THE ONE unresolvable---since refusal, shared by every host (M8). Four verbs consume --since and the
 // §P0.5c "a window nobody chose is not a measurement" fix landed on one of them; the other three either
 // worded it themselves or did not refuse at all. Hosts print this; nobody re-words it.
-inline std::string sinceUnresolvedRefusal( std::string_view value )
+// 0.6.7: on a shallow clone `--since=HEAD~3` IS a revision spelling that merely lies past the fetched history, so the host
+// appends gitstamp::shallowRefHint's sentence (`shallowHint`; "" on a full clone keeps this refusal byte-identical).
+inline std::string sinceUnresolvedRefusal( std::string_view value, std::string_view shallowHint = {} )
 {
-    return "ripwire: --since='" + std::string( value ) + "' is neither a git revision nor a real calendar date — refusing "
-           "rather than measuring under a window nobody chose (a revision: HEAD~20, v1.2.0, a sha; a date: 2026-01-01, "
-           "'2 weeks ago', yesterday)";
+    std::string out = "ripwire: --since='";
+    out += value;
+    out += "' is neither a git revision nor a real calendar date — refusing rather than measuring under a window nobody chose "
+           "(a revision: HEAD~20, v1.2.0, a sha; a date: 2026-01-01, '2 weeks ago', yesterday)";
+    out += shallowHint;
+    return out;
 }
 
-// Resolve a raw --since=VALUE into a SinceScope. Tries VALUE as a revision first (`git rev-parse
-// --verify --quiet VALUE^{commit}` — the ^{commit} peel rejects anything that isn't a committish, e.g.
-// a blob/tree hash or a malformed ref); a hit is unambiguous and deterministic, so it wins. Otherwise,
-// if VALUE passes the coarse looksLikeDate() gate, pass it through verbatim as a `--since=DATE` (git's
-// own approxidate does the real parsing — relative forms are inherently wall-clock-relative, which is
-// expected and documented, not a determinism bug). Anything else (no git / not a repo / VALUE is
-// neither a resolvable rev nor date-shaped) degrades to `active=false` + one stderr note; callers then
-// fall back to their pre-flag default window, so a bad --since can never crash or silently scope to
-// zero commits without explanation.
 // popen a shell command and return its trimmed stdout ("" on any failure — never crashes). THE one copy of the
 // popen-trim shape in the tool: the quality.h git one-liners, the doctor probes, crossref.h and binstale.h all
 // reach it as quality::popenTrimmed (a using-declaration of this). It lives HERE — the lower header, which
@@ -222,7 +244,7 @@ inline std::string sinceUnresolvedRefusal( std::string_view value )
 // '\n' the reader consumed, so multi-line callers (crossref.h, the rename map) read exactly what fgets gave them.
 inline std::string popenTrimmed( const std::string& cmd )
 {
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return {};
@@ -234,7 +256,7 @@ inline std::string popenTrimmed( const std::string& cmd )
         out += line;
         out += '\n';
     }
-    pclose( pipe );
+    os::pclose( pipe );
     while( !out.empty() && ( out.back() == '\n' || out.back() == '\r' || out.back() == ' ' ) )
     {
         out.pop_back();
@@ -242,6 +264,65 @@ inline std::string popenTrimmed( const std::string& cmd )
     return out;
 }
 
+// ─── r27 (Lane C routing) — the OBJECT-NAME gate on every token that reaches a git argv ────────────────
+//
+// `shSingleQuote` stops SHELL injection, but the token still arrives as its own argv ENTRY, and git reads a
+// leading `-` as an OPTION. Lane C's P0.1 defect is the proof this matters: `--pr-context=--output=FILE`
+// reached `git diff` as an option and TRUNCATED a file outside the repo, exit 0. The durable defense is not
+// quoting — it is refusing anything that is not a bare object name.
+//
+// A commit sha is 40 (SHA-1) or 64 (SHA-256) lowercase hex and NOTHING else: it cannot begin with `-`, cannot
+// contain a path separator, and cannot spell an option. Checking that SHAPE is a complete defense on its own
+// and needs no subprocess, so it is applied at both ends — at the trust boundary where an untrusted value is
+// READ (quality.h's readBaselineHeadSha, whose input is a COMMITTED, therefore clone-attacker-influenceable
+// sidecar) and again at the SINK (quality.h's gitIsAncestor), because a future caller will not remember the
+// boundary. crossref::isBlobSha delegates here: an object name is an object name, blob or commit.
+//
+// This pair lived in quality.h until 2026-09-10 and moved down when resolveSinceScope needed it (the same move
+// popenTrimmed made); quality.h's using-declarations keep every quality::isBareCommitSha / gitResolveCommitSha
+// call site spelled as it was.
+inline bool isBareCommitSha( std::string_view s ) noexcept
+{
+    if( s.size() != 40 && s.size() != 64 )
+    {
+        return false;
+    }
+    for( char c : s )
+    {
+        if( !std::isxdigit( static_cast<unsigned char>( c ) ) )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Resolve `ref` to a concrete commit sha, or "" if it does not resolve to one. Belt AND braces: the ref is
+// refused outright if it could be read as an option, and the ANSWER must itself be a bare object name — a
+// `rev-parse` that echoes something else (a path, an error, a multi-line answer, or the `^<sha>` that
+// `rev-parse --verify` prints for `^REF`) is not trusted. Callers that hand a token to git should hand THIS
+// result, never the caller's own string.
+inline std::string gitResolveCommitSha( const std::string& root, const std::string& ref )
+{
+    if( ref.empty() || ref[0] == '-' )
+    {
+        return {};
+    }
+    const std::string out = popenTrimmed( gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
+                                          + " rev-parse --verify --quiet " + shSingleQuote( ref + "^{commit}" ) + " 2>/dev/null" );
+    return isBareCommitSha( out ) ? out : std::string{};
+}
+
+// Resolve a raw --since=VALUE into a SinceScope. A value beginning with '-' is refused before any git call — git
+// reads a leading '-' as an OPTION whatever the quoting, and no ref name can begin with one. Otherwise VALUE is
+// tried as a revision first, through gitResolveCommitSha (`rev-parse --verify --quiet VALUE^{commit}` — the peel
+// rejects anything that isn't a committish, and an answer that is not a bare sha is not trusted); a hit is
+// unambiguous and deterministic, so it wins, and its sha — never VALUE — is what git log is handed (sinceLogArgs).
+// Otherwise, if VALUE passes the coarse looksLikeDate() gate, pass it through verbatim as a `--since=DATE` (git's
+// own approxidate does the real parsing — relative forms are inherently wall-clock-relative, which is expected
+// and documented, not a determinism bug). Anything else (no git / not a repo / VALUE is neither a resolvable rev
+// nor date-shaped) returns `active=false`, which main.cpp refuses once for every host — so a bad --since can
+// never crash or silently scope to zero commits without explanation.
 inline SinceScope resolveSinceScope( const std::string& root, std::string_view value )
 {
     SinceScope scope;
@@ -252,17 +333,24 @@ inline SinceScope resolveSinceScope( const std::string& root, std::string_view v
 
     const std::string val( value );
 
-    // 1) try as a revision boundary — deterministic, preferred when it resolves. The peeled sha rev-parse prints
-    //    IS the baseline (N4); before N4 only its EXISTENCE was read. popenTrimmed is the G3 reader
-    //    (readByteSafeLine) every git pipe in this header uses — gitCommandLines is defined further down.
+    // 0) option-shaped → refused before EITHER step below can hand it to git. The revision step alone would not
+    //    cover it: `-17 days ago` passes looksLikeDate, and reached `git rev-list --before=` and `git log --since=`
+    //    at exit 0 under window="-17 days ago". Inactive is main.cpp's unresolvable-value refusal, exactly as for
+    //    any other value that names nothing (sincecheck.sh S3).
+    if( val[0] == '-' )
     {
-        const std::string sha = popenTrimmed( "git -C " + shSingleQuote( root )
-                                              + " rev-parse --verify --quiet " + shSingleQuote( val + "^{commit}" ) + " 2>/dev/null" );
+        return scope;   // active=false
+    }
+
+    // 1) try as a revision boundary — deterministic, preferred when it resolves. The peeled sha IS the baseline
+    //    (N4) and the boundary git log is handed. Resolved by THE shared resolver, so `^HEAD~3` — which
+    //    `rev-parse --verify` answers with `^<sha>` at rc 0 — is not a revision here (sincecheck.sh S4).
+    {
+        const std::string sha = gitResolveCommitSha( root, val );
         if( !sha.empty() )
         {
             scope.active      = true;
             scope.isRev       = true;
-            scope.revBoundary = val;
             scope.baselineSha = sha;
             return scope;
         }
@@ -277,7 +365,14 @@ inline SinceScope resolveSinceScope( const std::string& root, std::string_view v
         scope.active      = true;
         scope.isRev       = false;
         scope.sinceDate   = val;
-        scope.baselineSha = popenTrimmed( "git -C " + shSingleQuote( root ) + " rev-list -1 --before=" + shSingleQuote( val ) + " HEAD 2>/dev/null" );
+        scope.baselineSha = popenTrimmed( gitCmd( " -C " ) + shSingleQuote( root ) + " rev-list -1 --before=" + shSingleQuote( val ) + " HEAD 2>/dev/null" );
+        // git's OUTPUT is external input, and this sha goes straight back to git (--slice's `git show <sha>:path`).
+        // Empty is the honest "history never reaches the date"; anything else must be a bare object name.
+        if( !VALIDATE( scope.baselineSha.empty() || isBareCommitSha( scope.baselineSha ) ) )
+        {
+            DISCLOSE( scope, SinceScope::DisclosureWhy::BaselineNotObjectName,
+                      "resolveSinceScope: rev-list answered a date's baseline with something that is not an object name — dropped" );
+        }
         return scope;
     }
 
@@ -291,7 +386,7 @@ inline SinceScope resolveSinceScope( const std::string& root, std::string_view v
     return scope;   // active=false
 }
 
-// Build the `git log` window arguments for a SinceScope: either a `LOW..` revision-range prefix (REV
+// Build the `git log` window arguments for a SinceScope: either a `<sha>..` revision-range prefix (REV
 // form — deterministic) or a `--since=DATE ` flag (date form — wall-clock-relative by construction).
 // `inactive` (scope.active==false) returns the caller-supplied fallback window verbatim, so every call
 // site's pre-flag behavior is reproduced byte-for-byte when --since is absent or unresolvable.
@@ -303,7 +398,23 @@ inline std::string sinceLogArgs( const SinceScope& scope, const char* fallbackSi
     }
     if( scope.isRev )
     {
-        return shSingleQuote( scope.revBoundary + ".." ) + " ";   // positional rev-range, not a --since flag
+        // The RESOLVED commit, never the caller's string: this is a positional argv entry, and a bare sha cannot
+        // begin with '-', so it can only ever be read as a revision range (sincecheck.sh S2). resolveSinceScope is
+        // the one producer of an active REV scope and stores nothing but a bare sha there.
+        //
+        // CHECKED, not asserted, and this is the one site here where that distinction is load-bearing: the value
+        // originates OUTSIDE this process (a --since argument, or git's own output), so an ASSUME would hand the
+        // optimizer the promise that external data is well formed — and under NDEBUG that promise is all that
+        // would be left of the check. A malformed baseline degrades to the caller's own fallback window, which is
+        // exactly what an inactive scope yields, rather than reaching `git log` as a positional argument.
+        // FIX ROUND 2: that check moved to the one PRODUCER, where the value crosses from git into this process —
+        // resolveSinceScope's revision step stores only gitResolveCommitSha's answer, which returns a bare sha or
+        // nothing (VALIDATEd there), and its date step VALIDATEs its own rev-list answer and discloses a refusal into
+        // the scope. So an active REV scope reaching here with anything else is a caller that built a SinceScope by
+        // hand: a DASSERT catches that in debug (a checked call, not an optimizer promise — selfcheckcheck arm C), and there
+        // is no silent fallback window left for window= to misreport.
+        DASSERT( isBareCommitSha( scope.baselineSha ), "an active REV scope carries the bare sha resolveSinceScope validated" );
+        return shSingleQuote( scope.baselineSha + ".." ) + " ";   // positional rev-range, not a --since flag
     }
     return "--since=" + shSingleQuote( scope.sinceDate ) + " ";
 }
@@ -563,7 +674,7 @@ struct GitCommandLines
 inline GitCommandLines gitCommandLines( const std::string& cmd )
 {
     GitCommandLines out;
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return out;
@@ -596,7 +707,7 @@ inline GitCommandLines gitCommandLines( const std::string& cmd )
             out.lines.push_back( line );
         }
     }
-    out.status = pclose( pipe );
+    out.status = os::pclose( pipe );
     return out;
 }
 
@@ -624,11 +735,11 @@ inline std::string gitRepoToplevel( const std::string& absDir )
         // the ONE git command in this file without `-c core.quotepath=false`, deliberately: that flag governs
         // how git renders PATHSPEC OUTPUT, and `rev-parse --show-toplevel` prints the directory verbatim —
         // measured on a root spelled "répo dïr", which comes back raw and joins correctly.
-        const GitCommandLines probe = gitCommandLines( "git -C " + shSingleQuote( absDir ) + " rev-parse --show-toplevel 2>/dev/null" );
+        const GitCommandLines probe = gitCommandLines( gitCmd( " -C " ) + shSingleQuote( absDir ) + " rev-parse --show-toplevel 2>/dev/null" );
         if( probe.isStarted && probe.status == 0 && !probe.lines.empty() )
         {
             char resolved[ PATH_MAX ];
-            top = ::realpath( probe.lines.front().c_str(), resolved ) ? std::string{ resolved } : probe.lines.front();
+            top = os::realpath( probe.lines.front().c_str(), resolved ) ? std::string{ resolved } : probe.lines.front();
         }
     }
 
@@ -906,7 +1017,7 @@ inline GitPathOffset deriveGitPathOffset( const IngestResult& ing, std::uint32_t
         const std::size_t  slash    = disk.rfind( '/' );
         const std::string  probeDir = ( slash == std::string::npos ) ? std::string{ "." } : ( slash == 0 ? std::string{ "/" } : disk.substr( 0, slash ) );
         char               resolvedDir[ PATH_MAX ];
-        if( !::realpath( probeDir.c_str(), resolvedDir ) )
+        if( !os::realpath( probeDir.c_str(), resolvedDir ) )
         {
             continue; // this probe is unreadable — try the next file
         }
@@ -967,7 +1078,7 @@ inline GitPathOffset deriveGitPathOffset( const IngestResult& ing, std::uint32_t
 // The join's DISCLOSURES (§H6 / F4). Each names a state where a number the reader is about to trust is
 // SHRUNK rather than wrong, so each is stated instead of absorbed, on the two surfaces this codebase has for a
 // degrade: one stderr line (which survives -DNDEBUG — the map's own `ambiguous=`/`unresolved=` gauges are
-// reference-resolution counters and a churn fix must not move them) plus a DEGRADED_PATH_ALERT for the plain
+// reference-resolution counters and a churn fix must not move them) plus a DISCLOSE for the plain
 // build that gates degrade paths. ONCE per process each, not once per occurrence.
 //
 // What is deliberately NOT disclosed: a git path that names no indexed file. That is the ordinary state of
@@ -994,7 +1105,7 @@ inline GitPathOffset deriveGitPathOffset( const IngestResult& ing, std::uint32_t
 // ONE emitter, three sentences: the only thing the three states differ in is the wording, and three copies of
 // "exchange the flag, print, alert" is exactly how a fourth state ends up disclosed differently from the first
 // three (the clone-seam pattern this round keeps finding). `hasReported` is per-state, so each sentence is said
-// once; DEGRADED_PATH_ALERT carries its OWN once-flag, and since that flag lives here it fires for the FIRST of
+// once; DISCLOSE carries its OWN once-flag, and since that flag lives here it fires for the FIRST of
 // these states in a process — the per-state surface is the stderr line, which is also the one that survives
 // -DNDEBUG and is therefore what the gates read.
 inline void noteGitJoinDegradeOnce( std::atomic<bool>& hasReported, const std::string& humanSentence )
@@ -1003,8 +1114,8 @@ inline void noteGitJoinDegradeOnce( std::atomic<bool>& hasReported, const std::s
     {
         return;
     }
-    std::fprintf( stderr, "ripwire: %s\n", humanSentence.c_str() );
-    DEGRADED_PATH_ALERT( "gitmine: a git-history path join was left unmade — see the stderr line naming the state and the path" );
+    rw::emitTo( stderr, "ripwire: {}\n", humanSentence.c_str() );
+    DISCLOSE( "gitmine: a git-history path join was left unmade — see the stderr line naming the state and the path" );
 }
 
 inline void noteUnderivableGitJoin( const std::string& probePath )
@@ -1059,7 +1170,7 @@ inline std::string gitSpellingOfPath( const std::string& repoToplevel, const std
         return {};
     }
 
-    const GitCommandLines out = gitCommandLines( "git -c core.quotepath=false -C " + shSingleQuote( repoToplevel )
+    const GitCommandLines out = gitCommandLines( gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( repoToplevel )
                                                + " ls-files --full-name -- " + shSingleQuote( gitRelPath ) + " 2>/dev/null" );
     if( !out.isStarted || out.lines.empty() )
     {
@@ -1276,7 +1387,7 @@ inline void forEachBoundGitPath( const Entries& entries, const IngestResult& ing
 inline void markChangedFilesFromGitPaths( const std::vector<std::string>& changedPaths, const IngestResult& ing,
                                           std::vector<char>& outMask, std::uint32_t onlyRoot = UINT32_MAX )
 {
-    VERIFY( outMask.size() == ing.files.size() );
+    ASSUME( outMask.size() == ing.files.size() );
     forEachBoundGitPath( changedPaths, ing, onlyRoot,
                          [ & ]( std::uint32_t fileId, const std::string& ) { outMask[ fileId ] = 1; } );
 }
@@ -1302,7 +1413,7 @@ inline void markChangedFilesFromGitPaths( const std::vector<std::string>& change
 inline void mapChurnCountsOntoFiles( const HashMap<std::string, std::uint32_t>& churnCounts, const IngestResult& ing,
                                      std::vector<std::uint32_t>& outChurn, std::uint32_t onlyRoot = UINT32_MAX )
 {
-    VERIFY( outChurn.size() == ing.files.size() );
+    ASSUME( outChurn.size() == ing.files.size() );
     forEachBoundGitPath( churnCounts, ing, onlyRoot,
                          [ & ]( std::uint32_t fileId, const auto& tallyEntry )
                          { outChurn[ fileId ] = std::max( outChurn[ fileId ], tallyEntry.second ); } );   // never a sum: two distinct git paths would invent commits
@@ -1316,12 +1427,49 @@ inline void mapChurnCountsOntoFiles( const HashMap<std::string, std::uint32_t>& 
 //
 // Shared stream core for the per-commit changed-file-set miners: run `git log <windowArgs> --name-only`
 // and resolve each commit's paths to ingested fileIds (the ONE exact git-path join), keeping sets of
-// 1..maxFiles files. `windowArgs` is the caller-built window clause — "--since='DATE' ", "'REV..' ", or
+// 1..maxFiles files. `windowArgs` is the caller-built window clause — "--since='DATE' ", "'<sha>..' ", or
 // "-N " (trailing space required, exactly as sinceLogArgs emits). Extracted (B3) so gitCommitFileSets
 // (date/rev windows) and gitRecentCommitFileSets (last-N-commits window) share ONE parser instead of
 // cloning it; gitCommitFileSets' behavior is byte-identical to its pre-extraction form.
+// What the window held and what this parser threw away for exceeding `maxFiles`. A dropped bulk commit is
+// invisible downstream — the co-change boost simply never sees that evidence — so the caller that discloses
+// the cut (kCoBoostMaxFilesPerCommit) needs the numbers from here. One struct, so the miners keep an arity.
+struct CommitWindowCensus
+{
+    std::uint32_t commits     = 0;   // commits in the window with at least one INDEXED file
+    std::uint32_t bulkDropped = 0;   // of those, the ones dropped for touching more than maxFiles of them
+};
+
+// The per-commit keep/drop decision, lifted out of gitLogFileSets so the census lives beside the rule it
+// counts and the parser stays a parser. `cur` is consumed (sorted, deduped, then cleared).
+inline void recordCommitFileSet( std::vector<std::uint32_t>& cur, std::size_t maxFiles,
+                                 std::vector<std::vector<std::uint32_t>>& sets, CommitWindowCensus* census )
+{
+    std::sort( cur.begin(), cur.end() );
+    cur.erase( std::unique( cur.begin(), cur.end() ), cur.end() );
+    if( cur.empty() )
+    {
+        cur.clear();
+        return;
+    }
+    if( census )
+    {
+        ++census->commits;
+    }
+    if( cur.size() <= maxFiles )
+    {
+        sets.push_back( cur ); // keep 1..max (freq needs size-1 too)
+    }
+    else if( census )
+    {
+        ++census->bulkDropped;
+    }
+    cur.clear();
+}
+
+// `outCensus` is optional and left alone when null; every caller that passes nothing is byte-identical.
 inline std::vector<std::vector<std::uint32_t>> gitLogFileSets( const std::string& root, const IngestResult& ing, const std::string& windowArgs, std::size_t maxFiles,
-                                                               std::uint32_t onlyRoot = UINT32_MAX )
+                                                               std::uint32_t onlyRoot = UINT32_MAX, CommitWindowCensus* outCensus = nullptr )
 {
     std::vector<std::vector<std::uint32_t>> sets;
 
@@ -1329,24 +1477,15 @@ inline std::vector<std::vector<std::uint32_t>> gitLogFileSets( const std::string
     // open --name-only pipe would leave a filled pipe buffer waiting on us while we wait on the probe.
     const GitPathIndex byGitPath = gitPathIndexOfFiles( ing, onlyRoot );
 
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root ) + " log " + kMergeDiffArgs + windowArgs + "--name-only --format=tformat:__C__ 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root ) + " log " + kMergeDiffArgs + windowArgs + "--name-only --format=tformat:__C__ 2>/dev/null";
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return sets;
     }
 
     std::vector<std::uint32_t> cur;
-    const auto flush = [ & ]()
-    {
-        std::sort( cur.begin(), cur.end() );
-        cur.erase( std::unique( cur.begin(), cur.end() ), cur.end() );
-        if( cur.size() >= 1 && cur.size() <= maxFiles )
-        {
-            sets.push_back( cur ); // keep 1..max (freq needs size-1 too)
-        }
-        cur.clear();
-    };
+    const auto flush = [ & ]() { recordCommitFileSet( cur, maxFiles, sets, outCensus ); };
     std::string s;
     while( readByteSafeLine( pipe, s ) )   // F6: THE line reader, not a char[4096] a long path can be split across
     {
@@ -1366,7 +1505,7 @@ inline std::vector<std::vector<std::uint32_t>> gitLogFileSets( const std::string
         }
     }
     flush();
-    pclose( pipe );
+    os::pclose( pipe );
     return sets;
 }
 
@@ -1388,10 +1527,10 @@ inline std::vector<std::vector<std::uint32_t>> gitCommitFileSets( const std::str
 // checkouts (a repo pinned to a 2024 base commit has nothing inside a wall-clock window measured in 2026,
 // which is exactly the LocBench-eval shape). Degrades to empty on no-git / no-history, like every miner here.
 inline std::vector<std::vector<std::uint32_t>> gitRecentCommitFileSets( const std::string& root, const IngestResult& ing, std::uint32_t commitCount, std::size_t maxFiles,
-                                                                        std::uint32_t onlyRoot = UINT32_MAX )
+                                                                        std::uint32_t onlyRoot = UINT32_MAX, CommitWindowCensus* outCensus = nullptr )
 {
     PROFILE_SCOPE_DESCRIBE( "gitmine: gitRecentCommitFileSets (co-change boost window)" );
-    return gitLogFileSets( root, ing, "-" + std::to_string( commitCount ) + " ", maxFiles, onlyRoot );
+    return gitLogFileSets( root, ing, "-" + std::to_string( commitCount ) + " ", maxFiles, onlyRoot, outCensus );
 }
 
 // git's approxidate for "<months> months ago" is calendar-month subtraction from the current local time
@@ -1404,7 +1543,7 @@ inline std::int64_t approxMonthsAgoEpoch( unsigned months )
 {
     const std::time_t now = std::time( nullptr );
     std::tm           tmv{};
-    localtime_r( &now, &tmv );
+    os::localtime_r( &now, &tmv );
     tmv.tm_mon -= int( months );                   // calendar-month subtraction (git approxidate semantics)
     return std::int64_t( std::mktime( &tmv ) );    // mktime normalizes the month/year underflow, like git
 }
@@ -1427,10 +1566,10 @@ inline RawCommitStream gitLogNameOnlyRaw( const std::string& root, const std::st
 {
     PROFILE_SCOPE_DESCRIBE( "gitmine: gitLogNameOnlyRaw (git log --name-only popen)" );
     RawCommitStream out;
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                           + " log " + kMergeDiffArgs + "--since=" + shSingleQuote( defaultWindowSince( root, coSince ) )   // F1: HEAD-anchored when `coSince` is a default month window
                           + " --name-only --format=tformat:__C__%x20%ct 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return out;
@@ -1459,7 +1598,7 @@ inline RawCommitStream gitLogNameOnlyRaw( const std::string& root, const std::st
         }
         out.commits.back().paths.push_back( std::move( s ) );   // readByteSafeLine clear()s its buffer first, so moving out of it is safe
     }
-    pclose( pipe );
+    os::pclose( pipe );
     return out;
 }
 
@@ -1477,7 +1616,7 @@ inline std::string gitWindowBoundarySha( const std::string& root, const std::str
     PROFILE_SCOPE_DESCRIBE( "gitmine: gitWindowBoundarySha (cheap window-drift probe)" );
     // G3: the shared reader, not a private `char buf[128]` + fgets accumulate. `| tail -1` already reduces
     // the output to one line, so `.back()` is that line; gitCommandLines has already stripped its CR/LF tail.
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                           + " log --since=" + shSingleQuote( defaultWindowSince( root, coSince ) )   // F1: the probe must resolve the window it guards, by the same rule
                           + " --format=%H 2>/dev/null | tail -1";
     const GitCommandLines res = gitCommandLines( cmd );
@@ -1600,7 +1739,7 @@ inline std::int64_t gitHeadCommitEpoch( const std::string& root )
 {
     // G3: the shared reader. `log -1 --format=%ct` prints exactly one line, so the first is the whole
     // answer; gitCommandLines strips the CR/LF tail, and the trailing-space strip is kept for the value.
-    const std::string     cmd = "git -c core.quotepath=false -C " + shSingleQuote( root ) + " log -1 --format=%ct HEAD 2>/dev/null";
+    const std::string     cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root ) + " log -1 --format=%ct HEAD 2>/dev/null";
     const GitCommandLines res = gitCommandLines( cmd );
     if( !res.isStarted || res.lines.empty() )
     {
@@ -1642,9 +1781,9 @@ inline std::vector<std::uint32_t> gitFileCommitCountsInDayWindow( const std::str
 
     // Stream `git log --name-only` with each commit's epoch on its __C__ marker line: "__C__ <epoch>".
     // A commit counts once per file it touches, iff its epoch is within [cutoff, headEpoch].
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root )
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                           + " log " + kMergeDiffArgs + "--name-only --format=tformat:__C__%x20%ct 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return counts;
@@ -1690,7 +1829,7 @@ inline std::vector<std::uint32_t> gitFileCommitCountsInDayWindow( const std::str
         }
     }
     flush();
-    pclose( pipe );
+    os::pclose( pipe );
     return counts;
 }
 
@@ -1714,7 +1853,7 @@ inline std::vector<float> churnPriorFromFreq( const IngestResult& ing, const std
     {
         if( !anyHistory )
         {
-            DEGRADED_PATH_ALERT( "gitmine: the churn window mined no commits — the churn prior is UNIFORM, so the ranking is the structural one" );
+            DISCLOSE( "gitmine: the churn window mined no commits — the churn prior is UNIFORM, so the ranking is the structural one" );
         }
         return p;
     }
@@ -1734,6 +1873,14 @@ inline std::vector<float> churnPriorFromFreq( const IngestResult& ing, const std
     return p;
 }
 
+// The merge-bomb rule's threshold for the churn rankers: a commit touching more than this many INDEXED files is skipped
+// (bulk renames / reformats / license sweeps / wide merges destroy the signal). kChurnDecayRankLegend and the compact
+// `merge_bombs_skipped=` reading spell the number in prose, so a change here moves both (the static_assert beside
+// the legend pins that). It sits ABOVE churnTeleport's own comment because its first consumer is churnTeleport's
+// body: moving it here split that comment in two, which left "the emitting verb needs that fact to stamp it"
+// dangling and orphaned the sentence that finishes it.
+inline constexpr std::size_t kChurnMergeBombMaxFiles = 100;   // the churn rankers' merge-bomb rule; skipped commits are disclosed as <recent merge_bombs_skipped=>
+
 // `outHasChurnEvidence` (§B2.2, optional): false ⇒ the window mined NOTHING and the returned prior is uniform,
 // i.e. the caller's "churn-ranked" map is the structural one. The emitting verb needs that fact to stamp it
 // (see churnWindowStamp); nullptr keeps every pre-existing call byte-identical.
@@ -1742,7 +1889,9 @@ inline std::vector<float> churnTeleport( const std::string& root, const IngestRe
 {
     PROFILE_SCOPE_DESCRIBE( "gitmine: churnTeleport (rank-by=churn)" );
     std::vector<std::uint32_t> freq( ing.files.size(), 0 );
-    const auto sets = gitCommitFileSets( root, ing, since, 100, scope );   // generous cap: keep refactors, drop merge-bombs
+    // The SAME merge-bomb threshold the decayed walk names (main.cpp's churn-decay call passes it by name and claims
+    // parity in a comment): a literal here is that claim written twice, and the second copy is the one that rots.
+    const auto sets = gitCommitFileSets( root, ing, since, kChurnMergeBombMaxFiles, scope );   // keep refactors, drop merge-bombs
     for( const auto& set : sets )
     {
         for( const std::uint32_t f : set )
@@ -1770,7 +1919,7 @@ inline std::vector<float> churnTeleportWorkspace( const std::vector<std::string>
     bool anyHistory = false;
     for( std::uint32_t r = 0; r < rootDirs.size(); ++r )
     {
-        const auto sets = gitCommitFileSets( rootDirs[r], ing, since, 100, nullptr, r );
+        const auto sets = gitCommitFileSets( rootDirs[r], ing, since, kChurnMergeBombMaxFiles, nullptr, r );   // the named threshold, not a second literal
         if( !sets.empty() )
         {
             anyHistory = true;
@@ -1827,6 +1976,14 @@ struct DecayedChurnMined
     std::vector<double>       weights;
     std::vector<std::int64_t> lastEpoch;
     bool                      anyHistory = false;
+    // merge_bombs_skipped= (2026-09-12): commits in the mined window the `maxFiles` rule SKIPPED — they touched more than
+    // kChurnMergeBombMaxFiles INDEXED files (the resolved fileIds in `cur`, never the commit's raw --name-only count)
+    // and contributed nothing to weights[] or lastEpoch[]. Counted so the <recent> block can say so, because such a
+    // commit is invisible to the rows AND to the prior and nothing else in the output says one was dropped: this
+    // repository's own history has five (the widest is a 349-indexed-file sweep). Always emitted, "0" included, so
+    // absence is never ambiguous. The distinction is load-bearing and used to be told wrong here: a commit of 121
+    // files of which 71 are indexed is NOT skipped — 71 is under the threshold — so the rule never hides it.
+    std::uint32_t             mergeBombsSkipped = 0;
 };
 
 inline DecayedChurnMined gitLogDecayedFileMining( const std::string& root, const IngestResult& ing, const std::string& windowArgs,
@@ -1846,16 +2003,16 @@ inline DecayedChurnMined gitLogDecayedFileMining( const std::string& root, const
     const std::int64_t headEpoch = gitHeadCommitEpoch( root );
     if( headEpoch <= 0 )
     {
-        DEGRADED_PATH_ALERT( "gitmine: no HEAD committer epoch — the decayed-churn prior is UNIFORM" );
+        DISCLOSE( "gitmine: no HEAD committer epoch — the decayed-churn prior is UNIFORM" );
         return m;
     }
 
     // built BEFORE the log pipe opens, for the reason gitLogFileSets states: it runs a git probe of its own.
     const GitPathIndex byGitPath = gitPathIndexOfFiles( ing, onlyRoot );
 
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root ) + " log " + kMergeDiffArgs + windowArgs
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root ) + " log " + kMergeDiffArgs + windowArgs
                           + "--name-only --format=tformat:__C__%x20%ct 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return m;
@@ -1876,6 +2033,10 @@ inline DecayedChurnMined gitLogDecayedFileMining( const std::string& root, const
                 weights[f] += curWeight;
                 if( curEpoch > m.lastEpoch[f] ) { m.lastEpoch[f] = curEpoch; }
             }
+        }
+        else if( cur.size() > maxFiles )
+        {
+            ++m.mergeBombsSkipped;   // the rule fired: disclosed on <recent>, never silently absorbed
         }
         cur.clear();
     };
@@ -1907,7 +2068,7 @@ inline DecayedChurnMined gitLogDecayedFileMining( const std::string& root, const
         }
     }
     flush();
-    pclose( pipe );
+    os::pclose( pipe );
     m.anyHistory = anyCommit;
     return m;
 }
@@ -1934,7 +2095,7 @@ inline std::vector<float> churnPriorFromDecayed( const IngestResult& ing, const 
     {
         if( !anyHistory )
         {
-            DEGRADED_PATH_ALERT( "gitmine: the decayed-churn walk mined no commits — the prior is UNIFORM, so the ranking is the structural one" );
+            DISCLOSE( "gitmine: the decayed-churn walk mined no commits — the prior is UNIFORM, so the ranking is the structural one" );
         }
         return p;
     }
@@ -1963,7 +2124,7 @@ inline std::vector<float> churnDecayTeleport( const std::string& root, const Ing
     PROFILE_SCOPE_DESCRIBE( "gitmine: churnDecayTeleport (rank-by=churn-decay)" );
     const std::string windowArgs = ( scope && scope->active ) ? sinceLogArgs( *scope, "" ) : std::string{};
     bool              anyHistory = false;
-    const std::vector<double> weights = gitLogDecayedFileWeights( root, ing, windowArgs, 100, &anyHistory );   // same merge-bomb cap as churnTeleport
+    const std::vector<double> weights = gitLogDecayedFileWeights( root, ing, windowArgs, kChurnMergeBombMaxFiles, &anyHistory );   // same merge-bomb cap as churnTeleport
     if( outHasChurnEvidence )
     {
         *outHasChurnEvidence = anyHistory;
@@ -1987,11 +2148,20 @@ struct RecentFile
 // top 40 (its 40th row was 21 days old) and is named by the age-first one. Age is measured on HEAD's clock, the
 // anchor the decay itself uses. `outOf` receives the number of files any mined commit touched. Empty when the
 // walk found no history.
-inline std::vector<RecentFile> recentRowsFromDecayed( const std::string& root, const IngestResult& ing, const DecayedChurnMined& m,
-                                                      std::size_t keep, std::size_t* outOf )
+// C1-b (2026-09-12): the same rows over the files `keepFile( fileId )` admits, as ONE page — rows [skip, skip+keep) of the
+// sorted list, pageWindow's semantics (a skip past the end is an empty page, never out of range). `outOf` receives the
+// admitted-file count BEFORE the window, so a caller can say capped= and spell the next page. The global block is this
+// with an admit-all predicate and skip 0 (recentRowsFromDecayed below), byte-identical to its pre-C1 form; --in=DIR
+// passes the root-relative directory-prefix predicate (main.cpp churnRankedGraph).
+// BUILD AND SORT ONCE. Split out of recentRowsFromDecayedIf so a run that wants TWO pages of the same mining
+// pass (--in=DIR: the global block and DIR's) pays for one build and one sort, not two — the scoped page is a
+// FILTER over this list, and filtering preserves order, so both pages come out of the same comparison work.
+// The HEAD anchor comes from the CACHED reader: this used to call gitHeadCommitEpoch directly, so the second
+// page opened a second `git log -1` popen for a number the process already had.
+inline std::vector<RecentFile> decayedRecentRowsSorted( const std::string& root, const IngestResult& ing, const DecayedChurnMined& m )
 {
     std::vector<RecentFile> rows;
-    const std::int64_t      headEpoch = m.anyHistory ? gitHeadCommitEpoch( root ) : 0;
+    const std::int64_t      headEpoch = m.anyHistory ? gitHeadCommitEpochCached( root ) : 0;
     for( std::uint32_t f = 0; f < std::uint32_t( m.weights.size() ); ++f )
     {
         if( m.weights[f] > 0.0 )
@@ -2000,22 +2170,48 @@ inline std::vector<RecentFile> recentRowsFromDecayed( const std::string& root, c
             rows.push_back( RecentFile{ f, std::uint32_t( age / 86400 ), m.weights[f] } );
         }
     }
-    if( outOf )
-    {
-        *outOf = rows.size();
-    }
     std::sort( rows.begin(), rows.end(), [ & ]( const RecentFile& a, const RecentFile& b )
                {
                    if( a.ageDays != b.ageDays ) { return a.ageDays < b.ageDays; }
                    if( a.weight != b.weight )   { return a.weight > b.weight; }
                    return ing.files[a.fileId] < ing.files[b.fileId];
                } );
-    if( rows.size() > keep )
+    return rows;
+}
+
+// ONE page out of that sorted list: rows [skip, skip+keep) of the files `keepFile` admits, pageWindow's
+// semantics (a skip past the end is an empty page, never out of range). `outOf` receives the admitted count
+// BEFORE the window, so the caller can say capped= and spell the next page.
+template <typename KeepFile>
+inline std::vector<RecentFile> recentPageFromSorted( const std::vector<RecentFile>& sorted, KeepFile&& keepFile,
+                                                     std::size_t keep, std::size_t skip, std::size_t* outOf )
+{
+    std::vector<RecentFile> rows;
+    std::size_t             admitted = 0;
+    for( const RecentFile& r : sorted )
     {
-        rows.resize( keep );
+        if( !keepFile( r.fileId ) )
+        {
+            continue;
+        }
+        if( admitted >= skip && rows.size() < keep )
+        {
+            rows.push_back( r );
+        }
+        ++admitted;
+    }
+    if( outOf )
+    {
+        *outOf = admitted;
     }
     return rows;
 }
+
+// (recentRowsFromDecayed/recentRowsFromDecayedIf stood here as one-line wrappers over the pair above. Both
+// lost their last caller when the map started taking BOTH its pages out of one sorted list, and a wrapper
+// nothing calls is the dead-code kind --quality-delta names — so they are gone rather than kept "for
+// symmetry": the two functions above are the whole surface, and the admit-all page is spelled at its one
+// call site, where the predicate is visible.)
 
 // Multi-root --rank-by=churn-decay: mine each root's history AGAINST ITS OWN files, accumulate ONE weight
 // table, apply the smoothing once — the churnTeleportWorkspace rule, with the same per-repo-scale caveat
@@ -2029,11 +2225,14 @@ inline std::vector<float> churnDecayTeleportWorkspace( const std::vector<std::st
     for( std::uint32_t r = 0; r < rootDirs.size(); ++r )
     {
         bool                      rootHistory = false;
-        const std::vector<double> w           = gitLogDecayedFileWeights( rootDirs[r], ing, std::string{}, 100, &rootHistory, r );
+        const std::vector<double> w           = gitLogDecayedFileWeights( rootDirs[r], ing, std::string{}, kChurnMergeBombMaxFiles, &rootHistory, r );
         if( rootHistory )
         {
             anyHistory = true;
         }
+        // weights is allocated once outside the root loop; w is a fresh return-by-value local each
+        // iteration — never the same storage.
+        ASSUME_NO_ALIAS_BUF( weights, w );
         for( std::size_t f = 0; f < weights.size(); ++f )
         {
             weights[f] += w[f];
@@ -2053,12 +2252,19 @@ inline std::vector<float> churnDecayTeleportWorkspace( const std::vector<std::st
 // Without it, `rank_by="churn" window="18mo"` sits over ranks byte-identical to pagerank — and --help sells
 // that stamp as the thing that stops churn "passing for the structural one" (cli.h:1070-1071), which it cannot
 // do while both cases are spelled the same.
-inline std::string churnWindowStamp( std::string_view minedWindow, bool hasChurnEvidence )
+// 0.6.6 command sweep: `shallow` is the third fact of the same kind. On a depth-limited clone the mined span is
+// the FETCHED history, not the window the label names, so the stamp says so in the same qualified-value form
+// (`18mo@HEAD (shallow clone)`); false keeps every full-history stamp byte-identical.
+inline std::string churnWindowStamp( std::string_view minedWindow, bool hasChurnEvidence, bool shallow = false )
 {
     std::string stamp{ minedWindow };   // brace-init: stamp( minedWindow ) parses as a function declarator (the vexing-parse lookalike hasEnclosingGitRepo warns about) and pollutes the symbol map
     if( !hasChurnEvidence )
     {
         stamp += " (no churn evidence)";
+    }
+    if( shallow )
+    {
+        stamp += " (shallow clone)";
     }
     return stamp;
 }
@@ -2167,7 +2373,7 @@ inline std::vector<FileOwnership> gitFileAuthors(
     // git log -c --name-only --format=tformat:__C__%ae|%at 2>/dev/null  (optionally scoped to one path with
     // -- <relpath>): one "__C__email|unix-ts" header per commit, then its changed files, one per line,
     // until a blank line / the next header. Mirrors gitCommitFileSets' exact invocation style.
-    std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root )
+    std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                      + " log " + kMergeDiffArgs + "--name-only --format=tformat:__C__%ae\\|%at";
     if( singleFile )
     {
@@ -2181,7 +2387,7 @@ inline std::vector<FileOwnership> gitFileAuthors(
     }
     cmd += " 2>/dev/null";
 
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return {};
@@ -2235,7 +2441,7 @@ inline std::vector<FileOwnership> gitFileAuthors(
             newest = curTs;
         }
     }
-    pclose( pipe );
+    os::pclose( pipe );
 
     std::vector<FileOwnership> result;
     result.reserve( perFile.size() );
@@ -2482,7 +2688,7 @@ inline std::uint32_t coSubWindowOf( std::size_t commitIndex, std::size_t commitC
 }
 
 // recur= from the accumulated sub-window bitmask. A pair over the support floor has at least one
-// joint commit, so a zero mask is unreachable from a real pair — but VERIFY would be wrong here (a
+// joint commit, so a zero mask is unreachable from a real pair — but ASSUME would be wrong here (a
 // caller may legitimately ask about a pair with no joint commit), so the clamp is silent and the
 // callers below only ever build masks from commits they actually saw.
 inline std::uint32_t coRecurrenceOf( std::uint32_t subWindowMask ) noexcept
@@ -2558,12 +2764,9 @@ inline std::vector<CoGroup> cochangeViolationGroups( std::vector<CoViolation>& v
                 core = f;
             }
         }
-        if( core == UINT32_MAX )
-        {   // unreachable while `remaining` counts the same set the degrees are built from — but a silent
-            // infinite loop is the failure mode if it ever is, so degrade loudly and stop covering.
-            DEGRADED_PATH_ALERT( "cochangeViolationGroups: uncovered pairs remain but no file carries one — cover abandoned" );
-            break;
-        }
+        // remaining > 0 means some violation is uncovered, and the degree pass just counted both of its endpoints, so
+        // best >= 1 and a core was chosen: `remaining` and `degree` are built from the same `covered` set, by this function.
+        ASSUME( core != UINT32_MAX, "an uncovered violation gives its endpoints a nonzero degree" );
         CoGroup g{ core, {} };
         for( std::size_t vi = 0; vi < viol.size(); ++vi )
         {
@@ -2748,7 +2951,7 @@ inline std::vector<CoPartner> cochangePartners( const std::string& root, const I
 inline bool hasEnclosingGitRepo( const std::string& root )
 {
     char resolved[ PATH_MAX ];
-    if( !::realpath( root.c_str(), resolved ) )
+    if( !os::realpath( root.c_str(), resolved ) )
     {
         return false; // unresolvable root → treat as no repo (degrade)
     }
@@ -2757,8 +2960,8 @@ inline bool hasEnclosingGitRepo( const std::string& root )
     // walk up at most 64 levels (any real path is far shallower; the bound is a hostile-symlink guard)
     for( int levelIndex = 0; levelIndex < 64 && !dir.empty(); ++levelIndex )
     {
-        struct stat st;
-        if( ::stat( ( dir + "/.git" ).c_str(), &st ) == 0 )
+        os::stat_t st;
+        if( os::stat( ( dir + "/.git" ).c_str(), &st ) == 0 )
         {
             return true;
         }
@@ -2795,6 +2998,12 @@ inline bool hasEnclosingGitRepo( const std::string& root )
 //     both selection sorts use total orders ((deg desc, path asc) / (score desc, id asc)).
 
 // Fixed knobs — deliberately NOT flags (one documented behavior, one ablation switch to kill it whole).
+// Two of the three CUT INVISIBLE EVIDENCE and therefore disclose (mention.h CapDisclosure states the rule):
+// kCoBoostMaxPartnerFiles drops whole partner files that then appear nowhere, and kCoBoostMaxFilesPerCommit
+// throws away whole COMMITS before the boost ever reads them, so a partner that only ever moves inside big
+// refactor commits is silently unreachable. kCoBoostMaxSymbolsPerFile does NOT: it trims symbols out of a
+// partner file whose promoted rows already carry p="<that file>", so the caller can see the file and page
+// into it, and it fires on nearly every promotion (any real file has more than three symbols).
 inline constexpr std::uint32_t kCoBoostCommitWindow      = 500;    // last-N-commits mining window (matches the eval's --history-depth=500 deepening)
 inline constexpr std::size_t   kCoBoostMaxFilesPerCommit = 30;     // same bulk-commit cap as the other co-change miners here
 inline constexpr std::uint32_t kCoBoostSeedCount         = 3;      // seeds = the top-3 positively-scored symbols' files
@@ -2809,15 +3018,31 @@ struct CoBoostInfo
     std::uint32_t partnerFileCount   = 0;   // partner files that passed support (before the kCoBoostMaxPartnerFiles cap)
     std::uint32_t boostedFileCount   = 0;   // partner files in which at least one symbol's score actually rose
     std::uint32_t boostedSymbolCount = 0;   // symbols whose score actually rose
+    CapDisclosure caps;                     // coboost_partners_capped= / coboost_commits_capped= (mention.h)
 };
 
 // Apply the co-change prior to `lensRank` in place. `sets` = per-commit changed-file sets from
 // gitRecentCommitFileSets (or empty ⇒ no-op). Returns true iff at least one score changed. Pure function
 // of (ing, sets, lensRank): no git, no I/O — callers own the mining (CLI --for / MCP `for` verb).
-inline bool applyCoChangeBoost( const IngestResult& ing, const std::vector<std::vector<std::uint32_t>>& sets, std::vector<float>& lensRank, CoBoostInfo* outInfo = nullptr )
+// `census` is the caller's own gitRecentCommitFileSets census (nullptr ⇒ the caller did not ask for it, and
+// nothing about commits is disclosed) — the mining happens outside this pure function, so the numbers have
+// to arrive with the sets they describe.
+inline bool applyCoChangeBoost( const IngestResult& ing, const std::vector<std::vector<std::uint32_t>>& sets, std::vector<float>& lensRank, CoBoostInfo* outInfo = nullptr,
+                                const CommitWindowCensus* census = nullptr )
 {
-    VERIFY( lensRank.size() == ing.symbols.size() );
-    if( sets.empty() || lensRank.empty() || lensRank.size() != ing.symbols.size() )
+    // EXPECTS, not DASSERT (rv-s2 review, 2026-09-19): every caller's lensRank is sized from ing.symbols by
+    // construction — lexicalScoresNameExactRanked/lexicalScoresTiered return an S = ing.symbols.size() vector
+    // on every path (including their own early return), optionally through anchoredLexicalRank/blendMaxNorm,
+    // which preserve that size — and all 3 callers (verbs_for.h::computeLensRanking, mcpverbs.h forTaskText /
+    // packTaskText) pass the SAME `ing` the vector was built from. No caller can present a mismatched size, so
+    // this is the function's real precondition, not a defensive fallback for a reachable mismatch; the old
+    // `!= ing.symbols.size()` re-test below was dead code and is deleted with it.
+    EXPECTS( lensRank.size() == ing.symbols.size() );
+    if( outInfo && census )
+    {
+        outInfo->caps.note( "coboost_commits_capped", "coboost_commits_total", census->bulkDropped > 0, census->commits );
+    }
+    if( sets.empty() || lensRank.empty() )
     {
         return false;
     }
@@ -2859,7 +3084,7 @@ inline bool applyCoChangeBoost( const IngestResult& ing, const std::vector<std::
         return false;
     }
     const float seedFloor = lensRank[ seedIds[ seedSymbolCount - 1 ] ];   // lowest seed score — the unbreakable ceiling
-    VERIFY( seedFloor > 0.0f );
+    ASSUME( seedFloor > 0.0f );
 
     // seed FILES (deduped, seed-rank order; <= kCoBoostSeedCount of them)
     std::uint32_t seedFiles[ kCoBoostSeedCount ];
@@ -2954,6 +3179,10 @@ inline bool applyCoChangeBoost( const IngestResult& ing, const std::vector<std::
     if( outInfo )
     {
         outInfo->partnerFileCount = std::uint32_t( partners.size() );
+        // Read BEFORE the resize below: partners.size() here is the true number of files that passed the
+        // support threshold, so coboost_partners_total= is exact at no cost.
+        outInfo->caps.note( "coboost_partners_capped", "coboost_partners_total",
+                            partners.size() > kCoBoostMaxPartnerFiles, std::uint64_t( partners.size() ) );
     }
 
     // strongest partners only: (deg desc, path asc) is a total order (paths are unique) → deterministic cap
@@ -3038,13 +3267,14 @@ inline bool applyCoChangeBoost( const IngestResult& ing, const std::vector<std::
 // that never changes costs nothing; complex code that changes constantly is where bugs live).
 // `scope`: nullptr (default) reproduces the pre-flag `--since=<since>` window byte-for-byte; a non-null
 // active scope (CLI --since=REV|DATE, see gitmine.h resolveSinceScope) overrides it with the resolved
-// window — REV form as a deterministic `REV..` range, date form as `--since=DATE` (wall-clock-relative).
+// window — REV form as the resolved commit's deterministic `<sha>..` range, date form as `--since=DATE`
+// (wall-clock-relative).
 inline bool gitChurnCounts( const std::string& root, const rw::IngestResult& ing, std::vector<std::uint32_t>& out, const char* since, const rw::SinceScope* scope = nullptr,
                      std::uint32_t onlyRoot = UINT32_MAX )   // multi-root §5: count ONLY files of that root
 {
     const std::string windowArgs = rw::historyWindowArgs( root, scope, since );
     const rw::GitCommandLines touched = rw::gitCommandLines(
-        "git -c core.quotepath=false -C " + shSingleQuote( root ) + " log " + rw::kMergeDiffArgs + windowArgs + "--name-only --format= 2>/dev/null" );
+        gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root ) + " log " + rw::kMergeDiffArgs + windowArgs + "--name-only --format= 2>/dev/null" );
     if( !touched.isStarted )
     {
         return false;
@@ -3096,6 +3326,10 @@ inline bool mineChurnPerFile( const rw::IngestResult& ing, const std::string& ro
             continue;
         }
         churnOk = true;
+        // churn is the caller's out-param; rootChurn is a fresh per-iteration local (line above) — never
+        // the same storage. The "nothing to do" case (this root's gitChurnCounts failing) already
+        // `continue`d above.
+        ASSUME_NO_ALIAS_BUF( churn, rootChurn );
         for( std::size_t f = 0; f < churn.size(); ++f )
         {
             churn[f] += rootChurn[f];

@@ -3,12 +3,15 @@
 #
 # --doctor is a DIAGNOSTIC verb (environment-dependent output is its whole point), so unlike every
 # other absorb gate this one does NOT assert byte-identical / golden output. Instead it asserts:
-#   (A) happy path: exit 0, all 6 <c> rows present, xmllint-clean, checks="N" matches N emitted rows.
+#   (A) happy path: exit 0, every named <c> row present, xmllint-clean, checks="N" matches N emitted rows.
 #   (B) an unwritable cache dir (via TMPDIR) makes the cache-dir row ok="0" and the whole run exit 1.
 #   (C) a non-repo target dir makes the git row ok="1" repo="0" (degrade, not a failure).
 #   (D) non-vacuity without a source mutation: assert the check COUNT in checks="N" equals the number
 #       of emitted <c ...> rows (a doctor that silently dropped a check would still exit 0/1 plausibly,
 #       but the count would betray it).
+#   (F4)-(F6) #334 binary-path lookup: PATH is read by this process (a shell's `which` is never asked); an unreadable
+#       PATH copy is UNVERIFIED (same_bytes="unknown"), never STALE; which= equals which(1)'s answer on POSIX; (F7) an
+#       unreadable file with different release numbers is STALE on those numbers, never "contents differ".
 #   (G) tracked-binary staleness: a binary committed, then its same-stem source
 #       edited in a LATER commit with the binary never recommitted, fires stale="1" ok="0" (git-commit-order,
 #       never mtime); a binary + source committed TOGETHER in their most recent touch stays stale="0" ok="1".
@@ -21,11 +24,12 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -66,11 +70,13 @@ printf 'temp-a'  >"$PRIVATECACHE/ripwire-temp-a/ripwire-decoy.bin"
 printf 'temp-b'  >"$PRIVATECACHE/ripwire-temp-b/ripwire-decoy.cache"
 printf 'nonhex'  >"$PRIVATECACHE/zz/ripwire-decoy.bin"
 
-OUT="$( PATH="$BINDIR:$PATH" TMPDIR="$HAPPYCACHE" "$BINDIR/ripwire" "$REPO" --doctor --no-cache 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact (its root leads with schema= and its legend is the short form); the
+# arms reading $OUT/$GOUT/$VOUT match the full-posture root '<doctor checks=' or the FULL legend's prose, so those runs ask for it.
+OUT="$( PATH="$BINDIR:$PATH" TMPDIR="$HAPPYCACHE" "$BINDIR/ripwire" "$REPO" --doctor --legend=full --no-cache 2>/dev/null )"
 RC=$?
 echo "happy-path output:"; echo "$OUT"; echo "(exit=$RC)"; echo
 
-[ "$RC" -eq 0 ] && ok "happy path exits 0" || no "happy path exit code was $RC, expected 0"
+if [ "$RC" -eq 0 ]; then ok "happy path exits 0"; else no "happy path exit code was $RC, expected 0"; fi
 
 # 2026-09-06: the fixture's one edit-lock file (locks/0b/ripwire-edit-test.lock) is counted by the cache-dir
 # row's locks= — the blob scan still never enters locks/ (blobs= stays 2), the count is a separate walk.
@@ -88,7 +94,7 @@ DECLARED_CHECKS="$( echo "$OUT" | grep -o '<doctor checks="[0-9]*"' | grep -o '[
     && ok "checks=\"$DECLARED_CHECKS\" equals the emitted <c n=> row count" \
     || no "checks=\"${DECLARED_CHECKS:-<absent>}\" disagrees with the $EMITTED_ROWS rows actually emitted"
 
-for row in binary-path grammars cache-dir git tree-sitter tracked-binaries index-cache; do
+for row in binary-path grammars cache-dir git tree-sitter tracked-binaries index-cache git-config-trust layout; do
     echo "$OUT" | grep -q "<c n=\"$row\" ok=" \
         && ok "row present: $row" \
         || no "row missing: $row"
@@ -102,7 +108,7 @@ echo "$HEAD_ATTR" | grep -qE '^head="[0-9a-f]{9}"$' \
     && ok "doctor git row head= is a 9-hex-char sha (matches at= width, §A10.4)" \
     || no "doctor git row head= is not 9 hex chars: $HEAD_ATTR"
 
-echo "$OUT" | xmllint --noout - 2>/dev/null && ok "xmllint clean" || no "xmllint reported malformed XML"
+if echo "$OUT" | xmllint --noout - 2>/dev/null; then ok "xmllint clean"; else no "xmllint reported malformed XML"; fi
 
 # §P11 doctor item: hint= is a FAILURE-only attribute — an all-green run must carry none.
 echo "$OUT" | grep -q 'hint=' \
@@ -135,7 +141,7 @@ echo "$UOUT" | grep -q '<c n="cache-dir" ok="0"' \
     && ok "unwritable cache dir -> cache-dir row ok=\"0\"" \
     || no "unwritable cache dir did not flag cache-dir row"
 
-[ "$URC" -eq 1 ] && ok "unwritable cache dir -> overall exit 1" || no "overall exit was $URC, expected 1"
+if [ "$URC" -eq 1 ]; then ok "unwritable cache dir -> overall exit 1"; else no "overall exit was $URC, expected 1"; fi
 
 # §P11 doctor item: a failing check carries a hint= naming the derived verdict, not just raw facts.
 echo "$UOUT" | grep -oE '<c n="cache-dir" ok="0"[^<]*/>' | grep -q 'hint="' \
@@ -158,7 +164,7 @@ echo "$NOUT" | grep -q 'repo="0"' \
     && ok "non-repo dir -> repo=\"0\"" \
     || no "non-repo dir: repo= attr missing/not 0"
 
-echo "$NOUT" | xmllint --noout - 2>/dev/null && ok "xmllint clean (non-repo)" || no "xmllint reported malformed XML (non-repo)"
+if echo "$NOUT" | xmllint --noout - 2>/dev/null; then ok "xmllint clean (non-repo)"; else no "xmllint reported malformed XML (non-repo)"; fi
 
 # ── (E) copied-but-identical binary: install.sh COPIES (never symlinks), so dev/ino always differ
 #     from a same-content build — same_file="0" alone false-positives every working install. The
@@ -184,7 +190,19 @@ echo "$COUT" | grep -q 'copied="1"' \
 #     the check claims to measure. ──
 STALEDIR="$TMP/staledir"; mkdir -p "$STALEDIR"
 cp -p "$BIN" "$STALEDIR/ripwire"; chmod +x "$STALEDIR/ripwire"
-printf 'X' | dd of="$STALEDIR/ripwire" bs=1 seek=100000 conv=notrunc 2>/dev/null   # one byte differs; size identical
+# Flip the byte at a fixed offset to a value it provably is NOT. Writing a CONSTANT here is a
+# 1-in-256 no-op PER BUILD CONFIGURATION: if that offset already holds the constant, the copy stays
+# byte-identical, --doctor correctly answers copied="1" same_bytes="1" ok="1", and every assertion
+# below inverts — the fixture reports a stale-detection bug that does not exist. Release+gcc on
+# ubuntu-24.04 drew exactly that byte (run 34299292778, the only red leg of 26). Read, then write
+# something else, so the fixture differs in the fact the check claims to measure on every toolchain.
+staleOld="$( dd if="$STALEDIR/ripwire" bs=1 skip=100000 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n' )"
+staleNew=$(( ( ${staleOld:-0} + 1 ) % 256 ))
+printf "\\$( printf '%03o' "$staleNew" )" | dd of="$STALEDIR/ripwire" bs=1 seek=100000 conv=notrunc 2>/dev/null
+# and PROVE the flip landed: a silent no-op here is the whole defect, so it fails loudly instead.
+if cmp -s "$BIN" "$STALEDIR/ripwire"; then
+    no "genuine-stale fixture is byte-identical to \$BIN — the flip was a no-op, arm (F) cannot mean anything"
+fi
 touch -t 202001010000 "$STALEDIR/ripwire"   # and an older mtime, so the hint names the right side
 STALECACHE="$TMP/stalecache"; mkdir -p "$STALECACHE"
 SOUT="$( PATH="$STALEDIR:$PATH" TMPDIR="$STALECACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
@@ -216,11 +234,124 @@ echo "$TROW" | grep -q 'hint=' \
     && no "(F2) same-bytes row wrongly carries a hint" \
     || ok "(F2) same-bytes row carries no hint"
 
+# ── (F3) #334: a DIFFERENT, older ripwire earlier on PATH. The Windows tester's `which` found a 0.6.2 they had built
+#     themselves ahead of the 0.6.3 they ran. The row must fail on identity (not on the name, not on an mtime), keep
+#     both paths, and name the PATH copy's own build from its --version line, so the mismatch reads as two versions. ──
+OLDDIR="$TMP/olderripwire"; mkdir -p "$OLDDIR"
+printf '%s\n' '#!/bin/sh' 'case "$1" in --version) echo "ripwire 0.6.2 (Release, Clang 20.1.8, emit=std::print, built_from=0000000f334)";; esac' >"$OLDDIR/ripwire"
+chmod +x "$OLDDIR/ripwire"
+OLDCACHE="$TMP/oldcache"; mkdir -p "$OLDCACHE"
+OOUT="$( PATH="$OLDDIR:$PATH" TMPDIR="$OLDCACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+OROW="$( echo "$OOUT" | grep -oE '<c n="binary-path"[^<]*/>' )"
+{ echo "$OROW" | grep -q ' ok="0"' && echo "$OROW" | grep -q 'same_file="0"' && echo "$OROW" | grep -q 'same_bytes="0"' \
+  && echo "$OROW" | grep -qF "which=\"$OLDDIR/ripwire\""; } \
+    && ok "(F3) an older ripwire earlier on PATH fails the row on identity, naming its path in which=" \
+    || no "(F3) an older ripwire earlier on PATH: $OROW"
+echo "$OROW" | grep -qF 'which_version="ripwire 0.6.2 (Release, Clang 20.1.8, emit=std::print, built_from=0000000f334)"' \
+    && ok "(F3) the row names the PATH copy's own build (which_version=), so the mismatch reads as 0.6.2 vs this binary" \
+    || no "(F3) the row does not name the PATH copy's build: $OROW"
+# The fake is written AFTER this binary was built, so by mtime it is the newer file. The base binary's hint therefore
+# called the running binary STALE and said to invoke the 0.6.2 directly; the stated release numbers must win.
+OHINT="$( echo "$OROW" | grep -oE 'hint="STALE:[^"]*"' )"
+echo "$OHINT" | grep -qF "STALE: $OLDDIR/ripwire (ripwire 0.6.2" \
+    && ok "(F3) the hint names the 0.6.2 on PATH as the stale one, by its stated version, not by mtime" \
+    || no "(F3) the hint does not name the PATH copy as the older build: $OHINT"
+echo "$TROW" | grep -q 'which_version=' \
+    && no "(F3) a byte-identical copy was asked for its version (only a mismatch runs the PATH copy)" \
+    || ok "(F3) a byte-identical PATH copy carries no which_version= (the PATH binary is run only on a mismatch)"
+
+# ── (F4) #334: the row asks THIS process's PATH (os::which), never a child shell's `which`. On Windows, Git Bash's
+#     `which` answered from another PATH order, in a "/c/..." spelling, and named ~/bin's copy while PowerShell ran the
+#     0.6.4 install. Here a `which` that names a different copy (the byte-flipped STALEDIR one) comes first on PATH, and
+#     the ripwire PATH really runs is TWICEDIR's byte-identical copy. The row must follow PATH: ok="1" copied="1". ──
+FAKEWHICH="$TMP/fakewhich"; mkdir -p "$FAKEWHICH"
+printf '%s\n' '#!/bin/sh' "echo '$STALEDIR/ripwire'" >"$FAKEWHICH/which"
+chmod +x "$FAKEWHICH/which"
+F4CACHE="$TMP/f4cache"; mkdir -p "$F4CACHE"
+F4ROW="$( PATH="$FAKEWHICH:$TWICEDIR:$PATH" TMPDIR="$F4CACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null | grep -oE '<c n="binary-path"[^<]*/>' )"
+{ echo "$F4ROW" | grep -q ' ok="1"' && echo "$F4ROW" | grep -q 'copied="1"' && echo "$F4ROW" | grep -qF "which=\"$TWICEDIR/ripwire\""; } \
+    && ok "(F4) a shell \`which\` that names another copy is not asked: the row follows PATH to the identical copy (ok=\"1\" copied=\"1\")" \
+    || no "(F4) the row followed a child shell's \`which\` instead of PATH: $F4ROW"
+
+# ── (F5) #334: a PATH copy whose bytes cannot be READ has no known contents. Windows' version of this was the "/c/..."
+#     spelling std::fopen could not open: a byte-identical copy came out "STALE … their contents differ". Here the same
+#     size and the same build, but execute-only. The row must fail as unverified (same_bytes="unknown", the file named
+#     in the hint), never as STALE. (Skipped where the copy stays readable, e.g. as root.) ──
+UNREADDIR="$TMP/unreaddir"; mkdir -p "$UNREADDIR"
+cp -p "$BIN" "$UNREADDIR/ripwire"; chmod 111 "$UNREADDIR/ripwire"
+if [ -r "$UNREADDIR/ripwire" ]; then
+    ok "(F5) skipped: an execute-only copy is still readable here (root?), so it cannot model an unreadable file"
+else
+    F5CACHE="$TMP/f5cache"; mkdir -p "$F5CACHE"
+    F5ROW="$( PATH="$UNREADDIR:$PATH" TMPDIR="$F5CACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null | grep -oE '<c n="binary-path"[^<]*/>' )"
+    { echo "$F5ROW" | grep -q ' ok="0"' && echo "$F5ROW" | grep -q 'same_bytes="unknown"' \
+      && echo "$F5ROW" | grep -qF "hint=\"UNVERIFIED: could not read $UNREADDIR/ripwire"; } \
+        && ok "(F5) an unreadable same-size copy reads same_bytes=\"unknown\" with an UNVERIFIED hint naming it" \
+        || no "(F5) an unreadable copy was not reported as unverified: $F5ROW"
+    echo "$F5ROW" | grep -q 'STALE' \
+        && no "(F5) an unreadable copy was called STALE (no evidence the contents differ): $F5ROW" \
+        || ok "(F5) an unreadable copy is never called STALE"
+fi
+chmod 755 "$UNREADDIR/ripwire" 2>/dev/null
+
+# ── (F6) POSIX parity: dropping the child shell must not change which copy the row names. For each PATH shape, which=
+#     must be exactly what which(1) prints: a directory named ripwire first, a non-executable file first, a symlink, and
+#     an empty PATH entry (the current directory) leading, trailing ("/usr/bin:/bin:") and in the middle. (Skipped when
+#     this host has no which(1) to compare with.) ──
+if command -v which >/dev/null 2>&1 && [ -x "$( command -v which )" ]; then
+    SHAPES="$TMP/shapes"; mkdir -p "$SHAPES/dirnamed/ripwire" "$SHAPES/noexec" "$SHAPES/link" "$SHAPES/cwd"
+    cp "$BIN" "$SHAPES/noexec/ripwire"; chmod 644 "$SHAPES/noexec/ripwire"
+    ln -s "$TWICEDIR/ripwire" "$SHAPES/link/ripwire"
+    cp "$BIN" "$SHAPES/cwd/ripwire"; chmod 755 "$SHAPES/cwd/ripwire"
+    F6CACHE="$TMP/f6cache"; mkdir -p "$F6CACHE"
+    f6bad=0; f6n=0
+    for shape in "$SHAPES/dirnamed:$TWICEDIR:/usr/bin:/bin" "$SHAPES/noexec:$TWICEDIR:/usr/bin:/bin" \
+                 "$SHAPES/link:$TWICEDIR:/usr/bin:/bin" ":$TWICEDIR:/usr/bin:/bin" "/usr/bin:/bin:" "/usr/bin::/bin"; do
+        want="$( cd "$SHAPES/cwd" && PATH="$shape" which ripwire 2>/dev/null )"
+        row="$( cd "$SHAPES/cwd" && PATH="$shape" TMPDIR="$F6CACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null | grep -oE '<c n="binary-path"[^<]*/>' )"
+        f6n=$(( f6n + 1 ))
+        if [ -z "$want" ] || ! echo "$row" | grep -qF "which=\"$want\""; then
+            f6bad=$(( f6bad + 1 )); echo "    PATH=$shape: which(1)=[$want] row: $row"
+        fi
+    done
+    [ "$f6bad" -eq 0 ] \
+        && ok "(F6) which= equals which(1)'s answer on all $f6n PATH shapes (directory, non-executable, symlink, empty entry leading/trailing/middle)" \
+        || no "(F6) which= differs from which(1) on $f6bad of $f6n PATH shapes"
+else
+    ok "(F6) skipped: no which(1) on this host to compare with"
+fi
+
+# ── (F7) #334 review N1 (self= is the realpath of the running copy, so the unread name is read from it): an unreadable file with DIFFERENT stated release numbers. The release numbers are the evidence,
+#     so the row may say STALE, but it must not claim "their contents differ" (no bytes were compared) and it must name
+#     the file it could not read. Built so the RUNNING binary is the unreadable one (an execute-only copy of $BIN; exec
+#     needs no read permission) and the PATH copy is a readable same-size script that prints an older version: sizes
+#     equal, so the byte compare runs and cannot open self. (Skipped where the copy stays readable, e.g. as root.) ──
+F7="$TMP/f7"; mkdir -p "$F7/self" "$F7/path"
+cp "$BIN" "$F7/self/ripwire"; chmod 111 "$F7/self/ripwire"
+if [ -r "$F7/self/ripwire" ]; then
+    ok "(F7) skipped: an execute-only copy is still readable here (root?)"
+else
+    printf '%s\n' '#!/bin/sh' 'echo "ripwire 0.6.2 (Release, fake, emit=std::print, built_from=0000000f334)"' 'exit 0' >"$F7/path/ripwire"
+    pad=$(( $( wc -c <"$BIN" ) - $( wc -c <"$F7/path/ripwire" ) ))
+    head -c "$pad" /dev/zero | tr '\0' '#' >>"$F7/path/ripwire"; chmod 755 "$F7/path/ripwire"
+    F7CACHE="$TMP/f7cache"; mkdir -p "$F7CACHE"
+    F7ROW="$( PATH="$F7/path:$PATH" TMPDIR="$F7CACHE" "$F7/self/ripwire" "$REPO" --doctor --no-cache 2>/dev/null | grep -oE '<c n="binary-path"[^<]*/>' )"
+    { echo "$F7ROW" | grep -q ' ok="0"' && echo "$F7ROW" | grep -q 'same_bytes="unknown"' && echo "$F7ROW" | grep -q 'hint="STALE: ' \
+      && echo "$F7ROW" | grep -qF "could not read $( echo "$F7ROW" | sed -n 's/.* self="\([^"]*\)".*/\1/p' ) (" \
+      && echo "$F7ROW" | grep -q 'state different release numbers'; } \
+        && ok "(F7) unreadable + different release numbers: STALE on the release numbers, naming the unread file" \
+        || no "(F7) unreadable + different release numbers: $F7ROW"
+    echo "$F7ROW" | grep -q 'contents differ' \
+        && no "(F7) the hint claims the contents differ though no bytes were compared: $F7ROW" \
+        || ok "(F7) the hint makes no claim about contents it never read"
+    chmod 755 "$F7/self/ripwire" 2>/dev/null
+fi
+
 # ── (G) NOT on PATH at all — the state every fresh install is in until the user adds ~/.local/bin, and the
 #     state in which a stranger runs this binary by absolute path to ask what is wrong. Used to be ok="1"
 #     (passed=7/7) with `ripwire` a "command not found" at the prompt. Fails the row, names the fix. ──
 NOPATHCACHE="$TMP/nopathcache"; mkdir -p "$NOPATHCACHE"
-GOUT="$( PATH="/usr/bin:/bin" TMPDIR="$NOPATHCACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+GOUT="$( PATH="/usr/bin:/bin" TMPDIR="$NOPATHCACHE" "$BIN" "$REPO" --doctor --legend=full --no-cache 2>/dev/null )"
 GROW="$( echo "$GOUT" | grep -oE '<c n="binary-path"[^<]*/>' )"
 echo "$GROW" | grep -q ' ok="0"' && echo "$GROW" | grep -q 'on_path="0"' \
     && ok "(G) no ripwire on PATH -> binary-path row ok=\"0\" on_path=\"0\"" \
@@ -232,6 +363,84 @@ echo "$GOUT" | grep -q '<doctor checks="[0-9]*" passed="[0-9]*"' \
     && [ "$( echo "$GOUT" | grep -oE 'passed="[0-9]+"' | grep -oE '[0-9]+' )" -lt "$( echo "$GOUT" | grep -oE 'checks="[0-9]+"' | grep -oE '[0-9]+' )" ] \
     && ok "(G) passed= is below checks= when ripwire is not on PATH" \
     || no "(G) passed= still equals checks= with ripwire off PATH"
+
+# ── (G2) CodeRabbit 4109273959: the not-on-PATH hint's export line must quote the directory as a shell LITERAL
+#     — unquoted or double-quoted, a `$`, a backtick or `$(...)` inside it would expand or run when the user
+#     pastes the hint. Copy the binary into a directory whose name has all four (`$`, a backtick, a `'`, a
+#     space), extract the pasted line from the (XML-unescaped) hint, actually EVAL it, and check PATH's first
+#     entry is that directory byte for byte — proof the paste stayed inert, not just that it "looks quoted". ──
+WEIRDNAME='w $eird `date` name'\''s dir'
+WEIRDDIR="$TMP/$WEIRDNAME"
+mkdir -p "$WEIRDDIR"
+WEIRDDIR_REAL="$( cd "$WEIRDDIR" && pwd -P )"   # macOS: /var/folders/... resolves through the /private symlink
+cp "$BIN" "$WEIRDDIR/ripwire"
+chmod +x "$WEIRDDIR/ripwire"
+WEIRDCACHE="$TMP/weirdcache"; mkdir -p "$WEIRDCACHE"
+WOUT="$( PATH="/usr/bin:/bin" TMPDIR="$WEIRDCACHE" "$WEIRDDIR/ripwire" "$REPO" --doctor --no-cache 2>/dev/null )"
+WHINT="$( echo "$WOUT" | grep -oE 'hint="NOT ON PATH:[^"]*"' )"
+WHINT_UNESC="$( printf '%s' "$WHINT" | sed -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/\&amp;/\&/g' )"
+WLINE="$( printf '%s' "$WHINT_UNESC" | grep -oE 'export PATH=.*:"\$PATH"' )"
+[ -n "$WLINE" ] \
+    && ok "(G2) not-on-PATH hint for a \$/\`/'/space directory still carries an export line" \
+    || no "(G2) not-on-PATH hint has no export line for the weird directory: $WHINT"
+MARKER="$TMP/g2-marker-must-not-exist"
+WEVALSCRIPT="$TMP/g2-eval.sh"
+{
+    printf '%s\n' "$WLINE"                              # the pasted line, verbatim
+    echo 'printf "%s" "${PATH%%:*}"'
+} >"$WEVALSCRIPT"
+WGOTPATH="$( PATH="/usr/bin:/bin" bash "$WEVALSCRIPT" 2>/dev/null )"
+[ "$WGOTPATH" = "$WEIRDDIR_REAL" ] \
+    && ok "(G2) evaluating the pasted export line puts the \$/\`/'/space directory on PATH literally" \
+    || no "(G2) pasted export line did not literally prepend the directory: got [$WGOTPATH] want [$WEIRDDIR_REAL]"
+[ ! -e "$MARKER" ] \
+    && ok "(G2) no side effect from evaluating the pasted line (a broken quote would let \` or \$() run)" \
+    || no "(G2) a marker file exists — the pasted line ran something"
+
+# ── (G3) CodeRabbit 4109273959, second comment: a user pastes the hint from the command to its END, so nothing may
+#     follow the command. The hint used to end "... :"$PATH" (and put that line in your shell rc file)", and pasting
+#     that made bash and sh refuse the whole line (syntax error near `(`) and zsh fail ("number expected"), so PATH
+#     never changed. Evaluate everything from `export PATH=` to the end of the hint in each shell present, and require
+#     exit 0 with the literal directory first on PATH. RED on 0.6.4's trailing guidance.
+WTAIL="$( printf '%s' "$WHINT_UNESC" | sed -e 's/^hint="//' -e 's/"$//' | sed -n 's/.*\(export PATH=\)/\1/p' )"
+[ -n "$WTAIL" ] || no "(G3) no 'export PATH=' in the not-on-PATH hint: $WHINT"
+for g3sh in bash sh zsh; do
+    command -v "$g3sh" >/dev/null 2>&1 || continue
+    printf '%s\nprintf "%%s" "${PATH%%%%:*}"\n' "$WTAIL" >"$TMP/g3-$g3sh.sh"
+    G3OUT="$( PATH="/usr/bin:/bin" "$g3sh" "$TMP/g3-$g3sh.sh" 2>"$TMP/g3-$g3sh.err" )"; G3RC=$?
+    [ "$G3RC" -eq 0 ] && [ "$G3OUT" = "$WEIRDDIR_REAL" ] \
+        && ok "(G3) $g3sh: pasting the hint from 'export PATH=' to its end runs and puts the directory first on PATH" \
+        || no "(G3) $g3sh: pasting the hint's tail failed (rc=$G3RC, PATH head [$G3OUT], stderr [$( head -c 120 "$TMP/g3-$g3sh.err" )]): [$WTAIL]"
+done
+
+# ── (G4) review R4 of the CodeRabbit 4109273959 follow-up: the hint ATTRIBUTE is XML-escaped (&apos; &quot;) like every
+#     attribute, so the bytes a terminal shows do not paste into any shell. With ripwire not on PATH, --doctor also prints
+#     the remedy UNESCAPED on stderr, the command alone on the last line. Paste that raw last line, byte for byte, into
+#     each shell present: exit 0 and the literal $/`/'/space directory first on PATH. stdout stays one well-formed
+#     document. RED on 0.6.4, which printed nothing on stderr.
+WERR="$TMP/g4-doctor.err"
+PATH="/usr/bin:/bin" TMPDIR="$WEIRDCACHE" "$WEIRDDIR/ripwire" "$REPO" --doctor --no-cache >"$TMP/g4-doctor.out" 2>"$WERR"
+xmllint --noout "$TMP/g4-doctor.out" 2>/dev/null \
+    && ok "(G4) stdout is still one well-formed XML document when the remedy is also on stderr" \
+    || no "(G4) --doctor stdout is not well-formed XML"
+G4LINE="$( tail -n 1 "$WERR" )"
+case "$G4LINE" in
+    export\ PATH=*) ok "(G4) stderr's last line is the bare command: [$G4LINE]" ;;
+    *)              no "(G4) stderr's last line is not the command (nothing pasteable unescaped): [$G4LINE]" ;;
+esac
+for g4sh in bash sh dash zsh; do
+    command -v "$g4sh" >/dev/null 2>&1 || continue
+    printf '%s\nprintf "%%s" "${PATH%%%%:*}"\n' "$G4LINE" >"$TMP/g4-$g4sh.sh"
+    G4OUT="$( PATH="/usr/bin:/bin" "$g4sh" "$TMP/g4-$g4sh.sh" 2>"$TMP/g4-$g4sh.err" )"; G4RC=$?
+    [ "$G4RC" -eq 0 ] && [ "$G4OUT" = "$WEIRDDIR_REAL" ] && [ ! -e "$MARKER" ] \
+        && ok "(G4) $g4sh: the raw stderr line pastes as-is and puts the directory first on PATH" \
+        || no "(G4) $g4sh: the raw stderr line did not paste (rc=$G4RC, PATH head [$G4OUT], stderr [$( head -c 120 "$TMP/g4-$g4sh.err" )])"
+done
+# control: with ripwire on PATH, --doctor says nothing on stderr about PATH
+PATH="$WEIRDDIR:/usr/bin:/bin" TMPDIR="$WEIRDCACHE" "$WEIRDDIR/ripwire" "$REPO" --doctor --no-cache >/dev/null 2>"$TMP/g4-onpath.err"
+grep -q 'no ripwire resolves from PATH' "$TMP/g4-onpath.err" \
+    && no "(G4) control: stderr carries the PATH remedy even with ripwire on PATH" \
+    || ok "(G4) control: with ripwire on PATH, stderr carries no PATH remedy"
 
 # §P11 doctor item: binary-path's ok="0" row names which of self=/which= is the STALE (older) one.
 echo "$SOUT" | grep -oE '<c n="binary-path" ok="0"[^<]*/>' | grep -q 'hint="STALE:' \
@@ -275,8 +484,8 @@ echo "$GOUT" | grep -qF 'p0="bin/tool"' && echo "$GOUT" | grep -qF 'src0="bin/to
 echo "$GOUT" | grep -oE '<c n="tracked-binaries" ok="0"[^<]*/>' | grep -q 'hint="' \
     && ok "G: stale tracked-binaries row carries hint=" \
     || no "G: stale tracked-binaries row has no hint="
-[ "$GRC" -eq 1 ] && ok "G: a stale tracked binary fails the overall --doctor exit (1)" || no "G: overall exit was $GRC, expected 1"
-echo "$GOUT" | xmllint --noout - 2>/dev/null && ok "G: xmllint clean (stale case)" || no "G: xmllint reported malformed XML (stale case)"
+if [ "$GRC" -eq 1 ]; then ok "G: a stale tracked binary fails the overall --doctor exit (1)"; else no "G: overall exit was $GRC, expected 1"; fi
+if echo "$GOUT" | xmllint --noout - 2>/dev/null; then ok "G: xmllint clean (stale case)"; else no "G: xmllint reported malformed XML (stale case)"; fi
 
 FRESHREPO="$TMP/freshbinrepo"; mkdir -p "$FRESHREPO/bin"
 git -C "$FRESHREPO" init -q
@@ -293,9 +502,9 @@ echo "tracked-binary-staleness (fresh case) output:"; echo "$FOUT"; echo "(exit=
 echo "$FOUT" | grep -q '<c n="tracked-binaries" ok="1"' \
     && ok "G: binary + source committed together (never re-edited) -> tracked-binaries row ok=\"1\"" \
     || no "G: fresh binary/source pair wrongly flagged"
-echo "$FOUT" | grep -q 'stale="0"' && ok "G: fresh pair reports stale=\"0\"" || no "G: fresh pair did not report stale=\"0\""
-[ "$FRC" -eq 0 ] && ok "G: a fresh tracked binary does not fail the overall --doctor exit" || no "G: overall exit was $FRC, expected 0"
-echo "$FOUT" | xmllint --noout - 2>/dev/null && ok "G: xmllint clean (fresh case)" || no "G: xmllint reported malformed XML (fresh case)"
+if echo "$FOUT" | grep -q 'stale="0"'; then ok "G: fresh pair reports stale=\"0\""; else no "G: fresh pair did not report stale=\"0\""; fi
+if [ "$FRC" -eq 0 ]; then ok "G: a fresh tracked binary does not fail the overall --doctor exit"; else no "G: overall exit was $FRC, expected 0"; fi
+if echo "$FOUT" | xmllint --noout - 2>/dev/null; then ok "G: xmllint clean (fresh case)"; else no "G: xmllint reported malformed XML (fresh case)"; fi
 
 # non-git root degrades quietly (ok=1, non_git=1) — mirrors the git-row's own non-repo degrade in (C).
 NGOUT="$( "$BIN" "$NONREPO" --doctor --no-cache 2>/dev/null )"
@@ -307,8 +516,8 @@ echo "$NGOUT" | grep -q '<c n="tracked-binaries" ok="1"' && echo "$NGOUT" | grep
 REPO2="$TMP/repo2"; mkdir -p "$REPO2"; echo 'int g(){return 0;}' >"$REPO2/g.cpp"
 MOUT="$( "$BIN" "$REPO" "$REPO2" --doctor --no-cache 2>&1 )"
 MRC=$?
-[ "$MRC" -eq 1 ] && ok "multi-root --doctor refuses (exit 1)" || no "multi-root --doctor exit was $MRC, expected 1"
-echo "$MOUT" | grep -qi 'doctor' && ok "multi-root refusal names --doctor" || no "multi-root refusal message missing"
+if [ "$MRC" -eq 1 ]; then ok "multi-root --doctor refuses (exit 1)"; else no "multi-root --doctor exit was $MRC, expected 1"; fi
+if echo "$MOUT" | grep -qi 'doctor'; then ok "multi-root refusal names --doctor"; else no "multi-root refusal message missing"; fi
 
 # §L10: a legend, and blobs_floor= when the 4096-blob scan cap fires — blobs="4096" alone cannot say
 # whether that is the TRUE count or a floor (at least that many). Built in an ISOLATED TMPDIR (never the
@@ -344,7 +553,7 @@ echo "$CAP_ROW" | grep -q 'truncated="1"' \
 [ "$CAPOUT1" = "$CAPOUT2" ] \
     && ok "L10: over-the-cap cache-dir row is byte-identical run-to-run (truncated is monotone in blobs, not a flake)" \
     || { no "L10: over-the-cap cache-dir row DIFFERED run-to-run on a static fixture"; diff <(echo "$CAPOUT1") <(echo "$CAPOUT2"); }
-echo "$CAPOUT1" | xmllint --noout - 2>/dev/null && ok "L10: over-the-cap output is well-formed XML" || no "L10: over-the-cap output malformed XML"
+if echo "$CAPOUT1" | xmllint --noout - 2>/dev/null; then ok "L10: over-the-cap output is well-formed XML"; else no "L10: over-the-cap output malformed XML"; fi
 
 # ── (H) TWO SHAS, LABELLED: built_from= (the binary) vs at= (the tree) ──────────────────────────
 # lens2-crossverb L6 (capture-audit-2026-09-04): --version printed "git <sha>" — the commit this BINARY was
@@ -367,7 +576,7 @@ BUILT="$( printf '%s' "$HOUT" | sed -n 's/.*<doctor[^>]* built_from="\([^"]*\)".
 printf '%s' "$HOUT" | grep -q ' at="' \
     && ok "H: at= (the tree's HEAD) rides beside it, so the two facts are distinguishable" \
     || no "H: --doctor lost its at= anchor"
-printf '%s' "$HOUT" | xmllint --noout - 2>/dev/null && ok "H: xmllint clean" || no "H: malformed XML"
+if printf '%s' "$HOUT" | xmllint --noout - 2>/dev/null; then ok "H: xmllint clean"; else no "H: malformed XML"; fi
 
 
 # ── (V) F6 — the machine-dependent fields are NAMED, and everything else is deterministic under load ─────
@@ -381,7 +590,7 @@ printf '%s' "$HOUT" | xmllint --noout - 2>/dev/null && ok "H: xmllint clean" || 
 # one shared helper (test/lib/doctorvolatile.sh). See that file for why a hard-coded list was not enough.
 echo
 VOUT="$TMP/v_doctor.xml"
-"$BIN" "$REPO" --doctor >"$VOUT" 2>/dev/null
+"$BIN" "$REPO" --doctor --legend=full >"$VOUT" 2>/dev/null
 VLIST="$( grep -oE '<c n="cache-dir"[^>]*>' "$VOUT" | head -1 | grep -oE ' volatile="[^"]*"' | sed -E 's/.*="([^"]*)"/\1/' )"
 if [ -z "$VLIST" ]; then
     no "(V) the cache-dir row does not declare volatile= — the fields that read live machine state are unnamed, so every reader has to guess (and two gates guessed differently)"

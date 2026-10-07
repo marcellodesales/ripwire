@@ -4,8 +4,8 @@
 # WHY THIS GATE EXISTS. PageRank here stops on one of two conditions: the L1 residual falls below tolerance
 # (the fixed point), or the iteration ceiling is reached with the residual still above it (a TRUNCATION of
 # the computation). Before this item the two produced byte-identical documents. `pageRankDouble` fired
-# DEGRADED_PATH_ALERT on the truncating exit and returned its iteration count; `rankGraphTeleport` discarded
-# that return, and DEGRADED_PATH_ALERT is `#ifndef NDEBUG`, so on every shipped Release binary it is not code
+# DISCLOSE on the truncating exit and returned its iteration count; `rankGraphTeleport` discarded
+# that return, and DISCLOSE is `#ifndef NDEBUG`, so on every shipped Release binary it is not code
 # at all. A release build emitted a ranking from an unfinished iteration with no alert, no attribute, exit 0.
 # `pr_iters=` / `pr_converged=` put the fact in the document, where a release build cannot delete it.
 #
@@ -40,7 +40,7 @@
 # arm (C) proves it, so the arming mechanism cannot become a way to change shipped behaviour — it is not a
 # flag and appears in no --help (arm (G) asserts that), and unlike serialize.h's RIPWIRE_FAULT_CHARGE_BUFFER
 # it is honoured in EVERY build flavour, which is the whole point: the question this gate asks is whether an
-# NDEBUG build still discloses after DEGRADED_PATH_ALERT has been compiled out of it.
+# NDEBUG build still discloses after DISCLOSE has been compiled out of it.
 #
 # Arms:
 #   (A) presence   — the default map root carries pr_iters="N" with 1 <= N <= 100, and NO pr_converged=
@@ -75,7 +75,7 @@ TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 cd "$ROOT"
 CORPUS="test/fixture"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 # The root open tag of an XML document, which is where every one of these attributes lives.
@@ -85,7 +85,8 @@ rootTag(){ grep -o '<r [^>]*>' "$1" | head -1; }
 # The number is asserted as a RANGE, not a value: pinning 13 would red on any corpus edit and teach the
 # next agent to update the expectation instead of reading it. What must hold is that it is a real
 # iteration count — at least one iteration ran, and it is inside the ceiling the kernel ships with.
-"$BIN" "$CORPUS" --no-cache >"$TMP/a.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; (B) and (I) read the FULL legend's pr_converged= prose, so these runs ask for it.
+"$BIN" "$CORPUS" --no-cache --legend=full >"$TMP/a.xml" 2>/dev/null
 aRoot="$( rootTag "$TMP/a.xml" )"
 aIters="$( printf '%s' "$aRoot" | sed -n 's/.* pr_iters="\([0-9]*\)".*/\1/p' )"
 if [ -n "$aIters" ] && [ "$aIters" -ge 1 ] 2>/dev/null && [ "$aIters" -le 100 ]; then
@@ -99,7 +100,7 @@ case "$aRoot" in
 esac
 
 # ── (B) the truncating exit, plain build ──────────────────────────────────────────────────────────
-RIPWIRE_TEST_PR_MAXITERS=2 "$BIN" "$CORPUS" --no-cache >"$TMP/b.xml" 2>/dev/null
+RIPWIRE_TEST_PR_MAXITERS=2 "$BIN" "$CORPUS" --no-cache --legend=full >"$TMP/b.xml" 2>/dev/null
 bRoot="$( rootTag "$TMP/b.xml" )"
 case "$bRoot" in
     *' pr_iters="2"'*' pr_converged="0"'*) ok "(B) plain build discloses the truncation: $bRoot" ;;
@@ -117,7 +118,7 @@ else
 fi
 
 # ── (B2) the truncating exit under NDEBUG — the reason this whole item exists ──────────────────────
-# A Release build has no DEGRADED_PATH_ALERT. If the disclosure were still carried by the alert, this arm
+# A Release build has no DISCLOSE. If the disclosure were still carried by the alert, this arm
 # is where that would show. Build the reference with:
 #     cmake -S . -B build_rel -DCMAKE_BUILD_TYPE=Release && cmake --build build_rel -j
 #     RIPWIRE_RELEASE_BIN=build_rel/ripwire bash test/prconvergecheck.sh
@@ -150,7 +151,7 @@ fi
 # hook would be a behaviour switch rather than a test ceiling, and every arm above would be measuring a
 # binary nobody ships.
 for v in 100 100000 0 "" "2x" "x2" " 2" "-2"; do
-    RIPWIRE_TEST_PR_MAXITERS="$v" "$BIN" "$CORPUS" --no-cache >"$TMP/c.xml" 2>/dev/null
+    RIPWIRE_TEST_PR_MAXITERS="$v" "$BIN" "$CORPUS" --no-cache --legend=full >"$TMP/c.xml" 2>/dev/null
     if cmp -s "$TMP/a.xml" "$TMP/c.xml"; then
         ok "(C) RIPWIRE_TEST_PR_MAXITERS='$v' leaves the document byte-identical (cannot raise, cannot corrupt)"
     else
@@ -215,7 +216,7 @@ grep -q '"pr_iters":2,"pr_converged":false' "$TMP/f2.json" \
     || no "(F) the truncated JSON run does not carry \"pr_iters\":2,\"pr_converged\":false"
 
 # ── (G) the hook is not a flag (G5) ───────────────────────────────────────────────────────────────
-if "$BIN" --help 2>&1 | grep -q 'RIPWIRE_TEST_PR_MAXITERS'; then
+if "$BIN" --help=all 2>&1 | grep -q 'RIPWIRE_TEST_PR_MAXITERS'; then
     no "(G) RIPWIRE_TEST_PR_MAXITERS is advertised in --help — it is a gate's arming hook, not a user surface"
 else
     ok "(G) RIPWIRE_TEST_PR_MAXITERS appears in no --help text (G5)"

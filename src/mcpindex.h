@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // mcpindex.h — the warm in-memory index for --mcp: parse-once/reuse-across-calls
 // {ingest, graph, rank} keyed by root, its staleness machinery (mtime+size stat sweep, the
@@ -18,51 +21,38 @@
 #include "gitmine.h"
 #include "lexical.h"
 #include "recall.h"
+#include "valuerefs.h"          // reference-as-value round: the per-index ValueRefIndex cache (valueRefIndexOf)
 #include "situ.h"
 #include "workspace.h"          // multi-root `paths` array (A11): root hygiene + labels + merge
+#include "infra/statclock.h"    // rw::saturatingNanoseconds — the staleness stat reads without signed overflow past 2262
 #include "quality.h"            // computeSnapshot/computeDelta + writeBaseline + gitHeadSha/computeHeadSnapshot — the quality_delta/quality_baseline verbs reuse the exact CLI logic
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — no-op in release; the visible line on a watcher-degrade path
+#include "infra/Diagnostics.h"  // DISCLOSE — no-op in release; the visible line on a watcher-degrade path
 #include "infra/hashutil.h"     // sanitizer-clean modulo-2^64 FNV multiplication
 
-#include <sys/stat.h>
-#include <sys/time.h>  // struct timespec for a non-blocking kevent poll
-#include <fcntl.h>     // open() the watched dir fds + O_CREAT for the per-file edit lockfile
-#include <unistd.h>    // close()
-#include <sys/file.h>  // flock(LOCK_EX|LOCK_NB) — the ripwire-vs-ripwire edit serializer (F1); POSIX-wide, incl. glibc
+#include "infra/os.h"    // rw::os — stat + the nanosecond stat fields, open/close, flock, and the directory watcher
 
-// kqueue/kevent is a BSD interface: <sys/event.h> does not exist on Linux at all, which is where the first
-// public CI run stopped ("fatal error: sys/event.h: No such file or directory", both ubuntu legs). It powers
-// ONE optimisation — eliding the directory-mtime sweep on a settled tree — and the watcher already has a
-// fully-specified degrade path for "kqueue unavailable" (see FsWatcher below): stay unhealthy, and getIndex()
-// runs the full stat/mtime sweep on every request, i.e. the exact pre-Feature-1 behaviour. A platform without
-// kqueue takes that same path, so the MCP staleness CONTRACT is unchanged — a stale index is still detected
-// on request, by the per-file mtime+size loop that runs regardless of the watcher. FUTURE UPGRADE: inotify
-// (Linux) / FSEvents would restore the elision; that is new code with its own event-semantics bug surface and
-// is deliberately not attempted here, because the poll fallback is already correct.
+// The FS-event watcher (os::dirwatch_*) exists only where the platform has kqueue: <sys/event.h> does not exist on
+// Linux at all, which is where the first public CI run stopped ("fatal error: sys/event.h: No such file or
+// directory", both ubuntu legs). It powers ONE optimisation — eliding the directory-mtime sweep on a settled tree —
+// and the watcher already has a fully-specified degrade path for "no watcher" (see FsWatcher below): stay
+// unhealthy, and getIndex() runs the full stat/mtime sweep on every request, i.e. the exact pre-Feature-1
+// behaviour. A platform without kqueue takes that same path, so the MCP staleness CONTRACT is unchanged — a stale
+// index is still detected on request, by the per-file mtime+size loop that runs regardless of the watcher. FUTURE
+// UPGRADE: inotify (Linux) / FSEvents would restore the elision; that is new code with its own event-semantics bug
+// surface and is deliberately not attempted here, because the poll fallback is already correct.
 //
-// The `#ifndef` is a deliberate override seam, not decoration: `-DRIPWIRE_HAS_KQUEUE=0` compiles the Linux
-// path on a Mac, so the fallback can be built and RUN here instead of being first discovered by a CI leg
-// nobody can reproduce locally.
+// `-DRW_OS_HAS_KQUEUE=0` (read by os.h) compiles the no-watcher path on a Mac, so the fallback can be built and RUN
+// here instead of being first discovered by a CI leg nobody can reproduce locally.
 //
-// L2 (Linux runtime probe) — why FsWatcher::arm's no-kqueue branch is SILENT while its kqueue()-failed
-// branch still emits DEGRADED_PATH_ALERT. An alert marks an UNEXPECTED fallback: something that normally
-// works did not, this run. On a build with no kqueue at all (every Linux build, and any
-// -DRIPWIRE_HAS_KQUEUE=0 build), the stat-sweep is not a fallback — it is the only path the binary has,
-// taken on every arm() call for the life of the process, forever. Alerting on it made every Linux MCP run
-// emit a degrade line nobody can act on, and reddened the stderr-clean gates that correctly read an alert as
-// a signal. The freshness CONTRACT is identical either way, which is precisely why that branch has nothing
-// to report. A RUNTIME kqueue() failure on a kqueue platform is the opposite event — the fast path exists
-// and did not come up — so it keeps its alert.
-#ifndef RIPWIRE_HAS_KQUEUE
-  #if defined( __APPLE__ ) || defined( __FreeBSD__ ) || defined( __OpenBSD__ ) || defined( __NetBSD__ ) || defined( __DragonFly__ )
-    #define RIPWIRE_HAS_KQUEUE 1
-  #else
-    #define RIPWIRE_HAS_KQUEUE 0
-  #endif
-#endif
-#if RIPWIRE_HAS_KQUEUE
-#include <sys/event.h>     // kqueue / kevent — the FS-event freshness watcher (macOS/BSD; Feature-1 hot-reload)
-#endif
+// L2 (Linux runtime probe) — why FsWatcher::arm's no-watcher branch (os::dirwatch_available() is false) is SILENT
+// while its watcher-failed branch still emits DISCLOSE. An alert marks an UNEXPECTED fallback: something
+// that normally works did not, this run. On a build with no watcher at all (every Linux build, and any
+// -DRW_OS_HAS_KQUEUE=0 build), the stat-sweep is not a fallback — it is the only path the binary has, taken on
+// every arm() call for the life of the process, forever. Alerting on it made every Linux MCP run emit a degrade
+// line nobody can act on, and reddened the stderr-clean gates that correctly read an alert as a signal. The
+// freshness CONTRACT is identical either way, which is precisely why that branch has nothing to report. A RUNTIME
+// kqueue() failure on a kqueue platform is the opposite event — the fast path exists and did not come up — so it
+// keeps its alert.
 
 #include <algorithm>    // std::sort — the card-A3 content-change merge-walk over two path lists
 #include <atomic>       // RIPWIRE_MCP_TIMINGS rebuild-count observable (env-gated stderr timing; off → untouched)
@@ -86,46 +76,34 @@ namespace rw
 
 namespace mcpdetail
 {
-    // nanosecond mtime out of a filled `struct stat`. The sub-second field is spelled DIFFERENTLY per
-    // platform — st_mtimespec on Darwin/BSD, st_mtim on Linux (POSIX.1-2008) — and neither name exists on
-    // the other, so this is a compile error, not a portability nicety. Same ladder (and same whole-second
-    // last resort) as ingest.cpp's statSizeTimes; kept local rather than shared because that one lives in a
+    // nanosecond mtime out of a filled stat_t, saturating past 2262 (infra/statclock.h) where the plain product
+    // overflowed. os::st_mtim reads the sub-second field under whichever name the platform gives it (st_mtimespec
+    // on Darwin/BSD, st_mtim on Linux, a whole-second fallback elsewhere), so no platform switch is needed here.
+    // Same arithmetic as ingest.cpp's statSizeTimes; kept local rather than shared because that one lives in a
     // .cpp and hoisting it would move ingest internals into a header for two call sites.
-    inline long long mtimeNsOf( const struct stat& st ) noexcept
+    inline long long mtimeNsOf( const os::stat_t& st ) noexcept
     {
-#if defined( __APPLE__ ) || defined( __FreeBSD__ ) || defined( __OpenBSD__ ) || defined( __NetBSD__ )
-        return (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
-#elif defined( __linux__ )
-        return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
-#else
-        return (long long)st.st_mtime * 1000000000LL;   // whole-second fallback
-#endif
+        return saturatingNanoseconds( os::st_mtim( st ) );
     }
 
     // nanosecond mtime of a path, or -1 if it can't be stat'd. The staleness signal for the in-memory index.
     inline long long mtimeOf( const std::string& p )
     {
-        struct stat st;
-        if( ::stat( p.c_str(), &st ) != 0 )
+        os::stat_t st;
+        if( os::stat( p.c_str(), &st ) != 0 )
         {
             return -1;
         }
         return mtimeNsOf( st );
     }
 
-    // ctime-ns out of a filled `struct stat`, spelled per platform exactly like mtimeNsOf above. POSIX
-    // st_ctime is the inode CHANGE time, not a creation time: it moves on any write to the file and on any
-    // metadata change, INCLUDING the utimes() that a `touch -r` / `cp -p` / mtime-preserving editor performs.
-    // There is no POSIX interface for setting it, so an unprivileged writer cannot restore it.
-    inline long long ctimeNsOf( const struct stat& st ) noexcept
+    // ctime-ns out of a filled stat_t, exactly like mtimeNsOf above. POSIX st_ctime is the inode CHANGE time, not a
+    // creation time: it moves on any write to the file and on any metadata change, INCLUDING the utimes() that a
+    // `touch -r` / `cp -p` / mtime-preserving editor performs. There is no POSIX interface for setting it, so an
+    // unprivileged writer cannot restore it.
+    inline long long ctimeNsOf( const os::stat_t& st ) noexcept
     {
-#if defined( __APPLE__ ) || defined( __FreeBSD__ ) || defined( __OpenBSD__ ) || defined( __NetBSD__ )
-        return (long long)st.st_ctimespec.tv_sec * 1000000000LL + st.st_ctimespec.tv_nsec;
-#elif defined( __linux__ )
-        return (long long)st.st_ctim.tv_sec * 1000000000LL + st.st_ctim.tv_nsec;
-#else
-        return (long long)st.st_ctime * 1000000000LL;   // whole-second fallback
-#endif
+        return saturatingNanoseconds( os::st_ctim( st ) );
     }
 
     // (mtime-ns, size, ctime-ns) of a path in ONE stat(), or (-1,-1,-1) if it can't be stat'd. mcpStale()
@@ -134,8 +112,8 @@ namespace mcpdetail
     struct FileStat { long long mtimeNs; long long sizeBytes; long long ctimeNs; };
     inline FileStat statOf( const std::string& p )
     {
-        struct stat st;
-        if( ::stat( p.c_str(), &st ) != 0 )
+        os::stat_t st;
+        if( os::stat( p.c_str(), &st ) != 0 )
         {
             return { -1, -1, -1 };
         }
@@ -249,13 +227,13 @@ namespace mcpdetail
             {
                 if( fd >= 0 )
                 {
-                    ::close( fd );
+                    os::close( fd );
                 }
             }
             dirFds.clear();
             if( kq >= 0 )
             {
-                ::close( kq );
+                os::close( kq );
             }
             kq = -1;
             healthy = false;
@@ -275,35 +253,38 @@ namespace mcpdetail
         void arm( const std::vector<std::string>& dirs )
         {
             reset();
-#if !RIPWIRE_HAS_KQUEUE                                             // the DESIGNED path here (no watcher exists) — unhealthy → getIndex() always sweeps, silently
-            (void) dirs; return;
-#else
-            kq = ::kqueue();
-            if( kq < 0 ) { DEGRADED_PATH_ALERT( "mcp watcher: kqueue() unavailable — falling back to stat-sweep freshness" ); return; }
+            if( !os::dirwatch_available() )                             // the DESIGNED path here (no watcher exists) — unhealthy → getIndex() always sweeps, silently (L2)
+            {
+                return;
+            }
+            kq = os::dirwatch_open();
+            if( kq < 0 )
+            {
+                DISCLOSE( Diagnostics::answerUnchanged, "the full stat sweep keeps the index exactly as fresh: only slower",
+                          "mcp watcher: kqueue() unavailable — falling back to stat-sweep freshness" );
+                return;
+            }
 
             dirFds.reserve( dirs.size() );
             for( const std::string& d : dirs )
             {
-                const int fd = ::open( d.c_str(), O_RDONLY | O_CLOEXEC );
+                const int fd = os::open( d.c_str(), O_RDONLY | O_CLOEXEC );
                 bool isRegistered = fd >= 0;
                 if( isRegistered )
                 {
-                    struct kevent ev;
-                    EV_SET( &ev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
-                            NOTE_WRITE | NOTE_DELETE | NOTE_RENAME | NOTE_EXTEND, 0, nullptr );
-                    struct timespec zero = { 0, 0 };
-                    if( ::kevent( kq, &ev, 1, nullptr, 0, &zero ) < 0 ) { ::close( fd ); isRegistered = false; }
+                    os::dirwatch_event ev;
+                    if( os::dirwatch_add( kq, fd, &ev ) < 0 ) { os::close( fd ); isRegistered = false; }
                 }
                 if( !isRegistered )                                     // fd limit / unopenable dir → degrade whole
                 {
-                    DEGRADED_PATH_ALERT( "mcp watcher: dir watch failed (fd limit or unopenable dir) — falling back to stat-sweep freshness" );
+                    DISCLOSE( Diagnostics::answerUnchanged, "the full stat sweep keeps the index exactly as fresh: only slower",
+                              "mcp watcher: dir watch failed (fd limit or unopenable dir) — falling back to stat-sweep freshness" );
                     reset();
                     return;
                 }
                 dirFds.push_back( fd );
             }
             healthy = true;                                             // kq live AND every dir registered → the fast path is available
-#endif
         }
 
         // drain all pending events (EV_CLEAR → edge-triggered, so this both reports AND resets them). Returns
@@ -313,15 +294,14 @@ namespace mcpdetail
         {
             if( kq < 0 )
             {
-                return true; // unhealthy (incl. every non-kqueue platform, where arm() never opens kq) → force the sweep
+                return true; // unhealthy (incl. every platform with no watcher, where arm() never opens kq) → force the sweep
             }
-#if RIPWIRE_HAS_KQUEUE
-            struct kevent out[ 32 ];
-            struct timespec zero = { 0, 0 };
-            bool any = false;
+            os::dirwatch_event out[ os::kDirwatchBatch ];
+            struct timespec    zero = { 0, 0 };
+            bool               any = false;
             for( ;; )
             {
-                const int n = ::kevent( kq, nullptr, 0, out, 32, &zero );
+                const int n = os::dirwatch_poll( kq, out, os::kDirwatchBatch, &zero );
                 if( n < 0 )
                 {
                     return true; // poll error → conservative: assume changed
@@ -331,15 +311,12 @@ namespace mcpdetail
                     break;
                 }
                 any = true;
-                if( n < 32 )
+                if( n < os::kDirwatchBatch )
                 {
                     break; // fewer than the batch cap → queue drained
                 }
             }
             return any;
-#else
-            return true;
-#endif
         }
     };
 
@@ -424,7 +401,7 @@ namespace mcpdetail
     {
         const std::uint64_t idHash = str64( stableHandleId( canonId, path, name ) );
         char buf[ 64 ];
-        std::snprintf( buf, sizeof( buf ), "sym#%016llx@%016llx",
+        rw::formatTo( buf, sizeof( buf ), "sym#{:016x}@{:016x}",
                        (unsigned long long)idHash, (unsigned long long)contentHash );
         return buf;
     }
@@ -524,6 +501,8 @@ struct McpIndex
                                                       //   pr_iters= / pr_converged= on every ranked MCP payload.
                                                       //   Held beside the vector it describes so a verb cannot
                                                       //   serve one without the other (src/prconverge.h).
+    bool                              isCleanWorkingSet = false;   // no uncommitted change: `rank` is the plain uniform one,
+                                                                   //   the default map's question — analyze picks code-first
     std::vector<long long>            fileMtime;   // parallel to ing.files
     std::vector<long long>            fileSize;    // parallel to ing.files: st_size at index build (staleness fast-path discriminator,
                                                    //   free from the same stat() as mtime — a size change is caught without a read).
@@ -550,6 +529,16 @@ struct McpIndex
     // working-set personalization (feature 2, Cody-style): the uncommitted-diff mask `rank` was teleport-biased
     // toward, as of the LAST rebuild — kept so mcpStale() can detect "same tree, different diff" (see below).
     std::uint64_t                     workingSetHash = 0;   // FNV-1a of the changed-file id list used to build `rank`
+
+    // Reference-as-value round: the value-reference index (src/valuerefs.h) is O(references) to build, which on a large
+    // tree is most of a warm 1-hop call's cost — so it is built on first use and reused until `ing` is replaced. It
+    // holds pointers into `ing` (ValueRefIndex::m_importsByFile keeps `const Binding*`), so EVERY write of `ing` drops
+    // it first: getIndex's rebuild and releaseMcpIndexMemory. Keying it on contentHash was not enough — a rebuild with
+    // unchanged file content (a directory mtime moved, or only a file's ctime after a chmod) keeps contentHash and the
+    // reference count, and the old index then read the freed bindings. Pure cache: it is a function of `ing`, so no
+    // output byte depends on whether it was warm.
+    mutable std::shared_ptr<const ValueRefIndex> valueRefs;
+    mutable std::uint64_t                        valueRefBuilds = 0;   // monotone: McpRequestTiming's vri= reads it
 
     // ── P1-15 incremental-pass disclosure (the `_reingest` envelope field; mcpReingestField below).
     //
@@ -581,14 +570,21 @@ struct McpIndex
 // Cache file path, deterministic per (user, root), under the shared private cache ladder and its existing
 // two-hex shard layout. MCP sessions used to leave one flat file per temporary checkout directly in TMPDIR;
 // tens of thousands of those files made every later cache-hygiene scan enumerate the shared directory.
+//
+// The root field is `quality::cacheRootKeyHex` — the ONE canonical spelling the CLI families use, so an MCP
+// blob is pinned by the byte-budget sweep alongside its own root's lean/rich/qchurn siblings instead of
+// looking like a foreign root. This used to open-code the hash AND skip realpath entirely, so the MCP blob
+// diverged from the CLI's twice over: a different offset basis, and a key that followed the SPELLING of the
+// root (a trailing slash or a symlinked checkout minted a second blob).
+//
+// The name carries the build tag too (`ripwire-mcp-<rootKey>-c<format>p<parser>.cache`, quality.h rootBlobTail): two MCP
+// servers of different formats on one root — an agent wired to an older install beside one wired to a newer —
+// each keep their own warm index instead of refusing and rewriting one file on every start.
 inline std::string mcpCachePath( const std::string& root )
 {
-    std::uint64_t h = 1469598103934665603ULL;     // FNV-1a of the root → a stable per-root cache name
-    for( char c : root ) { h ^= static_cast<unsigned char>( c ); h = hashutil::fnv1aMultiply( h ); }
-    char name[ 64 ];
-    std::snprintf( name, sizeof( name ), "ripwire-mcp-%016llx.cache", (unsigned long long)h );
-
-    return quality::resolveCacheBlobPath( quality::cacheDirLadder(), name );
+    std::string path = quality::rootKeyedCachePath( root, quality::RootBlobFamily::Mcp );
+    ENSURES( path.ends_with( ".cache" ), "the MCP index family's row names a .cache blob, flat or sharded" );
+    return path;
 }
 
 // working-set (Cody-style): FNV-1a-64 of the SORTED changed-file id list, so the hash is a pure
@@ -818,6 +814,22 @@ inline void invalidateMcpIndex()
     mcpIndexSlot().valid = false;
 }
 
+// #350: over the memory guard's hard limit, drop the resident index's bulk (the ingest, the graph, the ranks and the
+// per-file arrays) and mark it stale, so the footprint can fall back under the line; the next getIndex() rebuilds.
+inline void releaseMcpIndexMemory()
+{
+    McpIndex& ix = mcpIndexSlot();
+    ix.valid = false;
+    ix.valueRefs.reset();   // it points into `ing` (see McpIndex::valueRefs) — and it is resident bulk too
+    ix.ing   = IngestResult{};
+    ix.g     = Graph{};
+    std::vector<float>().swap( ix.rank );
+    std::vector<long long>().swap( ix.fileMtime );
+    std::vector<long long>().swap( ix.fileSize );
+    std::vector<long long>().swap( ix.fileCtime );
+    std::vector<std::uint64_t>().swap( ix.fileByteHash );
+}
+
 // RIPWIRE_MCP_TIMINGS observable (MEASURE-FIRST, mirrors ingest.cpp's RIPWIRE_CACHE_STATS precedent): a
 // monotone count of FULL getIndex() rebuilds (the staleness/edit path — NOT warm reuses). The spec_trace
 // harness reads it before/after each request to attribute per-request wall time to "rebuilt" vs "warm".
@@ -827,6 +839,43 @@ inline std::atomic<std::uint64_t>& mcpRebuildCounter()
     static std::atomic<std::uint64_t> n{ 0 };
     return n;
 }
+
+// The RIPWIRE_MCP_TIMINGS line of one request, shared by the stdio loop (runMcp) and the HTTP server (runMcpHttp):
+//   ripwire-timing verb=<v> wall_ms=<f> rebuilt=<0|1> vri=<0|1>
+// rebuilt=1: a full getIndex() rebuild fired while the request was handled (mcpRebuildCounter). vri=1: the request built
+// the value-reference index (McpIndex::valueRefBuilds) — once after every rebuild, never on a warm reuse. Off (the env
+// unset): no clock read, no counter read, nothing printed. stderr only, after the response is out.
+struct McpRequestTiming
+{
+    explicit McpRequestTiming( bool timingsOn )
+        : m_on( timingsOn )
+    {
+        if( m_on )
+        {
+            m_t0          = std::chrono::steady_clock::now();
+            m_rebuildAt0  = mcpRebuildCounter().load( std::memory_order_relaxed );
+            m_vriAt0      = mcpIndexSlot().valueRefBuilds;
+        }
+    }
+    void emit( std::string_view verb ) const
+    {
+        if( !m_on )
+        {
+            return;
+        }
+        const double   wallMs  = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - m_t0 ).count();
+        const unsigned rebuilt = mcpRebuildCounter().load( std::memory_order_relaxed ) != m_rebuildAt0 ? 1u : 0u;
+        const unsigned vri     = mcpIndexSlot().valueRefBuilds != m_vriAt0 ? 1u : 0u;
+        rw::emitTo( stderr, "ripwire-timing verb={} wall_ms={:.3f} rebuilt={} vri={}\n", verb, wallMs, rebuilt, vri );
+        std::fflush( stderr );
+    }
+
+private:
+    bool                                  m_on = false;
+    std::chrono::steady_clock::time_point m_t0{};
+    std::uint64_t                         m_rebuildAt0 = 0;
+    std::uint64_t                         m_vriAt0     = 0;
+};
 
 // P1-15 — the `_reingest` envelope field for a response whose handling ran an INCREMENTAL pass, or "" when
 // it did not. `passesAtEntry` is McpIndex::incrementalPasses as read before the verb ran; a difference means
@@ -964,8 +1013,8 @@ inline std::size_t mcpPrefetchMinFiles()
 inline std::uint64_t gitHeadMoveToken( const std::string& root )
 {
     std::string gitDir = root + "/.git";
-    struct stat st;
-    if( ::stat( gitDir.c_str(), &st ) != 0 )
+    os::stat_t st;
+    if( os::stat( gitDir.c_str(), &st ) != 0 )
     {
         return 0; // not a git working tree we track
     }
@@ -994,7 +1043,7 @@ inline std::uint64_t gitHeadMoveToken( const std::string& root )
         {
             return 0;
         }
-        if( gd.front() != '/' )
+        if( !os::path_is_absolute( gd ) )   // "/x" here; "C:/x" in a Windows checkout's .git file (git writes that spelling)
         {
             gd = root + "/" + gd; // relative gitdir → resolve against root
         }
@@ -1085,19 +1134,31 @@ inline void maybePrefetchHeadSnapshot( const std::string& root, std::size_t file
     mcpPrefetchSpawnCount().fetch_add( 1, std::memory_order_relaxed );
 
     const bool timingsOn = std::getenv( "RIPWIRE_MCP_TIMINGS" ) != nullptr;
-    if( timingsOn ) { std::fprintf( stderr, "ripwire-prefetch spawn root=%s\n", root.c_str() ); std::fflush( stderr ); }
+    if( timingsOn ) { rw::emitTo( stderr, "ripwire-prefetch spawn root={}\n", root.c_str() ); std::fflush( stderr ); }
 
     // DETACHED worker: copies `root` by value (no dangling), runs the SAME computeHeadSnapshot the lazy
     // quality_delta uses with the SAME default args (so it warms the IDENTICAL qsnap key), then clears the
     // in-flight flag via an RAII guard on EVERY exit path. (3) discard-on-error: a throw (OOM at operator new)
     // is swallowed; the flag is always cleared so the mechanism never wedges.
-    std::thread( [ root, timingsOn ]()
+    std::thread( [ root, timingsOn ]() noexcept
     {
         struct FlagGuard { ~FlagGuard(){ mcpPrefetchInFlight().store( false, std::memory_order_release ); } } guard;
         try   { (void)rw::quality::computeHeadSnapshot( root ); }      // side effect: warm the sha-keyed qsnap (atomic publish)
         catch( ... ) { /* optional work — drop silently (§2b rule 3) */ }
-        if( timingsOn ) { std::fprintf( stderr, "ripwire-prefetch done root=%s\n", root.c_str() ); std::fflush( stderr ); }
+        if( timingsOn ) { rw::emitTo( stderr, "ripwire-prefetch done root={}\n", root.c_str() ); std::fflush( stderr ); }
     } ).detach();
+}
+
+// The value-reference index of `ix`, built on first use and reused until `ix.ing` is replaced (every writer of `ing`
+// resets it — see McpIndex::valueRefs).
+inline const ValueRefIndex& valueRefIndexOf( const McpIndex& ix )
+{
+    if( !ix.valueRefs )
+    {
+        ix.valueRefs = std::make_shared<const ValueRefIndex>( ix.ing );
+        ++ix.valueRefBuilds;
+    }
+    return *ix.valueRefs;
 }
 
 // the cached index for `root`, rebuilt only when stale (otherwise returned as-is, no parse, no graph rebuild).
@@ -1131,6 +1192,10 @@ inline const McpIndex& getIndex( const std::string& root )
     // read at the same moment and for the same reason as the line above. Rebuild path only — nothing here
     // touches the warm reuse that returned above.
     const McpRebuildBaseline a3Before = mcpRebuildBaseline( ix, isIncrementalPass );
+
+    // `ing` is about to be replaced: the value-reference index points into it (McpIndex::valueRefs), so it goes first —
+    // whether or not the file content moved.
+    ix.valueRefs.reset();
 
     // Multi-root workspace key (A11): per-root ingest (each with ITS OWN mcpCachePath blob — an edit in
     // one root never reparses another) merged into one IngestResult; else the single-root path unchanged.
@@ -1197,6 +1262,9 @@ inline const McpIndex& getIndex( const std::string& root )
         }
     }
     ix.workingSetHash = workingSetHashOf( changed );
+    // The map scope (docs/EVALS.md "Map data Sections never crowd code out of the default map"): a CLEAN working set is
+    // the default map's own question, so analyze then picks its rows code-first like the CLI map (serialize.h codeFirstKeep).
+    ix.isCleanWorkingSet = std::none_of( changed.begin(), changed.end(), []( char c ) { return c != 0; } );
     const auto [ wsRank, wsIters, wsConverged ] = rankGraphTeleport( ix.g, diffTeleport( ix.ing, changed ) );
     ix.rank         = wsRank;
     ix.prDisclosure = RankDisclosure{ wsIters, wsConverged, true };   // W2-F: a teleport variant is still a power iteration
@@ -1270,6 +1338,7 @@ inline const McpIndex& getIndex( const std::string& root )
 // identity and there is nothing to strip.
 inline void handleIdentity( const McpIndex& ix, NodeId id, std::string& canonOut, std::string& pathOut )
 {
+    ASSUME_NO_ALIAS( canonOut, pathOut );
     const Symbol&          s       = ix.ing.symbols[ id ];
     const std::string_view rootArg = ix.ing.realPaths.empty() ? std::string_view( ix.root ) : std::string_view();
     canonOut = ( id < ix.g.canonId.size() ) ? canonicalIdForEmit( ix.ing, s, rootArg ) : s.name;

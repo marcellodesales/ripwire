@@ -1,5 +1,3 @@
-<p align="center"><img src="docs/assets/banner.svg" alt="ripwire — the ripgrep of AI context" width="880"></p>
-
 [![CI](https://github.com/redhat-et/ripwire/actions/workflows/ci.yml/badge.svg)](https://github.com/redhat-et/ripwire/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/redhat-et/ripwire)](https://github.com/redhat-et/ripwire/releases/latest)
 [![Licence](https://img.shields.io/badge/licence-Apache%202.0-blue.svg)](LICENSE)
@@ -7,18 +5,112 @@
 [![Runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-none-blue.svg)](THIRD_PARTY.md)
 [![Slides](https://img.shields.io/badge/slides-the%20showcase%20deck-56d6e8.svg)](present/ripwire-showcase.pdf)
 
-# Rip'n Fast. Less Tokens. Better Code.
+<p align="center"><img src="docs/assets/banner.svg" alt="ripwire — the ripgrep of AI context" width="880"></p>
 
-## Give your coding agent a map before it reads the repo.
+# Rip'n Fast. Fewer Tokens. Better Code.
 
-**ripwire is the ripgrep of AI context.** Point it at any repository and your agent gets a ranked,
-deterministic call graph — what to touch, what it breaks, which tests to run — instead of grepping
-around and reading whole files.
+**The ripgrep of AI context. A map before your agent reads the repo — and a check on what it writes.**
 
-***Paddle out with a map.***
+Ranked, deterministic call graph: what to touch, what it breaks, which tests to run. On the edit: blast
+radius, tests that reach it, eleven quality kinds reporting only what got worse, forgotten co-changes, fields
+read and written, names that resolve more than one way.
+
+**Just want to use it?** Install it with the one line below, then start each coding session by telling your agent to
+use it, for example: *"Use ripwire on this repo."* That is all most people need: the install also teaches your agent
+when to reach for each command.
+
+**Want every detail?** [The reference guide](#reference-guide) near the bottom covers install, commands, output
+format, exit codes and limits. You do not need it to get started.
+
+<p align="center"><a href="https://trendshift.io/repositories/217924?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-217924"><img src="https://trendshift.io/api/badge/trendshift/repositories/217924/weekly?language=C%2B%2B" alt="Trendshift: C++ Repository of the Week badge for redhat-et/ripwire" width="250" height="55"></a></p>
 
 <details>
-<summary><b>Fifty years of software-engineering results, and research from last month.</b> 42 repositories and 69 papers folded — McCabe (1976) through to <b>seven papers published in the last two months</b> — each row in <a href="docs/LINEAGE.md"><b>docs/LINEAGE.md</b></a> naming the lesson taken and the file it lives in, all of it put into a single blazing-fast compiled executable</summary>
+<summary><b>Field report: what ripwire contributed to a large multi-agent coding engagement</b> — written by Claude Fable 5.0, the frontier model orchestrating ~20 coding agents over two days on a ~1,500-file C++/Metal codebase. Click for the full report.</summary>
+
+> For a single developer, this tool is a good lookup accelerator. For an *orchestrated fleet*, it's load-bearing: it
+> halved the research spend, twice redirected tasks before wasted work, prevented at least one silent-divergence shipped
+> bug, and turned code-quality hygiene from a hope into a per-task mechanical gate. Whole-workflow ~2×; per-lookup
+> 10–25×; and two moments where one call was worth more than the rest of the session's tooling combined.
+>
+> — the report's bottom line
+
+<p align="center"><a href="docs/assets/field-report-multi-agent.jpg"><img src="docs/assets/field-report-multi-agent.jpg"
+  alt="The full field report: what ripwire contributed to a large multi-agent coding engagement — headline numbers, where the value concentrated, the honest boundary, and the bottom line" width="720"></a></p>
+
+<details>
+<summary>Text version of the report</summary>
+
+**Field report: what ripwire contributed to a large multi-agent coding engagement**
+
+*Context, genericized: one orchestrating session directing ~20 sequential/parallel coding agents over a ~1,500-file
+C++/Metal codebase across two days — a deep architecture audit, then a 14-task feature wave (new subsystems,
+measurement infrastructure, a search-archive migration), ending in a verified all-on release flip. Every agent was
+instructed to lead with ripwire for orientation and to close with its quality gates.*
+
+**The headline numbers**
+
+- **Roughly half the total token spend of the audit/research phase, saved.** This is the operator's whole-phase
+  estimate — it includes everything the research agents did, ordinary file reads and all, which makes it conservative
+  rather than cherry-picked. The per-call factors underneath are much steeper: a single doc-recall call served the
+  relevant sections of a 164KB planning document in ~6K tokens (~25×), and agents that led with the tool ran ~30–40%
+  leaner on tool-call counts than agents doing raw read fan-outs over comparable questions.
+- **Two tasks had their direction changed by a single call.** One task was chartered to activate a steering behavior
+  the team believed was in production; one `--callers` query returned **zero production callers**, redirecting the
+  task to the real gap (the data provider that behavior needed had never been wired anywhere). Another task
+  refactored a widely-shared computation; `--edit-check` flagged **5 of 6 call sites** as incompatible — sites a text
+  search had missed — that would otherwise have silently diverged from the canonical path the day the feature was
+  enabled, surfacing months later as an unexplainable visual bug.
+- **A dozen-plus real code-quality defects fixed, not waived, across ~15 implementing agents** — all caught by
+  `--quality-delta` at each agent's "I think I'm done" moment: a 480-token duplicated routine, a fourth private copy of
+  a shared RNG utility, a hand-duplicated cost function, a pair of near-identical functions with a flipped sign
+  (correct at one boundary, quietly wrong at the other), test-fixture duplication across sibling suites, and functions
+  that had quietly absorbed a second job. None of these would have failed a test; all of them are the sediment that
+  rots a codebase under high-velocity multi-agent development. The gate made removing them routine instead of heroic.
+
+**Where the value concentrated**
+
+1. **Orientation and recall (the token win).** Ranked-signature task orientation and section-granular document recall
+   meant agents started from *answers*, not file dumps. Recall over planning docs was the orchestrator's single
+   most-used verb — the audit's entire framing came from two calls.
+2. **The contract checker (the shipped-bug preventions).** Beyond the 5-of-6 catch above, `--edit-check` gave
+   near-free proof-of-contract on every public-symbol change across the wave — the kind of verification that
+   otherwise simply doesn't happen at agent speed.
+3. **The quality gate as a *protocol*.** The measurable effect wasn't any single catch — it was that fifteen different
+   agents, none sharing context, all converged on the same "fix or justify with a written reason" discipline, with an
+   acknowledgments ledger that survived across tasks. Unattended orchestration usually leaks quality; here the
+   leak-check was mechanized.
+4. **Persistent notes.** Agents left gotcha notes pinned to symbols mid-wave (a caller-wiring law, an arming-rule
+   invariant), which later agents' lookups surfaced automatically — cheap institutional memory between contexts
+   that never met.
+
+**The honest boundary**
+
+- **The engagement's deepest findings did not come from the tool.** A structural capacity ceiling, a mis-derived
+  constant, a floating-point re-association drift of 1 ulp, and a seed-keying bug were all found by *bespoke
+  measurement the agents built* — baseline worktree diffs over full data fills, multi-arm attribution sweeps,
+  funnels. The tool is a floor for honesty and orientation, not a substitute for measurement design.
+- **Known false-positive mode, handled by its own documentation:** the contract checker's arity heuristic
+  over-counts on defaulted trailing parameters (one task saw "incompatible=18" that were all fine). The tool's own
+  trust-calibration notes say to verify by compiling in exactly this case, and agents that followed them lost nothing.
+- For broad, common-word conceptual queries, plain grep-and-read still occasionally won — consistent with the tool's
+  own guidance that it shines on specific technical asks.
+
+**Bottom line**
+
+For a single developer, this tool is a good lookup accelerator. For an *orchestrated fleet*, it's load-bearing: it
+halved the research spend, twice redirected tasks before wasted work, prevented at least one silent-divergence shipped
+bug, and turned code-quality hygiene from a hope into a per-task mechanical gate. Whole-workflow ~2×; per-lookup
+10–25×; and two moments where one call was worth more than the rest of the session's tooling combined.
+
+</details>
+
+*The model's own report of one engagement, on a version before 0.5; not a controlled measurement. Controlled
+measurements are in [docs/EVALS.md](docs/EVALS.md).*
+
+</details>
+
+<details>
+<summary><b>Fifty years of software-engineering results, and research from last month.</b> 49 repositories and 71 papers folded — McCabe (1976) through to <b>seven published in the last two months</b> — each row in <a href="docs/LINEAGE.md"><b>docs/LINEAGE.md</b></a> naming the lesson taken and the file it lives in</summary>
 
 Beside those sits a labelled survey of **237 tools** that contributed nothing and says so. The two
 sets are disjoint by construction, so they add rather than nest — a tool that gave a lesson is never
@@ -44,10 +136,17 @@ claim cannot quietly drift. The row-by-row ledger is
 </details>
 
 **Languages:** Rust · C++ · Objective-C/C++ · C · Metal · CUDA · Python · Go · Swift · TypeScript ·
-JavaScript · Java · Ruby · PHP · Lua · Elixir · Bash · C# · Dart · JSON · TOML · YAML · Markdown — see
+JavaScript · Java · Ruby · PHP · Lua · Elixir · Dart · Kotlin · GDScript · Bash · C# · JSON · TOML · YAML · Markdown — see
 [language support and limits](#languages).
 
-### No API key. No embeddings. No index server. No daemon.
+**Latest: 0.6.5** — TypeScript alias imports resolve, and fixes from Windows testers. [Release notes](#release-notes) ·
+[the presentation](present/ripwire-showcase.pdf) · [the changelog](CHANGELOG.md) — with thanks to the
+contributors named there; this release is largely theirs.
+
+---
+
+<p align="center"><img src="docs/assets/no-deps.svg"
+  alt="No API key. No embeddings. No index server. No daemon." width="470"></p>
 
 <details>
 <summary><b>One process, no server</b> — indexes this repository in <b>0.25 s</b> using <b>6.6 MB</b>, against <b>46.8 s</b> and <b>391 MB</b> for the graph-database MCP server it was measured against; warm queries answer in <b>197 ms</b> to its <b>1,082 ms</b></summary>
@@ -78,9 +177,52 @@ cd your-repo
 ripwire . --for="<the change you are about to make, in words>"
 ```
 
+Every install route (prebuilt, from source, per-agent skills, hooks, the MCP server) is in [INSTALL.md](INSTALL.md).
+
 **Reach for the CLI first — it is the cheaper interface.** The MCP server is the optional second
 way in, and its convenience has a cost the shell pipe does not carry: its verb schemas sit in your
 agent's context every session, whether or not it calls them.
+
+### The goal: one question, one complete answer.
+
+**Terminality is the objective.** Ask the codebase a question and the answer should carry everything
+you need — no follow-on grep, no three more whole-file reads to fill in what it left out. A call
+followed by three greps is the same search paid for twice: it does not save you tokens and it does
+not make the coding faster.
+
+<details>
+<summary>The two stair-steps that make it reachable — <b>honest about what is missing</b>, <b>priced in what it spends</b></summary>
+
+**Two things make that reachable in practice, and neither is the destination.** Answers are honest
+about their own limits — a count that cannot be a total is labelled a floor, a zero means "none
+found" and never "none exists", every truncation is disclosed — so an answer never looks more
+complete than it is, and the map never degrades the code by guessing. And an answer can be given a
+token budget, so what one costs is something you ask for rather than discover; where a complete
+answer will not fit, it says it went over rather than silently dropping the row you needed.
+
+Those two are the stair-steps: honest about what is missing, priced in what it spends. The step they
+climb toward is a question fully answered in one call, which is not always trivial to reach — and
+where it is not, the output says so rather than pretending otherwise.
+
+**How we measure the climb.** A complete answer to every code question is genuinely hard, and it is
+reached over many releases rather than in one. Until an answer can be complete, it owes you three
+things: it stays bounded in size, it is fully honest about what it does not know, and it gives you a
+clue where to look next. So every change is judged on more than "was it right":
+
+- **Complete answers:** the share of questions answered so you can act without re-checking.
+- **Honest-partial rate:** how often an incomplete answer says what it is missing, instead of
+  sounding confident.
+- **False-confidence rate:** wrong answers that claim to be complete — the worst case, held near zero.
+- **Next-clue usefulness:** for partial and wrong answers, whether following the answer's first
+  suggested next step reaches what the question needed, within one hop. Graded blind.
+
+**Answering comes first; efficiency is how we get there.** We aim for answers about as lean as the
+leanest tools, but a byte budget is never allowed to cost an answer. We have gone too far toward short
+answers before and cut information that was needed, so now every size limit has one of two jobs: a
+runaway guard far above typical answers (it catches an output bug, and says so when it trips), or a
+stair-step target where anything over it must be explained. A capped answer is always measured
+against the same answer uncapped, and the one that answers better wins.
+</details>
 
 ### Same answer, a fraction of the tokens — read this table first if your agent is on a budget
 
@@ -255,8 +397,9 @@ and the three controls below it.
 ```
 
 `cx=` complexity, `churn=` git edit frequency, `amp=` change amplification, `r=` rank; `<hops>` rows
-carry the one-hop call context, caps disclosed. Every attribute is defined in the one legend at the
-top of the real output, which also self-reports the bundle's cost — `est_tokens="3995"` here.
+carry the one-hop call context, caps disclosed. The one legend at the top of the real output defines
+them — tersely by default, every reading in full with `--legend=full` — and the root self-reports the
+bundle's cost — `est_tokens="3995"` here.
 
 </details>
 
@@ -346,6 +489,8 @@ your agent starts in the right place at all.
 | Aider repo-map 0.86.2 | 20.0% | 35.0% | *(inside query)* | 2.920 s |
 | codeseek 0.1.31 (better of its two arms) | 15.0% | 20.0% | 3.37 s | 0.040 s |
 
+*Measured 2026-08-08, before the performance work that ships in 0.6.0. ripwire has become faster since — llvm-project's cold parse (182,555 files) fell from 194.1 s to 155.6 s of CPU, and `--pack-task` on a Go repository from 8.13 s to 5.88 s — but these timing columns have not been re-measured.*
+
 <details>
 <summary>What this table costs us — six paired losses named, a runner-up we had under-credited at <b>26.7%</b> and corrected to <b>40.0%</b>, and the multi-file stratum no arm solves</summary>
 
@@ -380,7 +525,8 @@ wherever they live — not by file path alone. On an astral-sh/ruff clone (5,945
 ---
 
 *The table above, read two other ways. Every figure in both is one of its measured numbers; only the
-manners and the cynicism are editorial.*
+manners and the cynicism are editorial. Should the reader find the manners excessive, the author begs
+them to recall that the alternative was a second table.*
 
 <details>
 <summary>📖 &nbsp;<b>The same table, as narrated by Jane Austen</b></summary>
@@ -627,7 +773,16 @@ to do with it.** Two shapes get the most out of it, and one gets nothing.
 <details>
 <summary>The three controls that decide what it costs — <b>a budget</b> (<code>--token-budget</code> / <code>--top-k</code>), <b>routing</b> (<code>--help-task</code>), and <b>the skills</b> that teach an agent when <i>not</i> to reach for it</summary>
 
-1. **A budget.** `--token-budget=N` caps the bundle; `--top-k=N` caps the rows. Unbudgeted `--for` returns
+1. **A budget.** `--token-budget=N` caps the bundle; `--top-k=N` caps the rows **of the default map,
+   `--query`, `--format=candidates`, `--recall` and `--graph-query` — it does not shape plain `--for`**.
+   On `--for`, a *positive, explicit* `--top-k` is read by nothing: the run prints a stderr note
+   (`--top-k is not read by --for`) and still emits the full bundle. Two neighbours of that shape are
+   different and neither warns: `--for --format=candidates --top-k=N` *does* consume the flag (the
+   candidate export composes with it and caps the rows), and `--for --top-k=0` is refused outright by the
+   payload-only guard (`--top-k=0` needs a payload verb), not warned-and-emitted. Narrow plain `--for`
+   with its own arguments instead — `--signatures-only`
+   (drop the auto-bodies), `--token-budget=N` (shapes the bundle to fit), `--detail=N` (full bodies for
+   just the top N). Unbudgeted `--for` returns
    a rich terminal bundle by design — right when it ends the question, wasteful when it does not.
 2. **Routing.** `ripwire . --help-task="<task>"` names the ONE command the task actually wants, and
    abstains when the evidence is thin. It is advice, it never runs anything. An answer of "just grep
@@ -635,6 +790,27 @@ to do with it.** Two shapes get the most out of it, and one gets nothing.
 3. **The skills.** `skills/install.sh` teaches an agent *when* to reach for which verb. Without them
    an agent has 175 flags and no map of which moment each is for, and it will reach for the map every
    time — including the times it should not.
+</details>
+
+<details>
+<summary>The invocations first-time users get wrong — <b>WRONG → RIGHT</b>, each row a real failure reported from the field</summary>
+
+| WRONG | RIGHT | why |
+|---|---|---|
+| `ripwire . --for="…" --top-k=5` | `ripwire . --for="…" --signatures-only` (or `--token-budget=N`, `--detail=N`) | `--top-k` is inert on `--for`: the run warns on stderr and emits the full bundle anyway, so the agent *believes* it narrowed the output and did not. |
+| `ripwire . --query="…"` as the default lens | `ripwire . --for="…"` | `--query` is the raw BM25 ranking — the binary's own help calls it debug and says "use --for". It is the right tool for hunting a vocabulary, the wrong default for a task. |
+| `ripwire . --expand=SYM` where SYM is an **ambiguous** bare name | `ripwire . --expand=SYM --top-k=0` (or name it exactly: `--expand=FILE:NAME`) | A multi-match name keeps the ranked map — there IS something to disambiguate — so ~9K est_tokens of map ride along with the bodies. An **unambiguous** single match already defaults to `--top-k=0` on its own (disclosed as `topk_default="0"`); no flag needed there. |
+| `--callers=<route handler>` expecting routes | find the URL in the project's own docs (e.g. a feature map), then `--expand` the handler | Framework route handlers have no callers in the graph — the decorator reaches them, not project code. Empty `--callers` on a handler is the design, not a bug. |
+| `ripwire <dir-of-repos> …` (ONE root that happens to contain checkouts) | `cd` into ONE checkout first | Nothing refuses this: the crawl silently walks the nested repos and merges them into one corpus, so you pay for a map of everything and rank across unrelated codebases. Distinct from the real multi-root feature, which is N **explicit** positional roots (`ripwire dir1 dir2 … <verb>`, 2–16 checkouts merged on purpose). |
+
+**What ripwire does not replace** — reach for `grep`/`read` here even when a verb looks close:
+
+| still use grep/read for | why |
+|---|---|
+| route → handler lookup from a URL | ripwire ranks symbols, not URLs; it does not know your routes |
+| templates, i18n catalogs, SQL migrations | not call-graph territory |
+| one exact string in one file you can already name | `--grep=TERM` works, but `rg` is fine too — and the map is a fixed cost you did not need |
+| UX flow through frontend event handlers | the JS is in the graph, but the flow needs line context, not a ranking |
 </details>
 
 <details>
@@ -668,8 +844,9 @@ firing on the same function is corroboration rather than one metric counted twic
 
 That matters most for code an agent wrote. Empty-catch error masking is **+47%** more common in
 AI-authored commits, a function rewritten again inside two weeks **+15%** more likely, and reuse is
-*declining* as AI's share of commits grows (GitClear, *AI Copilot Code Quality*, 2026). Each of
-`--quality-delta`'s 10 kinds targets one measured mode like those, and it reports **only what your
+*declining* as AI's share of commits grows (GitClear, *AI Copilot Code Quality*, 2026). Ten of
+`--quality-delta`'s 11 kinds each target one measured mode like those (the eleventh, `placeholder`,
+lists the stubs and TODOs a change adds, and never gates), and it reports **only what your
 change made worse** — then `--exemplar` shows the pattern in your own repo to copy, and `--test-gate`
 names the tests that must run before "done."
 
@@ -691,15 +868,14 @@ call a CLI.
 <summary><b>What comes back</b> — real output from this repository, pretty-printed and trimmed (re-captured 2026-09-05; rows are served in rank order, each naming its file)</summary>
 
 ```xml
-<ctx task="incremental cache invalidation" route="routed: subtoken+body BM25 (--for's default) — no strong
-     name hit, multi-word conceptual query" confidence="high" margin_pct="20"
+<ctx task="incremental cache invalidation" route="subtoken+body" confidence="high" margin_pct="20"
      bundle="compact" bodies="0" reason="compact-route" est_tokens="3995">
   <sigs shown="23" total="40" capped="1">
     <d l="106" n="kCacheMagic" p="src/ingest_cache.h" cx="0" ccx="0" in="0" churn="11" amp="71" pure="1" r="1"
        next="--expand=src/ingest_cache.h:kCacheMagic"><doc>incremental cache (--cache): per-file content hash + raw facts so a re-run re-parses ONLY c…</doc>constexpr std::uint32_t kCacheMagic = 0x4b505443</d>
-    <d l="1307" n="spanTierMemoPath" id="src/ingest_astquery.h::rw::spanTierMemoPath" p="src/ingest_astquery.h" cx="1" ccx="0" in="2" churn="5" amp="44" r="2"><doc>Composed exactly the way every OTHER blob family is (quality.h): one fixed-width identity hex pe…</doc>inline std::string spanTierMemoPath( const std::string&amp; diskPath )</d>
-    <d l="247" n="ingestCommitTree" id="src/dmm.h::rw::dmm::ingestCommitTree" p="src/dmm.h" cx="6" ccx="5" in="1" churn="6" amp="27" r="3"><doc>Ingest the tree at `sha`, materialized out of `root`&apos;s object store. …</doc>inline bool ingestCommitTree( const std::string&amp; root, const std::string&amp; sha, … )</d>
-    <d l="841" n="mcpRefreshedThisRequest" id="src/mcpindex.h::rw::mcpRefreshedThisRequest" p="src/mcpindex.h" cx="1" ccx="0" in="2" churn="20" amp="43" r="4"><doc>P1-15 — the `_reingest` envelope field for a response whose handling ran an INCREMENTAL pass, …</doc>inline bool mcpRefreshedThisRequest( std::uint64_t passesAtEntry )</d>
+    <d l="1307" n="spanTierMemoPath" sc="rw" p="src/ingest_astquery.h" cx="1" ccx="0" in="2" churn="5" amp="44" r="2"><doc>Composed exactly the way every OTHER blob family is (quality.h): one fixed-width identity hex pe…</doc>inline std::string spanTierMemoPath( const std::string&amp; diskPath )</d>
+    <d l="247" n="ingestCommitTree" sc="rw::dmm" p="src/dmm.h" cx="6" ccx="5" in="1" churn="6" amp="27" r="3"><doc>Ingest the tree at `sha`, materialized out of `root`&apos;s object store. …</doc>inline bool ingestCommitTree( const std::string&amp; root, const std::string&amp; sha, … )</d>
+    <d l="841" n="mcpRefreshedThisRequest" sc="rw" p="src/mcpindex.h" cx="1" ccx="0" in="2" churn="20" amp="43" r="4"><doc>P1-15 — the `_reingest` envelope field for a response whose handling ran an INCREMENTAL pass, …</doc>inline bool mcpRefreshedThisRequest( std::uint64_t passesAtEntry )</d>
     …
   </sigs>
   <hops shown="2" total="6" capped="1" noedge="2">
@@ -755,7 +931,7 @@ Full retrieval tables — including the MRR figures behind the router numbers ab
 </p>
 
 <p align="center">
-  <a href="present/ripwire-showcase.pdf"><b>▶ The whole tool in 29 slides</b></a> — every figure names the instrument that pins it<br>
+  <a href="present/ripwire-showcase.pdf"><b>▶ The whole tool in 36 slides</b></a> — every figure names the instrument that pins it<br>
   <sub>renders in your browser · <a href="present/ripwire-showcase.pptx">pptx</a> beside it · <a href="docs/EVALS.md">the numbers behind it</a></sub>
 </p>
 
@@ -769,10 +945,12 @@ Full retrieval tables — including the MRR figures behind the router numbers ab
 ## What it answers
 
 <details>
-<summary><b>179 long flags</b> across seven families, plus the MCP server — and <code>--help-task</code> names the ONE command a task wants, or abstains honestly when the evidence is too thin</summary>
+<summary><b>185 long flags</b> across seven families, plus the MCP server — and <code>--help-task</code> names the ONE command a task wants, or abstains honestly when the evidence is too thin</summary>
 
-Around the core sit 179 long flags advertised in `--help`, across seven families — plus an MCP
+Around the core sit 185 long flags advertised in `--help`, across seven families — plus an MCP
 server, so a coding agent can call any of them mid-task instead of grepping and reading whole files.
+`--help` prints one line per flag (~4.5K tokens); `--help=--FLAG` prints that flag's full entry with
+every caveat, `--help=SECTION` one family, and `--help=all` the whole catalog.
 Not sure which of them fits the task in front of you? `ripwire . --help-task="<task in words>"`
 recommends ONE executable command with the evidence behind the pick — advice only, it never runs
 the recommendation — and abstains honestly when the evidence is too thin to name a winner.
@@ -782,9 +960,10 @@ the recommendation — and abstains honestly when the evidence is too thin to na
 <summary>Which surface is the authority — <code>--help</code> vs <code>docs/COMMANDS.md</code> — and the four reflex verbs worth memorising</summary>
 
 `./build/ripwire --help` is generated from the binary's own flag table and is always the authority;
-[`docs/COMMANDS.md`](docs/COMMANDS.md) documents every one of the 145 documented flags — 94 of them
-with a real invocation and its recorded output (counts re-derived 2026-08-23; `test/docscommandscheck.sh`
-fails if that documented set and the binary's own flag table ever disagree). Each family below links there.
+[`docs/COMMANDS.md`](docs/COMMANDS.md) documents every one of the 176 documented flags — 162 of them
+with a real invocation and its recorded output (both counts are reported by the generator that writes the
+document, `docs/docs_commands_build.py`, and were re-derived from it on 2026-09-14;
+`test/docscommandscheck.sh` fails if that documented set and the binary's own flag table ever disagree). Each family below links there.
 
 Four reflexes worth wiring into muscle memory: `--from-trace=FILE` for an error you have in hand,
 `--edit-check=SYM` right after an edit (did the contract change, and which callers are now provably
@@ -808,9 +987,10 @@ ranking, bodies, callers and tests in one budgeted bundle.
 ## Quickstart
 
 <details>
-<summary><b>Prebuilt binary</b> — macOS and Linux (arm64 / x86-64, built for <b>RHEL 8+</b>), SHA-256 verified, shipping <b>seventeen agent skills</b> the installer activates for every agent it detects</summary>
+<summary><b>Prebuilt binary</b> — macOS on Apple silicon and Linux (arm64 / x86-64, built for <b>RHEL 8+</b>), SHA-256 verified, shipping <b>seventeen agent skills</b> the installer activates for every agent it detects</summary>
 
-**Prebuilt binary** — macOS (arm64 / x86-64) and Linux (arm64 / x86-64, built for **RHEL 8+**;
+**Prebuilt binary** — macOS (arm64; 0.6.1 is the last release with an Intel macOS binary, and an Intel Mac
+builds later releases from source) and Linux (arm64 / x86-64, built for **RHEL 8+**;
 every release is smoke-tested on a RHEL 9 userland before it publishes). Downloads the latest
 [GitHub Release](https://github.com/redhat-et/ripwire/releases), verifies its SHA-256, and installs
 to `~/.local/bin`. From v0.2.2 the release tarball also ships the seventeen agent skills, and the
@@ -829,6 +1009,52 @@ export PATH="$HOME/.local/bin:$PATH"      # not on PATH by default on macOS or m
 ```
 </details>
 
+<a id="windows"></a>
+<details>
+<summary><b>Windows x64 (preview)</b> — a zip with <code>ripwire.exe</code> and the skills, no runtime to install first; a preview until Windows users confirm it</summary>
+
+**Windows x64 — preview.** From 0.6.3 each release carries `ripwire-<version>-windows-x64.zip` and its `.zip.sha256`.
+It is built with clang-cl against the static C runtime, so it needs no Visual C++ Redistributable, and like the Linux
+x64 binary it needs an x86-64-v3 (AVX2) CPU. CI unzips and exercises it on every train, including a byte-for-byte
+comparison of its output with Linux's, but no maintainer runs Windows, so treat it as a preview until Windows users
+report back. The exe is not code-signed. `Expand-Archive` does not pass the download's Mark-of-the-Web on to the
+files it extracts, so SmartScreen does not prompt for an exe unpacked this way; no prompt is not a verdict. In PowerShell:
+
+```powershell
+$v = "0.6.3"; $a = "ripwire-$v-windows-x64"; $u = "https://github.com/redhat-et/ripwire/releases/download/v$v"
+Invoke-WebRequest "$u/$a.zip" -OutFile "$a.zip"; Invoke-WebRequest "$u/$a.zip.sha256" -OutFile "$a.zip.sha256"
+# extracts only when the SHA-256 matches; on a mismatch it throws and nothing is unpacked
+if ((Get-FileHash "$a.zip" -Algorithm SHA256).Hash -eq (Get-Content "$a.zip.sha256").Split(" ")[0]) { Expand-Archive "$a.zip" -DestinationPath "$env:LOCALAPPDATA\Programs" } else { throw "SHA-256 mismatch: do not run $a.zip" }
+$bin = "$env:LOCALAPPDATA\Programs\$a"
+[Environment]::SetEnvironmentVariable("Path", "$bin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
+$env:Path = "$bin;$env:Path"   # this window too; new windows read the user Path
+ripwire --version
+```
+
+- **The hash check** passes because `-eq` ignores case: `Get-FileHash` prints upper-case hex and the `.sha256` file
+  is lower-case. For a case-sensitive compare, use `.Hash.ToLower() -ceq`.
+- **Comparing two outputs in Git Bash:** use `cmp`. There `fc` is a shell builtin (it replays history) and compares
+  nothing; the Windows tool is `fc.exe`, run as `MSYS_NO_PATHCONV=1 fc.exe /b a b` so `/b` is not rewritten as a path.
+- **Git for Windows** is needed for the git-history features (churn, `--situ`, the `git` row of `--doctor`) and for
+  the skills installer. The map itself runs without it.
+- **`ripwire . --doctor`**: every row should read `ok="1"`. `binary-path` finds `ripwire` the way PowerShell does
+  (`Path` in order, then `PATHEXT`). When it fails, `which=` names the `ripwire` that `Path` finds first, and
+  `which_version=` is what that one prints for `--version`. `same_bytes="unknown"` means a copy could not be read;
+  the row fails as unverified, so compare the two with `Get-FileHash`. The cache lives in `%LOCALAPPDATA%\Temp\ripwire-<uid>`
+  (your `TEMP`). With `TMPDIR`, `TEMP` and `TMP` all unset, Windows' own temp-directory rule falls back to your profile
+  folder, so the cache is `%USERPROFILE%\ripwire-<uid>`; the `cache-dir` row names the directory either way.
+- **Checking cache reuse:** in PowerShell `$env:RIPWIRE_CACHE_STATS=1; ripwire . > $null` (in Git Bash
+  `RIPWIRE_CACHE_STATS=1 ripwire . > /dev/null`) prints one `cache-stats` line on stderr. Run it twice with no other ripwire build in between: `reparsed=0` and `reused=` equal to `files=` mean every
+  file came from the cache. `warm_growths=` is a performance counter, not a reuse fact: it counts how often a worker
+  thread's buffer had to grow, which depends on how the threads split the files, so it varies from run to run by design.
+- **Agent skills** (Claude Code, Codex): from Git Bash, in the unzipped folder, `bash skills/install.sh` (Claude Code)
+  or `bash skills/install.sh --codex`. From PowerShell, name Git Bash by full path,
+  `& "C:\Program Files\Git\bin\bash.exe" skills/install.sh`: a bare `bash` there is often WSL's
+  (`C:\Windows\System32\bash.exe`), which installs into the WSL home, where Windows agents never look. Or copy them by hand in PowerShell:
+  `New-Item -ItemType Directory -Force "$HOME\.claude\skills" | Out-Null; Copy-Item -Recurse -Force "$bin\skills\ripwire-*" "$HOME\.claude\skills\"`
+  (Codex reads `$HOME\.agents\skills`). `--hook` is untested on Windows, and `scripts/install.sh` (the curl installer) does not run there.
+</details>
+
 **Building it yourself needs CMake 3.24+ and a C++23 compiler, and nothing else installed first** —
 every dependency is vendored in-tree, so the build completes with the network off.
 
@@ -843,7 +1069,7 @@ cmake -S . -B build && cmake --build build -j
 <summary>Why there is no download step — vendored grammars, the offline-build proof, the languages parsed, and putting it on <code>PATH</code></summary>
 
 **Or build from source.** Requirements: CMake 3.24+ and a C++23 compiler — that means clang 16+ /
-AppleClang 15+ (Xcode 15) / gcc 13+ / MSVC 19.36+, and if your distro's CMake is older than 3.24,
+AppleClang 15+ (Xcode 15) / gcc 13+, and if your distro's CMake is older than 3.24,
 `pip install cmake` or `brew install cmake` gets a current one everywhere. Nothing else —
 tree-sitter's core, the grammars listed in [THIRD_PARTY.md](THIRD_PARTY.md) and the test framework are vendored under `third_party/deps`,
 so there is no download step and no package manager to satisfy. Prove that with the network off:
@@ -885,6 +1111,9 @@ ripwire . --for="incremental cache invalidation"   # the task lens: what to touc
 ripwire . --callers=someFunction                   # who calls it
 ripwire . --test-gate                              # before you commit: which tests must run
 ```
+
+> **Written for your agent.** By default, every command prints compact XML sized for an AI agent to read, not for a person
+> scanning a terminal. Human-readable output is on the roadmap.
 
 <details>
 <summary>CLI or MCP, the <code>-DCMAKE_BUILD_TYPE=Release</code> trap, and the honesty contract in one line</summary>
@@ -955,7 +1184,7 @@ The structural family's `nest=` reports the single deepest line in a function. O
 a thousand lines at depth 9 produce the same number — which means a long **blocked-sequential** body (a
 run of shallow scoped steps, its max set by one inner loop nobody has to hold in their head) is
 indistinguishable from a **tangled** one that sustains depth for hundreds of lines. Every consumer of
-`nest=` inherited that blindness: the panel's structural family, `--readability`'s rank, the ensemble join.
+`nest=` inherited that blindness: the panel's structural family, `--biggest-first`'s rank, the ensemble join.
 
 `--metrics` now emits the **profile** beside the max — `humps=` (how many maximal regions reach the
 nesting bar, CodeScene's "bumpy road": a rise above the threshold then a fall, so repeated missing
@@ -1001,7 +1230,7 @@ stated reason, not an oversight:
 | --- | --- | --- | --- |
 | `--field-affinity` | which struct fields are read together but declared far apart; each loop's access shape (index vs pointer-chase) | its subject is a **type**, not a function — attributing a struct's finding to the functions touching it is a claim the lens never makes | `MainDispatch`: **12** findings at separation cost **92.88**; **1,374** loops classified, **5** genuine pointer-chases |
 | `cache-*` lint rules + `--with-profile` | cache-hostile access shapes (alloc-in-loop, `p=p->next`, `a[b[i]]`, node containers, …), then which are *measured* hot | rows are facts about **sites**, joined to per-scope hardware counters — not per-function evidence a family vote could count | aggressive rules: **0** hits in shipping `src/`; **327** findings adversarially triaged → **0** fix-worthy; the one open refactor settled by measurement (5.2 ms) |
-| `--readability` | least-readable-first ordering (Halstead volume, Posnett sigmoid) | the fitted score **saturates past 20 lines** — only the ordering is meaningful, and an ordering cannot vote in a count | ordering only, never a grade |
+| `--biggest-first` (was `--readability`) | orders by Halstead volume, Posnett sigmoid (a size proxy — the readability-ordering claim is withdrawn) | the fitted score **saturates past 20 lines** — only the ordering is meaningful, and an ordering cannot vote in a count | ordering only, never a grade |
 | `--naming-consistency` | off-convention names, each with a computed `propose=` | the one lens that emits **advice** — a fix is not evidence, so it does not vote | camelCase dominant at **93.0%**; **136** names flagged with proposals |
 | `--lint --naming-locals` | the naming rules pointed at local variables inside already-flagged functions | **opt-in and unvalidated** — stays outside any join until a real-corpus audit clears it (the withdrawn-rule lesson) | +**973** findings that were structurally invisible before |
 
@@ -1055,16 +1284,31 @@ rather than blurring it:
   measured run — **5.2 ms, 5.9% of the verb** — a wasted afternoon prevented by a number
   ([`docs/CACHELINT.md`](docs/CACHELINT.md) holds the full catalog, the wave-2 specs, and the
   compiler-handled myths deliberately *not* checked).
-- **`--readability`** is a sibling lens, not a panel family either — the one classic model in the tree
+- **`--biggest-first`** (renamed from `--readability`, which still works — a stderr note points scripts at
+  the new spelling) is a sibling lens, not a panel family either — the one classic model in the tree
   with a published closed form: Halstead volume (Halstead, *Elements of Software Science*, 1977) and
   the Posnett/Hindle/Devanbu sigmoid fit (MSR 2011, [doi:10.1145/1985441.1985454](https://doi.org/10.1145/1985441.1985454)),
   fitted on snippets of 20 lines or fewer — past that the fitted score saturates and only the
-  *ordering* stays meaningful, which is exactly how the verb is used: least-readable-first, never as a
+  *ordering* stays meaningful, which is exactly how the verb is used: largest-first, never as a
   grade. Halstead's volume specifically (not the later, less-trusted difficulty/effort derivatives) is
   among the metrics shown to track measured cognitive load directly (Peitek, Apel, Parnin, Brechmann &
   Siegmund, ICSE 2021, [doi:10.1109/ICSE43902.2021.00056](https://doi.org/10.1109/ICSE43902.2021.00056)) —
-  `--readability` emits volume and stops there; difficulty and effort are computed nowhere in this
-  tree.
+  `--biggest-first` emits volume and stops there; difficulty and effort are computed nowhere in this
+  tree. **A ranking lens, never a grade, and here is what it actually orders:** on ripwire's own
+  history at the pinned `v0.6.2` tag (412 function pairs mined from 80 refactor/simplify/cleanup
+  commits), the order between two versions of a function followed the sign of its token-count change
+  in 96.0% of pairs — read a move as *more or fewer tokens*, not as *more or less readable*. Of the 412,
+  154 (37.4%) ran the commit's implied direction and 258 (62.6%) ran opposite it; Halstead volume drove
+  91.1% of those 258; a separate self-consistency check confirms the formula
+  computes exactly what it says it computes, so this is a construct-validity finding about the
+  ordering claim, not an arithmetic bug. (First recorded as 484 pairs / 30.2% from an unpinned `git
+  log --all` walk that does not reproduce — full derivation, the instrument fix and the retracted
+  figure: [`docs/EVALS.md` §8](docs/EVALS.md).) **WITHDRAWN:** the ordering claim is withdrawn —
+  stratified into narrow token-count bands, the later-fix association disappears in 8 of 10 deciles
+  (CIs include 1), so the order this verb produces is better explained as a residual size proxy,
+  measured in the lens's own units, than as an independent readability signal (derivation:
+  [`docs/EVALS.md` §8](docs/EVALS.md)). The lens's computation is unchanged pending a proper human
+  study, and `--help=--biggest-first` carries the same figures where a CLI reader meets them.
 - **`--naming-consistency`** is the *lexical* family's one exception to "evidence, never advice": every
   other lens in this panel tells you WHAT is wrong, never a computed fix. Case-style consistency is
   the one property with a corpus-derivable answer — on this repository's `src/`, camelCase is the
@@ -1090,6 +1334,43 @@ Full citation table, evidence tiers, and what got measured and *withdrawn* (a na
 flagged this repository's best-named functions, kept as the standing argument for measuring before
 shipping) → [`docs/LINEAGE.md`](docs/LINEAGE.md).
 </details>
+
+---
+
+> **Want to help?** Start anywhere on the spectrum. At the ready-made end, open problems — languages,
+> resolver bugs, fuzzers, docs — are written up as starter kits: the research is done, the file and line pointers
+> are in the prompt, and **each prompt writes a plan and stops**, so we can agree the approach before you write any
+> code.
+>
+> ```bash
+> git clone https://github.com/redhat-et/ripwire && cd ripwire
+> cmake -S . -B build && cmake --build build -j     # plain build, no build type
+> ls prompts/help-wanted/                           # pick one
+> claude "follow prompts/help-wanted/zig-language.md"     # or your agent of choice
+> ```
+>
+> In the middle, a few prompts hand your agent the whole repository and a job to do:
+>
+> - **[Full audit](prompts/full-audit.md)** — six independent lenses over the codebase; take one, or all six.
+> - **[Add a language](prompts/add-a-language.md)** — a vendored grammar, extraction and gates, start to finish.
+> - **[Use it for real, log every gap](prompts/dogfood-gaps.md)** — do an actual task with ripwire and write down
+>   every place it let you down.
+>
+> At the other end, bring your own:
+>
+> - research an idea you have been turning over
+> - bring in a paper that deserves to be in a tool
+> - show how AI agents could read and write better code
+> - automate something decades of software engineering already know
+> - check software algorithmically — a smell nobody measures yet, a way to prove an answer is complete, a bug class
+>   a tool could catch before a reviewer does
+>
+> Open an issue; we want to hear it. The part we would most like help thinking about is the quality lens: measuring
+> what a change makes *worse*, and handing that back while the code is still being written.
+>
+> [help wanted](https://github.com/redhat-et/ripwire/labels/help%20wanted) ·
+> [good first issue](https://github.com/redhat-et/ripwire/labels/good%20first%20issue) ·
+> [all the prompts](prompts/help-wanted/)
 
 ---
 
@@ -1119,20 +1400,23 @@ trailing `…`.
 </details>
 
 <details>
-<summary><code>--callers</code> — a call graph built on the spot, and why <code>count="6"</code> ships labelled a floor</summary>
+<summary><code>--callers</code> — a call graph built on the spot, and why <code>count="7"</code> ships labelled a floor</summary>
 
 **Ten seconds, no index server, no embeddings, no API key** — a parse and a call graph, built on the
-spot:
+spot. The rows below are a real capture: the callers and their files are gate-held current
+(`test/readmeexamplecheck.sh`), the `:line` suffixes were true when captured and drift as the files
+grow — nothing can keep a line number true in a document, so it is not claimed here.
 
 ```
 $ ripwire . --callers=rankGraphTeleport
-<callers of="rankGraphTeleport" defs="1" count="6" root="." hop_tested="0" hop_untested="6" counts_floor="1">
-<s t="fn" n="runEval" p="src/eval.h:169"/>
-<s t="fn" n="rankGraph" p="src/graph.h:2984"/>
-<s t="fn" n="anchoredLexicalRank" p="src/graph.h:3533"/>
-<s t="fn" n="churnRankedGraph" p="src/main.cpp:994"/>
-<s t="fn" n="runDefaultMap" p="src/main.cpp:1119"/>
-<s t="fn" n="getIndex" p="src/mcpindex.h:1104"/>
+<callers of="rankGraphTeleport" defs="1" count="7" root="." hop_tested="0" hop_untested="7" counts_floor="1">
+<s t="fn" n="runEval" p="src/eval.h:171"/>
+<s t="fn" n="rankGraph" p="src/graph.h:3445"/>
+<s t="fn" n="anchoredLexicalRank" p="src/graph.h:3995"/>
+<s t="fn" n="churnDecayRanking" p="src/main.cpp:1157"/>
+<s t="fn" n="churnRankedGraph" p="src/main.cpp:1191"/>
+<s t="fn" n="runDefaultMap" p="src/main.cpp:1295"/>
+<s t="fn" n="getIndex" p="src/mcpindex.h:1108"/>
 </callers>
 ```
 
@@ -1140,7 +1424,7 @@ $ ripwire . --callers=rankGraphTeleport
 dispatch contributes no edge (a call through a function pointer or callback is an edge only when
 ONE function is bound to that variable in scope and the variable never escapes — its address taken
 or reference-bound — and a macro-generated call site — tagged
-`role="macro"` — only when its function-like `#define` is indexed): `count="6"` is a **floor**,
+`role="macro"` — only when its function-like `#define` is indexed): `count="7"` is a **floor**,
 and the element says so before you read a single row.
 
 </details>
@@ -1156,12 +1440,12 @@ $ ripwire . --top-k=3
      precise=… skipped_oversize=… order=important-first -->
 <r est_tokens="435">
 <f p="./src/infra/svector.h" layer="infra">
-<s t="method" n="size" id="./src/infra/svector.h::svector::size" k="…"></s>
-<s t="method" n="push_back" id="./src/infra/svector.h::svector::push_back" amb="2" k="…">
-<c n="buf"/><c n="buf"/><c n="grow"/></s>
+<s t="method" n="size" sc="svector" k="…"></s>
+<s t="method" n="push_back" sc="svector" amb="2" k="…">
+<c n="buf" l="…,…"/><c n="grow" l="…"/></s>
 </f>
 <f p="./src/scipoverlay.h">
-<s t="method" n="empty" id="./src/scipoverlay.h::ScipOverlay::empty" k="…"></s>
+<s t="method" n="empty" sc="ScipOverlay" k="…"></s>
 </f>
 </r>
 ```
@@ -1179,16 +1463,19 @@ with several definitions and the resolver guessed. Read the source when which-ta
 
 **The test gate** — `--test-gate` names the obligations and exits 4 while any remain. Captured with an
 uncommitted change in the tree: `changed="1"` and the rows below appear only because something was
-actually pending. A clean clone exits 0 with every changed/impacted/test count at zero — except
-`script_gates_unmodelled=`, which is structural (it counts script-to-binary test runners the call
-graph cannot see, not git status) and stays nonzero even then:
+actually pending. A clean clone exits 0 with every changed/impacted/test count at zero. The structural
+counts describe the tree, not git status, so they stay nonzero even then: `script_gates_unmodelled=`
+(script-to-binary test runners the call graph cannot see), `script_gates_registered=`,
+`script_gates_mapped=` and `script_gates_unresolved_dynamic=` (the suite's registered shell gates, and how
+many of them map to their dependencies), and the resolver gauges `graph_ambiguous=`, `graph_unresolved=`
+and `graph_unindexed=`. The capture below predates the `script_gates_*` registry counts and those gauges:
 
 ```
 $ ripwire . --test-gate          # exit code: 4
 <test-gate changed="1" impacted="80" tests="2" untested="76" shown_tests="2" tests_capped="0"
            shown_untested="25" untested_capped="1" script_gates_unmodelled="332" at="9cf0b16f3+dirty">
 <t p="./test/adaptivecutshapefix/adaptive_cut_shape_test.cpp" run="bash test/adaptivecutshapecheck.sh"/>
-<t p="./test/verify_radix.cpp"/>
+<t p="./test/verify_radix.cpp" run_unknown="1"/>
 <u sym="buildGraph" p="./src/graph.h" ccx="712"/>
 <u sym="dispatchMcpLine" p="./src/mcp.h" ccx="428"/>
 …
@@ -1196,11 +1483,107 @@ $ ripwire . --test-gate          # exit code: 4
 ```
 
 A `run=` attribute appears only when a runner is derivable from real evidence — a test-dir script
-whose stem matches the harness, or whose text names it. No `run=` means *not derivable*, never a
-guessed suite command. `script_gates_unmodelled="332"` is the same discipline: script-to-binary is not
-a call edge, so those gates are invisible to this walk, and the number says so rather than letting
-`tests="2"` read as complete. The `<u>` rows are the untested blast radius: impacted symbols that no
-test in the corpus reaches.
+whose stem matches the harness, or whose text names it; for TypeScript/JavaScript, a file already
+recognized as test code (`test/`/`tests/`/`__tests__/`, or a `_test./.test./_spec./.spec.` name — the
+`__tests__/` directory convention is shared with every language, the rest are TS/JS's own) whose name
+ALSO matches vitest/jest's own test-name shape (`.test.`/`.spec.`, or living under `__tests__/` at
+all, jest's own two default conventions — never a `.d.ts` declaration file) — whose nearest
+`package.json` names `vitest`, `jest`, or node's own test runner. Its own `package.json` is
+AUTHORITATIVE for the whole subtree below it: a non-empty, non-placeholder `scripts.test` entry
+decides the runner (or decides none — a same-named dependency never overrides it, whether that
+dependency sits in the same manifest or a parent one), and only a manifest with NEITHER a real
+`scripts.test` NOR a `vitest`/`jest` dependency is skipped in favour of one further up. A TS/JS file
+with no manifest evidence of its own still falls back to the SAME test-dir shell/Python driver search
+every other language uses — a named driver beats an
+unguessed default. A row with none says so — `run_unknown="1"`, never a guessed suite command — and a
+`<t>` or `<g>` row carries one or the other, never neither. A
+`<g hops="2" n="3" p="a,b,c" run_unknown="1"/>` row is **two or more contiguous runner-less rows whose
+attributes are byte-identical**, served as one: `n=` is how many, `p=` is their paths verbatim in list
+order, and the disclosure is paid once per group rather than once per row. Everything else stays its own
+row — a row with a `run=`, a row whose attributes differ from its neighbour's, and a path containing a
+comma, which is never grouped at all, so `p=` splits on `,` into exactly `n=` paths. A `shown=`/`total=`
+over these rows counts test FILES: a `<g>` row is `n=` of them.
+
+`script_gates_unmodelled="332"` is the same discipline: script-to-binary is not a call edge, so those
+gates are invisible to this walk, and the number says so rather than letting `tests="2"` read as
+complete. The `<u>` rows are the untested blast radius: impacted symbols that no test in the corpus
+reaches — never a file's own `<file-scope>` module scope (a top-level statement or anonymous-callback
+body), since nothing in any language can name it and no test could ever be written for it; it still
+counts toward `impacted=` when it is a real caller in the blast radius, just never as an obligation.
+Those excluded owners are counted, not dropped without a trace: `untested_modscope="N"` (always
+present, alongside `untested=`) says how many, so a change whose only reader is an untestable
+entrypoint discloses why `untested=` reads zero instead of looking like there was nothing to find.
+The capture above predates that attribute (and a few other root attributes added since), so its root
+lacks it; today's root carries `untested_modscope="N"` immediately after `untested=`.
+
+A TS/JS file with NO manifest evidence of its own (no `package.json` anywhere in the crawl boundary, or
+the nearest one decides nothing) still gets one more chance before falling to the shell/Python driver
+search above: its own bytes are read for a `node:test` import or require — `import test from "node:test"`,
+`import { test, describe } from "node:test"`, `require("node:test")`, single or double quoted (#60). This
+is a real parse, not a substring scan: a `"node:test"` mention inside a comment or an unrelated string
+literal is not evidence. An explicit `package.json` `scripts.test` (or `vitest`/`jest` dependency) still
+wins over this — including an authoritative-but-unrecognized script, which is a decided "no" — so the
+import fallback only ever fires on what was previously `run_unknown="1"`.
+
+For a `.ts`/`.mts`/`.cts` file — whether the runner was named by `scripts.test: "node --test"` or inferred
+from the import above — a `run=` command is spelled only where the checks below find nothing that makes Node
+refuse to start it. They are read off the repository's own bytes, so they cannot see the Node that will run
+it, and a refusal is `run_unknown="1"`, never a guess:
+
+- **`.tsx` and `.jsx` never get a command.** Node's type stripping does not cover `.tsx` at all
+  (`ERR_UNKNOWN_FILE_EXTENSION`), and plain `node` cannot load a `.jsx` file at all, on any Node version —
+  both stay `run_unknown="1"` unconditionally.
+- **Every relative import/require must resolve exactly as written, in the test file and in every local
+  TypeScript module it reaches.** Node's module resolver, under type stripping, never probes an extension
+  and never maps a `.js` specifier onto a `.ts` source — the exact shapes tsc-, tsx- and bundler-run TS code
+  uses to import its own siblings. So a command is spelled only when every relative (`./`/`../`) static
+  `import`/`export … from` specifier or `require(...)` argument names a file that exists on disk at that
+  exact path. The walk follows each specifier that lands on a `.ts`/`.mts`/`.cts` file, reads at most 64
+  modules, and a walk cut at that bound stays `run_unknown="1"` too.
+- **No module on that walk may use syntax type stripping cannot erase.** Node strips types and rewrites
+  nothing, so an `enum`, a `namespace` with runtime code (or holding only `declare` statements), the legacy
+  `module M {}` keyword, a constructor parameter property, an import alias (`import A = B.C`,
+  `import x = require(…)`), `export =`, an angle-bracket assertion `<T>x` or a decorator stops it with
+  `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` (or a parse error) before any test runs; any of them outside a
+  `declare` stays `run_unknown="1"`. A type-only namespace and a `declare enum` are erased and do not count.
+- **The command is additionally Node-version-aware, from `engines.node`.** `--experimental-strip-types`
+  itself exists from Node 22.6 only (an older Node refuses to start at all with it); stripping is ON BY
+  DEFAULT — the flag becomes a harmless no-op — from Node 22.18 and separately from Node 23.6 (two floors,
+  not one continuous range: 23.6 turned it on first, the 22.x line got it later by backport, and a bare
+  23.0–23.5 does not have it). This tool cannot see which
+  Node will run the emitted command, so it reads `engines.node` from the nearest manifest: the bare
+  `node --test <file>` when that range proves every satisfying Node has stripping on by default; the
+  flagged `node --experimental-strip-types --test <file>` when it proves >= 22.6 but not provably
+  default-on, or when there is no manifest at all (a stated assumption of a Node that strips types with the
+  flag, not a guess at an unseen runtime); and `run_unknown="1"` when the range admits ANY Node below 22.6
+  (a plain `>=18`/`^20`, or a compound range like `>=24 || ^20`, where every `||` alternative must pass on
+  its own) or cannot be read with confidence at all. Each alternative is read for its upper bound too,
+  because the default-on versions have a gap: `^22.18.0` gets the bare form, but `>=22.18` also admits
+  23.0–23.5 and keeps the flag.
+
+Every node:test file, `.js` or TypeScript, must also load as the module kind its own syntax needs. A file
+with a static ES `import`/`export` runs as an ES module only as `.mjs`/`.mts`, under `"type": "module"` in
+its nearest `package.json`, or on a Node with default module-syntax detection (22.7 and later, 20.19 on the
+20.x line). Without one of those the command stays `run_unknown="1"`: an explicit `"type": "commonjs"` (or a
+`.cjs`/`.cts` file) turns detection off, and with no `"type"` the `engines.node` range must prove detection —
+`>=22.7` does, `>=20.19` does not, since it admits 21.x. With no `engines.node` at all, a TypeScript file keeps
+the stated assumption above and a `.js` file stays `run_unknown="1"`, since its command otherwise rests on
+no assumption at all. A CommonJS file (`require`, no ES `import`/`export`) runs either way.
+
+`.js`/`.mjs`/`.cjs` never need the flag. Their one version question is the runner itself: the `--test` flag
+exists from Node 18.1 and, by backport, 16.17 — never on 17.x, and 18.0 has the `node:test` module but not
+the flag. So `engines.node` must not admit a Node below 18 without it: `^16.17.0`, `>=18` and `>=18.1` get the bare
+form, while `>=16`, `>=16.17` and `16.17 - 18` (they reach 17.x) stay `run_unknown="1"`, and so does a range confined
+to 18.0.x such as `18.0.x`. A hyphen range `A - B` is bounded by B. `>=18` is accepted although it admits 18.0:
+that is one release from April 2022, the command fails loudly there, and refusing the most common spelling would make
+the answer useless on most projects. No `engines.node` at all keeps the bare form.
+
+A TS/JS `run_unknown="1"` can still mean the manifest genuinely names nothing recognized (and the test file
+itself names no `node:test` import either), one of the refusals above, or a real runner this tool does not
+yet derive: node's own test runner invoked through `tsx` (when neither the manifest nor the test file's own
+bytes name `node:test` directly) and `bun`'s test runner. These stay an honest unknown rather than a guess;
+`pnpm`/`yarn`-prefixed test scripts derive correctly today (spelled `npx …`, which finds a local binary
+first).
 
 </details>
 
@@ -1219,108 +1602,6 @@ cmake --build build 2>&1 | ./build/ripwire . --from-trace=-
 </details>
 
 ---
-
-## What's new
-
-<details>
-<summary><b>New (2026-08-30)</b> — each measured, dated, and re-derivable; the losses and caveats stated in place</summary>
-
-- **`--slice-flow=back|fwd|both` — cross-statement data-flow slicing (ARISE rung 2, arXiv:2605.03117).**
-  A bounded BFS from one variable over line-granular reaching-definition edges — backward to the
-  statements whose values feed it, forward to the statements its value reaches — that **stops at
-  function boundaries**, exactly as the paper's own slicer does. `--slice-depth=1..32` bounds it
-  (default 8, always disclosed as `depth=`); a bound that cuts a row says `flow_truncated="1"`;
-  without the new flags the v1 output is byte-identical. Measured on the registered fix-commit
-  protocol over this repository's own history (**7 commits / 38 instances, cpp only — a thin corpus,
-  reported as thin**): flow rows lift function-level added-line recall **0.163 → 0.198**, at a mean
-  4,993 output bytes — **25% of the 20,034-byte `--expand` whole-body baseline** whose recall is 1.0
-  by construction. (`bench/slice/run_slicerecall.py`; protocol, per-instance ledger and caveats in
-  [`docs/EVALS.md`](docs/EVALS.md).)
-- **The `--slice` v1 contract got its first measured numbers** (registered 2026-08-28, no numbers
-  until now): per-variable line-recall **0.726**, hit-all rate 0.632, over-inclusion 3.77×. The
-  misses were inspected one by one and are dominated by the measurement's own relevance oracle — a
-  word-regex that matches short identifiers inside comments and string literals, occurrences the
-  slicer correctly refuses to call variable uses — so 0.726 is a **floor under a noisy oracle**; no
-  inspected instance showed a real occurrence the slice dropped.
-- **`--expand` no longer hangs on minified bundles: the secret-redaction sweep was quadratic in LINE
-  length.** Invisible on ~100-byte source lines, fatal on a 2.9 KB-average-line minified bundle: one
-  selector in babel's 2.1 MB / 768-line yarn bundle **never completed** (killed at 1,343.9 s of user
-  CPU with an empty output file; 196.7 s is the only clean lower bound) and now answers in **0.46 s
-  warm**; the self-contained 20 KB single-line fixture went **23.02 s → 0.017 s (~1350×)**. A pure
-  memoization, so an output no-op — **120/120 invocations byte-identical** across 24 corpora × 5 verb
-  shapes — gated on behaviour only (`test/redactfixcheck.sh`), with the timings a ledger row in
-  [`bench/PROFILE.md`](bench/PROFILE.md), never a red-CI threshold.
-
-</details>
-
-<details>
-<summary><b>New (2026-08-23)</b> — each measured on this tree's binary, with the command that re-derives it</summary>
-
-- **`--pattern` — structural search written in CODE, not in node kinds.** `--pattern='foo($X, ...)'`
-  where `$NAME` binds one node, `$_` binds nothing and `...` is an ellipsis over siblings; comments
-  are transparent, everything else is kind- and text-exact. Served across **13 grammar objects (11
-  languages)**, and it *refuses* rather than lying: a pattern no served grammar resolves, or that
-  collapses to a bare token, exits 1 naming the served and unserved families — never `hits=0`.
-  (`./build/ripwire . --pattern='VERIFY($X)'` on this repo: **101 hits over 625 eligible files**,
-  each row carrying its enclosing symbol; `--pattern='$X'` exits **1** with the refusal text.)
-- **`--safe-delete=SYM` — "can I delete this?" in ONE call.** Composes the signals the tool already
-  computes for a resolved symbol: 1-hop callers, the transitive blast radius, every read/write/
-  import/call site, how much of that radius any test reaches, and `--dead-code`'s own shape — then
-  reports `risk=` as a **fact**, never a go/no-go verdict. (`--safe-delete=coversOrEquals`:
-  `callers="2" impact_reaches="17" uses="2" radius_tested="0" radius_untested="17"
-  dead_code_candidate="0" risk="untested-radius"`.)
-- **`--impact` grew a disclosed import tier.** A class whose consumers `#include` or `require` the
-  file that defines it used to look like it had no blast radius at all. `importers=` is now a second,
-  weaker reach beside `reaches=` — with its own cap pair and `<f via="import">` rows, and **never
-  summed into `reaches=`**, because files and symbols are different units.
-  (`--impact=IngestResult` on this repo: `reaches="0" importers="70" shown_importers="40"
-  importers_capped="1"` — a symbol that reads as unreachable by calls and is included by 70 files.)
-- **Conceptual `--for` queries serve a compact map instead of inline bodies.** Bodies were **52.7% of
-  every conceptual-query byte** — the one class that missed the byte target — so the subtoken+body
-  route now ships the ranked map plus one-hop `<hops>` edge context and no body CDATA, disclosed on
-  the root as `bundle="compact" bodies="0" reason="compact-route"`. Across the frozen 15-query class-B
-  set that is **184,857 B → 95,256 B, −48.5%**, with all 11 judged-decisive markers still present
-  (better than either pre-existing lever's 10/11). `--auto-bodies` is a permanent opt-out, not a
-  migration aid. (One pair on this repo, re-derived 2026-08-23:
-  `--for="incremental cache invalidation"` **8,487 B** compact vs **12,044 B** with `--auto-bodies`,
-  **−29.5%**; the 15-query total is [`docs/EVALS.md` §5](docs/EVALS.md).)
-- **`--pack-task` orders callers by corroboration.** A neighbour reached by several of the bundle's
-  top anchors is more likely to be the thing you must touch than one reached by exactly one, so rows
-  sort by `shared=` — the count of top-K anchors that reach them — omitted at 1 because that is what
-  every 1-hop row satisfies by construction. (`--pack-task="emit the minified xml map"` puts
-  `escapeXml` first at `shared="4"`.)
-- **`--lint` rolls up per rule, so a capped view stops hiding whole rules.** Every rule gets a
-  `<rule name= count= shown_rows= rows_capped=/>` row, and a rule whose registered languages match
-  nothing in the corpus carries `applicable="0"` so its zero reads as structural inertness rather
-  than a measurement. On this repository the default view shows 692 of 3,332 findings — and **14 of
-  the 31 rules that fired contribute zero shown rows**, 368 findings whose only evidence is their
-  `count=`. (`./build/ripwire . --lint`, counted from the `<rule>` rows.)
-- **PHP and Lua joined the language line**, with their floors stated rather than implied: PHP's
-  dynamic dispatch (`$fn()`, `call_user_func`, `__call`) names its callee at run time and is a
-  declared floor; a Lua corpus reports no inheritance edges, because metatable inheritance is a
-  runtime call with no syntax to read.
-</details>
-
-<details>
-<summary>Earlier — <b>New (2026-08-15)</b>, kept with its own dates rather than overwritten</summary>
-
-- **`--expand` answers "show me this function" in one call, −47.3% tokens** — an exact-name ask now
-  skips the ranked-map preamble by default and the body arrives with its file's sibling symbols and
-  imports inline (`sibs=`/`inc=`), so the follow-up "what else is in this file?" call never happens.
-  (Re-derived 2026-08-15 fix-expand round: `--expand=emitGrepReport` — 47,252 B classic 200-row-map
-  bundle vs 24,911 B today's exact-name default, on this repo; the figure moves as the corpus grows
-  and is not itself CI-gated, so re-measure before citing it in a future round.)
-- **`--grep` groups, deduplicates, and speaks boolean** — per-file grouping, identical-line collapse
-  ("this exact guard appears at 6 call sites" is the finding), and `--and=`/`--not=`/`--grep-scope=`:
-  a two-term ask returns the *complete* answer at **−78%** of the single-term dump. Default view now
-  runs at ~clean-grep cost while naming the enclosing symbol for every hit.
-- **C++ maps got materially truer**: out-of-line definitions past one qualifier
-  (`Outer::Inner::method(){}` — the house style of large C++ codebases) were silently invisible;
-  on one 6,600-file production tree that was ~15% of qualified definitions. Now indexed at any depth.
-- **Compound `--graph-query` filters run ~25× faster** via predicate pushdown — an exact algebraic
-  identity, byte-identical output, gate-enforced.
-
-</details>
 
 ## Measured
 
@@ -1354,6 +1635,8 @@ profile-guided release build that now ships), one evaluator, all arms re-run on 
 | Aider repo-map 0.86.2 (no-personalization control) | 10.0% | 25.0% | *(inside query)* | 0.818 s |
 | codeseek 0.1.31 (ident-mention convention arm) | 15.0% | 20.0% | 3.37 s | 0.040 s |
 | codeseek 0.1.31 (raw issue text, keyless fallback) | 0.0%² | 0.0% | 3.37 s | 0.024 s |
+
+*Measured 2026-08-08, before the performance work that ships in 0.6.0. ripwire has become faster since — llvm-project's cold parse (182,555 files) fell from 194.1 s to 155.6 s of CPU, and `--pack-task` on a Go repository from 8.13 s to 5.88 s — but these timing columns have not been re-measured.*
 
 <details>
 <summary>Round-4 method and the paired losses — one binary, one evaluator, what re-running cost us, and the three limits that travel with this table</summary>
@@ -1488,7 +1771,7 @@ pins it:
 
 | Where the saving comes from | Measured | Pinned by |
 | --- | --- | --- |
-| `--pack-signatures` — body-elided declaration skeletons instead of full bodies | **80.2% fewer element bytes** at top-50 (84.5% at top-10, 80.6% at top-100) — re-derived 2026-08-30 | `test/showcasecapturecheck.sh`, re-derived from this repo every run |
+| `--pack-signatures` — body-elided declaration skeletons instead of full bodies | **81.8% fewer element bytes** at top-50 (89.5% at top-10, 84.3% at top-100) — re-derived 2026-09-10 | `test/showcasecapturecheck.sh`, re-derived from this repo every run |
 | Query-shape routing, on the production token ceiling | **−39.4%** p50, while strict file@10 rose +33.33pp | `bench/locbench/`, [EVALS §3](docs/EVALS.md) |
 | A whole-question bundle against a naive agent read | **96.0% fewer tokens (24.9×)** — 14,758 against 367,192, tiktoken `cl100k_base`, six realistic questions | `bench/BENCHMARK.md` — *historical, private corpus, not reproducible from this tree* |
 
@@ -1580,8 +1863,8 @@ via `PL2_CACHE_MISS_LD`).
 **Every number on this page is the DEFAULT build — and there is a faster one you can opt into.** A
 clang optimization-remarks pass over `src/` (`-DRIPWIRE_OPT_REMARKS=ON`; the whole triage is in
 [`docs/OPTREMARKS.md`](docs/OPTREMARKS.md)) found that the phases above spend their time calling
-tree-sitter's C API across a translation-unit boundary — 397 of 636 distinct `inline/NoDefinition`
-remarks in the hot TU name a `ts_*` accessor. Two build options answer that, both **off by default**:
+tree-sitter's C API across a translation-unit boundary — 831 of 1,437 distinct `inline/NoDefinition`
+sites in the hot TU name a `ts_*` accessor. Two build options answer that, both **off by default**:
 
 | build | cold | warm | |
 | --- | --- | --- | --- |
@@ -1642,10 +1925,10 @@ timing-only, and `pmccheck`'s inactive arm now proves that was truly the case.
 ## Standing on the whole field
 
 <details>
-<summary>42 repositories, 69 papers and a 237-tool survey — and the study where search over a pre-built index beats a delegating planner <b>65.2% to 46.2%</b>, at under half the cost</summary>
+<summary>49 repositories, 71 papers and a 237-tool survey — and the study where search over a pre-built index beats a delegating planner <b>65.2% to 46.2%</b>, at under half the cost</summary>
 
 Almost none of the ideas here are new; the combination and the constraints are. Lessons folded from
-**42 repositories and 69 papers** into one deterministic executable, alongside a labelled
+**49 repositories and 71 papers** into one deterministic executable, alongside a labelled
 survey of 237 tools that folded nothing and are catalogued separately — the two sets are disjoint,
 so they add rather than nest. The row-by-row ledger, each with the lesson taken and where it lives, is
 [`docs/LINEAGE.md`](docs/LINEAGE.md). Those three counts are derived from that document's own tables
@@ -1696,7 +1979,8 @@ When a mark says the cheap answer is not enough, escalate on purpose — never b
 2. **`--uses=SYM` / `--impact=SYM`** — every read, write and import site, and the transitive blast
    radius. `--callers` alone under-counts, and says so.
 3. **`--scip=index.scip`** — hand it a compiler-grade index and precise edges *replace* the
-   name-based guesses, tagged `prov="scip"`. Missing or corrupt index degrades; it never fails.
+   name-based guesses, tagged `prov="scip"`. A path that is missing, empty or not a regular file
+   refuses (exit 1); a corrupt index warns on stderr and proceeds name-based.
 
 </details>
 
@@ -1798,9 +2082,9 @@ wrong, and it has. These are the results that say so, all in-tree, all published
 ### In the tests
 
 <details>
-<summary><b>563 gate scripts</b>, five contracts no unit test can hold, and the house rule: write the gate before the code it measures</summary>
+<summary><b>664 gate scripts</b>, five contracts no unit test can hold, and the house rule: write the gate before the code it measures</summary> <!-- gatecount -->
 
-`test/regression.sh` names **563 gate scripts** and is the authoritative list;
+`test/regression.sh` names **664 gate scripts** and is the authoritative list; <!-- gatecount -->
 `python3 test/pargates.py . ./build/ripwire -j 6` runs the same set in parallel. On top of them sit the
 contracts that do not fit a unit test: two runs byte-identical, warm output identical to cold, output
 that pipes clean through `xmllint --noout`, a sanitizer build with `-fno-sanitize-recover=all`, and a
@@ -1850,6 +2134,7 @@ ripwire wrap claude      # CLI-first: the CLI call, then `claude mcp add` as the
 ripwire wrap codex       # CLI-first: optional MCP restricted to audit/health verbs in Codex TOML
 ripwire wrap opencode    # CLI-first: the AGENTS.md wiring; its "mcp" stanza offered as the alternative
 ripwire wrap openclaw    # CLI-first: same ~/.agents/skills root Codex uses; no shell hook slot
+ripwire wrap hermes      # CLI-first: hermes mcp add as the warm-index alternative; hook port pending
 ripwire wrap cursor      # MCP:       the mcpServers stanza for .cursor/mcp.json (or ~/.cursor/mcp.json)
 ripwire wrap windsurf    # MCP:       that client's stanza
 ripwire wrap gemini      # MCP:       that client's stanza
@@ -1858,16 +2143,16 @@ ripwire wrap --all       # detect every installed agent and emit each one's conf
 ```
 
 <details>
-<summary><b>One stdio server, 31 verbs</b> — 16 read, 12 flagship-reflex, 3 span-addressed edit</summary>
+<summary><b>One stdio server, 33 verbs</b> — 17 read, 13 flagship-reflex, 3 span-addressed edit</summary>
 
-**One stdio server, 31 verbs** — 16 read, 12 flagship-reflex, 3 span-addressed edit — and a client
+**One stdio server, 33 verbs** — 17 read, 13 flagship-reflex, 3 span-addressed edit — and a client
 that isn't one of the six above can be pointed at the same process by hand.
 </details>
 
 <details>
-<summary>What the 31 verbs are — lazy body handles, the edit verbs' safety contract, the pre-print skill scan, and the hand-written stanza for any other MCP client</summary>
+<summary>What the 33 verbs are — lazy body handles, the edit verbs' safety contract, the pre-print skill scan, and the hand-written stanza for any other MCP client</summary>
 
-That registers one stdio server — `ripwire --mcp` — exposing **31 verbs**: 16 read verbs, 12
+That registers one stdio server — `ripwire --mcp` — exposing **33 verbs**: 17 read verbs, 13
 flagship-reflex verbs, and 3 span-addressed edit verbs. Read verbs mirror the CLI (`analyze`, `for`,
 `grep`, `cochange`, `fetch_body`, `lego`, `mentions`, `owners`, `memory_recall`,
 `situational_awareness`, `batch`, …); `find_symbol` and `find_referencing_symbols` attach a stable
@@ -1898,16 +2183,16 @@ socket instead of stdio, `ripwire --listen=HOST:PORT` serves the same verbs.
 ### 2. Install the skills
 
 <details>
-<summary>Eighteen task-shaped skills, every install mode, and the <code>--scan-skills</code> verdict to read first</summary>
+<summary>Seventeen task-shaped skills, every install mode, and the <code>--scan-skills</code> verdict to read first</summary>
 
-`skills/` ships **eighteen task-shaped skills** that tell an agent *which* verb answers the moment it
+`skills/` ships **seventeen task-shaped skills** that tell an agent *which* verb answers the moment it
 is in — orienting cold, tracing a call, sizing a refactor, checking a diff, hunting a bug, writing
-tests, reviewing security. Without them an agent has 31 verbs and no map of when each applies; the skills name the moment
+tests, reviewing security. Without them an agent has 33 verbs and no map of when each applies; the skills name the moment
 each verb is for. Install as symlinks back into this repo, so edits here take effect
 immediately:
 
 ```bash
-skills/install.sh                 # → ~/.claude/skills
+skills/install.sh                 # → ${CLAUDE_CONFIG_DIR:-~/.claude}/skills
 skills/install.sh --codex         # → ${AGENTS_HOME:-~/.agents}/skills (canonical Codex/agent path)
 skills/install.sh --codex --hook  # → also install Codex's task router, CLI nudge + session primer
 skills/install.sh --codex-legacy  # → ${CODEX_HOME:-~/.codex}/skills (older Codex installs)
@@ -1927,7 +2212,7 @@ it points at the installer's staged copy of the skills when the cwd is not a che
 
 ## Improve it with your agent
 
-[`prompts/`](prompts/) holds twelve **self-contained orchestrator prompts**: the loops this project is
+[`prompts/`](prompts/) holds thirteen **self-contained orchestrator prompts**: the loops this project is
 built with, written so a coding agent can run them. They encode the workflow rather than describing
 it.
 
@@ -1955,11 +2240,13 @@ Three worth starting with:
 | [`capture-audit.md`](prompts/capture-audit.md) | A fresh showcase capture read by parallel adversarial lenses, and the findings turned into family-wide gates. |
 
 <details>
-<summary>The other seven — head-to-head, ranking-eval from your own sessions, per-language, onboarding, sibling sweep, command tour, showcase build</summary>
+<summary>The other ten — head-to-head, ranking-eval from your own sessions, per-language, onboarding, sibling sweep, command tour, showcase build, add a language, quality-panel calibration, COBOL corpus measurement</summary>
 
-The other seven — a paired head-to-head against a competitor, a ranking-eval loop that mines real
+The other ten — a paired head-to-head against a competitor, a ranking-eval loop that mines real
 retrieval misses from your own sessions, a per-language improvement pass, a zero-context onboarding
-study, a sibling sweep, a live command tour, a showcase build — are listed with their audiences in
+study, a sibling sweep, a live command tour, a showcase build, the path a new language's grammar
+actually took, a quality-panel calibration round, and a COBOL two-pass corpus measurement — are
+listed with their audiences in
 [`prompts/README.md`](prompts/README.md). Each states its own scope and its honesty rules, and most name the gates they must leave green.
 
 </details>
@@ -1988,7 +2275,7 @@ are one contributor's corpus away from being measurably better, and we cannot se
 ## Languages
 
 <details>
-<summary><b>23</b> vendored grammars, and what each parser does and does not see — CUDA launch edges, Dart `part of` floors, PHP dynamic dispatch, Lua metatables</summary>
+<summary><b>25</b> vendored grammars, and what each parser does and does not see — CUDA launch edges, PHP dynamic dispatch, Lua metatables</summary>
 
 C, C++, Objective-C / Objective-C++, **Metal** (Metal Shading Language, `.metal` — indexed with the
 C++ grammar, since MSL is a C++14 dialect, so a dual-compile header's symbols resolve from both the
@@ -2003,9 +2290,10 @@ imports. Dynamic dispatch — `$fn()`, `call_user_func`, `__call` — names its 
 a stated floor, not a silence), **Lua** (all five spellings that define a function, including the
 `M.f = function` and table-constructor forms; `function M:f()` is a method. Metatable inheritance is
 a runtime call with no syntax to read, so a Lua corpus reports no inheritance edges — stated, not
-implied), **Elixir** (`.ex`/`.exs` — modules, protocols, protocol implementations, functions, macros, guards and delegates;
-literal ExUnit tests, local calls, remote calls and pipes; see the
-[static-analysis limits](docs/ARCHITECTURE.md#elixir-extraction)), Bash, Go, Rust, Swift, C#, JSON + TOML + YAML (config keys — a
+implied), **Dart** (`.dart` — classes, mixins, extensions, enums, typedefs, functions, methods, getters/setters; `recv.m()`, `recv?.m()` and cascade `..m()` invocations are edges. Two stated floors: named constructors and factories index under the CLASS name, so `C()`, `C.seeded()` and `factory C.fromA()` are overloads of `C`; and `noSuchMethod` dynamic dispatch names its callee at run time. The grammar makes a function body a SIBLING of its signature rather than a child, so the definition span is extended through it at capture time — without that, every call in a body attributes to the enclosing class), **Elixir** (`.ex`/`.exs` — nested modules, structs, protocols and implementations, functions, macros, guards,
+delegates, types, callbacks, attributes and literal ExUnit tests; module/name/arity resolution with lexical aliases,
+filtered imports, default arguments, captures and pipes; see the
+[static-analysis limits](docs/ARCHITECTURE.md#elixir-extraction)), **Kotlin** (`.kt` — classes, objects, companion objects, interfaces, enum classes and functions, extension functions included; bare and navigation calls and constructor delegation are call-graph edges; an import is a dependency edge only (role="import" on `--uses`, never a `--callers`/`--impact` edge — T13/fix3, 2026-09-20). Kotlin and Java share one call graph, and a call reaches the other language only when its own defines no candidate of that name, so adding `.kt` files never moves a Java edge. Stated floors: an explicit receiver (`A.f()`) does not narrow candidates; a multiplatform `expect`/`actual` type pair is two candidates; `.kts` is not indexed; and a file nesting string templates past 128 levels is refused and listed by `--skipped` — see the [Kotlin limits](docs/ARCHITECTURE.md#kotlin-extraction)), **GDScript** (`.gd` — a Godot file is a class body: `class_name` names it and its file-scope `func`/`var` are its members, with inner classes, constants, enums and their members, signals and call edges; `preload`/`load` produce no dependency edge yet, and `.tscn`/`.tres`/`.gdshader` are not indexed — see the [GDScript notes](docs/ARCHITECTURE.md#gdscript-extraction)), Bash, Go, Rust, Swift, C#, JSON + TOML + YAML (config keys — a
 `[tool.ruff.lint]` table is one symbol under its full dotted name, and
 `pyproject.toml`/`Cargo.toml`/CI workflows become greppable), and **Markdown** (`.md`/`.markdown` —
 the DOC tier: every heading, ATX or setext, is a section symbol whose span runs to the next
@@ -2017,14 +2305,7 @@ Want another language? The pipeline is language-agnostic past the parse: a new l
 vendored tree-sitter grammar, its query file, and entries in the declarative
 `extension → { grammar, queries }` table (the "declarative constexpr tables" rule in
 [`CONTRIBUTING.md`](CONTRIBUTING.md)). Some grammars also need capture filters: Elixir, for example,
-represents definitions as ordinary calls. **Dart** (`.dart` — classes, mixins, extensions, extension
-types, enums, typedefs, fields/getters/setters, constructors including named/factory forms, and
-function/method doc comments; relative, `package:`, `import`, `export`, `part` and conditional-directive
-targets are captured, with `package:` narrowed only through the corpus's own `pubspec.yaml` and
-`.dart_tool/package_config.json` metadata). `dart:` SDK imports and `part of some.library.name` remain
-shown but unresolved unless the corpus provides unique file evidence, and Flutter widget/runtime
-relationships are out of scope for this language-only round. Open an issue naming the grammar and the repo
-you'd run it on.
+represents definitions as ordinary calls. Open an issue naming the grammar and the repo you'd run it on.
 
 Notebooks, HTML and CSV are indexed as *documents* for `--recall` and the doc↔code edges behind
 `--mentions`; Office and PDF join them through an optional bridge. Markdown graduated from that
@@ -2034,12 +2315,801 @@ tier: it parses with its own vendored grammar, so its headings are symbols, not 
 
 ---
 
+## Reference guide
+
+> **You do not need this guide to use ripwire.** Install it, tell your agent to use it, and the agent takes it from
+> there. Come here when you want to know exactly what a command does, what its output means, or where the tool stops
+> being right.
+
+Re-verified against a 0.6.1 build on 2026-09-14.
+
+ripwire reads a source tree and writes a ranked symbol map to standard output: the symbols that matter for a
+task, their callers, and the tests that reach them. One binary, and a map that costs nothing to serve — no API
+key, no embeddings, no index server. The history-backed commands need `git` on the path and a repository to
+read. Two commands reach the network and nothing else does: a git URL in place of a directory, which is
+shallow-cloned into a cache, and `--mcp --listen=HOST:PORT`, which binds a socket and is the one mode that
+serves other processes (see `--mcp-token` and `--allow-remote-edits` before exposing it).
+
+This guide tells you how to install, operate, and evaluate ripwire. Read `docs/COMMANDS.md` for the
+full command reference. Run `ripwire --help` for the current flag list. The binary generates
+`--help` from its own flag table, so `--help` is the authority. If this guide disagrees with
+`--help`, report this guide as a defect.
+
+<details>
+<summary><b>Evidence basis.</b> Fifty years of software-engineering results. 49 repositories and 71 papers are folded. A survey of 237 tools is separate.</summary>
+
+The counts come from `docs/LINEAGE.md`. Counts are current as of 2026-09-14. Seventeen of the folded papers are from 2026, seven published in the last two months, and three in the last thirty days. The survey describes 237 tools that contributed no lesson. The two sets are disjoint, so the counts add.
+
+</details>
+
+---
+
+### 1. Purpose and function
+
+ripwire reads a source tree, answers these questions about it, and can apply whole-symbol edits
+to it:
+
+**Orient**
+
+- Which symbols matter most in this tree? (`ripwire .`)
+- Where do I start on this task, and which code does it touch? (`--for`)
+- Can I get the ranking, the key function bodies, their callers and the tests to run in one bounded bundle? (`--pack-task`)
+- How do I split this work across several agents without them colliding? (`--partition`, `--plan-lanes`)
+- What does the tree look like, directory by directory? (`--tree`)
+- Which command answers my question? (`--help-task`)
+- What do the project's notes and docs already say about this task? (`--recall`, `--notes`)
+- Which existing code should new code imitate? (`--exemplar`)
+- What must a new implementation of this interface provide, and who implements it already? (`--lego`)
+- Which names does this repo use but never define — its standard library and third-party surface? (`--external-surface`)
+
+**Navigate**
+
+- Who calls this symbol? (`--callers`)
+- What does this symbol call? (`--callees`)
+- Where is this symbol read, written or imported, not only called? (`--uses`)
+- What does a change to this symbol affect, transitively? (`--impact`)
+- How does one symbol reach another, following the direction of the calls? (`--path`)
+- How do several symbols connect, in any direction? (`--connect`)
+- What sits around this symbol in the graph? (`--around`)
+- What does this function's body say, with its callees' signatures inline? (`--expand`)
+- Where does this text appear, and in which function? (`--grep`)
+- Where does this code shape appear? (`--match`)
+- How does one variable flow through a function? (`--slice`)
+- Which branch's tree defines or mentions this symbol? (`--whereis`)
+- Which frames of this stack trace, sanitizer report or compiler error are in my code? (`--from-trace`)
+- Is this claim about the code true? (`--verify`)
+- Can I ask the call graph a question these commands do not phrase? (`--graph-query`)
+- Can I run several of these lookups in one turn? (`--batch`)
+
+**Change it safely**
+
+- Is it safe to delete this symbol? (`--safe-delete`)
+- Did my edit change a function's contract, and which callers does that break? (`--edit-check`)
+- Can I replace one function's body without reading the whole file? (`--replace-symbol-body`, `--insert-before-symbol`, `--insert-after-symbol`)
+- Which tests must run for this change, and what does no test reach? (`--test-gate`)
+- Which tests reach these changed files? (`--affected`)
+- What is my change's blast radius, and which files usually change with these that I haven't touched? (`--situ`)
+- What does this branch touch, and which of those files are risky? (`--pr-context`)
+- Do these branches conflict, and in what order should they land? (`--merge-scout`)
+- How did the map change between two revisions? (`--map-diff`)
+
+**Quality and structure**
+
+- Which quality problems does this tree have at all, in one ranked report? (`--quality-panel`)
+- Where is the risk: complex code that changes often? (`--hotspots`)
+- Did my change make the code worse? (`--quality-delta`)
+- Where is code duplicated? (`--clones`)
+- What does the linter flag? (`--lint`)
+- Which cross-module call seams does no test reach? (`--seams`)
+- What is built but switched off in this repo? (`--flags`)
+- How do the modules depend on each other? (`--deps`)
+- Does the code follow our layering rules? (`--arch`)
+- Which clusters of code belong together? (`--communities`)
+- Who knows this code, and where is that knowledge concentrated in one person? (`--owners`)
+- Which documented claims are no longer true? (`--doc-drift`)
+- Which files did ripwire skip, why, and which indexed files can it therefore not vouch for? (`--skipped`)
+
+**Setup and safety**
+
+- Is my install working? (`--doctor`)
+- Is this agent skill file safe to install? (`--scan-skill`)
+- Is this whole skills directory safe to install? (`--scan-skills`)
+
+The tool performs five steps in a fixed order:
+
+1. **Ingest.** The tool crawls the tree, parses each file with tree-sitter, and extracts definitions
+   and references.
+2. **Graph.** The tool resolves each reference to a definition and builds a call graph. The
+   resolution is name-based. Section 7 states the limits of this method.
+3. **Rank.** The tool ranks the symbols with Personalized PageRank.
+4. **Serialize.** The tool writes a minified XML map. The output is deterministic. Section 8 states
+   the determinism rules.
+5. **Serve.** Two front doors run that map: the command line, and an optional MCP server that a
+   coding agent starts on demand.
+
+Every command is a different view of the same graph. The command line and the MCP server use the
+same renderer. One computation has one output shape.
+
+### 2. System requirements
+
+| Item | Requirement |
+| --- | --- |
+| Operating system | macOS (arm64 or x86-64) or Linux (arm64 or x86-64). Native Windows x64 **builds** with both clang-cl and MSVC `cl.exe` — CI builds both on `windows-latest` every full matrix and smoke-tests each binary (`--version`, `ctest`, a real crawl, the two-run byte-identical contract, well-formed XML); the 660-gate suite does not run there, and ASan is compiled but never executed, so treat it as a build, not a validated platform. From 0.6.3 a prebuilt `windows-x64` zip ships as a **preview** ([Windows](#windows)): CI unzips it and compares its output with Linux's byte for byte, but no maintainer runs Windows, so WSL2 remains the fully supported way to run it on a Windows machine. |
+| Prebuilt Linux floor | RHEL 8 or later (glibc 2.28) |
+| Prebuilt macOS floor | macOS 14 or later, Apple silicon. 0.6.1 is the last release with an Intel macOS binary; on an Intel Mac, pin `RIPWIRE_VERSION=v0.6.1` or build from source. |
+| x86-64 floor | x86-64-v3 (Intel Haswell, 2013, or later), for a prebuilt binary and a source build alike |
+| Build tools | CMake 3.24 or later, and a C++23 compiler |
+| Compilers | clang 16+, AppleClang 15+, or gcc 13+ |
+| Build dependencies | None outside the source tree. Every dependency is vendored. |
+| Runtime dependencies | None for the map itself. The history-backed commands need `git` on the path, and a repository to read. |
+| Network | Not required for a build or for a run. A git URL as the root is the one exception: ripwire shallow-clones it into a cache. |
+
+The history-backed commands are `--hotspots`, `--owners`, `--cochange`, `--quality-delta`, `--dmm`,
+`--map-diff`, `--whereis`, `--stray-content`, `--merge-scout`, `--pr-context`, `--situ` and
+`--rank-by=churn`. Without git, or outside a repository, none of them returns a thin answer: most
+refuse with exit 1 and a named reason, `--dmm` and `--pr-context` return an explicit unavailable
+row, and `--map-diff` and `--rank-by=churn` still answer but disclose that the ranking fell back to
+uniform.
+
+The build completes with the network off, and `test/dependencypincheck.sh` proves it on every
+commit: it runs a real disconnected configure — the step at which FetchContent would fetch — with
+`-DFETCHCONTENT_FULLY_DISCONNECTED=ON`.
+
+### 3. Installation
+
+#### 3.1 Install a prebuilt binary
+
+1. Run the installer:
+
+   ```bash
+   RIPWIRE_REPO=redhat-et/ripwire bash -c "$(curl -fsSL https://raw.githubusercontent.com/redhat-et/ripwire/main/scripts/install.sh)"
+   ```
+
+2. Add the install directory to the path if necessary:
+
+   ```bash
+   export PATH="$HOME/.local/bin:$PATH"
+   ```
+
+3. Check the version:
+
+   ```bash
+   ripwire --version
+   ```
+
+The installer downloads the latest GitHub release, verifies the SHA-256 digest, and installs the
+binary to `~/.local/bin`. The installer also stages the agent skills under
+`~/.local/share/ripwire/skills`. It activates the skills for each agent it finds. It does not edit
+your shell profile. It does not register hooks. To register hooks, run
+`bash ~/.local/share/ripwire/skills/install.sh --hook`.
+
+On Windows the installer does not apply: download the `windows-x64` zip instead ([Windows](#windows), a preview).
+
+#### 3.2 Build from source
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/redhat-et/ripwire.git
+   cd ripwire
+   ```
+
+2. Build. Which build you want depends on why you are here.
+
+   **To use the tool**, build the fast binary the released one is built as. `scripts/pgobuild.sh`
+   instruments, trains and re-optimizes in one command, into `build_pgo/` — Release, plus link-time
+   optimization, plus profile-guided optimization, which is 14-25% faster cold than the default
+   build and byte-identical in output:
+
+   ```bash
+   scripts/pgobuild.sh
+   ```
+
+   A plain Release build is the shorter path if you would rather skip the training run. It still
+   gets link-time optimization; it does not get PGO:
+
+   ```bash
+   cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+   cmake --build build-release -j
+   ```
+
+   **To work on the tool**, build the development tree, with no build type at all:
+
+   ```bash
+   cmake -S . -B build
+   cmake --build build -j
+   ```
+
+3. Test the binary you built:
+
+   ```bash
+   ./build_pgo/ripwire .               # or ./build-release/ripwire . or ./build/ripwire .
+   ```
+
+**Note:** do not add `-DCMAKE_BUILD_TYPE=Release` to the *development* tree. Release defines
+`NDEBUG`. `NDEBUG` removes the `DISCLOSE( msg )` traces at compile time. A gate that
+asserts a degrade path then passes without evidence. That is why the two builds above write to two
+trees, and why `scripts/pgobuild.sh` writes to a third: CMakeLists refuses a profile-guided build in
+`build/` or `asan/` by name, because every gate and bench number in this repository is measured
+against those trees.
+
+The continuous-integration pipeline builds both flavors. The plain build proves the degrade paths.
+The release build proves the optimizer-visible invariants. Neither flavor replaces the other.
+
+**Note:** make decides what to rebuild by comparing timestamps, so a source that changes *while* a
+build runs — most often a `git checkout` under a build in flight — leaves object files that are
+newer than the sources they disagree with, and no later incremental build repairs them. After a
+branch switch, or whenever sources may have moved under a build, use `cmake --build build
+--clean-first -j`. CONTRIBUTING.md records the three ways this has been hit and what each looked
+like.
+
+#### 3.3 Install the agent skills
+
+The `skills/` directory holds 17 routable skills, one directory each, holding a `SKILL.md`. The
+skills tell an agent which command is correct for each situation. Sixteen are for using the tool;
+`ripwire-opt-remarks` is `audience: contributor` and installs only with `--contributor`.
+`skills/hermes/` holds one more, Hermes-native, which is why a `find` for `SKILL.md` returns 18.
+Install the skills with the script:
+
+```bash
+skills/install.sh
+skills/install.sh --codex
+skills/install.sh --contributor
+```
+
+The script links the skills into the configuration directory of the agent. The `--contributor` mode
+adds the skill for compiling ripwire itself. Read the header of `skills/install.sh` for all modes.
+To check one file before installing it, run `ripwire --scan-skill=FILE`; for a whole directory, run
+`ripwire --scan-skills=DIR`. `ripwire wrap` runs that scan itself and refuses to wire an agent when
+it finds a CRITICAL, unless you pass `--force`.
+
+#### 3.4 Register the MCP server (optional)
+
+The command line is the primary interface. The MCP server is the optional second interface. The MCP
+server exposes 33 MCP verbs. The verb schemas reside in the agent context for every session. For
+this reason, register the MCP server only when you need it.
+
+`ripwire wrap <agent>` prints the recipe for one agent — `claude`, `cursor`, `codex`, `aider` and
+others — and `ripwire wrap --all` prints one for every agent it detects. For Claude Code it
+recommends the command line over the server, for the reason above.
+
+The server is a standard input and output MCP process. The complete configuration is:
+
+```json
+{
+  "mcpServers": {
+    "ripwire": { "command": "ripwire", "args": ["--mcp"] }
+  }
+}
+```
+
+To list fewer tools, add `--mcp-tools=` to the server's arguments: a comma list of tool names and/or the `core`
+profile (explore, batch, from_trace, impact, uses, fetch_body, edit_check, quality_delta, the loop the server's own
+instructions teach). A client that loads every tool schema at session start then pays for 8 schemas instead of 33
+(`tools/list` measured at 13,834 bytes instead of 46,368). A call to a tool that is not listed is refused with the
+flag that enables it. The list is not access control: `batch` sub-queries still reach hidden verbs. `ripwire wrap AGENT --mcp-tools=core` writes the flag
+into the recipe it prints. The default stays the full catalog.
+
+For a socket instead of standard input and output, run `ripwire --listen=HOST:PORT`. A non-loopback
+bind requires `--mcp-token`. The three edit verbs are disabled on a remote bind unless you pass
+`--allow-remote-edits`. The socket speaks plain HTTP with no TLS, so on a non-loopback bind the bearer token and
+every request cross the network in the clear: put a TLS-terminating reverse proxy in front of it.
+
+### 4. First use
+
+> **ripwire is AI-driven today.** By default, every command prints compact XML sized for a coding agent to read, not for a person
+> scanning a terminal. The commands in this section are the ones your agent runs. Human-friendly use is on the
+> roadmap: output a person can read, and more convenient input for common coding cases.
+
+#### 4.1 Make the first map
+
+Change to the repository. Run the following command:
+
+```bash
+ripwire . --max-tokens=3000   # start here on an unfamiliar repository
+```
+
+The command writes the top of the ranked map within the token budget. Remove `--max-tokens=3000`
+for the complete map. The complete map is larger. On a large tree, use `--top-k=N` to limit the row
+count.
+
+The first call on a tree parses it; every call after that reads a cache and answers in a fraction of
+the time. Judge the cost of the tool by the second call, not the first. If the first call fails, or
+looks wrong, run `ripwire . --doctor`: it checks the binary, the grammars, the cache and the git
+identity of the index, and says which one is at fault.
+
+#### 4.2 Use the common commands
+
+| Task | Command |
+| --- | --- |
+| Orient in a new tree | `ripwire . --max-tokens=3000` |
+| Prepare for a task | `ripwire . --for="<task description>"` |
+| Get everything for one task in a single call | `ripwire . --pack-task="<task description>"` |
+| Ask which command to run | `ripwire . --help-task="<task description>"` |
+| Find a symbol's callers | `ripwire . --callers=SYM` |
+| Find the callees | `ripwire . --callees=SYM` |
+| Measure the blast radius | `ripwire . --impact=SYM` |
+| List the use sites | `ripwire . --uses=SYM` |
+| Read one function body | `ripwire . --expand=SYM` |
+| Find the tests for a change | `ripwire . --test-gate` |
+| Check an edit's contract | `ripwire . --edit-check=SYM` |
+| Check what a change made worse | `ripwire . --quality-delta` |
+| Find the pattern to imitate before writing | `ripwire . --exemplar="<what you are writing>"` |
+| Review the current diff | `ripwire . --situ` |
+| Review a branch against a base | `ripwire . --pr-context=BASEREF` |
+| Read a stack trace | `ripwire . --from-trace=FILE` |
+| Inspect code quality | `ripwire . --quality-panel` |
+| Locate a literal, or a regex | `ripwire . --grep=STRING`, `ripwire . --regex=PAT` |
+| Search the documents | `ripwire . --recall="<task>"` |
+
+### 5. Command families
+
+The `--help` output groups 185 long flags advertised in `--help` into seven families. The `--help=`
+column below is the argument that prints one family: `ripwire --help=navigate`. `ripwire
+--help=--FLAG` prints one flag's full text — the caveats, the units, what it refuses and why.
+`ripwire --help=all` is the whole catalog, about 46,000 tokens.
+
+| Family | `--help=` | Purpose | Representative flags |
+| --- | --- | --- | --- |
+| Understand a codebase cold | `understand` | What is this repository, and what matters? | `--for`, `--help-task`, `--tree`, `--lego`, `--exemplar`, `--recall`, `--top-k`, `--token-budget`, `--max-tokens` |
+| Navigate and answer a question | `navigate` | Who calls this, and is it safe to change? | `--callers`, `--callees`, `--uses`, `--impact`, `--path`, `--connect`, `--situ`, `--test-gate`, `--grep` |
+| Zoom the detail ladder | `zoom` | Show more detail only where it pays | `--detail`, `--pack-signatures`, `--outline`, `--expand`, `--compress` |
+| Assess quality and structure | `quality` | Where is the risk, and did a change add risk? | `--quality-panel`, `--hotspots`, `--clones`, `--metrics`, `--deps`, `--lint`, `--quality-delta`, `--edit-check`, `--pr-context`, `--merge-scout` |
+| Self-diagnosis | `self-diagnosis` | Is the setup correct? | `--doctor` |
+| Security | `security` | Is this agent skill file safe to install? | `--scan-skill`, `--scan-skills` |
+| Knobs and modes | `knobs` | Shape, format, cache, and budget | `--json`, `--format`, `--mcp` |
+
+The `--help=` argument matches on a substring of the family's own name, so the family titles in the
+first column are not themselves valid arguments.
+
+Not sure which command answers the task? Run `ripwire . --help-task="<task in words>"`. The command
+returns one recommended command, or it abstains when the evidence is thin. The command gives advice
+only. It does not run the recommendation. A short bare word — a lone letter, a SCREAMING name, or an
+ordinary word that happens to match an indexed name (django's `F`, for instance) — does not resolve on
+its own; only genuine identifier shape does (camelCase, snake_case, `::`/`.`). Mark it as code in the
+task text — backtick it or write it in call form, e.g. `` `F` `` or `F()` — to route on it by name.
+
+### 6. Output format
+
+**You do not have to learn the schema, because the document carries it.** Every answer opens with a
+legend comment defining each attribute it uses, including what each count does and does not include.
+The map is `<r>` root, `<f p="PATH">` files, `<s t n k>` symbols, `<c n>` call edges; each answering
+command wraps its rows in an element named for the verb — `<callers>`, `<uses>`, `<pr-context>`,
+`<dmm>`, `<skillscan>`.
+
+Two runs over one tree produce the same bytes, and every attribute and text node is XML-escaped, so
+`operator<` and a path containing `&` round-trip: `ripwire . | xmllint --noout -` is a gate here.
+`docs/ARCHITECTURE.md` has the schema and the streaming writer behind it.
+
+#### 6.1 Output example
+
+```bash
+ripwire . --callers=rankGraphTeleport
+```
+
+The leading legend comment is elided here; the line numbers are a capture and move as files grow:
+
+```xml
+<callers of="rankGraphTeleport" defs="1" count="7" root="." hop_tested="0" hop_untested="7" graph_ambiguous="7827" graph_unresolved="4865" graph_unindexed="218" counts_floor="1" next="--uses=rankGraphTeleport">
+<s t="fn" n="runEval" p="src/eval.h:171"/>
+<s t="fn" n="rankGraph" p="src/graph.h:3445"/>
+<s t="fn" n="anchoredLexicalRank" p="src/graph.h:3995"/>
+<s t="fn" n="churnDecayRanking" p="src/main.cpp:1157"/>
+<s t="fn" n="churnRankedGraph" p="src/main.cpp:1191"/>
+<s t="fn" n="runDefaultMap" p="src/main.cpp:1295"/>
+<s t="fn" n="getIndex" p="src/mcpindex.h:1108"/>
+</callers>
+```
+
+`counts_floor="1"` says every count on that row is a floor, never a total. `next=` is the one
+follow-up command worth pasting.
+
+#### 6.2 Exit codes
+
+This is the part to wire into a script.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The command completed. |
+| 1 | The command refused the request. A refusal names the reason on stderr. When `--callers`, `--callees`, `--uses`, `--impact` or `--path` refuse a selector that matches no indexed definition, they also print an answer on stdout: the verb's element with `found="0"` and the name to retry with. |
+| 2 | A policy gate fired: `--arch` found a layering violation, `--scan-skill` found a CRITICAL, `--quality-delta` found new debt. |
+| 3 | The output exceeded the token budget that you set. |
+| 4 | `--test-gate` found an open obligation. |
+| 5 | The memory guard stopped the run: over `--max-memory` (default 65% of the machine's memory) with no partial answer possible, or a verb other than the default map facing a partial index. One stderr line names the limit and the override. |
+
+#### 6.3 JSON output
+
+`--json` emits JSON instead of XML, with keys mirroring the XML attribute names one to one. It is an
+allow-list: the default map, `--for`, `--pack-task`, `--callers`, `--callees`, `--impact`,
+`--quality-delta`, `--test-gate`, `--metrics`, and `--plan-lanes`, which is JSON-native. Every other
+verb refuses on stderr with exit 1 rather than silently falling back to XML, so a verb added tomorrow
+refuses by default.
+
+### 7. Accuracy and disclosure rules
+
+The call graph is extracted from source text by name. The tool does not have a type system or a
+compiler. These limits follow:
+
+- A virtual call produces one edge per candidate in the receiver's inheritance cone — its static
+  type, that type's ancestors and its descendants — and not one edge to the target it dispatches to
+  at run time. Each such edge carries `prov="split"`. When the receiver's static type is unknown,
+  the candidate set is not narrowed at all.
+- A callback through a function pointer contributes an edge in one case. One function must be bound
+  to the variable in scope, the variable must not escape, and the variable's type must be provably a
+  function pointer: a typedef or declarator in the same file proves it, a typedef in a header is
+  missed, and an `auto` or template type is read as unpinned and kept.
+- A macro-generated call site contributes an edge only when the tool indexes the function-like
+  `#define`.
+- A name that has several definitions at the same resolution tier produces one edge per candidate.
+  Each edge carries the weight `1/k`. The symbol carries `amb="K"`. The header totals the events in
+  `ambiguous=`.
+- Two further gauges sit beside `ambiguous=`. `unresolved=` counts calls left with no edge and no
+  proof that the target is outside the tree: every same-named in-repo definition is language-filtered
+  or out of the language's lookup (a method for a receiverless call, another Go package). `external=`
+  counts the calls the language does prove are outside (a builtin or global, an outside import).
+  `unindexed=` counts files no grammar could read, whose calls raise neither of the other two.
+
+The output uses these disclosure rules without exception:
+
+- **A zero is a measurement.** A zero means "none found". A zero never means "none exists".
+- **A floor is labelled.** A count that cannot be a total carries `counts_floor="1"`.
+- **A truncation is disclosed.** The element that truncated carries `total=`, `shown=` and
+  `capped=`. A document that a budget cut carries its own marker and a `next=` step.
+- **A refusal is not a zero.** A selector that names nothing indexed refuses with a did-you-mean
+  suggestion computed from an edit distance. A query that resolves and selects nothing reports
+  `count="0"`.
+- **An estimate is labelled.** Token estimates are calibrated approximations. They are not exact
+  counts for every model.
+- **Counting units are named.** `--callers` counts distinct symbols. `--uses` counts
+  use sites. The two numbers differ by design.
+
+Use these methods when a disclosure says the answer is incomplete:
+
+1. Use `--skipped` to see which files are missing from the index, and which indexed answers it
+   therefore cannot vouch for.
+2. Use `--expand=SYM` to read the body.
+3. Use `--uses=SYM` and `--impact=SYM` to measure the blast radius.
+4. Use `--verify="CLAIM"` to test one claim about the code: confirmed, refuted, or not-established.
+5. Use `--scip=FILE` to supply a compiler-grade index. A precise index replaces the name-based edges
+   and marks the affected edges with `prov="scip"`. A path that is missing, empty or not a regular file
+   causes a refusal (exit 1). A corrupt index causes a fallback to the name-based edges and a warning on
+   standard error. Neither case is silent.
+
+### 8. Determinism
+
+The determinism contract is byte-identity. One tree produces one byte sequence on every run. The
+contract holds under four rules:
+
+1. The crawl sorts all candidate paths before it assigns symbol identifiers.
+2. Every global reduction folds fixed contiguous blocks in index order. No reduction uses an atomic
+   floating-point add.
+3. The rank vector uses type `double`. Edges stay `float`; the multiplication and the accumulation
+   promote to `double`.
+4. The PageRank translation unit compiles without floating-point reassociation: `-fno-fast-math`,
+   set on `src/pagerank.cpp` alone.
+
+Thread count and thread timing never change the output. Neither does the output emitter: the
+`std::print` build and the `std::format` fallback emit the same bytes, which
+`test/printffmtparitycheck.sh` asserts directly — the two disagree on float formatting by default,
+and nothing else in the suite would see it.
+
+Continuous integration runs the two-run byte diff on every leg — macOS on both architectures, Linux,
+a RHEL 9 userland, both build flavours, and the fallback-emitter build — so the contract is checked
+on every commit, not only when you check it. To re-check it on your own tree:
+
+```bash
+t=$(mktemp -d)           # outside the tree: an output written inside it is crawled by the next run
+ripwire . > "$t/a"
+ripwire . > "$t/b"
+diff -q "$t/a" "$t/b"    # two runs, byte-identical
+ripwire . --no-cache > "$t/c"
+diff -q "$t/a" "$t/c"    # and the warm run equals the cold one
+```
+
+Neither diff may report a difference.
+
+### 9. Verification and quality control
+
+`test/regression.sh` names **every gate script**. It is the authoritative list.
+
+**The gate scripts** hold five contracts that a unit test cannot hold.
+
+1. Two runs over one tree are byte-identical — the determinism gate of section 8, run on every CI leg.
+2. A warm run equals a cold run — the cache-transparency gates.
+3. Every XML output is well-formed. The verification command is `xmllint --noout`.
+4. The sanitizer build uses `-fno-sanitize-recover=all`, without which a run with undefined behaviour
+   still exits 0. AddressSanitizer, UndefinedBehaviorSanitizer and LeakSanitizer are part of the
+   guardrails:
+
+   ```bash
+   cmake -S . -B asan -DRIPWIRE_ASAN=ON && cmake --build asan -j
+   LSAN_OPTIONS=suppressions=lsan_suppressions.txt ./asan/ripwire <dir> >/dev/null
+   ```
+
+5. `test/argvdiffcheck.sh` runs a reference binary and the candidate binary over an argument matrix.
+   Standard output, standard error, and the exit code must match for every vector.
+
+Run the full gate suite in the foreground:
+
+```bash
+python3 test/pargates.py . ./build/ripwire -j 6
+```
+
+A new gate script must be added to `test/regression.sh` in the same change. The gate
+`test/manifestcheck.sh` enforces this rule.
+
+Another gate derives the cap inventory. The tool has 236 compile-time caps and 7 ranking parameters.
+`docs/LIMITS.md` lists each cap, its value, and whether the file discloses a truncation when the cap
+fires, and `python3 docs/limits_build.py --check` proves that list against `src/`. `docs/TUNING.md`
+lists the measured cost of each cap.
+
+### 10. Quality evaluation
+
+`ripwire . --quality-panel` joins six independent evidence families:
+
+| Family | Question | Supporting command |
+| --- | --- | --- |
+| Structural | Shape: complexity, size, nesting, parameters, local variables | `--metrics` |
+| Lexical | Identifier text: the naming rules | `--lint`, `--naming-consistency` |
+| Confusion | Syntactic idiom: the confusion rules | `--lint` |
+| Historical | Git change frequency | `--hotspots` |
+| Colocation | How much code a reader must read outside the current file | `--context-ratio` |
+| State | Mutable state that a change can disturb at a distance | `--nonlocal-state` |
+
+The panel ranks a row by the count of families that agree. It does not blend the families into one
+score. A row appears at an agreement count of two or more.
+
+That is the default preset. `--quality-panel=strict` keeps only the four families measured steadily
+enough to gate on, still at two: historical and colocation are out because each is a fixed-size
+worst-40 cut over a ranking whose population moves, so both re-shuffle on code that did not change.
+`--quality-panel=lenient` takes all six at one, which is a reading order rather than a verdict. A
+family that could not be measured on this tree reports UNAVAILABLE, never "did not fire".
+
+`--quality-delta` reports only the properties that the working tree made worse against a baseline.
+`--test-gate` names the tests that must run. `--edit-check` compares an edited symbol against git
+HEAD. `--safe-delete=SYM` composes the callers, the blast radius, the use sites, and the dead-code
+shape into one risk report.
+
+### 11. Agent integration
+
+The command line is the recommended interface. An agent that can run shell commands needs no
+registration. The installer adds the skills. The skills teach the agent when to use each command.
+
+`ripwire wrap <agent>` prints the wiring recipe for one agent. The command prints the recipe. It
+does not edit a configuration file. Run `ripwire wrap --all` to detect every installed agent and to
+print each recipe. The recipe differs by agent, and `wrap` decides which interface to recommend: an
+agent that can run shell commands gets the command line, and one that cannot gets the MCP server.
+
+```bash
+ripwire wrap claude
+ripwire wrap codex
+ripwire wrap cursor
+ripwire wrap windsurf
+ripwire wrap gemini
+ripwire wrap opencode
+ripwire wrap openclaw
+ripwire wrap hermes
+ripwire wrap aider
+```
+
+The write verbs are `--replace-symbol-body=SYM`, `--insert-before-symbol=SYM`, and
+`--insert-after-symbol=SYM`. Supply the new text with `--edit-payload=FILE` or `--edit-payload=-`
+for standard input.
+
+**The payload replaces the whole definition, signature included — not the braced body.** A payload
+that carries only `{ … }` deletes the signature. The tool discloses that in the receipt, as
+`post_check_unavailable`, rather than refusing. One trailing newline on the payload folds into the
+newline already after the span, which a heredoc or `echo` always adds; a second newline is kept and
+is reported as `trailing_newline_folded`.
+
+**Every write returns a receipt, so an agent never re-reads the file.** The receipt carries the
+edited region with surrounding context, the new `blob_sha`, the contract check against the edited
+symbol, the tests to run, and one `next=` step:
+
+```
+ripwire edit: applied atomically; receipt carries region, blob_sha, edit_check, tests_to_run; next: --test-gate=t.cpp
+```
+
+The CLI write verbs and the MCP write verbs use the same safety contract:
+
+- A stale file hash causes a refusal.
+- An ambiguous selector causes a refusal.
+- A symlink target causes a refusal.
+- The tool preserves the file mode.
+- The tool writes a temporary file, synchronizes it, and renames it over the target. A failure leaves
+  the original file unchanged.
+
+### 12. Supported languages and formats
+
+The tool vendors 25 tree-sitter grammars. A table maps a file extension to a grammar and a query
+file. One query engine runs over every language. A new language requires a vendored grammar, a query
+file, and one row in the extension table.
+
+| Language or format | Extensions | Notes |
+| --- | --- | --- |
+| C | `.c`, `.h` | |
+| C++ | `.cc`, `.cpp`, `.cxx`, `.hpp`, and others | Qualified calls and explicit template calls resolve in a precise tier. |
+| Objective-C / Objective-C++ | `.m`, `.mm` | |
+| Metal (MSL) | `.metal` | Indexed with the C++ grammar. |
+| CUDA | `.cu`, `.cuh` | `<<<>>>` launch sites are call edges. |
+| Python | `.py` | |
+| TypeScript / JavaScript | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` | Named imports and default imports resolve. One vendored dependency supplies two of the 25 grammars, `typescript` and `tsx`. `.astro` frontmatter rides this same `Lang` — see its own row below. |
+| Java | `.java` | Qualified `new` calls resolve in a precise tier. |
+| Kotlin | `.kt` | Shares one call graph with Java. A file with string templates past 128 levels is refused and listed by `--skipped`. |
+| Ruby | `.rb` | Superclasses, mixins, `autoload`, and constant receivers are read. |
+| PHP | `.php`, `.phtml` | Dynamic dispatch is a stated floor. |
+| Lua | `.lua` | Metatable inheritance produces no inheritance edge. `require` is a function call. A string-literal `require` that names exactly one file in the tree adds a dependency edge. |
+| Dart | `.dart` | A function body is a sibling of the signature. The capture extends the span through the body. |
+| Elixir | `.ex`, `.exs` | Modules, protocols, implementations, functions, macros, guards, and delegates are indexed. |
+| Swift | `.swift` | |
+| C# | `.cs` | The `?.` family resolves in a precise tier. |
+| Go | `.go` | Qualified calls are rejected and fenced, not guessed. |
+| Rust | `.rs` | Scoped, turbofish, and `Self::` calls resolve in a precise tier. |
+| Bash | `.sh`, `.bash` | |
+| Astro | `.astro` | **Frontmatter only.** The `---`-fenced block is parsed as TypeScript, through one `ts_parser_set_included_ranges` call; the template half — including `<script>` bodies and `{…}` interpolations — is NOT indexed, so a call made only from the template produces no edge. An `.astro` file reports `lang="ts"` because it rides `Lang::TypeScript` (that is what lets a frontmatter call resolve into a `.ts` service). A top-level frontmatter call is module-scope code, so `--callers` names `<file-scope>` rather than a function. No Astro grammar is vendored. |
+| GDScript | `.gd` | A file is a class body: `class_name` names it and file-scope `func`/`var` are its members. A signal is indexed as a member. `preload`/`load` produce no dependency edge. `.tscn`, `.tres`, and `.gdshader` are not indexed. |
+| JSON | `.json` | Config keys become symbols. The lane emits no call edges. |
+| TOML | `.toml` | A table header is one symbol. Keys below it are one level down. |
+| YAML | `.yml`, `.yaml` | Mapping depth 2 is the cut. Sequence levels are transparent. |
+| Markdown | `.md`, `.markdown` | Every heading is a section symbol. The span runs to the next heading of the same or higher level. |
+
+Notebooks, HTML, and CSV files are indexed as documents for `--recall` and `--mentions`.
+
+### 13. Performance
+
+| Operation | Scale | Measured result |
+| --- | --- | --- |
+| Cold parse | llvm-project, 182,555 files | 194.1 s to 155.6 s of CPU, measured 2026-08-08, before the performance work in 0.6.0 |
+| Cold parse and answer | This repository | Parse and query retire 3.2 to 3.5 instructions per cycle |
+| Warm run, cache load | The same tree | 52.3 M instructions in place of the cold run's dominant 8.74 B phase: about 167 times fewer |
+
+The per-scope hardware-counter table behind these rows is in
+[Where its own cycles go](#where-its-own-cycles-go--hardware-counters-per-scope).
+
+One process answers a query. The tool starts no daemon and holds no server connection. The parse
+cache is keyed by file content hash and a parser version. An extraction change bumps the version and
+causes one cold re-parse. A gate asserts that the warm output is byte-identical to the cold output.
+
+Measured results with their instruments and corpora are in `docs/EVALS.md`. The document also lists
+the counterexamples that this project publishes against itself. For example, one comparison ran
+graphify 0.9.34 with `--code-only --no-cluster`. The measurement is in `bench/headtohead/r4-2026-08-06/`.
+
+### 14. Known limits
+
+**What the analysis cannot see**
+
+- The call graph is name-based, with no type system and no compiler. A virtual call resolves to every
+  candidate in the receiver's inheritance cone rather than to the one target it dispatches to at run
+  time, and a callback, a macro expansion or a duck-typed call can produce no edge at all. Section 7
+  states the disclosure rules; `--scip=FILE` supplies a compiler-grade index where precision matters.
+- Test coverage is read from call edges out of indexed test symbols, so a shell or command-line test
+  that runs a built binary as a subprocess is invisible, and a repository tested that way reads as
+  untested. Such a harness is labelled `harness=script` with `reaches=0`, which is a stated limit
+  rather than a measurement. This repository's own gate suite has exactly that shape.
+- Multi-file localization is the weakest measured result. The published metric is Strict@k — every
+  gold file of a task inside the top k — and the tool finds one gold file far more often than it
+  finds all of them. `docs/EVALS.md` carries the numbers, the 560-instance dataset and the split.
+- The config and prose lanes index symbols but emit no call edges: JSON, TOML, YAML and Markdown, and
+  the notebooks, HTML and CSV files read as documents for `--recall` and `--mentions`. They answer
+  retrieval questions and never appear in a call-graph answer.
+- Churn, ownership and co-change need real git history. A shallow clone reports every file as one
+  commit.
+- PHP dynamic dispatch and Lua metatable inheritance are floors, not complete answers.
+
+**What the crawl skips, and how to change it**
+
+- Files over 4 MB: `--max-file-size=N[K|M|G]`.
+- JSON files over 256 KB, and YAML files over 512 KB.
+- Paths covered by `.gitignore`: `--no-ignore`.
+- Every symlink, whether it points at a file or a directory. A symlinked source file is not indexed
+  at all, so a tree that reaches its sources through symlinks reads as if they were not there.
+- `--skipped` names every file that was skipped, why, and which indexed answers cannot vouch for it.
+
+**When a verb is not the right tool**
+
+- `--grep` can cost more tokens than a plain grep on a small result set.
+- `--pack-signatures` can be larger than the body when a symbol is short.
+- A multi-root run merges 2 to 16 checkouts into one graph, but `--quality-delta`, `--test-gate`,
+  `--arch` baselines, `--pr-context` and the evaluation verbs stay single-root. Run those per root.
+
+### 15. Documentation
+
+Every document this project publishes is listed under [Documentation](#documentation) below, with
+the question each one answers. Two of them matter while you are reading this guide: `docs/COMMANDS.md`
+gives every flag a real invocation and its recorded output, and `ripwire --help` is the authority
+whenever a document disagrees with it.
+
+The presentation rebuilds from `present/deck5_ripwire_build.js`. The preprint draft is in
+`paper/PREPRINT.md`. The method is not submitted for peer review. Its tables name the measurement
+files under `bench/`.
+
+### 16. Improvement
+
+`prompts/` holds thirteen **self-contained orchestrator prompts**. Each prompt is a workflow that a
+coding agent can run against this repository. Each prompt writes a plan and stops for your approval
+before it runs a command. Build the binary first. The prompts measure against the binary.
+
+The prompts cover a full audit, a gap analysis from real use, a capture audit, a head-to-head
+comparison, a ranking evaluation, a language improvement pass, a zero-context onboarding study, a
+sibling sweep, a command tour, a presentation build, adding a new language, a quality-panel
+calibration round, and a COBOL corpus measurement. The index is `prompts/README.md`.
+
+If the tool answers incorrectly on your codebase, run `prompts/improve-for-my-language.md`. The
+prompt harvests your session transcript and produces one finding per event with its evidence. Open
+an issue with the result.
+
+### 17. License
+
+Apache License 2.0. See `LICENSE` for the full text.
+
+Copyright 2026 David Brewster
+
+Vendored third-party code keeps its own license. `THIRD_PARTY.md` lists every dependency and its
+terms.
+
+---
+
+## Release notes
+
+**ripwire 0.6.5 — TypeScript alias imports resolve, and fixes from Windows testers.** Imports through a tsconfig alias,
+`baseUrl` or a workspace package are now real edges, so `--deps`, `--arch`, `--impact` and the call graph see them, and a
+config ripwire could not read is disclosed rather than guessed (thanks @srinchow). On Windows, `--doctor` searches PATH as
+Windows does and no longer calls a byte-identical copy stale; two ripwire builds on one tree no longer re-parse on every
+run (thanks @elsRobin, @lennix1337 and @antoniojosedev for testing). `--doctor`'s PATH hint can be pasted as printed.
+`--for` lifts a symbol the task names verbatim. In Python, JS/TS and Ruby, a method call on a dict or map binds to an
+in-repo method of that name only when the calling file names its class (or one in its inheritance cone); otherwise it
+is declined and counted (`declined_calls=`).
+
+**ripwire 0.6.4 — Windows fixes from real testers, and honest TypeScript answers.** On Windows without symlink rights,
+the skills installer no longer reports success after creating empty folders: it copies instead, or says it failed. `--doctor`
+no longer mistakes an older ripwire on PATH for the running one (thanks @elsRobin). `--deps` no longer reports `cycles="0"`
+when TypeScript alias or workspace imports couldn't be resolved (thanks @srinchow). `node:test` files get a runnable
+`node --test` command where Node can run them as written (thanks @YogevKr and @alex-michaud), and a long `next=` is
+never dropped. Astro joins the languages (thanks @sclyde).
+
+**ripwire 0.6.3 — nothing cut quietly, and a Windows download.** A cut answer now keeps its strongest rows and
+names what it dropped, with a `next=` for the rest. Releases include a Windows x64 zip (preview), checked against
+Linux output on every train, and the Windows cache works as `--doctor` reports (thanks @elsRobin). `--regex`
+escapes, nested `std::` calls, `--field-affinity` and `--clones` paging no longer give wrong answers, and
+`--test-gate` finds TS/JS test runners (thanks @mariadb-KyleHutchinson). Ruby's `attr_*` defines its methods (thanks
+@mpapis), and the hooks no longer stall long Bash calls (thanks @KilimcininKorOglu).
+
+**ripwire 0.6.2 — complete, honest, fast lookups, and Windows.** Calls that live outside any named function now
+have a caller: on vue-core, 72.83% of call sites that `--callers`, `--impact` and `--test-gate` could not see.
+Answers got smaller where it counts: the compact legend is the default (`--legend=full` restores the old bytes
+byte-for-byte), and over MCP each definition is sent once per session instead of in every answer.
+`--quality-delta` is trustworthy on a clean tree again. Native Windows x64 now builds and gates with **both**
+clang-cl and MSVC's own `cl.exe`, verified in CI on every full matrix — the 647-gate suite doesn't run on
+Windows yet, and ASan compiles there but never executes.
+*Thanks to @lennix1337 for the native Windows port. Code from @mpapis (`--lsp`), @sclyde (GDScript), @s0undt3ch,
+@rainhuang0220, @qinghuanandejiangshi, @csy20, @aniruddhaadak80 and @llvm-x86. Reports from @YogevKr,
+@alex-michaud, @mariadb-KyleHutchinson, @hnipps and @SVC-MACSTUDIO.*
+
+**ripwire 0.6.1 — the answers an agent reads got smaller.** A compact answer is 46–66% smaller per call, and on
+llvm-project the declined-call index drops from 114 MB to 368 KB with every count and every byte of output
+unchanged. `--in=DIR` scopes "what changed recently" to a directory. Elixir resolves natively by module, name and
+arity (thanks @henry-hz), `--scip` reads scip-java indexes (thanks @dpunosevac), and a `file:name` selector no
+longer answers with a definition from another file (thanks @andriytyurnikov).
+*Also thanks to @antoleod (a first contribution) and @heliocipher (the README rewrite).*
+
+**ripwire 0.6.0 — out now.** Kotlin and Dart bring it to 24 vendored grammars, and Ruby now reads the dependencies a
+Rails application actually has: superclasses, mixins, `autoload`, and the constant receivers an autoloader loads
+through. On llvm-project — 182,555 files — the cold parse drops from 194 s to 156 s of CPU. Declined calls, derailed parses
+and cut answers now say so, instead of returning a quiet zero.
+*Thanks to @xCatG (Kotlin), @calvinchengx (Dart), @andriytyurnikov (Ruby dependencies), @AnkitArya and
+@ashutoshsinghpr7 (Hermes), @s0undt3ch and @PollyBot13. Reports from @snrmwg, @mariadb-KyleHutchinson and @YogevKr.*
+
+Every release, with its measurements and its caveats, is in **[CHANGELOG.md](CHANGELOG.md)** — that file is the
+record, and this line is only the pointer to it.
+
+---
+
 ## Documentation
 
 | Need | File |
 | --- | --- |
 | Every flag, with a real invocation and its recorded output | [`docs/COMMANDS.md`](docs/COMMANDS.md) |
-| The authoritative flag list, always current | `./build/ripwire --help` |
+| The authoritative flag list, always current | `ripwire --help` |
 | Pipeline, data model, determinism contract, output-honesty contract | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | Every published number, its instrument, and what is *not* published | [`docs/EVALS.md`](docs/EVALS.md) |
 | Compiler optimization remarks: the triage, and the two opt-in faster builds | [`docs/OPTREMARKS.md`](docs/OPTREMARKS.md) |
@@ -2049,7 +3119,11 @@ tier: it parses with its own vendored grammar, so its headings are symbols, not 
 | Orientation for a coding agent working *on* this repository | [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) |
 | User-visible capabilities, behaviour changes, known limits | [`CHANGELOG.md`](CHANGELOG.md) |
 | Vendored dependencies and their licences | [`THIRD_PARTY.md`](THIRD_PARTY.md) |
-| The whole tool in 29 slides — the showcase deck | [`present/ripwire-showcase.pdf`](present/ripwire-showcase.pdf) ([pptx](present/ripwire-showcase.pptx), rebuilt by [`present/deck5_ripwire_build.js`](present/deck5_ripwire_build.js)) |
+| Installation and removal procedures | [`INSTALL.md`](INSTALL.md) |
+| The compile-time cap inventory | [`docs/LIMITS.md`](docs/LIMITS.md) |
+| The measured cost of each cap | [`docs/TUNING.md`](docs/TUNING.md) |
+| Skill-file security checks | [`docs/COMMANDS.md`](docs/COMMANDS.md#--scan-skillsdir) |
+| The whole tool in 36 slides — the showcase deck | [`present/ripwire-showcase.pdf`](present/ripwire-showcase.pdf) ([pptx](present/ripwire-showcase.pptx), rebuilt by [`present/deck5_ripwire_build.js`](present/deck5_ripwire_build.js)) |
 
 If a document disagrees with `--help`, the document is the bug.
 

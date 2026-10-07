@@ -31,7 +31,7 @@
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 command -v python3 >/dev/null 2>&1 || { no "python3 is required by binoverridecheck"; echo "FAILURES ABOVE"; exit "$fail"; }
@@ -76,6 +76,7 @@ EXEMPT = {
     "adaptivecutshapecheck.sh":  "compiles an isolated $CXX probe .cpp; never invokes build/ripwire",
     "aiderbytescheck.sh":        "pure-python test of bench/headtohead/r4-2026-08-06/r4_worker.py's aider byte-count wiring; no ripwire binary invocation",
     "argvdiffcheck.sh":          "sanctioned skip fires BEFORE the RIPWIRE_BIN guard, gated on a second env var (RIPWIRE_BASE) neither pargates.py nor regression.sh ever sets; independent of RIPWIRE_BIN/broken-binary state, and already asserted intentional by gateexitcheck.sh arm (D)",
+    "nodekindcheck.sh":         "compiles an isolated $CXX harness against src/infra/nodekind.h (plus two mutated copies of that header) and greps the git-tracked walk sections; the subject is a header-inline function and the source that calls it, so no ripwire binary is bound or executed at all",
     "nulbytecheck.sh":           "reads the SOURCE TREE (git ls-files), not the binary; BIN is bound for interface uniformity and explicitly documented as unused in the gate's own header",
     "agentloopfollowupcheck.sh": "pure-python test of bench/agentloop/followup_calls.py over a synthetic pilot json and the committed pilot-6run.json; BIN is bound for interface uniformity and never executed (verified by reading the gate)",
     "arisefollowupcheck.sh":     "pure-python test of bench/arise-h2h/followup_calls.py over synthetic SWE-agent .traj fixtures; BIN is bound for interface uniformity and never executed (verified by reading the gate)",
@@ -84,14 +85,20 @@ EXEMPT = {
     "agentloopcodexcheck.sh":    "pure-python test of bench/agentloop prompt-building; the path to build/ripwire is asserted as a STRING, never executed",
     "agentloopgradercheck.sh":   "pure-python test of the agentloop grader's circular-invocation detector; 'ripwire' appears only in fixture command strings, never executed",
     "agentlooplockcheck.sh":     "pure-python/schema test of tasks.lock partitioning; no CLI invocation",
+    "buildtypestampcheck.sh":    "CMake-configure-level gate: configures the real CMakeLists.txt into scratch trees under single- and multi-config generators, builds only the ripwire_version_stamp target (a cmake -P script) and reads the generated version.h each configuration's compile resolves via the CMake File API; no ripwire binary is built, bound or executed — the file contains neither RIPWIRE_BIN nor $BIN",
     "clonebandcheck.sh":         "compiles an isolated $CXX probe .cpp; never invokes build/ripwire",
     "clonelexcheck.sh":          "builds its OWN standalone harness binary from src/*.cpp, independent of build/ripwire",
     "codexplugincheck.sh":       "pure-python/json check of a static MCP manifest file; 'ripwire' only appears as a string field",
     "columnarcommacheck.sh":     "compiles an isolated $CXX probe .cpp; never invokes build/ripwire",
     "connectcorecheck.sh":       "builds its OWN standalone harness binary, independent of build/ripwire",
+    "diagnoticecheck.sh":        "builds its OWN standalone harness (test/diagnotice_harness.cpp) against src/infra/diagnostics.cpp and statically reads that file; the subject is the Diagnostics reporters, so no ripwire binary is bound or executed — the file contains neither RIPWIRE_BIN nor $BIN",
     "dependencypincheck.sh":     "CMake-configure-level gate (checks CMakeLists.txt text + a throwaway cmake -S/-B configure); no ripwire binary",
     "dynmapsimdcheck.sh":        "builds its OWN standalone harness binaries per SIMD arm, independent of build/ripwire",
     "flagtablecheck.sh":         "pure file/doc-table check; no binary invocation",
+    "limitstablecheck.sh":       "gates docs/LIMITS.md against the CAP DECLARATIONS in src/, so its subject is the generator and the source text, not the binary — it binds no ripwire binary at all (the file contains neither RIPWIRE_BIN nor $BIN), the same shape as formatgatecheck below",
+    "capsweepcheck.sh":          "gates bench/capsweep (a python harness) and the docs/TUNING.md it generates: the arms run the cap patcher against a SYNTHETIC tree, the corpus-freeze assertion against a SYNTHETIC corpus, and `emit --check` against the committed TSV records plus src/. The sweep those records came from does need a binary — a specially PATCHED one built into a scratch dir, never build/ripwire — but the gate never re-runs it, so no ripwire binary is bound here at all (the file contains neither RIPWIRE_BIN nor $BIN, verified by reading it), the same shape as limitstablecheck above",
+    "gitenvhermeticcheck.sh":    "harness-hygiene gate for the GIT_* repository-selection variables: its subjects are test/lib/clean-env.sh and the gate scripts that source it, and the only executable it drives is git itself. It accepts $1 for regression.sh's uniform call shape and never binds it, so a broken ripwire cannot make it green or red -- the file contains neither RIPWIRE_BIN nor $BIN (verified by reading it), so (2b)'s static tell needs no exemption row for it, the same shape as gatecountcheck below",
+    "gatecountcheck.sh":         "gates the PUBLISHED GATE COUNT against the absorb loop in test/regression.sh, so its subject is docs/gatecount_build.py and three prose/JS site files — it binds no ripwire binary at all (the file contains neither RIPWIRE_BIN nor $BIN, so (2b)'s static tell needs no exemption row for it), exactly the shape of limitstablecheck above",
     "formatgatecheck.sh":        "runs scripts/formatcheck.sh under a pinned clang-format; the subject is the FORMATTER and the gated file list, so no ripwire binary is bound at all — the file contains neither RIPWIRE_BIN nor $BIN (verified by reading it), which is also why (2b)'s static tell needs no exemption for it",
     "g1configcheck.sh":          "greps CMakeLists.txt for the G1 sanitizer flag derivation; no binary invocation",
     "g1freshcheck.sh":           "checks asan/ripwire's mtime on disk against src/; never executes the binary",
@@ -100,15 +107,24 @@ EXEMPT = {
     "loopconservationcheck.sh":  "reads test/regression.sh's absorb loop via `git show REF:...` across HEAD and its merge parents (a pure git-history check); never invokes build/ripwire",
     "manifestcheck.sh":          "checks that every test/*check.sh is listed in test/regression.sh; pure file check",
     "optremarkscheck.sh":        "checks -DRIPWIRE_OPT_REMARKS/-DRIPWIRE_PGO CMake config text; no binary invocation",
+    "osswitchcheck.sh":          "scans src/ and the CMake files for OS preprocessor tests, POSIX/Windows system headers, force-includes, libc-renaming macros, raw POSIX calls and platform facts outside src/infra/os.h; its subject is the source text, so no ripwire binary is bound at all (the file contains neither RIPWIRE_BIN nor $BIN), the same shape as infraportcheck",
+    "oswin32logiccheck.sh":      "drives the CMake target ripwire_test_oswin32logic (test/verify_os_win32_logic.cpp) plus a sanitizer and a mutant compile of the same file; its subject is src/infra/os_win32_logic.h, so build/ripwire is never bound or executed",
+    "optremarkshotcheck.sh":     "audits scripts/optremarks.py's HOT_FILES/COLD_FILES against the SOURCE TREE (os.walk over src/, plus each file's own RIPWIRE_<X>_TU guard); the subject is a triage list versus the files it claims to cover, so no ripwire binary is bound or executed at all",
     "pargatescheck.sh":          "meta-check of test/pargates.py's own source; pure file check",
+    "enumtablecheck.sh":         "scans the SOURCE TREE (src/, plus scratch copies of it for its positive controls) for literal-extent tables indexed by an enum; no ripwire binary is bound or executed — the file contains neither RIPWIRE_BIN nor $BIN",
+    "noaliascheck.sh":           "compiles its OWN $CXX probes against src/infra/Diagnostics.h (debug trap, -O2 -DNDEBUG IR + objdump bands, the GCC-shape preprocess, the =false control) and greps src/ for a bare __restrict; READS build/CMakeCache.txt for the front end and CMake's -basic-aa-separate-storage probe result but never invokes build/ripwire — the file contains neither RIPWIRE_BIN nor $BIN",
     "pmccheck.sh":               "builds its OWN standalone harness binary, independent of build/ripwire",
     "portablebuildcheck.sh":     "CMake-configure-level gate only; the gate's own banner says 'no ripwire binary needed'",
     "qschemetripcheck.sh":       "greps src/quality.h's tripwire comment against the test/*.sh manifest; pure file check",
     "radixsimdcheck.sh":         "builds its OWN standalone harness binaries per SIMD arm, independent of build/ripwire",
+    "strkerncheck.sh":           "drives the CMake target ripwire_test_strkern (test/verify_strkern.cpp) and two direct-compiled SIMD arms (mutated, x86_64 cross) — never invokes build/ripwire",
     "releaseinstallcheck.sh":    "tests install.sh against a FABRICATED release asset/stub server; independent of build/ripwire",
     "reusefirstworkflowcheck.sh":"checks skills/ripwire-reuse-first/SKILL.md content; pure file check",
     "ripwirepubliccheck.sh":     "checks git-tracked files for leaked private content; pure file/grep check",
+    "skipclassifycheck.sh":      "meta-check of test/pargates.py's SKIPPED-vs-PASSED classification: it drives pargates.py over synthetic probe corpora with a fake binary it writes itself, so build/ripwire is never bound or executed — the file contains neither RIPWIRE_BIN nor $BIN (so (2b)'s static tell needs no exemption row for it), the same shape as pargatescheck above",
     "svectorcheck.sh":           "compiles isolated $CXX probes for the svector container; never invokes build/ripwire",
+    "timsortcheck.sh":           "compiles isolated $CXX harnesses for the vendored timsort header (correctness, determinism and the zero-allocation workspace property); never invokes build/ripwire",
+    "worktreeleakcheck.sh":      "kills COPIES of the gates that check out a commit of the repository (and headbinlib's HEAD-binary builder) inside throwaway repositories, against a stub ripwire and a cmake shim it writes itself; the subject is what a killed gate leaves in the shared .git, so build/ripwire is never bound or executed -- the file contains no $BIN (verified by reading it), so (2b)'s static tell needs no exemption for it",
 }
 
 toRun = [ g for g in gates if g not in EXEMPT ]

@@ -58,6 +58,43 @@
 # (est_tokens 815 > 800), which is the re-anchor earning its keep rather than an argument against it.
 # The corpus is a generated temp fixture, not the live tree, so the number does NOT move with repo growth.
 #
+# ── RE-ANCHORED 2026-09-11 (0.6.1, the L1 lane): the TIGHT rung 950 → 1100. ──
+# The instruction the 2026-09-05 block below left ("The next change that adds a byte to --for's floor at 950 must
+# re-anchor that rung with its own arithmetic") is now due, and this is that arithmetic. The ceiling ladder's
+# RUNG ZERO — the one that drops the confidence=/margin_pct=/budget_tokens= clause and the r=/tail clause to buy
+# the header back under the allowance — used to do it in SILENCE: the attributes stayed on the root with nothing
+# defining them and no word that a definition had been removed. It now splices a 181 B sentence naming exactly
+# those attributes (verbs_for.h kForLegendDroppedNote). 181 B is 73 tokens at the conservative rate, against the
+# TWO tokens of headroom the rung had left. The note is not shortened to fit the rung; the rung moves.
+#
+# MEASURED, both binaries, this corpus in a mktemp dir, --token-budget swept 950..3000:
+#   · 950  post-fix: NOTHING the ladder can build fits the 950 × 2.36 × 1.15 = 2 578 B allowance, so it lands on
+#     its last rung — the emitted document is 2 756 B, est_tokens=1102. An honest overshoot, labelled
+#     over_ceiling="1", which is the rung earning its move rather than an argument against the disclosure.
+#   · 1000 post-fix: 2 624 B fits the 2 714 B allowance, but est_tokens=1050 is 50 over the TOKEN ceiling (the
+#     70 B of over_ceiling="1" and its legend clause are the difference between this row and the next).
+#   · 1050 / 1100 / 1150 post-fix: est_tokens=1022 at all three, 2 554 B — the serving shape is FLAT across that
+#     band (no additional row fits anywhere in it), so the rung buys headroom rather than a different selection.
+# 1100 sits mid-plateau with 78 tokens of headroom, one step clear of the short edge (1000) and of the upper edge
+# where the next row would land. The pre-fix binary reads est_tokens=949 at 1100, so the history is green at every
+# step. The other two rungs did not move: 1640 reads 1620 and 3000 reads 2802 on BOTH binaries — rung zero never
+# fires there, which is the whole reason only the tight rung moved.
+# (Re-measured 2026-09-12 when the note's closing clause was corrected: it had pointed the reader at a help text
+# that defines two of the four attributes it names. The replacement is 181 B against 182 B, so every number in
+# this block moved by at most one byte — the figures above are the re-measured ones, not the originals.)
+#
+# ── MOVED BACK 2026-09-13 (lane for-widen, owner decision 22:55: coverage= present-only): 1700 → 1640. ───────────
+# This fixture's answer is CONFIDENT (coverage would read 100 over a 12-file head), so under present-only it carries no
+# coverage= and no clause and reads the base numbers again: 1640 → est_tokens=1620 (7 rows), 1100 → 1022, 3000 → 2802;
+# 1700 now overshoots (1779, the 8-row state). The paragraph below records the one-day excursion for the next reader.
+# ── RE-ANCHORED 2026-09-12 (lane for-widen, L-W): the MIDDLE rung 1640 → 1700. ──────────────────────────────
+# The coverage= root fact and its legend clause (forpage.h kForCoverageLegend, ~300 B, byte-exempt like the confidence
+# clause it extends) landed on every --for header. Measured on this fixture at the gate's own (mktemp) path length: the
+# base build read est_tokens=1620 at 1640; this build's 7-row state reads 1780 there and over_ceiling="1" rides along;
+# its 8-row state fits from 1680 to 1770 at est_tokens=1556 (1660 and 1780 both read over). 1700 sits inside that
+# window with 144 tokens of headroom. The other two rungs stay: 1100 still reads 1032 (4 rows) and 3000 reads 2934
+# (16 rows, from 2802) inside its rung. The header's own rule: the signal is expected, the response is a deliberate
+# re-anchor with the number recorded.
 # ── RE-ANCHORED 2026-09-05 (terminality round A, lane R, P7 rank order): the MIDDLE rung 1600 → 1640. ──
 # The lens <sigs> is FLAT now: rows in rank order, each carrying p="src/modN.py" (16 B), no <f p=> wrapper (24 B
 # each). At this fixture's 7-row state that is 7 × 16 − 2 × 24 = +64 B = +26 tokens at the conservative rate.
@@ -136,13 +173,14 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 CORPUS="$TMP/corpus"
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "fornotesbudgetcheck: no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -192,8 +230,8 @@ jsonRows(){ "$BIN" "$CORPUS" --for="$TASK" --token-budget="$1" --json 2>/dev/nul
             | python3 -c 'import sys,json; d=json.load(sys.stdin); print(len(d["sigs"]))' 2>/dev/null; }   # P7: flat sigs array
 
 # ── arm 1: est_tokens must fit the ceiling the user asked for, in BOTH dialects ────────────────────
-# (tight budget 950, re-anchored 2026-08-28 — see the CEILING MARGIN block above for the arithmetic)
-for tb in 950 1640 3000; do
+# (tight budget 1100, re-anchored 2026-09-11 — see the CEILING MARGIN block above for the arithmetic)
+for tb in 1100 1640 3000; do
   xe="$( xmlEst "$tb" )"; je="$( jsonEst "$tb" )"
   if [ -z "$xe" ] || [ -z "$je" ]; then no "budget=$tb: could not read est_tokens from one of the dialects (xml='$xe' json='$je')"; continue; fi
   if [ "$xe" -le "$tb" ]; then ok "budget=$tb: XML est_tokens=$xe fits the ceiling"
@@ -204,7 +242,7 @@ done
 
 # ── arm 2: the two dialects select COMPARABLE row counts (they need not be equal) ──────────────────
 # Before the fix the XML lens bought 2-2.4x the rows with the same budget, because notes were free.
-for tb in 950 1640 3000; do
+for tb in 1100 1640 3000; do
   xr="$( xmlRows "$tb" )"; jr="$( jsonRows "$tb" )"
   if [ -z "$jr" ] || [ "$jr" -eq 0 ]; then no "budget=$tb: JSON selected no rows — the comparison has no denominator"; continue; fi
   if [ "$xr" -le $(( jr * 13 / 10 + 1 )) ] && [ "$xr" -ge $(( jr * 7 / 10 )) ]; then
@@ -329,9 +367,24 @@ fi
 rm -f "$CORPUS/.ripwire_notes"
 bare="$( "$BIN" "$CORPUS" --for="$TASK" --token-budget=800 2>/dev/null )"
 case "$bare" in *"<note "*) no "a tree with no .ripwire_notes still emitted a <note> element";; *) ok "a tree with no notes emits none (L3 inertness)";; esac
-bareEst="$( printf '%s' "$bare" | grep -o 'est_tokens="[0-9]*"' | head -1 | tr -dc '0-9' )"
-if [ -n "$bareEst" ] && [ "$bareEst" -le 800 ]; then ok "no-notes tree also fits the ceiling (est_tokens=$bareEst)"
-else no "no-notes tree reports est_tokens='$bareEst' against a budget of 800"; fi
+# L1 (2026-09-19): the 800-token fit was calibrated in the full legend, the default when it was written, and is asked
+# for by name. The DEFAULT (compact) answer on this tree carries more rows and lands over 800 at this one budget; that is
+# the --for sig ledger's exemption design (disclosure clauses exempt from the sig charge, recovered by rung zero, which
+# the compact dialect's shorter clauses rarely pay for). RE-MEASURED in the L1 fix round with a script, not a count typed
+# here: 66 budgets (300..3550 step 50) on the P4-shape fixtures, the default is over on 15 (72 functions) and 15 (12
+# functions), --legend=full on 11 and 12; the earlier "8 of 66 vs 2, 55 before" did not reproduce. What the default MUST do
+# there is say so — asserted below.
+bareFull="$( "$BIN" "$CORPUS" --for="$TASK" --token-budget=800 --legend=full 2>/dev/null )"
+bareEst="$( printf '%s' "$bareFull" | grep -o 'est_tokens="[0-9]*"' | head -1 | tr -dc '0-9' )"
+if [ -n "$bareEst" ] && [ "$bareEst" -le 800 ]; then ok "no-notes tree also fits the ceiling in the full legend (est_tokens=$bareEst)"
+else no "no-notes tree reports est_tokens='$bareEst' against a budget of 800 (full legend)"; fi
+defEst="$( printf '%s' "$bare" | grep -o 'est_tokens="[0-9]*"' | head -1 | tr -dc '0-9' )"
+if [ -z "$defEst" ]; then no "no-notes tree at the default posture carries no est_tokens="
+elif [ "$defEst" -le 800 ]; then ok "no-notes tree at the default posture fits (est_tokens=$defEst)"
+else
+    case "$bare" in *'over_ceiling="1"'*) ok "no-notes tree at the default posture is over 800 (est_tokens=$defEst) and SAYS so (over_ceiling=\"1\")" ;;
+                    *) no "no-notes tree at the default posture is over 800 (est_tokens=$defEst) in SILENCE" ;; esac
+fi
 
 # ── arm 5: still deterministic and well-formed after the accounting change ─────────────────────────
 if [ "$( "$BIN" "$CORPUS" --for="$TASK" --token-budget=800 2>/dev/null )" = "$bare" ]; then ok "output is byte-identical run-to-run"

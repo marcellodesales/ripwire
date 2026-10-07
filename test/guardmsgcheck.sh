@@ -26,7 +26,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 cd "$ROOT"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN"; exit 2; }
 
@@ -57,8 +57,13 @@ guard()
 }
 
 # ── the 20 guards, in source order ────────────────────────────────────────────────────────────────────
-# 1. no root at all → usage() dump (the only guard with no ripwire: prefix)
-guard "no-root prints usage"        'ripgrep of AI context'
+# 1. no root at all. This used to dump the WHOLE 185 KB catalog to stderr — ~46 000 tokens for the
+# likeliest first-run mistake there is, when an unknown flag had always cost 32 bytes — and it was the
+# only guard here without the `ripwire: ` prefix. Both were fixed together (two-tier --help,
+# 2026-09-09): it is now a short refusal in the same shape as the other nineteen, and what it must
+# still do is NAME THE FLAG THAT ANSWERS, so a reader is one hop from the catalog rather than buried
+# in it. That is what this arm pins — the naming, not the wording around it.
+guard "no-root prints usage"        'no <dir> given'
 
 # 2. --listen serves one fixed workspace, so it needs a root (bare --mcp does not)
 guard "--listen without a root"     'serves ONE workspace fixed at startup'  --listen=127.0.0.1:8765
@@ -121,7 +126,7 @@ stableorder()
     local got mode
     got="$( "$BIN" "$@" </dev/null 2>/dev/null | grep -c 'order=important-first' )"
     [ "$got" = 0 ] && mode=STABLE || mode=UNSTABLE
-    [ "$mode" = "$want" ] && ok "$name" || no "$name (map came out $mode, want $want)"
+    if [ "$mode" = "$want" ]; then ok "$name"; else no "$name (map came out $mode, want $want)"; fi
 }
 stableorder "plain run is NOT stable-ordered"         UNSTABLE  test/fixture
 stableorder "--order=stable IS stable-ordered"        STABLE    test/fixture --order=stable
@@ -138,7 +143,7 @@ stablemcp()
     got="$( printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"analyze","arguments":{"path":"test/fixture"}}}\n' \
             | "$BIN" "$@" 2>/dev/null | grep -c 'order=important-first' )"
     [ "$got" = 0 ] && mode=STABLE || mode=UNSTABLE
-    [ "$mode" = "$want" ] && ok "$name" || no "$name (map came out $mode, want $want)"
+    if [ "$mode" = "$want" ]; then ok "$name"; else no "$name (map came out $mode, want $want)"; fi
 }
 stablemcp "--mcp implies --stable"           STABLE    --mcp
 stablemcp "--mcp --no-stable opts back out"  UNSTABLE  --mcp --no-stable

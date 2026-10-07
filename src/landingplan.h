@@ -1,4 +1,6 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // landingplan.h — --stray-content --plan: "of all my branches, which still hold REAL work, and in what
 // order should I land them?" Two verbs already answer adjacent questions and stop just short of this one:
@@ -44,7 +46,7 @@
 #include "crossref.h"
 #include "mergescout.h"
 #include "serialize.h"          // escapeXml
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT
+#include "infra/Diagnostics.h"  // DISCLOSE
 #include "gitstamp.h"           // r26-stamp Task A: gitstamp::stampAt — the at="<sha>[+dirty]" root anchor
 
 #include <cstdint>
@@ -80,6 +82,15 @@ struct PlanResult
                                                         // e.g. a local branch literally named "working-tree" collides
                                                         // with its reserved arm name) — degrade, arms/pairs/landing empty
     mergescout::ScoutResult   scout;                  // computeMergeScout() over `scouted`'s ref names, in order
+    enum class DisclosureWhy : std::uint8_t
+    {
+        ScoutRefused,
+    };
+    void disclose( DisclosureWhy ) noexcept   // the DISCLOSE sink: the field the emitter reads
+    {
+        scoutOk = false;
+    }
+
     std::string               atStamp;                // r26-stamp Task A: gitstamp::stampAt(root) — "" on a non-git root
 };
 
@@ -151,10 +162,10 @@ inline PlanResult computePlan( const std::string& root, std::string_view filter,
 
     const std::string refsCsv = joinRefNames( result.stray.refs, result.scouted );
     result.scout   = mergescout::computeMergeScout( root, refsCsv, workingIng, excludes, maxFileBytes );
-    result.scoutOk = result.scout.ok;
-    if( !result.scoutOk )
+    if( !result.scout.ok )
     {
-        DEGRADED_PATH_ALERT( "landing-plan: merge-scout refused the selected landing set — reporting the sweep without arms/conflicts/order" );
+        DISCLOSE( result, PlanResult::DisclosureWhy::ScoutRefused,
+                  "landing-plan: merge-scout refused the selected landing set — reporting the sweep without arms/conflicts/order" );
     }
     return result;
 }
@@ -165,7 +176,7 @@ using XmlEscaper = std::function<std::string( std::string_view )>;
 
 inline void writePlanRef( std::FILE* out, const crossref::RefRow& r, bool scouted, const XmlEscaper& ex )
 {
-    std::fprintf( out, "<ref name=\"%s\" v=\"%s\" stray=\"%u\" files=\"%u\" scouted=\"%d\"/>",
+    rw::emitTo( out, "<ref name=\"{}\" v=\"{}\" stray=\"{}\" files=\"{}\" scouted=\"{}\"/>",
                   ex( r.ref.name ).c_str(), crossref::verdictTag( r.verdict ), r.strayLines, r.strayFiles, scouted ? 1 : 0 );
 }
 
@@ -184,12 +195,12 @@ inline void writePlanDrop( std::FILE* out, const crossref::RefRow& r, const XmlE
 {
     if( !r.ok || r.verdict == crossref::Verdict::Unknown )
     {
-        std::fprintf( out, "<undetermined name=\"%s\" v=\"%s\" reason=\"no merge base with HEAD (shallow clone or unrelated "
+        rw::emitTo( out, "<undetermined name=\"{}\" v=\"{}\" reason=\"no merge base with HEAD (shallow clone or unrelated "
                            "history) — this ref could not be analysed, it is NOT known to be merged; deepen the clone and re-run\"/>",
                       ex( r.ref.name ).c_str(), crossref::verdictTag( crossref::Verdict::Unknown ) );
         return;
     }
-    std::fprintf( out, "<excluded name=\"%s\" v=\"%s\" stray=\"%u\" reason=\"already re-implemented on the live line\"/>",
+    rw::emitTo( out, "<excluded name=\"{}\" v=\"{}\" stray=\"{}\" reason=\"already re-implemented on the live line\"/>",
                   ex( r.ref.name ).c_str(), crossref::verdictTag( r.verdict ), r.strayLines );
 }
 
@@ -209,7 +220,7 @@ inline void writePlan( std::FILE* out, const PlanResult& p )
 
     // G4: an XML comment may not contain a double hyphen, so this text (like writeStrayContent's and
     // writeWhereis's) uses an em dash for punctuation and names flags WITHOUT their leading dashes.
-    std::fprintf( out, "<!-- ripwire landing-plan: stray-content's cheap per-blob sweep composed with merge-scout's "
+    rw::emitRaw( out, "<!-- ripwire landing-plan: stray-content's cheap per-blob sweep composed with merge-scout's "
                        "per-arm overlap oracle — of every local branch, which still hold REAL work (v=\"unmerged\"), "
                        "which were already re-implemented on the live line (v=\"superseded\", EXCLUDED below — landing "
                        "them re-does work that is already done) or are already merged (omitted entirely, counted in "
@@ -225,7 +236,9 @@ inline void writePlan( std::FILE* out, const PlanResult& p )
                        "are the same commit: head= is the bare 9 hex chars this verb has always printed, at= is the "
                        "tool wide anchor and is head= plus a \"+dirty\" suffix when the working tree is not clean. Prefer "
                        "at= (it is the one spelling every other repo reading verb uses, and the only one that tells you "
-                       "whether uncommitted work was in scope); head= is kept for callers already keyed to it. -->" );
+                       "whether uncommitted work was in scope); head= is kept for callers already keyed to it. "
+                       "refs_dropped= (present only when non-zero) counts local branches git listed that the sweep could "
+                       "NOT read (a tip that is not an object name): they are in none of the counts and none of the rows. -->" );
     // r26-stamp Task A: head= (pre-existing, bare 9-char sha, unchanged) and at= (this round's sha[+dirty]
     // anchor) are BOTH kept here rather than converged onto one: head= is an established attribute name this
     // verb already shipped and other callers may already key off, so it stays byte-for-byte what it was;
@@ -237,11 +250,12 @@ inline void writePlan( std::FILE* out, const PlanResult& p )
     // DOCUMENTED instead: the header above states the containment in the OUTPUT, where consumers read it.
     // Converge by retiring head= across the whole family at once, never one verb at a time.
     const std::string atAttr = p.atStamp.empty() ? std::string() : ( " at=\"" + p.atStamp + "\"" );
-    std::fprintf( out, "<landing-plan head=\"%.9s\" refs=\"%zu\" unmerged=\"%zu\" superseded=\"%u\" merged=\"%u\" "
-                       "undetermined=\"%zu\" scouted=\"%zu\" bounded=\"%zu\" scout-ok=\"%d\"%s>",
+    const std::string droppedAttr = p.stray.refsDropped == 0 ? std::string() : ( " refs_dropped=\"" + std::to_string( p.stray.refsDropped ) + "\"" );
+    rw::emitTo( out, "<landing-plan head=\"{:.9}\" refs=\"{}\" unmerged=\"{}\" superseded=\"{}\" merged=\"{}\" "
+                       "undetermined=\"{}\" scouted=\"{}\" bounded=\"{}\" scout-ok=\"{}\"{}{}>",
                   p.stray.headSha.c_str(), p.stray.refsScanned, p.scouted.size() + p.bounded.size(),
                   supersededCount, p.stray.mergedRefs, p.undetermined.size(), p.scouted.size(), p.bounded.size(),
-                  p.scoutOk ? 1 : 0, atAttr.c_str() );
+                  p.scoutOk ? 1 : 0, atAttr.c_str(), droppedAttr.c_str() );
 
     for( std::size_t i : p.scouted )
     {
@@ -277,7 +291,7 @@ inline void writePlan( std::FILE* out, const PlanResult& p )
     }
     mergescout::writeScoutLanding( out, p.scout.arms, pairs, ex );
 
-    std::fprintf( out, "</landing-plan>" );
+    rw::emitRaw( out, "</landing-plan>" );
 }
 
 }}   // namespace rw::landingplan

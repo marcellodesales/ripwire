@@ -46,7 +46,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -159,7 +159,8 @@ L_HI="$(    liveHits --limit=536870912 )"
     || no "(5) live repo --grep=budget disagrees across windows: unpaged=\"$L_PLAIN\" lo=\"$L_LO\" hi=\"$L_HI\""
 
 # ── (5b) the ordering the legend now claims (§A10.3) is actually stated ───────────────────────────────
-run --limit=5 | grep -q 'SOURCE files before test/bench files before docs' \
+# L1 (2026-09-19): the CLI default legend is compact; this arm reads the FULL legend's ordering clause, so it asks for it.
+run --limit=5 --legend=full | grep -q 'SOURCE files before test/bench files before docs' \
     && ok "(5b) §A10.3 the grep legend states its §P11.1 ordering" \
     || no "(5b) §A10.3 the grep legend never states its ordering (silent reordering)"
 

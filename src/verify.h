@@ -36,6 +36,8 @@
 // is one shape word, one paren pair, one or two arguments. Anything else refuses with the whole
 // vocabulary in the message (the --graph-query refusal posture).
 
+#include "infra/enumcount.h"   // rw::enumCountIsExact — ClaimShape's count, proven at compile time beside kShapeTags
+
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -193,10 +195,12 @@ inline Claim parseClaim( std::string_view src )
 // the tag the emitter prints for a shape (shape= is what a consumer switches on, so the spelling is
 // pinned here where the parser lives). A declarative table, no lookup helper: the parser is the only
 // producer of ClaimShape values and every one it produces is in range, so the emitter indexes the table
-// directly (with a VERIFY at the use-site) — the enum order IS the tag order, and the static_assert pins
+// directly (with an ASSUME at the use-site) — the enum order IS the tag order, and the static_assert pins
 // the count so a new shape cannot silently miss a tag.
 inline constexpr const char* kShapeTags[] = { "calls", "uses", "unused", "contains", "defines", "reaches" };
 static_assert( std::size_t( ClaimShape::Reaches ) + 1 == std::size( kShapeTags ), "ClaimShape grew — extend kShapeTags" );
+// `Reaches + 1` names the last enumerator by hand; enumCountIsExact is what makes an append after it a build error.
+static_assert( enumCountIsExact<ClaimShape, std::size( kShapeTags )>(), "ClaimShape grew past Reaches — extend kShapeTags and the assert above" );
 
 // ── the limit= vocabulary — the not-established verdict's REASON, closed like the shapes ─────────────
 inline constexpr const char* kLimitCallGraphFloor   = "call-graph-floor";     // name-based edges: dynamic dispatch/fn-ptr/macros may be missing
@@ -224,6 +228,8 @@ inline constexpr const char* kVerifyLegend =
     "so a refuted defines means the name token never occurs in that file's indexed bytes. "
     "reaches' direction: some symbol defined in the named file or layer transitively CALLS the target. "
     "Evidence rows are a bounded sample when capped (disclosed on the root); every total lives in the attributes. "
+    "A <hit>'s <m> is the matched line; line_bytes= rides only a row whose line was too long to print whole and names that WHOLE "
+    "line's byte length, so its ABSENCE means the printed <m> is the entire line. "
     // M12: a uses()/unused() <u> row's in_id= — the same attribute --uses itself defines (kUsesLegendOpen), stated
     // again here because this element's legend is its own leading comment run, not --uses'.
     "A uses()/unused() <u> row's in_id= is the canonical id (root-relative path::scope::name) of the enclosing "

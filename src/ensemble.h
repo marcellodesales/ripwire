@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // ensemble.h — `--ensemble`: the FAMILY JOIN. Wave 1 shipped four readability-adjacent evidence families and
 // nothing that combines them; four lenses run separately are four opinions, not an ensemble. This verb is the
@@ -10,7 +13,7 @@
 // Corroboration is only worth something when the lenses
 // fail DIFFERENTLY, so the partition is by KIND OF EVIDENCE, not by metric:
 //   structural  — the shape of the code: cognitive complexity, physical size, nesting depth, parameter count
-//                 (the four bars quality.h already uses) plus the --readability lens' Posnett rank.
+//                 (the four bars quality.h already uses) plus the --biggest-first lens' Posnett rank.
 //   lexical     — the identifier TEXT: the naming-* rules (src/naminglens.h).
 //   confusion   — the syntactic CONSTRUCT: the atom-* rules (src/atoms.h, Gopstein et al. ESEC/FSE 2017).
 //   historical  — git: how often the FILE changes (the --hotspots churn axis, same 12-month window). Its unit
@@ -40,7 +43,7 @@
 // TWO KINDS OF THRESHOLD, AND THE DIFFERENCE IS DISCLOSED. Four of the structural signals are ABSOLUTE bars
 // reused verbatim from src/quality.h (kCcxBar 15, kLocBar 60, kNestBar 4, kParamBar 5) — no new magic numbers.
 // The other two signals (Posnett readability, churn) are RANKINGS whose own authors publish no defensible
-// absolute cut: --readability's header says in so many words to read the ORDER, not the number. The only honest
+// absolute cut: --biggest-first's header says in so many words to read the ORDER, not the number. The only honest
 // predicate on an ordinal signal is an ordinal cut, so each fires for the WORST DECILE of its own ranking,
 // bounded above by that verb's own default display window (40 rows) and below by one row. That means some
 // symbol is ALWAYS in the worst decile of its own corpus — which is what "ordinal" means, and the legend says
@@ -87,6 +90,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>          // std::popcount — familyCountOf
+#include <limits>       // std::numeric_limits — the mask-width static_assert: an index shifted into a mask must fit it
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -104,7 +108,7 @@ namespace ensemble
 inline constexpr std::size_t kEnsembleSymbolRowCap = 40;
 inline constexpr std::size_t kEnsembleFileRowCap   = 20;
 
-// The ordinal-signal window: --readability and --hotspots both default to showing 40 rows, so a symbol or file
+// The ordinal-signal window: --biggest-first and --hotspots both default to showing 40 rows, so a symbol or file
 // inside that window is exactly "what the existing verb would have put on your screen".
 inline constexpr std::size_t kOrdinalWindowCap = 40;
 
@@ -125,7 +129,8 @@ enum : std::uint8_t
     kFamilyCount   = 4
 };
 
-inline constexpr std::array<const char*, kFamilyCount> kFamilyNames = { { "structural", "lexical", "confusion", "historical" } };
+inline constexpr const char* kFamilyNames[] = { "structural", "lexical", "confusion", "historical" };
+static_assert( std::size( kFamilyNames ) == kFamilyCount, "kFamilyNames is indexed by family — one name per kFam* value (a spelled extent zero-fills a missing one)" );
 
 // ── THE FAMILY-VOCABULARY HELPERS, written ONCE over a (count, name lookup) pair ──────────────────────────
 // Three operations are pure functions of "a bitmask over a family table": name the set bits, mark one family
@@ -228,6 +233,12 @@ struct EnsembleFileRow
     std::uint8_t  unionMask = 0;
 };
 
+// Every family mask above and below is one bit per family, set by `1u << family` at runtime (markUnavailableIn, the
+// join's per-symbol mask): a family index at or past the mask's width would be a shift into undefined behaviour.
+static_assert( kFamilyCount <= std::numeric_limits<decltype( EnsembleRow::firedMask )>::digits
+                   && kFamilyCount <= std::numeric_limits<decltype( EnsembleFileRow::unionMask )>::digits,
+               "ensemble families are bits of a std::uint8_t mask — widen firedMask/unionMask/unavailMask first" );
+
 struct EnsembleScan
 {
     std::vector<EnsembleRow>     rows;
@@ -271,7 +282,7 @@ struct FamilyHit
     std::string  tag;
 };
 
-// The join's eligibility predicate, and it is deliberately the SAME one --readability uses: a function or
+// The join's eligibility predicate, and it is deliberately the SAME one --biggest-first uses: a function or
 // method with a body. A declaration has no shape to measure and no construct to confuse, so counting its
 // silent families as "did not fire" would be the very lie the unavailable/silent distinction exists to stop.
 inline bool eligibleForJoin( const Symbol& s ) noexcept
@@ -792,7 +803,7 @@ inline constexpr const char* kEnsembleLegend =
     "bar_params=parameter count; a row shows only the ones that crossed, with the value that crossed. "
     "Two signals are RANKINGS with no defensible absolute cut, so each fires for the worst decile of its own "
     "ranking, at least one row and at most 40 (each verb's own default window): rrank=the symbol's rank in the "
-    "readability lens (0 is least readable) rcut=how many ranks that decile covers rmeasured=functions the "
+    "readability lens (0 is the lowest posnett=, i.e. the largest body; a size proxy) rcut=how many ranks that decile covers rmeasured=functions the "
     "readability lens measured; hrank=the file's rank by git churn (0 is most changed) churn=its in-window "
     "commit count hcut=how many ranks that decile covers hranked=files with any in-window commit "
     "window=the churn window. An ordinal cut is RELATIVE: some symbol is always in the worst decile of its own "
@@ -862,30 +873,30 @@ inline int writeEnsembleReport( const IngestResult& ing, const std::vector<std::
     const std::string ensUnavailableAttr    = ensUnavailNamesStr.empty() ? std::string() : ( " unavailable=\"" + ensUnavailNamesStr + "\"" );
     const std::string ensUnavailableWhyAttr = ensUnavailWhyStr.empty()   ? std::string() : ( " unavailable_why=\"" + std::string( escapeXml( ensUnavailWhyStr, escUnavail ) ) + "\"" );
     std::fputs( rw::rootRelPathsLegend( singleRoot ), stdout );   // M12: root= is new below
-    std::printf( "<ensemble families=\"%u\" eligible=\"%zu\" ranked=\"%zu\" no_family=\"%zu\"%s%s",
+    rw::emitTo( stdout, "<ensemble families=\"{}\" eligible=\"{}\" ranked=\"{}\" no_family=\"{}\"{}{}",
                  unsigned( kFamilyCount ), scan.eligibleCount, total, scan.noFamilyCount,
                  ensUnavailableAttr.c_str(), ensUnavailableWhyAttr.c_str() );
-    std::printf( " bar_ccx=\"%u\" bar_loc=\"%u\" bar_nest=\"%u\" bar_params=\"%u\"",
+    rw::emitTo( stdout, " bar_ccx=\"{}\" bar_loc=\"{}\" bar_nest=\"{}\" bar_params=\"{}\"",
                  quality::kCcxBar, quality::kLocBar, quality::kNestBar, quality::kParamBar );
-    std::printf( " rcut=\"%zu\" rmeasured=\"%zu\" hcut=\"%zu\" hranked=\"%zu\" window=\"%s\"",
+    rw::emitTo( stdout, " rcut=\"{}\" rmeasured=\"{}\" hcut=\"{}\" hranked=\"{}\" window=\"{}\"",
                  scan.readabilityCut, scan.readabilityMeasured, scan.churnCut, scan.churnRanked, kEnsembleWindowLabel );
     // The LANGUAGE-COVERAGE denominators — what the availability verdict was computed FROM, so a reader can
-    std::printf( " cfiles=\"%zu\" cscope=\"%zu\" lscope=\"%zu\"",     // check the verdict instead of taking it.
+    rw::emitTo( stdout, " cfiles=\"{}\" cscope=\"{}\" lscope=\"{}\"",     // check the verdict instead of taking it.
                  scan.confusionFiles, scan.confusionScope, scan.lexicalScope );
     if( scan.unreadableFileCount != 0 )
     {
-        std::printf( " unreadable_files=\"%u\"", scan.unreadableFileCount );
+        rw::emitTo( stdout, " unreadable_files=\"{}\"", scan.unreadableFileCount );
     }
     if( !floorRules.empty() )
     {
-        std::printf( " findings_capped=\"1\" floor_rules=\"%s\"%s", std::string( escapeXml( std::string_view( floorRules ), escFloor ) ).c_str(),
-                     kGraphCountFloorAttrXml );   // H8: a floored family floors the root's counts
+        rw::emitTo( stdout, " findings_capped=\"1\" floor_rules=\"{}\"{}", std::string( escapeXml( std::string_view( floorRules ), escFloor ) ).c_str(),
+                     kGraphCountFloorAttrXml  );   // H8: a floored family floors the root's counts
         // (kGraphCountFloorAttrXml: graphlegend.h — one attribute, one reading, for cap floors and graph floors alike)
     }
-    std::printf( " shown_syms=\"%zu\" syms_capped=\"%s\" shown_files=\"%zu\" files_capped=\"%s\"%s%s%s>",
+    rw::emitTo( stdout, " shown_syms=\"{}\" syms_capped=\"{}\" shown_files=\"{}\" files_capped=\"{}\"{}{}{}>",
                  shown, shown < total ? "1" : "0",
                  fileShown, fileShown < scan.files.size() ? "1" : "0",
-                 paging, gitstamp::atAttr( root ).c_str(), rootAttr.c_str() );
+                 rw::cstr( paging ), gitstamp::atAttr( root ).c_str(), rootAttr.c_str() );
 
     // TWO scratch buffers, not one reused twice in the same call: escapeXml returns a VIEW into its `out`, so a
     // second call with the same buffer invalidates the first view (readability.h carries the same note).
@@ -903,7 +914,7 @@ inline int writeEnsembleReport( const IngestResult& ing, const std::vector<std::
         const std::string_view rp = singleRoot ? rw::sarif::rootRelativeUri( ing.files[s.fileId], rootPrefix ) : std::string_view( ing.files[s.fileId] );
         const std::string  path( escapeXml( rp, escPath ) );
         const std::string  name( escapeXml( s.name, escName ) );
-        std::printf( "<s p=\"%s:%u\" n=\"%s\" fam=\"%u\" of=\"%u\" fired=\"%s\"%s>",
+        rw::emitTo( stdout, "<s p=\"{}:{}\" n=\"{}\" fam=\"{}\" of=\"{}\" fired=\"{}\"{}>",
                      path.c_str(), s.line, name.c_str(), unsigned( row.firedCount ), evaluable,
                      familyList( row.firedMask ).c_str(), unavailAttr.c_str() );
         for( std::uint8_t family = 0; family < kFamilyCount; ++family )
@@ -913,10 +924,10 @@ inline int writeEnsembleReport( const IngestResult& ing, const std::vector<std::
                 continue;
             }
             std::vector<char> escWhy;
-            std::printf( "<e f=\"%s\" why=\"%s\"/>", kFamilyNames[family],
+            rw::emitTo( stdout, "<e f=\"{}\" why=\"{}\"/>", kFamilyNames[family],
                          std::string( escapeXml( row.why[family], escWhy ) ).c_str() );
         }
-        std::printf( "</s>" );
+        rw::emitRaw( stdout, "</s>" );
     }
     for( std::size_t fileIndex = 0; fileIndex < fileShown; ++fileIndex )
     {
@@ -926,11 +937,11 @@ inline int writeEnsembleReport( const IngestResult& ing, const std::vector<std::
         const std::string      path( escapeXml( frp, escPath ) );
         const std::string      name( escapeXml( top.name, escName ) );
         const std::string      names = familyList( agg.unionMask );
-        std::printf( "<f p=\"%s\" top=\"%s\" top_l=\"%u\" top_fam=\"%u\" union_fam=\"%u\" union=\"%s\" syms=\"%u\"/>",
+        rw::emitTo( stdout, "<f p=\"{}\" top=\"{}\" top_l=\"{}\" top_fam=\"{}\" union_fam=\"{}\" union=\"{}\" syms=\"{}\"/>",
                      path.c_str(), name.c_str(), top.line, unsigned( agg.topCount ),
                      unsigned( detail::familyCountOf( agg.unionMask ) ), names.c_str(), agg.symCount );
     }
-    std::printf( "</ensemble>" );
+    rw::emitRaw( stdout, "</ensemble>" );
     return 0;
 }
 

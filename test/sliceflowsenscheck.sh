@@ -30,12 +30,13 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/sliceflowsensfix"
 EXPECT="$FIX/expect.tsv"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -103,7 +104,7 @@ for (file, fn, var) in groups:
             edges += 0 if e["rd"] == "-" else len(e["rd"].split(","))
         # the source-order rule, re-derived from the tool's own rows: last unconditional def before the use + pp defs after it
         old = set()
-        for d in found:
+        for d in sorted(found, key=lambda d: d["line"]):   # the SOURCE-order rule walks lines ascending; rows emit order="defuse"
             if d["line"] >= row["line"] or d["k"] not in ("def", "both"):
                 continue
             if not d["pp"]:
@@ -136,7 +137,7 @@ python3 "$TMP/score.py" "$FIX" "$BIN" "$EXPECT" >"$TMP/score.out" 2>&1
 grep -v '^CLASS\|^SENTINEL' "$TMP/score.out" | head -20
 for c in kill join straight; do
     n="$( grep -oE "^CLASS $c fns=[0-9]+" "$TMP/score.out" | grep -oE '[0-9]+$' )"
-    [ "${n:-0}" -ge 10 ] && ok "(0) fixture composition: $c functions = $n (>= 10)" || no "(0) fixture composition: $c functions = ${n:-0} (< 10)"
+    if [ "${n:-0}" -ge 10 ]; then ok "(0) fixture composition: $c functions = $n (>= 10)"; else no "(0) fixture composition: $c functions = ${n:-0} (< 10)"; fi
 done
 S="$( grep '^SENTINEL' "$TMP/score.out" )"
 printf '  INFO  %s\n' "$S"
@@ -152,7 +153,9 @@ R="$( printf '%s' "$S" | grep -oE 'use_rows=[0-9]+' | cut -d= -f2 )"
     || no "(1) disappearances: unexplained=${U:-?} spurious=${P:-?}"
 
 # ── (2) reach= per family ───────────────────────────────────────────────────────────────────────────
-C="$( run --slice=joins.cpp:cj01:x )"
+# L1 (2026-09-19): the CLI default legend is compact; (3) reads the FULL legend and (4) compares compact rows to the
+# full tier, so this capture (and its determinism twin C2) ask for --legend=full, the pre-change default.
+C="$( run --slice=joins.cpp:cj01:x --legend=full )"
 Y="$( run --slice=joins.py:pj01:x )"
 J="$( run --slice=linear.js:lj01:x )"
 [ "$( attr "$C" reach )" = 'reach="cfg"' ] && [ "$( attr "$Y" reach )" = 'reach="cfg"' ] \
@@ -222,8 +225,8 @@ FBC="$( run --slice=joins.cpp:cj11:y --slice-flow=back --legend=compact )"
     || { no '(7) MCP and CLI slice payloads differ on the fixture'; printf '%s\n' "$MCP" | head -c 400; echo; }
 
 # ── (8) determinism ─────────────────────────────────────────────────────────────────────────────────
-C2="$( run --slice=joins.cpp:cj01:x )"; Y2="$( run --slice=joins.py:pj01:x )"
-[ "$C" = "$C2" ] && [ "$Y" = "$Y2" ] && ok '(8) determinism x2 (C++ and Python runs byte-identical)' || no '(8) output differs between runs'
+C2="$( run --slice=joins.cpp:cj01:x --legend=full )"; Y2="$( run --slice=joins.py:pj01:x )"
+if [ "$C" = "$C2" ] && [ "$Y" = "$Y2" ]; then ok '(8) determinism x2 (C++ and Python runs byte-identical)'; else no '(8) output differs between runs'; fi
 
 # ── (9) well-formedness ─────────────────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then

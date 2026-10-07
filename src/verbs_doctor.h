@@ -9,6 +9,7 @@
 // linkage it had inside main.cpp, so the split adds zero API surface) and leans on main.cpp's own
 // top-of-file #includes and preamble helpers. The RIPWIRE_MAIN_TU guard turns a second includer into
 #include "gitstamp.h"          // isShallow — the git row's shallow="1" (2026-09-06 stranger audit)
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
 // a compile error instead of a silent per-TU-copy ODR trap.
 
 namespace
@@ -48,43 +49,31 @@ extern "C"
     const TSLanguage* tree_sitter_markdown( void );
     const TSLanguage* tree_sitter_php( void );
     const TSLanguage* tree_sitter_lua( void );
-    const TSLanguage* tree_sitter_dart( void );
     const TSLanguage* tree_sitter_elixir( void );
+    const TSLanguage* tree_sitter_dart( void );
+    const TSLanguage* tree_sitter_kotlin( void );
+    const TSLanguage* tree_sitter_gdscript( void );
 }
 
-// This process's own executable path, realpath'd. macOS uses _NSGetExecutablePath and Linux uses
-// /proc/self/exe because argv[0] is often just "ripwire" after shell PATH resolution. Other platforms
-// fall back to realpath(argv0), then an explicit PATH search. Never crashes: failure degrades to "".
+// This process's own executable path, realpath'd. The platform's own answer comes first (rw::os::exepath) because
+// argv[0] is often just "ripwire" after shell PATH resolution. Where the platform cannot say, fall back to
+// realpath(argv0), then an explicit PATH search. Never crashes: failure degrades to "".
 inline std::string selfExecutablePath( const char* argv0 )
 {
-#if defined( __APPLE__ )
-    char          buf[ PATH_MAX ];
-    std::uint32_t size = sizeof( buf );
-    if( _NSGetExecutablePath( buf, &size ) == 0 )
     {
-        char resolved[ PATH_MAX ];
-        if( ::realpath( buf, resolved ) )
+        char buf[ PATH_MAX ];
+        if( rw::os::exepath( buf, sizeof( buf ) ) == 0 )
         {
-            return std::string( resolved );
+            char resolved[ PATH_MAX ];
+            if( rw::os::realpath( buf, resolved ) )
+            {
+                return std::string( resolved );
+            }
+            return std::string( buf );
         }
-        return std::string( buf );
     }
-#elif defined( __linux__ )
-    char          buf[ PATH_MAX ];
-    const ssize_t byteCount = ::readlink( "/proc/self/exe", buf, sizeof( buf ) - 1 );
-    if( byteCount > 0 )
-    {
-        buf[ byteCount ] = '\0';
-        char resolved[ PATH_MAX ];
-        if( ::realpath( buf, resolved ) )
-        {
-            return std::string( resolved );
-        }
-        return std::string( buf );
-    }
-#endif
     char resolved[ PATH_MAX ];
-    if( argv0 && ::realpath( argv0, resolved ) )
+    if( argv0 && rw::os::realpath( argv0, resolved ) )
     {
         return std::string( resolved );
     }
@@ -100,7 +89,7 @@ inline std::string selfExecutablePath( const char* argv0 )
             const std::size_t split = remaining.find( ':' );
             const std::string_view dir = remaining.substr( 0, split );
             const std::string candidate = std::string( dir.empty() ? "." : dir ) + "/" + argv0;
-            if( ::realpath( candidate.c_str(), resolved ) && ::access( resolved, X_OK ) == 0 )
+            if( rw::os::realpath( candidate.c_str(), resolved ) && rw::os::access( resolved, X_OK ) == 0 )
             {
                 return std::string( resolved );
             }
@@ -133,33 +122,86 @@ inline std::string doctorPopenTrim( const std::string& cmd )
 // mtime) came out STALE: two byte-identical files, one verdict saying reinstall. Content is the fact this check
 // is about, so read the content: ~10 ms for a 42 MB binary, cheaper than one of the git popens --doctor already
 // pays. Sizes are compared first by the caller so this only runs on a plausible pair.
-inline bool doctorSameFileBytes( const std::string& a, const std::string& b )
+// #334: THREE answers, not two. A file that cannot be opened or read has no known contents; counting that as "differ"
+// is how a byte-identical copy on Windows came out "STALE … their contents differ". Both files are read through the
+// path layer (os::open/os::read take the program's UTF-8 '/' spelling on every OS, binary mode on Windows), never
+// std::fopen, which on Windows reads a narrow path in the ANSI code page and cannot open a non-ASCII user folder.
+enum class DoctorBytes : std::uint8_t
 {
-    std::FILE* fa   = std::fopen( a.c_str(), "rb" );
-    std::FILE* fb   = std::fopen( b.c_str(), "rb" );
-    bool       same = ( fa != nullptr && fb != nullptr );
-    if( same )
+    Same,
+    Differ,
+    Unread,   // `unread` says which file and why; the row makes no claim about the contents
+};
+inline constexpr std::size_t kDoctorBytesCount = static_cast<std::size_t>( DoctorBytes::Unread ) + 1;
+// Unread must stay the LAST value: move the count with any append. (rw::enumCountIsExact cannot prove it here: an enum
+// in main.cpp's unnamed namespace prints as "(anonymous namespace)::…" in __PRETTY_FUNCTION__, which its probe reads as a cast.)
+
+// Fill `buf` from `fd` until it is full or the file ends, retrying EINTR. The byte count, or -1 on a read error.
+inline rw::os::ssize_t doctorReadFull( int fd, std::vector<char>& buf )
+{
+    std::size_t got = 0;
+    while( got < buf.size() )
     {
-        std::vector<char> ba( 1u << 20 ), bb( 1u << 20 );
-        for( ;; )
+        const rw::os::ssize_t n = rw::os::read( fd, buf.data() + got, buf.size() - got );
+        if( n > 0 )
         {
-            const std::size_t na = std::fread( ba.data(), 1, ba.size(), fa );
-            const std::size_t nb = std::fread( bb.data(), 1, bb.size(), fb );
-            if( na != nb || std::memcmp( ba.data(), bb.data(), na ) != 0 )
-            {
-                same = false;
-                break;
-            }
-            if( na == 0 )
-            {
-                break;
-            }
+            got += static_cast<std::size_t>( n );
+        }
+        else if( n == 0 )
+        {
+            break;
+        }
+        else if( errno != EINTR )
+        {
+            return -1;
         }
     }
-    if( fa ) { std::fclose( fa ); }
-    if( fb ) { std::fclose( fb ); }
-    return same;
+    ENSURES( got <= buf.size(), "a read never reports more bytes than it was given room for" );
+    return static_cast<rw::os::ssize_t>( got );
 }
+
+// The loop over two open files: 1 MiB at a time, until they differ, one ends, or a read fails.
+inline DoctorBytes doctorCompareOpenFiles( int fa, int fb, const std::string& a, const std::string& b, std::string& unread )
+{
+    std::vector<char> ba( 1u << 20 ), bb( 1u << 20 );
+    for( ;; )
+    {
+        const rw::os::ssize_t na    = doctorReadFull( fa, ba );
+        const int             errRa = errno;
+        const rw::os::ssize_t nb    = doctorReadFull( fb, bb );
+        if( na < 0 || nb < 0 )
+        {
+            unread = na < 0 ? a + " (" + std::strerror( errRa ) + ")" : b + " (" + std::strerror( errno ) + ")";
+            return DoctorBytes::Unread;
+        }
+        if( na != nb || std::memcmp( ba.data(), bb.data(), static_cast<std::size_t>( na ) ) != 0 )
+        {
+            return DoctorBytes::Differ;
+        }
+        if( na == 0 )
+        {
+            return DoctorBytes::Same;
+        }
+    }
+}
+
+inline DoctorBytes doctorCompareFileBytes( const std::string& a, const std::string& b, std::string& unread )
+{
+    EXPECTS( !a.empty() && !b.empty(), "the caller compares a resolved PATH copy with a resolved self path" );
+    const rw::pathguard::OwnedFd fa( rw::os::open( a.c_str(), O_RDONLY | O_CLOEXEC ) );
+    const int                    errA = errno;
+    const rw::pathguard::OwnedFd fb( rw::os::open( b.c_str(), O_RDONLY | O_CLOEXEC ) );
+    const int                    errB = errno;
+    if( !fa.valid() || !fb.valid() )
+    {
+        unread = fa.valid() ? b + " (" + std::strerror( errB ) + ")" : a + " (" + std::strerror( errA ) + ")";
+        return DoctorBytes::Unread;
+    }
+    return doctorCompareOpenFiles( fa.get(), fb.get(), a, b, unread );
+}
+
+// same_bytes=: the value each answer prints, indexed by DoctorBytes.
+inline constexpr std::array<const char*, kDoctorBytesCount> kDoctorBytesValue { "1", "0", "unknown" };
 
 // Count the advisory edit-lock files under <cacheDir>/locks/<xx>/ (mcpedit.h editLockPath). They are deliberately
 // never unlinked by the process that holds them; quality.h's sweepStaleEditLocks reclaims the unheld ones older
@@ -183,29 +225,133 @@ inline std::size_t doctorEditLockCount( const std::string& dir )
     return count;
 }
 
-// 2026-09-06 stranger audit: the not-on-PATH verdict, with the fix spelled out (see the call site).
-inline std::string doctorNotOnPathHint( const std::string& selfPath, std::vector<char>& esc )
+// The ripwire a bare `ripwire` runs, and its stat. "" when none resolves. The lookup is this process's own:
+// os::which reads the PATH ripwire was started with (Windows: PATHEXT too, the order PowerShell and cmd use), never a
+// child shell. #334: Git Bash's `which`, asked through a shell, answered from THAT shell's PATH, in a "/c/..." spelling
+// with no ".exe", so on Windows the row named a copy PowerShell does not run and could not open the file it named.
+// Identity is then decided by the caller from the stat (device + inode, the volume serial + file index on Windows) and
+// the bytes, never from the name.
+inline std::string doctorWhichRipwire( rw::os::stat_t& st )
+{
+    std::string path = rw::os::which( "ripwire" );
+    if( !path.empty() && rw::os::stat( path.c_str(), &st ) != 0 )
+    {
+        path.clear();   // it vanished between the search and the stat: nothing on PATH to compare
+    }
+    return path;
+}
+
+// The first line the PATH copy prints for --version: the build a bare `ripwire` actually runs, so a mismatch names two
+// builds (#334: "0.6.2" beside this run's "0.6.3") instead of two paths and two mtimes. "" when it prints nothing
+// (not a ripwire, or it failed) — the row has already failed on identity either way.
+inline std::string doctorWhichVersionLine( const std::string& whichPath )
+{
+    std::string line = doctorPopenTrim( rw::shSingleQuote( whichPath ) + " --version 2>/dev/null" );
+    const std::size_t eol = line.find( '\n' );
+    if( eol != std::string::npos )
+    {
+        line.resize( eol );
+    }
+    return line;
+}
+
+// "X.Y.Z" at the front of `v` as three numbers; nullopt when it is not one. Only the release number is read.
+inline std::optional<std::array<int, 3>> doctorReleaseTriple( std::string_view v )
+{
+    std::array<int, 3> out {};
+    const char*        at  = v.data();
+    const char* const  end = v.data() + v.size();
+    for( std::size_t i = 0; i < out.size(); ++i )
+    {
+        const auto [ next, ec ] = std::from_chars( at, end, out[ i ] );
+        const bool dotFollows   = next != end && *next == '.';
+        if( ec != std::errc() || ( i < 2 && !dotFollows ) )
+        {
+            return std::nullopt;
+        }
+        at = next + ( i < 2 ? 1 : 0 );
+    }
+    return out;
+}
+
+// Order a `--version` line's X.Y.Z against this binary's: <0 the line's is older, >0 newer, 0 equal or unreadable.
+// Equal numbers on different bytes (two builds of one release) are left to the mtime rule, the only fact that remains.
+inline int doctorVersionOrder( std::string_view versionLine, std::string_view mine )
+{
+    constexpr std::string_view kPrefix = "ripwire ";
+    const auto theirs = versionLine.starts_with( kPrefix ) ? doctorReleaseTriple( versionLine.substr( kPrefix.size() ) ) : std::nullopt;
+    const auto ours   = doctorReleaseTriple( mine );
+    if( !theirs || !ours || *theirs == *ours )
+    {
+        return 0;
+    }
+    return *theirs < *ours ? -1 : 1;
+}
+
+// The line that puts this binary's directory first on PATH (#334: PowerShell's spelling on Windows).
+inline std::string doctorPathPrependLine( const std::string& selfPath )
 {
     const std::size_t slash   = selfPath.find_last_of( '/' );
     const std::string selfDir = ( slash == std::string::npos ) ? std::string( "." ) : selfPath.substr( 0, slash );
-    return " hint=\"" + std::string( rw::escapeXml( std::string_view(
-                  "NOT ON PATH: no ripwire resolves from PATH; this run used " + selfPath
-                + " — add its directory: export PATH=\"" + selfDir + ":$PATH\" (and put that line in your shell rc file)" ), esc ) ) + "\"";
+    return rw::os::path_prepend_hint( selfDir );
 }
 
-inline std::string doctorBinaryPathVerdictAttr( bool copied, const std::string& selfPath, const std::string& whichPath,
-                                                const struct stat& selfSt, const struct stat& whichSt, std::vector<char>& esc )
+// 2026-09-06 stranger audit: the not-on-PATH verdict, with the fix spelled out (see the call site). The attribute is
+// XML-escaped like every other one, so its raw bytes (&apos; &quot;) do not paste into a shell; runDoctor also prints
+// the same line unescaped on stderr (doctorPasteablePathLine), and the hint says so.
+inline std::string doctorNotOnPathHint( const std::string& selfPath, std::vector<char>& esc )
 {
-    if( copied )
-    {
-        return " copied=\"1\"";
-    }
-    const bool        selfIsOlder = selfSt.st_mtime < whichSt.st_mtime;
-    const std::string olderPath   = selfIsOlder ? selfPath : whichPath;
-    const std::string newerPath   = selfIsOlder ? whichPath : selfPath;
     return " hint=\"" + std::string( rw::escapeXml( std::string_view(
-                  "STALE: " + olderPath + " is older than " + newerPath
-                + " and their contents differ — rebuild/reinstall so PATH points at the newer one, or invoke "
+                  "NOT ON PATH: no ripwire resolves from PATH; this run used " + selfPath
+                + " — add its directory (" + std::string( rw::os::path_prepend_scope() ) + "; stderr carries this line unescaped): "
+                + doctorPathPrependLine( selfPath ) ), esc ) ) + "\"";
+}
+
+// CodeRabbit 4109273959 / review R4: the not-on-PATH remedy as a terminal shows it — no XML escaping — on stderr, after
+// the document, with the command alone on its own last line so a paste of that line runs as-is. stdout stays the one
+// well-formed XML document; a run with ripwire on PATH prints nothing here.
+inline void doctorPasteablePathLine( const std::string& selfPath )
+{
+    std::fflush( stdout );
+    rw::emitTo( stderr, "ripwire --doctor: no ripwire resolves from PATH. To put this binary's directory first ({}), paste this line:\n{}\n",
+                rw::os::path_prepend_scope(), doctorPathPrependLine( selfPath ) );
+}
+
+// `unread` is non-empty when the byte comparison could not read a file (DoctorBytes::Unread): "PATH (reason)".
+inline std::string doctorBinaryPathVerdictAttr( const std::string& selfPath, const std::string& whichPath,
+                                                  const rw::os::stat_t& selfSt, const rw::os::stat_t& whichSt, std::string_view unread,
+                                                  std::vector<char>& esc )
+{
+    // #334: a different ripwire earlier on PATH read as a timestamp puzzle. Its own --version line names the build a
+    // bare `ripwire` actually runs. Asked only here, on a mismatch — never when the PATH copy is this file or its
+    // byte-identical copy: a version stamp alone is not identity (a byte-flipped copy prints the same one;
+    // test/doctorcheck.sh's genuine-stale fixture is exactly that).
+    const std::string whichVersion = doctorWhichVersionLine( whichPath );
+    std::string       out = whichVersion.empty() ? std::string()
+                          : " which_version=\"" + std::string( rw::escapeXml( whichVersion, esc ) ) + "\"";
+    // The release number each binary states outranks the mtimes. A 0.6.2 copied onto PATH after 0.6.3 has the newer
+    // mtime, and the mtime rule alone called the running 0.6.3 STALE and told the user to run the 0.6.2 instead.
+    const int         order       = doctorVersionOrder( whichVersion, rw::kRipwireVersion );
+    if( !unread.empty() && order == 0 )
+    {
+        // #334: no bytes and no differing release number means no evidence of a difference. Say what is unknown and
+        // why; a STALE verdict here would be a confident wrong answer (it was, for a byte-identical copy on Windows).
+        return out + " hint=\"" + std::string( rw::escapeXml( std::string_view(
+                      "UNVERIFIED: could not read " + std::string( unread ) + ", so the two were not compared byte for byte;"
+                      " compare " + whichPath + " with " + selfPath + " by hand (cmp on POSIX, Get-FileHash in PowerShell)" ), esc ) ) + "\"";
+    }
+    const bool        selfIsOlder = order != 0 ? order > 0 : selfSt.st_mtime < whichSt.st_mtime;
+    const std::string selfName    = order != 0 ? selfPath + " (ripwire " + rw::kRipwireVersion + ")" : selfPath;
+    const std::string whichName   = order != 0 ? whichPath + " (" + whichVersion + ")" : whichPath;
+    const std::string& olderName  = selfIsOlder ? selfName : whichName;
+    const std::string& newerName  = selfIsOlder ? whichName : selfName;
+    const std::string& newerPath  = selfIsOlder ? whichPath : selfPath;
+    // Unread here means the release numbers differ (order != 0): that, not the bytes, is the evidence, so say it.
+    const std::string  evidence   = unread.empty() ? std::string( " and their contents differ" )
+                                  : " and they state different release numbers (could not read " + std::string( unread ) + ", so no bytes were compared)";
+    return out + " hint=\"" + std::string( rw::escapeXml( std::string_view(
+                  "STALE: " + olderName + " is older than " + newerName + evidence
+                + " — rebuild/reinstall so PATH points at the newer one, or invoke "
                 + newerPath + " directly" ), esc ) ) + "\"";
 }
 
@@ -277,6 +423,21 @@ inline const char* doctorLegendComment()
                        "file, so an answer is not stale because lean= is not ok — it is merely slower. source= says whether "
                        "the artifact was named on the cache= flag or picked automatically, and only a NAMED artifact this "
                        "binary cannot read is ok=\"0\" (a missing auto blob is the ordinary cold-start miss). "
+                       "git-config-trust reads the checkout's OWN core.fsmonitor as this process saw it at startup: hook is a "
+                       "COMMAND git would run on every read-only call, and neutralised=\"1\" says core.fsmonitor=false was "
+                       "appended to git's environment override for this run (stderr said so as git_harden=fsmonitor-hook); "
+                       "builtin, off and unset need no override and read neutralised=\"0\". Independently of this row, every git command "
+                       "ripwire runs carries no-optional-locks and core.fsmonitor=false, so no monitor of either form runs for its "
+                       "read-only calls. "
+                       "layout's state=\"agree\" means the layout records match; agree compares only the types= registered in src/model.h; "
+                       "a same-size layout change or a stale constant is invisible, so agree does not rule out a mixed binary; "
+                       "checked=\"1\" means the comparison ran; "
+                       "units=\"N\" counts translation units and types=\"N\" counts recorded types. On state=\"disagree\", types= is omitted, because the "
+                       "disagreeing records need not register the same types and no one count is a total; "
+                       "type= names the first differing type, unit0=/unit1= name the two records, and "
+                       "present0=/present1=, size0=/size1=, and align0=/align1= disclose their values; the row gives the rebuild action; "
+                       "state=\"not-checked\" means records exist but fewer than two records with a recorded type could be compared; "
+                       "state=\"no-records\" means no layout record was registered. "
                        "NB no flag below is spelled with its leading dashes: an XML comment may not contain a "
                        "double hyphen, and this legend is one comment. -->";
 }
@@ -457,6 +618,8 @@ inline DoctorGrammarProbe doctorProbeGrammars()
         { "lua",        &tree_sitter_lua,        "lua"        },
         { "elixir",     &tree_sitter_elixir,     "elixir"     },
         { "dart",       &tree_sitter_dart,       "dart"       },
+        { "kotlin",     &tree_sitter_kotlin,     "kotlin"     },
+        { "gdscript",   &tree_sitter_gdscript,   "gdscript"   },
         // markdown carries NO tags.scm — ingest extracts sections by a custom tree walk, so the honest
         // probe is the pairing ingest actually uses: set_language + a real parse, not a query compile.
         { nullptr,      &tree_sitter_markdown,   "markdown"   },
@@ -623,6 +786,74 @@ inline DoctorAgentRows doctorAgentRows( const rw::Config& cfg, const char* argv0
     return out;
 }
 
+// --doctor check 8's body: the git-config trust boundary (harvest 2026-09-09; measurement + reasoning in
+// githarden.h). Reads the form main() probed BEFORE it applied the override — a re-probe here would see the
+// override and report "off" for the very root whose file says hook. Informational: a hook-form key is the
+// CHECKOUT's state, not a broken setup, and the neutralisation IS the verdict — so the row is ok="1" always, the
+// way tree-sitter's is.
+inline std::string doctorGitConfigTrustAttrs( const rw::Config& cfg )
+{
+    using namespace rw;
+    const githarden::FsmonitorForm form        = githarden::startupFormFor( cfg.rootPath );
+    const bool                     neutralised = form == githarden::FsmonitorForm::Hook && githarden::g_startup.applied;
+    std::string attrs = "fsmonitor=\"" + std::string( githarden::fsmonitorFormName( form ) ) + "\"";
+    attrs += " neutralised=\"" + std::string( neutralised ? "1" : "0" ) + "\"";
+    return attrs;
+}
+
+struct DoctorLayoutCheck
+{
+    bool        ok = false;
+    std::string attrs;
+};
+
+inline DoctorLayoutCheck doctorLayoutCheck( std::vector<char>& esc )
+{
+    using namespace rw::layout_registry;
+    const LayoutCheck check = compare();
+    DoctorLayoutCheck out;
+    const auto escaped = [ &esc ]( const char* value )
+    {
+        return std::string( rw::escapeXml( std::string_view( value == nullptr ? "" : value ), esc ) );
+    };
+
+    switch( check.state )
+    {
+        case CheckState::Agree:
+        {
+            out.ok = true;
+            out.attrs = "state=\"agree\" checked=\"1\" units=\"" + std::to_string( check.unitCount )
+                      + "\" types=\"" + std::to_string( check.typeCount ) + "\"";
+            break;
+        }
+        case CheckState::Disagree:
+        {
+            // No types= here (CodeRabbit on #283): compare() takes typeCount from the first sorted record, and records
+            // that disagree may not register the same types, so that one record's count is not a total.
+            const LayoutMismatch& mismatch = check.mismatch;
+            out.attrs = "state=\"disagree\" checked=\"1\" units=\"" + std::to_string( check.unitCount )
+                      + "\" type=\"" + escaped( mismatch.typeName )
+                      + "\" unit0=\"" + escaped( mismatch.unit0 ) + "\" unit1=\"" + escaped( mismatch.unit1 )
+                      + "\" present0=\"" + std::string( mismatch.present0 ? "1" : "0" )
+                      + "\" present1=\"" + std::string( mismatch.present1 ? "1" : "0" )
+                      + "\" size0=\"" + std::to_string( mismatch.size0 ) + "\" size1=\"" + std::to_string( mismatch.size1 )
+                      + "\" align0=\"" + std::to_string( mismatch.align0 ) + "\" align1=\"" + std::to_string( mismatch.align1 )
+                      + "\" hint=\"mixed translation-unit layouts detected — rebuild with cmake --build build --clean-first -j\"";
+            break;
+        }
+        case CheckState::NoRecords:
+        case CheckState::NotChecked:
+        {
+            const char* const state = check.state == CheckState::NoRecords ? "no-records" : "not-checked";
+            out.attrs = "state=\"" + std::string( state ) + "\" checked=\"0\" units=\"" + std::to_string( check.unitCount )
+                      + "\" types=\"" + std::to_string( check.typeCount )
+                      + "\" hint=\"not checked: layout records from at least two translation units are required\"";
+            break;
+        }
+    }
+    return out;
+}
+
 int runDoctor( const rw::Config& cfg, const char* argv0 )
 {
     using namespace rw;
@@ -631,6 +862,7 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
     int                okCount = 0;
     std::string        rows;
     std::vector<char>  esc;
+    std::string        notOnPathSelf;   // set by the binary-path row's NOT ON PATH verdict: stderr repeats its remedy unescaped
 
     const auto row = [ & ]( const char* name, bool ok, const std::string& attrs )
     {
@@ -644,16 +876,15 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
         rows += "/>";
     };
 
-    // ---- check 1: binary-vs-PATH staleness (no --version mechanism exists — checked; compare
-    // realpath'd identity via (device,inode), then mtime/size, of argv[0]'s resolved binary vs
-    // `which ripwire`'s) ----
+    // ---- check 1: binary-vs-PATH staleness: identity via (device,inode), then content, of this process's own
+    // binary vs the one os::which( "ripwire" ) finds on PATH; on a mismatch the PATH copy's own --version line names its build ----
     {
         const std::string selfPath  = selfExecutablePath( argv0 );
-        const std::string whichPath = doctorPopenTrim( "which ripwire 2>/dev/null" );
-        struct stat        selfSt {};
-        struct stat         whichSt {};
-        const bool haveSelf  = !selfPath.empty()  && ::stat( selfPath.c_str(),  &selfSt )  == 0;
-        const bool haveWhich = !whichPath.empty() && ::stat( whichPath.c_str(), &whichSt ) == 0;
+        rw::os::stat_t        selfSt {};
+        rw::os::stat_t         whichSt {};
+        const bool haveSelf  = !selfPath.empty()  && rw::os::stat( selfPath.c_str(),  &selfSt )  == 0;
+        const std::string whichPath = doctorWhichRipwire( whichSt );
+        const bool haveWhich = !whichPath.empty();
 
         bool        ok    = true;
         std::string attrs = "self=\"" + std::string( escapeXml( selfPath, esc ) ) + "\"";
@@ -667,6 +898,7 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
             // not found". Not being on PATH is the commonest state a fresh install is in; it fails this row, with the fix.
             ok = false;
             attrs += " on_path=\"0\"" + doctorNotOnPathHint( selfPath, esc );
+            notOnPathSelf = selfPath;
         }
         else if( haveSelf )
         {
@@ -679,10 +911,12 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
                 // Cheap content-equality fallback (degrade, don't crash): equal mtime AND equal size is the
                 // sanctioned proxy for "copied but identical" — a genuine stale shadow almost always differs
                 // in at least one. Only a real mismatch still flags ok=false.
-                const bool sameBytes = ( selfSt.st_size == whichSt.st_size ) && doctorSameFileBytes( selfPath, whichPath );
-                const bool copied    = sameBytes;   // content equality, not the mtime proxy (see doctorSameFileBytes)
+                std::string       unread;
+                const DoctorBytes bytes  = selfSt.st_size != whichSt.st_size ? DoctorBytes::Differ
+                                         : doctorCompareFileBytes( selfPath, whichPath, unread );
+                const bool        copied = bytes == DoctorBytes::Same;   // content equality, not the mtime proxy
                 ok = copied;   // this exact failure bit the LocBench round — stale PATH binary shadows a freshly built one
-                attrs += " same_bytes=\"" + std::string( sameBytes ? "1" : "0" ) + "\"";
+                attrs += " same_bytes=\"" + std::string( kDoctorBytesValue[ static_cast<std::size_t>( bytes ) ] ) + "\"";
                 attrs += " self_mtime=\""  + std::to_string( (long long)selfSt.st_mtime )  + "\"";
                 attrs += " self_size=\""   + std::to_string( (long long)selfSt.st_size )    + "\"";
                 attrs += " which_mtime=\"" + std::to_string( (long long)whichSt.st_mtime ) + "\"";
@@ -690,7 +924,7 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
                 // §P11 doctor item: a raw ok="0" with four raw timestamps made the reader do the
                 // subtraction themselves — name which of the two IS the stale one (older mtime) and the
                 // fix, so the LocBench-round failure this check exists for reads as a VERDICT.
-                attrs += doctorBinaryPathVerdictAttr( copied, selfPath, whichPath, selfSt, whichSt, esc );
+                attrs += copied ? std::string( " copied=\"1\"" ) : doctorBinaryPathVerdictAttr( selfPath, whichPath, selfSt, whichSt, unread, esc );
             }
         }
         else
@@ -714,15 +948,28 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
 
     // ---- check 3: cache-dir health — resolves, writable (create+delete a probe file), report
     // existing ripwire-* blob count + total bytes (eviction sanity: flag >50 blobs, informational) ----
+    //
+    // #326: on Windows, a bare std::fopen or std::filesystem call on cacheDirLadder()'s return value used to
+    // measure a directory the cache never actually uses (typically nonexistent on the current drive) — Git for
+    // Windows' "/tmp" is real only through os::mkdir/os::lstat/os::chmod's own silent rebase onto the real user
+    // temp directory, which a non-os:: call does not get. Fixed at the SOURCE (cacheDirLadder() itself now
+    // returns the already-rebased spelling via rw::os::rebased_path — see its own comment), so `dir` below is
+    // already the real, in-use path with no local rebase needed here: this row's `dir=`/hint= attributes and
+    // doctorCacheStats/doctorEditLockCount's scans all read the one path the cache actually uses, identically
+    // to every other cacheDirLadder() consumer in the tree.
     {
         const std::string dir   = cacheDirLadder();
-        const std::string probe = dir + "/.ripwire-doctor-probe-" + std::to_string( ::getpid() );
+        const std::string probe = dir + "/.ripwire-doctor-probe-" + std::to_string( rw::os::getpid() );
         bool writable = false;
-        if( std::FILE* f = std::fopen( probe.c_str(), "wb" ) )
+        // create+remove a real file — the only thing "writable" can honestly mean on either platform; a mode-bit
+        // check (POSIX access()/stat permission bits) is not equivalent on Windows, where an ACL can permit or
+        // deny a create independent of any bit this process could read.
+        if( const int fd = rw::os::open( probe.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600 ); fd >= 0 )
         {
-            std::fputs( "doctor", f );
-            std::fclose( f );
-            writable = ( ::unlink( probe.c_str() ) == 0 );
+            static constexpr std::string_view kProbeBody = "doctor";
+            (void)rw::os::write( fd, kProbeBody.data(), kProbeBody.size() );
+            rw::os::close( fd );
+            writable = ( rw::os::unlink( probe.c_str() ) == 0 );
         }
 
         const DoctorCacheStats stats = doctorCacheStats( dir );
@@ -753,13 +1000,13 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
     // ---- check 4: git reachability — `git` on PATH + the target dir's repo status; degrades
     // gracefully on non-repos (ok=1, repo="0" — doctor diagnoses, non-repo isn't sickness) ----
     {
-        const std::string gitVer       = doctorPopenTrim( "git --version 2>/dev/null" );
+        const std::string gitVer       = doctorPopenTrim( gitCmd( " --version 2>/dev/null" ) );
         const bool        gitAvailable = !gitVer.empty();
         std::string        attrs        = "git=\"" + std::string( gitAvailable ? "1" : "0" ) + "\"";
         if( gitAvailable )
         {
             const std::string root   = std::string( cfg.rootPath );
-            const std::string isRepo = doctorPopenTrim( "git -c core.quotepath=false -C " + shSingleQuote( root )
+            const std::string isRepo = doctorPopenTrim( gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
                                                           + " rev-parse --is-inside-work-tree 2>/dev/null" );
             const bool repo = ( isRepo == "true" );
             attrs += " repo=\"" + std::string( repo ? "1" : "0" ) + "\"";
@@ -833,6 +1080,18 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
         row( "index-cache", ic.ok, ic.attrs );
     }
 
+    // ---- check 8: the git-config trust boundary — body in doctorGitConfigTrustAttrs above, for the same reason
+    // check 7's lives in doctorIndexCacheRow: runDoctor is a dispatcher, and every check body it absorbs lands there.
+    row( "git-config-trust", true, doctorGitConfigTrustAttrs( cfg ) );
+
+    // ---- check 9: cross-translation-unit layout agreement — this is the one check that can identify a
+    // binary no single source tree could produce. A single record is deliberately not a pass: there is no
+    // second compiler view against which to compare it.
+    {
+        const DoctorLayoutCheck layout = doctorLayoutCheck( esc );
+        row( "layout", layout.ok, layout.attrs );
+    }
+
     const DoctorAgentRows agentRows = doctorAgentRows( cfg, argv0 );
     checks += agentRows.checks;
     okCount += agentRows.passed;
@@ -870,6 +1129,10 @@ int runDoctor( const rw::Config& cfg, const char* argv0 )
     out += "</doctor>";
     std::fputs( out.c_str(), stdout );
     std::fputc( '\n', stdout );
+    if( !notOnPathSelf.empty() )
+    {
+        doctorPasteablePathLine( notOnPathSelf );
+    }
     return ( okCount == checks ) ? 0 : 1;
 }
 

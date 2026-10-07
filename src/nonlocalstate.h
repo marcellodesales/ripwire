@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // nonlocalstate.h — `--nonlocal-state`: per function, the NON-LOCAL MUTABLE STATE it can reach, with
 // READS and WRITES kept apart.
@@ -64,7 +67,8 @@
 #include "pageview.h"           // pageWindow + pageDisclosure — THE TRUNCATION VOCABULARY
 #include "serialize.h"          // escapeXml
 #include "graphlegend.h"        // kGraphCountFloorAttrXml — the shared floor marker
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — a blind spot degrades the report, never aborts it
+#include "infra/Diagnostics.h"  // DISCLOSE — a blind spot degrades the report, never aborts it
+#include "infra/sortutil.h"     // svLess — pythonStubsWithSource sorts and searches string_views
 
 #include <algorithm>
 #include <array>
@@ -219,15 +223,24 @@ inline bool isAnalyzedLang( Lang l ) noexcept
 // be noise rather than a disclosure. PHP and Lua ARE named, for the reason the ceiling note above gives:
 // both hold real functions and real module-level state (`static $x`, a PHP class `const`, a Lua file-scope
 // `local`), and captureUses knows neither language's assignment shapes — so an unnamed zero would be exactly
-// the confident, wrong zero this table exists to prevent. The emission order is this table's order, which
-// makes it deterministic.
+// the confident, wrong zero this table exists to prevent. DART is named for the same reason and lands
+// here in the SAME change that appends Lang::Dart: a Dart corpus holds real functions and real library
+// scope state, captureUses reads neither, and before this row --nonlocal-state emitted no
+// unanalyzed_langs= at all on a corpus that was half Dart — the absence of the attribute, not a zero.
+// KOTLIN is named for the same reason: a Kotlin corpus holds real functions and real top-level/companion-
+// object state, captureUses does not read Kotlin's assignment shapes either, and the same "attribute
+// absent, not zero" failure applies. Gate: the registration arm of test/kotlincheck.sh (Dart's is
+// test/dartcheck.sh), with lua as their shared live contrast. The emission order is this table's order,
+// which makes it deterministic.
 struct UnanalyzedLang { Lang lang; std::string_view name; };
-inline constexpr std::array<UnanalyzedLang, 14> kUnanalyzedLangs = { {
+inline constexpr std::array<UnanalyzedLang, 16> kUnanalyzedLangs = { {
     { Lang::C, "c" }, { Lang::Go, "go" }, { Lang::Rust, "rust" },
     { Lang::JavaScript, "javascript" }, { Lang::TypeScript, "typescript" },
     { Lang::Java, "java" }, { Lang::CSharp, "csharp" }, { Lang::Swift, "swift" },
     { Lang::Ruby, "ruby" }, { Lang::Bash, "bash" },
-    { Lang::Php, "php" }, { Lang::Lua, "lua" }, { Lang::Elixir, "elixir" }, { Lang::Dart, "dart" } } };
+    { Lang::Php, "php" }, { Lang::Lua, "lua" }, { Lang::Elixir, "elixir" },
+    { Lang::Dart, "dart" }, { Lang::Kotlin, "kotlin" },
+    { Lang::GDScript, "gdscript" } } };
 
 // The immutability keywords of the covered families. A declaration prefix carrying any of these is not
 // mutable state. Conservative on purpose: a type argument that merely MENTIONS const (`vector<const T*> v`)
@@ -332,9 +345,36 @@ inline const AstMatch* enclosingDecl( std::span<const AstMatch* const> bucket, c
     return ( d->endByte >= name.endByte ) ? d : nullptr;
 }
 
+// A Python typing stub (`m.pyi`) RESTATES its module's globals (`COUNT: int` beside `m.py`'s `COUNT = 0`). Once
+// langOfPath learned `.pyi`, both files' declarations became cells, and one global counted twice under
+// counts_floor="1" — measured on a two-file probe: cells 1 -> 2, with every <fn>/<cell> row still bound to m.py. So a
+// stub's declarations are dropped when its same-stem `.py` is indexed; a stub with NO source beside it (the shape a
+// C extension ships) keeps its cells, because it is the only declaration of that module the index holds.
+// Marks, per fileId, a `.pyi` whose `.py` sibling is in ing.files.
+inline std::vector<char> pythonStubsWithSource( const IngestResult& ing )
+{
+    std::vector<char> shadowed( ing.files.size(), 0 );
+    std::vector<std::string_view> sources;
+    for( const std::string& path : ing.files )
+    {
+        if( path.ends_with( ".py" ) )
+        {
+            sources.push_back( std::string_view( path ).substr( 0, path.size() - 3 ) );
+        }
+    }
+    std::sort( sources.begin(), sources.end(), rw::sortutil::svLess );   // svLess, not operator<: infra/sortutil.h
+    for( std::size_t fileId = 0; fileId < ing.files.size(); ++fileId )
+    {
+        const std::string_view path = ing.files[fileId];
+        shadowed[fileId] = path.ends_with( ".pyi" ) && std::binary_search( sources.begin(), sources.end(), path.substr( 0, path.size() - 4 ), rw::sortutil::svLess ) ? 1 : 0;
+    }
+    return shadowed;
+}
+
 // Find the cell universe: run every rule's two queries through the shared astQuery pass, join each name
 // back to its declaration, apply the form's mutability test to the text that PRECEDES the name, and keep
-// what survives. Deduplicated by (scope key, name) so a header included many times contributes one cell.
+// what survives. Deduplicated by (scope key, name) so a header included many times contributes one cell,
+// and a typing stub's restatement of its own module's globals contributes none (pythonStubsWithSource).
 inline void discoverCells( const IngestResult& ing, Scan& scan )
 {
     std::vector<AstQuerySpec> specs;
@@ -386,6 +426,7 @@ inline void discoverCells( const IngestResult& ing, Scan& scan )
     }
 
     const flipimpact::SymbolLineIndex lineIndex = flipimpact::buildSymbolLineIndex( ing );
+    const std::vector<char>           stubWithSource = pythonStubsWithSource( ing );
     HashMap<std::string, std::uint32_t> seen;   // dedup key -> cell index (lookup only; never iterated)
 
     for( const AstMatch& m : matches )
@@ -397,7 +438,7 @@ inline void discoverCells( const IngestResult& ing, Scan& scan )
         // The coverage ceiling, enforced at the one place it can be: a C-family query compiles against the
         // C grammar too, so a .c file WOULD yield cells here that no access could ever reach (see the note
         // on kAnalyzedLangs). Drop them at discovery so cells= counts only what the lens can actually answer.
-        if( m.fileId >= ing.files.size() || !isAnalyzedLang( langOfPath( ing.files[m.fileId] ) ) )
+        if( m.fileId >= ing.files.size() || !isAnalyzedLang( langOfPath( ing.files[m.fileId] ) ) || stubWithSource[m.fileId] != 0 )
         {
             continue;
         }
@@ -879,7 +920,7 @@ inline Scan computeNonLocalState( const IngestResult& ing, const Graph& g )
                     // The bit exists but no reachable toucher explains it — a graph/closure disagreement.
                     // Drop the child rather than emit an unexplained one; the counts stay, and the row's
                     // cells_total vs its children is what makes the gap visible.
-                    DEGRADED_PATH_ALERT( "nonlocal-state: a reachable cell has no reachable direct access site" );
+                    DISCLOSE( "nonlocal-state: a reachable cell has no reachable direct access site" );
                     continue;
                 }
             }
@@ -955,8 +996,14 @@ inline int writeNonLocalStateReport( const IngestResult& ing, const Graph& g, in
     const PageWindow  page  = pageWindow( total, effectiveRowCap( pageLimit, int( kRowCap ) ), pageOffset );
     const std::size_t shown = page.end > page.begin ? page.end - page.begin : 0;
 
+    // cut-fix E (THE TRUNCATION VOCABULARY rule 4): cells_capped=/decls_capped= are COLLECTION cuts — rows exist that
+    // no page holds, and every writes=/reads= is a floor — so the paging half must not read as complete. They feed
+    // pageDisclosure's collectionCapped (capped="1" forced, counts_floor="1" rides it); on that run the graph floor
+    // below contributes its gauge alone, since counts_floor= is already on the root and an attribute appears once.
+    const bool collectionCut = scan.cellsCapped || scan.declsCapped;
     char disclosure[kPageDisclosureCap];
-    pageDisclosure( disclosure, sizeof disclosure, shown, total, page.end, pageLimit, pageOffset, true );
+    pageDisclosure( disclosure, sizeof disclosure, shown, total, page.end, pageLimit, pageOffset, true, kXmlPageSyntax,
+                    /*collectionCapped=*/collectionCut );
 
     const auto pathRel = [ & ]( std::uint32_t fileId ) -> std::string_view
     {
@@ -964,25 +1011,30 @@ inline int writeNonLocalStateReport( const IngestResult& ing, const Graph& g, in
     };
 
     std::fputs( kNonLocalStateLegend, stdout );
-    std::printf( "<nonlocal_state cells=\"%zu\" functions=\"%zu\"%s%s", scan.cells.size(), total, disclosure,
-                 rw::graphCountFloorAttrXml( g ).c_str() );   // M15: gauge + marker
+    // #66: the root below carries graph_unindexed= when the crawl could not read a file at all, and the legend
+    // above is one closed literal — so its definition rides as its own adjacent comment, emitted on exactly
+    // the emitter's own condition (graphlegend.h graphUnindexedLegendComment), never a re-derivation of it.
+    rw::emitTo( stdout, "{}", rw::graphUnindexedLegendComment( rw::graphGaugeClauses( g ) ).c_str() );
+    rw::emitTo( stdout, "<nonlocal_state cells=\"{}\" functions=\"{}\"{}{}", scan.cells.size(), total, rw::cstr( disclosure ),
+                 ( collectionCut ? rw::graphGaugeAttrXml( g.ambOut, g.unresolvedOut, g.unindexedFiles, g.rubyBasesUnscoped )
+                                 : rw::graphCountFloorAttrXml( g ) ).c_str()  );   // M15: gauge + marker
     if( !scan.unanalyzedLangs.empty() )
     {
-        std::printf( " unanalyzed_langs=\"%s\" unanalyzed_files=\"%u\"", scan.unanalyzedLangs.c_str(), scan.unanalyzedFileCount );
+        rw::emitTo( stdout, " unanalyzed_langs=\"{}\" unanalyzed_files=\"{}\"", scan.unanalyzedLangs.c_str(), scan.unanalyzedFileCount );
     }
     if( scan.undecidedDeclCount != 0 )
     {
-        std::printf( " undecided_decls=\"%u\"", scan.undecidedDeclCount );
+        rw::emitTo( stdout, " undecided_decls=\"{}\"", scan.undecidedDeclCount );
     }
     if( scan.cellsCapped )
     {
-        std::printf( " cells_capped=\"1\"" );
+        rw::emitRaw( stdout, " cells_capped=\"1\"" );
     }
     if( scan.declsCapped )
     {
-        std::printf( " decls_capped=\"1\"" );
+        rw::emitRaw( stdout, " decls_capped=\"1\"" );
     }
-    std::printf( "%s>", rootAttr.c_str() );
+    rw::emitTo( stdout, "{}>", rootAttr.c_str() );
 
     // Separate scratch buffers per concurrently-live view: escapeXml returns a VIEW into its `out`, so
     // reusing one buffer for two live strings invalidates the first (see readability.h's note).
@@ -995,14 +1047,14 @@ inline int writeNonLocalStateReport( const IngestResult& ing, const Graph& g, in
         const std::string name( escapeXml( s.name, escB ) );
         const std::size_t cellsShown = std::min( row.cells.size(), kCellsPerRowCap );
 
-        std::printf( "<fn p=\"%s:%u\" n=\"%s\" writes=\"%u\" reads=\"%u\" direct_writes=\"%u\" direct_reads=\"%u\" cells_total=\"%zu\"",
+        rw::emitTo( stdout, "<fn p=\"{}:{}\" n=\"{}\" writes=\"{}\" reads=\"{}\" direct_writes=\"{}\" direct_reads=\"{}\" cells_total=\"{}\"",
                      path.c_str(), s.line, name.c_str(),
                      row.writeCount, row.readCount, row.directWriteCount, row.directReadCount, row.cells.size() );
         if( cellsShown != row.cells.size() )
         {
-            std::printf( " cells_shown=\"%zu\" cells_capped=\"1\"", cellsShown );
+            rw::emitTo( stdout, " cells_shown=\"{}\" cells_capped=\"1\"", cellsShown );
         }
-        std::printf( ">" );
+        rw::emitRaw( stdout, ">" );
 
         for( std::size_t k = 0; k < cellsShown; ++k )
         {
@@ -1011,25 +1063,25 @@ inline int writeNonLocalStateReport( const IngestResult& ing, const Graph& g, in
             const std::string cellName( escapeXml( cell.name, escC ) );
             const std::string cellPath( escapeXml( pathRel( cell.fileId ), escD ) );
             const char*       dir = rc.read && rc.write ? "rw" : ( rc.write ? "w" : "r" );
-            std::printf( "<cell n=\"%s\" p=\"%s:%u\" dir=\"%s\"", cellName.c_str(), cellPath.c_str(), cell.line, dir );
+            rw::emitTo( stdout, "<cell n=\"{}\" p=\"{}:{}\" dir=\"{}\"", cellName.c_str(), cellPath.c_str(), cell.line, dir );
             if( rc.direct )
             {
                 std::vector<char>  escSite;
                 const std::string  sitePath( escapeXml( pathRel( rc.siteFile ), escSite ) );
                 const char*        atDir = rc.directRead && rc.directWrite ? "rw" : ( rc.directWrite ? "w" : "r" );
-                std::printf( " at=\"%s:%u\" at_dir=\"%s\"", sitePath.c_str(), rc.siteLine, atDir );
+                rw::emitTo( stdout, " at=\"{}:{}\" at_dir=\"{}\"", sitePath.c_str(), rc.siteLine, atDir );
             }
             else
             {
                 std::vector<char> escVia;
                 const std::string via( escapeXml( ing.symbols[rc.via].name, escVia ) );
-                std::printf( " via=\"%s\"", via.c_str() );
+                rw::emitTo( stdout, " via=\"{}\"", via.c_str() );
             }
-            std::printf( "/>" );
+            rw::emitRaw( stdout, "/>" );
         }
-        std::printf( "</fn>" );
+        rw::emitRaw( stdout, "</fn>" );
     }
-    std::printf( "</nonlocal_state>" );
+    rw::emitRaw( stdout, "</nonlocal_state>" );
     return 0;
 }
 

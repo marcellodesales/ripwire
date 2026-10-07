@@ -12,6 +12,7 @@
 # Usage: test/toolcallroutecheck.sh [PATH_TO_RIPWIRE]      ($1 is BIN)
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"   # a gate that builds a repo must not inherit GIT_DIR/GIT_WORK_TREE (gitenvhermeticcheck D)
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -24,7 +25,7 @@ command -v python3 >/dev/null 2>&1 || { echo "toolcallroutecheck: python3 is req
 
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 # ---- sandbox: a `ripwire` on PATH pointing at BIN (the hook shells out to the bare name), and a
@@ -99,6 +100,27 @@ else
     no "binary probe: a Read of src/svector.h did not yield --expand (binary unreachable or stem svector no longer a symbol) -- last row: $( tail -n1 "$LOG" | cut -c1-200 )"
 fi
 
+# ---- train20-cr C3's shape in this hook: a Read in a NON-git cwd must abstain with reason=no-repo, also when
+#      the caller exports GIT_DIR naming another repository. With it exported, `git -C "$cwd" rev-parse
+#      --show-toplevel` prints the non-git cwd as its own top level, so the hook routed there. RED on the hook
+#      without the inherited-variable reset. The first row is the control: no GIT_DIR, same cwd, same answer. ----
+NGCWD="$TMP/nongit"; mkdir -p "$NGCWD"
+NGOTHER="$TMP/othergit"; mkdir -p "$NGOTHER"; git -C "$NGOTHER" init -q
+NGREAD="$( jq -cn --arg p "$NGCWD/svector.h" '{file_path:$p}' )"
+for ngcase in control GIT_DIR; do
+    : >"$LOG"
+    if [ "$ngcase" = control ]; then
+        run_hook Read "$NGREAD" "nongit-$ngcase" "$NGCWD" >/dev/null; ngrc=$?
+    else
+        GIT_DIR="$NGOTHER/.git" run_hook Read "$NGREAD" "nongit-$ngcase" "$NGCWD" >/dev/null; ngrc=$?
+    fi
+    if [ "$ngrc" = 0 ] && tail -n1 "$LOG" | jq -e '.status == "abstain" and .reason == "no-repo"' >/dev/null 2>&1; then
+        ok "non-git cwd ($ngcase): a Read abstains with reason=no-repo"
+    else
+        no "non-git cwd ($ngcase): rc=$ngrc, last row: $( tail -n1 "$LOG" | cut -c1-200 )"
+    fi
+done
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # Per-session cap: the 4th recommend-worthy event in one session abstains with reason=cap, and injects
 # nothing, in either arm.
@@ -111,7 +133,7 @@ for i in 1 2 3 4; do
 done
 [ -n "${CAPOUT[1]}" ] && [ -n "${CAPOUT[2]}" ] && [ -n "${CAPOUT[3]}" ] \
     && ok "cap: calls 1-3 in a session recommend" || no "cap: an early call in the session did not recommend"
-[ -z "${CAPOUT[4]}" ] && ok "cap: the 4th call in the session injects nothing" || no "cap: the 4th call still injected: ${CAPOUT[4]}"
+if [ -z "${CAPOUT[4]}" ]; then ok "cap: the 4th call in the session injects nothing"; else no "cap: the 4th call still injected: ${CAPOUT[4]}"; fi
 tail -n1 "$LOG" | jq -e '.status == "abstain" and .reason == "cap"' >/dev/null 2>&1 \
     && ok "cap: the 4th call's logged row carries status=abstain reason=cap" \
     || no "cap: 4th row wrong -- $( tail -n1 "$LOG" )"
@@ -125,7 +147,7 @@ tail -n1 "$LOG" | jq -e '.status == "abstain" and .reason == "cap"' >/dev/null 2
 export RIPWIRE_METER_ARM=control
 COUT="$( run_hook Bash "$( jq -cn '{command:"grep -rn controlPattern src/"}' )" "control-session-1" )"
 unset RIPWIRE_METER_ARM
-[ -z "$COUT" ] && ok "control arm: injects nothing" || no "control arm: injected anyway -- $COUT"
+if [ -z "$COUT" ]; then ok "control arm: injects nothing"; else no "control arm: injected anyway -- $COUT"; fi
 tail -n1 "$LOG" | jq -e '.status == "recommend" and .arm == "control" and .recommended == "--grep"' >/dev/null 2>&1 \
     && ok "control arm: still logs the recommend decision (status/arm/recommended all correct)" \
     || no "control arm: logged row wrong -- $( tail -n1 "$LOG" )"

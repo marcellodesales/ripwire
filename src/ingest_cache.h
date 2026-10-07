@@ -3,6 +3,11 @@
 #error "ingest_cache.h is a SECTION of src/ingest.cpp's translation unit - include it only from ingest.cpp (see the ingest-family split note there)"
 #endif
 
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "pathguard.h"  // CWE-59/367 round 5: rw::pathguard::createExclTempFile — saveCache's temp is created exclusively, never through a link
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+#include <bit>               // std::endian — the cache blob's arch tag, without a compiler-specific macro
+
 // ingest_cache.h — the raw-facts model + incremental cache, moved VERBATIM from ingest.cpp in the
 // 2026-08-29 split: RawDef (the pre-id-assignment definition record), the extraction identity
 // (kCacheVersion + kParserVer + parserVerFor), content/blob hashing, FileFacts, the ByteW/ByteR
@@ -41,6 +46,13 @@ struct RawDef
     std::uint8_t  maxNest   = 0;   // Q4: max control-structure nesting depth inside the def (from cc_walk)
     std::uint8_t  arityExact = 0;  // B2.2: 1 ⇒ params is a fixed call-comparable arity (no variadic/default, not implicit-self)
     std::uint8_t  testScope = 0;   // L8: 1 ⇒ an IN-FILE test convention encloses this def (see inFileTestScope)
+    std::uint8_t  recovered = 0;   // extent honesty (extentsuspect.h kRecovered*): the parse RECOVERED this def's container
+                                   //   (a class whose body holds an error, inside an ERROR region) or its kind (a scopeless
+                                   //   C++ method inside one); 0 ⇒ no recovery claim. Feeds the `error` reason at load.
+    std::uint8_t  internalLinkage = 0;   // C/C++: anonymous-namespace or namespace-scope `static` def (model.h Symbol::internalLinkage)
+    std::uint8_t  scopeRootsStd = 0;     // #150: 1 ⇒ this def's full enclosing-namespace chain roots at std (model.h Symbol::scopeRootsStd)
+    std::uint32_t fnScopeStart = 0;      // a FUNCTION-LOCAL def (ingest_names.h enclosingFunctionScope): the byte span of the
+    std::uint32_t fnScopeEnd   = 0;      //   function whose body binds its name; End 0 ⇒ not function-local (model.h fnLocalScopes)
     SymKind       kind      = SymKind::Other;
     Lang          lang      = Lang::Unknown;
     std::string   name;
@@ -62,12 +74,17 @@ struct RawRef
     RecvKind      recv      = RecvKind::None;   // call-site receiver shape (P2-D narrowing)
     std::uint16_t argCount     = 0;             // B2.2: call-site positional arg count when countable; 0 otherwise
     bool          argCountKnown = false;        // B2.2: true ⇒ argCount is reliable (no spread/splat/apply)
+    bool          viaArrow  = false;   // a C++/ObjC call: the member access was written `->`. A compose ref: `name` is the POINTEE
+                                       //   of a std smart pointer member, which only `->` reaches (see Reference::viaArrow)
+    bool          qualifierRootsStd = false;   // #150: the FULL written qualifier chain is rooted at namespace std (model.h Reference::qualifierRootsStd)
+    bool          memberCall = false;   // FE-A: a Go/JS/TS/Rust call written on a receiver (`x.f()`), whose recv stays None (model.h Reference::memberCall)
     std::string   name;
     std::string   qualifier;           // explicit scope at a call site (`A` in `A::b()`); C++; "" if bare/method
     std::string   recvVar;             // receiver variable when recv==NamedVar/FieldOfVar (`x` in `x->m()`); Rule 2 fuel
     std::string   fieldName;           // member variable name when isCompose (e.g. "m_pool"); ALSO the intermediate
                                        //   field of a depth-2 chained receiver (recv FieldOfThis/FieldOfVar); "" otherwise
     std::string   composeRel;          // "creates" (value/inline) or "uses" (reference/pointer) when isCompose; "" otherwise
+    std::string   memberRoot;          // FE-A: the receiver chain's ROOT identifier when memberCall (`JSON` in `JSON.parse()`); see model.h
 };
 
 // P2-D Rule 2 raw local-variable type binding (pre-attribution). startByte sits inside the enclosing
@@ -79,10 +96,11 @@ struct RawBind
     std::uint32_t startByte = 0;   // position inside the enclosing function (for enclosing-def attribution)
     Lang          lang      = Lang::Unknown;
     LocalBindKind kind      = LocalBindKind::Type;   // Type = Rule 2 var→type; FnDecl/FnAssign = L3 var→function
-    std::uint32_t spanStart = 0;   // kind==VarDecl only: the declaring BLOCK's byte span (shadow scope);
-    std::uint32_t spanEnd   = 0;   //   {0,0} on every other kind — see model.h Binding
+    bool          isFromAssignment = false;          // kind==Type: an ASSIGNMENT's callee name, not a declaration's (model.h Binding)
+    std::uint32_t spanStart = 0;   // lexical visibility or declaration span; see model.h Binding/LocalBindKind
+    std::uint32_t spanEnd   = 0;
     std::string   var;             // the declared variable identifier (`x`)
-    std::string   importedName;    // JsImport only; persisted beside the local name and module target.
+    std::string   importedName;    // ES export identity or Elixir callable/import fact; see LocalBindKind.
     std::string   typeName;        // kind==Type: the written type's final segment (`Foo`);
                                    // kind==FnDecl/FnAssign: the bound function name (or an L3 sentinel)
 };
@@ -116,7 +134,88 @@ constexpr std::uint32_t kCacheMagic   = 0x4b505443;   // "CTPK"
 //   all match) rather than silently re-absolutizing a key that was never root-relative to begin
 //   with — a v2 cache simply misses on every lookup that survives the guard, which is exactly the
 //   self-healing full-reparse path already used for any other corrupt/stale cache.
-constexpr std::uint32_t kCacheVersion = 18;           // 18: #62 — call refs inside a preprocessor-DECIDED-dead region
+constexpr std::uint32_t kCacheVersion = 28;           // 28: FE-A (test/falseedgecheck.sh) — RawRef gains `memberCall` (u8) and
+                                                      //    `memberRoot` (str) after `qualifierRootsStd` (ref record 41 -> 46
+                                                      //    bytes lean). A FORMAT change: a v27 blob lacks the bytes, so the
+                                                      //    version guard rejects it (self-healing full reparse).
+                                                      // 27: same record layout as 26, new VALUES — the lane's second
+                                                      //    round changed which defs record fnScopeStart/End (the
+                                                      //    scope search descends to the OUTER def node, and
+                                                      //    kEscapingNestedBindings keeps globally-binding nested
+                                                      //    functions out). A 26 blob would serve the old spans
+                                                      //    (every top-level C/C++ function "nested in itself",
+                                                      //    PHP/Lua globals yielding) until its files changed.
+                                                      // 26: a FUNCTION-LOCAL def records the span of the function
+                                                      //    whose body binds its name — RawDef gains `fnScopeStart`
+                                                      //    and `fnScopeEnd` (two u32 after `scopeRootsStd`, def
+                                                      //    record 80 -> 88 bytes lean), read by graph.h's
+                                                      //    reachableByName (test/fnliteralcheck.sh §6). A FORMAT
+                                                      //    change: a v25 blob lacks the bytes, so the version
+                                                      //    guard rejects it (self-healing full reparse).
+                                                      //    kParserVer stays 128 (unreleased, same lane).
+                                                      // 25: #150 AND #157 (train 18 carries both bumps as ONE 24 -> 25:
+                                                      //    neither lane's 25 reached main or a release).
+                                                      //    #150 — nested std::-namespace resolution. RawDef gains
+                                                      //    `scopeRootsStd` (a u8 after `internalLinkage`, def record
+                                                      //    79 -> 80 bytes lean) and RawRef gains `qualifierRootsStd`
+                                                      //    (a u8 after `viaArrow`, ref record 40 -> 41 bytes) — the
+                                                      //    call/def-side facts graph.h::keepStdQualifiedCandidates
+                                                      //    needs to tell a NESTED std call (`std::ranges::move`) from
+                                                      //    a same-shaped user namespace (`mylib::ranges::move`),
+                                                      //    which the pre-existing IMMEDIATE-qualifier-only fields
+                                                      //    cannot (see model.h Reference::qualifierRootsStd /
+                                                      //    Symbol::scopeRootsStd). A FORMAT change: a v24 blob ends
+                                                      //    both records one byte early and would read the next
+                                                      //    record's own first byte as the new bit → reject them
+                                                      //    outright. kParserVer moves with it (119 -> 120).
+                                                      //    #157 (the same 25): NO record field changed shape — bumped anyway
+                                                      //    because a v24-or-older cache can hold a NORMAL (real-hash,
+                                                      //    zero-fact) record for a json/yaml/markdown file the nesting
+                                                      //    guard refused. Pre-fix, only Kotlin's refusal was forgotten
+                                                      //    before the save (forgetNestRefusalsForCache); the other
+                                                      //    three warm-hit that record forever and would stay invisible
+                                                      //    even after this fix ships, on any cache built before it.
+                                                      //    Bumping rejects every pre-fix blob outright (T5's v2
+                                                      //    precedent, two comments up) so every refused file is
+                                                      //    re-scanned, re-refused and re-rowed once, cold, instead of
+                                                      //    staying silently hidden. quality.h's
+                                                      //    kIngestCacheVersionMirror moves in the SAME commit.
+                                                      // 24: RawRef gains `viaArrow` (parser version 113, a u8 after
+                                                      //    `argCountKnown` in the ref record, kMinRefRecordBytes 39 -> 40)
+                                                      //    — a call's member access was written `->`, and a compose
+                                                      //    ref's type is the pointee of a std smart pointer member
+                                                      //    (test/fieldnarrowcheck.sh arm p). A FORMAT change: v23 blobs
+                                                      //    end the ref record one byte early and would read the next
+                                                      //    record's start byte as the bit → reject them. PR #282
+                                                      //    declared 22 -> 23; integration/train-5 assigns 24 over
+                                                      //    #278's 23.
+                                                      // 23: RawBind gains `isFromAssignment` (parser version 106, a u8 after
+                                                      //    `kind` in the bind record, 26 -> 27 bytes lean) — a C++
+                                                      //    assignment's callee-read type is kept only when it names a
+                                                      //    class (test/narrowcheck.sh arms 44-51). A FORMAT change: v22
+                                                      //    blobs read the new byte as spanStart's low byte → reject them.
+                                                      // 22: RawDef gains `internalLinkage` (parser version 96, a u8 after
+                                                      //    `recovered` in the def record, 78 -> 79 bytes lean) — an
+                                                      //    anonymous-namespace or namespace-scope `static` C/C++ def
+                                                      //    is visible to its own TU alone, and graph.h's decl-to-def
+                                                      //    widening stops gathering it for another file's declaration
+                                                      //    (test/decltodefcheck.sh arm B2). A FORMAT change: v21 blobs
+                                                      //    read the new byte as `kind` → reject them outright.
+                                                      // 21: Include gains `bool isValueUse` (parser version 93, a fourth
+                                                      //    u8 after isSymbolic) — the constant-argument / rescue-class
+                                                      //    origin bit the call narrow skips. A FORMAT change → reject
+                                                      //    v20 blobs. kParserVer moves with it.
+                                                      //    PR #81 (Elixir, parser version 95) changes NO record shape: its
+                                                      //    RecvKind / LocalBindKind enumerators are APPENDED and ride the
+                                                      //    existing u8, so the format stays at #139's 21.
+                                                      // 20: the member-macro re-parse (test/macroreparsecheck.sh) — each
+                                                      //    FILE record gains FileHealth::macroBlanked, a fifth health
+                                                      //    u32 after wsBytes — a FORMAT change → reject v19 blobs.
+                                                      //    kParserVer moves with it.
+                                                      // 19: extent honesty (test/extentcheck.sh) — each def record gains
+                                                      //    the `recovered` u8 (RawDef::recovered, after testScope) — a
+                                                      //    FORMAT change → reject v18 blobs. kParserVer moves with it.
+                                                      // 18: #62 — call refs inside a preprocessor-DECIDED-dead region
                                                       //    (`#if 0`, the `#else` of `#if 1`) are no longer captured. The
                                                       //    record SHAPE is unchanged, but a v17 blob holds refs this build
                                                       //    would not produce, and replaying them warm would resurrect the
@@ -179,7 +278,7 @@ constexpr std::uint32_t kCacheVersion = 18;           // 18: #62 — call refs i
                                                       //    dict INDICES + narrowest-exact-width tfs instead of raw
                                                       //    u64 hash + u32 tf pairs (the v9 shape grew the rich
                                                       //    blob +38-56% and dragged index/warm p95). Lossless by
-                                                      //    construction (widths from maxima, VERIFY'd) — a FORMAT
+                                                      //    construction (widths from maxima, ASSUME'd) — a FORMAT
                                                       //    change → reject v9 blobs (v9 never shipped; local v9
                                                       //    blobs self-heal via the same full-reparse path).
                                                       // 9 (B0.2 postings): each RICH-family def record gains the
@@ -203,19 +302,594 @@ constexpr std::uint32_t kCacheVersion = 18;           // 18: #62 — call refs i
                                                       //    (Py `pkg.mod`, TS `./x`, Rust `crate::a::b`/`mod:x`) —
                                                       //    a target FORMAT change → old caches must be rejected.
                                                       // 4: Include gained a `bool isAngle` (quote/angle) field
-constexpr std::uint32_t kParserVer    = 85;           // bump on any grammar/.scm/extraction change
-                                                      // 85 = 2026-09-09 (test/dartcheck.sh): Dart joins the
-                                                      //    indexed-language set with the vendored
-                                                      //    nielsenko/tree-sitter-dart grammar
-                                                      //    (b57d734c84f510bbd524097902cab671e4dbfca9),
-                                                      //    definition/call captures, doc-comment sidecar,
-                                                      //    and import/export/part edges resolved
-                                                      //    conservatively through the corpus's own
-                                                      //    pubspec.yaml / .dart_tool/package_config.json
-                                                      //    metadata. Flutter/runtime semantics and
-                                                      //    `dart:` SDK/library-name `part of` targets
-                                                      //    remain disclosed floors. Record shape
-                                                      //    unchanged (format 18).
+constexpr std::uint32_t kParserVer    = 143;          // bump on any grammar/.scm/extraction change
+                                                      // 143 = 2026-10-04 (train 25 review fixes): two extraction changes —
+                                                      //   a declaration named like the global object (`var self = this`, a
+                                                      //   parameter `window`) is now a JsShadow binding, and a value-reference
+                                                      //   slot text (into=/through=) is cut on a UTF-8 boundary, gets "…" only
+                                                      //   when really cut, and a JS string key is capped too. 143, not 142:
+                                                      //   141's RICH file tag was 142 (parserVerFor below adds 1), and a lean
+                                                      //   142 would have read those blobs as its own.
+                                                      // 141 = 2026-10-04 (train 25): cache-key hygiene above every branch build's number.
+                                                      //   Two merged lanes changed extraction under their own numbers: FE-A 134/135
+                                                      //   (member-call shape, ModuleAlias bindings, Rust path calls; kCacheVersion 28)
+                                                      //   and refval-edges 140 (reference-as-value rows; kQSnapCacheScheme 17); main
+                                                      //   was 133. 141 is above all of them, so no cache a branch build wrote is ever
+                                                      //   read as this build's. kCacheVersion stays FE-A's 28: every ingest key also
+                                                      //   carries kParserVer (lean 141 / rich 142 file tags, and a refval-edges rich
+                                                      //   blob was c27p141 — a different format number, so never this build's c28p141).
+                                                      // 140 = lane refval-edges (reference-as-value round): RefRole::Value /
+                                                      //    RefRole::Through rows from ingest_valuerefs.h, in BOTH families.
+                                                      //    A lane-local number above train 24's 133 — the train renumbers.
+                                                      // 135 = 2026-10-03 (lane FE-A fix round): Rust path calls (`<T as Trait>::f()`) are member
+                                                      //   calls — an extraction change; this lane's own earlier binaries ran 134 with the old
+                                                      //   extraction, so their caches must never be read as this build's.
+                                                      // 134 = 2026-10-03 (lane FE-A, test/falseedgecheck.sh): Go/JS/TS/Rust member calls
+                                                      //   record memberCall/memberRoot; JS/TS `require`, namespace-import and
+                                                      //   global-destructure aliases and Go import specs are ModuleAlias bindings; JsShadow
+                                                      //   also covers declarations spelled like a JS global (externalnames.h tables — a
+                                                      //   table edit is an extraction change). 133 is train 24's; the train renumbers.
+                                                      // 133 = 2026-10-02 (train 24): cache-key hygiene above every branch build's number. Two
+                                                      //   merged lanes changed extraction under their own numbers: 130 (a body-less C/C++
+                                                      //   enum/struct/union/class specifier in a function signature keeps its own span, so
+                                                      //   record VALUES change) and 131 (TS/TSX `await f<T>(x)` and unary `!f<T>(x)` are call
+                                                      //   references: new records); 132 was train 23's. 133 is above all of them, so no cache a
+                                                      //   branch build wrote is ever read as this build's. Same layout: kCacheVersion stays 27,
+                                                      //   kQSnapCacheScheme stays 16.
+                                                      // 132 = 2026-10-02 (train 23): cache-key hygiene, not an extraction change. Every
+                                                      //   branch build of this train's work ran at 129, and unmerged branch builds already
+                                                      //   ran at 130 and 131 with different extraction; 132 is above all of them, so no
+                                                      //   cache one of those builds wrote is ever read as this build's. Same layout:
+                                                      //   kCacheVersion stays 27, kQSnapCacheScheme stays 16.
+                                                      // 129 = 2026-09-30 (train 22): ONE bump past fn-literal's 128 for the two community
+                                                      //   PRs that merge after it — #338 (RSpec described_class, its 125 note below) and #325
+                                                      //   (Ruby inheritance edges, its note below). Each note keeps the number its PR carried.
+                                                      //   Record values change for Ruby only; kCacheVersion stays 27.
+                                                      // 129 (#325, train 22) = 2026-09-30 (Ruby inheritance edges, test/rubyinheritcheck.sh; carried as
+                                                      //   98 and 99 on the PR): isBaseTypeNodeIn gains a Ruby arm ((constant)/(scope_resolution)), so
+                                                      //   `class Child < Parent` emits an inherit RawRef (role Extends) where it emitted none, and
+                                                      //   captureBases does not descend into a computed superclass (`Struct.new( :a )` mints no ref to
+                                                      //   its receiver). New records, same layout: kCacheVersion unchanged (27; NOT the PR's 22/24);
+                                                      //   kQSnapCacheScheme unchanged. A Ruby cache written before this holds no inheritance refs.
+                                                      // 128 = 2026-09-29 (test/fnliteralcheck.sh): a name bound
+                                                      //   to a function literal (JS/TS `const f = (x) => …`, Lua
+                                                      //   `M.f = function … end`, a Python class-body lambda) owns
+                                                      //   the LITERAL's body (ingest_relations.h kFnLiteralBinding):
+                                                      //   bodyByte/sigEnd, params/cx/nest from the literal, and a
+                                                      //   multi-name binding's span narrows to its own binding.
+                                                      //   123/125/126/127 stay reserved for community PRs.
+                                                      //   Same lane, still 128: a function-local def's scope
+                                                      //   span (ingest_names.h enclosingFunctionScope) — a record
+                                                      //   layout change, so kCacheVersion 25 -> 26 rejects every
+                                                      //   older blob, including one this lane's first build wrote.
+                                                      // 125 = 2026-09-27 (#338, test/rubydescribedclasscheck.sh): RSpec's
+                                                      //   `described_class` receiver is classified as the constant
+                                                      //   the innermost constant-described example group names
+                                                      //   (ingest_binds.h::rspecDescribedClass), so RawRef::recv /
+                                                      //   recvVar change VALUE for those call sites — NamedVar
+                                                      //   "Calc" where they were NamedVar "described_class". Carried
+                                                      //   as 121 on the PR; renumbered 125 after #310 (121), #320
+                                                      //   (122) and #220 (124), with 123 reserved for #325. No record
+                                                      //   layout change: kCacheVersion stays 25 (NOT 24); a Ruby cache
+                                                      //   written at 124 holds the old receiver and must re-parse.
+                                                      // 124 = 2026-09-26 (#220 part 2, test/depsprecisecheck.sh
+                                                      //   P2-O): a TS/JS RE-EXPORT (`export … from './y'`) is an
+                                                      //   Include like an import (ingest_relations.h
+                                                      //   directiveTargetOf's export_statement branch), so a
+                                                      //   barrel's edges exist. 123 stays reserved for #325.
+                                                      //   No record layout change: kCacheVersion stays 25 (NOT 24);
+                                                      //   kQSnapCacheScheme stays 14.
+                                                      // 122 = 2026-09-25 (#320/#67, test/astrocheck.sh): .astro joins
+                                                      //   kLangTable on the TypeScript grammar, parsed through ONE
+                                                      //   included range over its `---` frontmatter; blank lines
+                                                      //   before the opening fence are skipped. Carried as 120 on
+                                                      //   the PR; renumbered 122 after #150 (120) and #310 (121).
+                                                      //   No record layout change: kCacheVersion stays 25 (NOT 24);
+                                                      //   kQSnapCacheScheme stays 14.
+                                                      // 121 = 2026-09-24 (#310, Ruby class-level attribute DSL,
+                                                      //   test/rubyattrscheck.sh — the attr_* floor reversal): a
+                                                      //   class-body-level receiver-less attr_reader/attr_writer/
+                                                      //   attr_accessor/attribute/attributes call defines one Var
+                                                      //   per simple_symbol argument (plus the `<x>=` setter for
+                                                      //   writer-side macros), so setter CALLS (`record.x = v`)
+                                                      //   now bind; the extracted def SET grows on every Ruby
+                                                      //   corpus. Landed at 115 on the pre-train-6 base, carried
+                                                      //   as 120 on the PR, renumbered 121 when merged after #150
+                                                      //   took 120. No record layout change: kCacheVersion stays
+                                                      //   25 (NOT 24); kQSnapCacheScheme stays 14. Folded in at 121
+                                                      //   (unreleased) in the train-19 review round: a comment before
+                                                      //   `attribute`'s first argument is skipped, `class << X` for
+                                                      //   X != self and `module_function attr_*` define nothing. A
+                                                      //   121 cache written before that round differs only there.
+                                                      // 120 = 2026-09-23 (#150): two new per-record extraction
+                                                      //   facts — RawRef::qualifierRootsStd (a C++ call's FULL
+                                                      //   written qualifier chain is rooted at namespace std, at
+                                                      //   any nesting depth) and RawDef::scopeRootsStd (a C++
+                                                      //   def's full enclosing-namespace chain roots at std) — see
+                                                      //   ingest_names.h cppQualifiedChainRootsStd /
+                                                      //   cppEnclosingChainRootsStd / cppDefinitionRootsStd, and
+                                                      //   graph.h::keepStdQualifiedCandidates, which reads both to
+                                                      //   stop `std::ranges::move`/`std::chrono::duration_cast`
+                                                      //   from binding an unrelated in-repo `move`/`duration_cast`
+                                                      //   the way #134's IMMEDIATE-qualifier-only guard could not
+                                                      //   tell from a user's own nested `mylib::ranges::`/
+                                                      //   `vendorlib::chrono::`. A cache written before this
+                                                      //   carries neither bit, always reading as "not std-rooted" —
+                                                      //   the SAFE direction (a stale-cache read degrades toward
+                                                      //   #134's old, narrower behaviour, never toward a new false
+                                                      //   bind) — but the format itself changed (RawDef/RawRef both
+                                                      //   grew a byte, kCacheVersion 24 -> 25), so a v24 blob is
+                                                      //   rejected outright by the version guard before this even
+                                                      //   matters.
+                                                      //   SAME-LANE CORRECTNESS FIX, folded into this same 120
+                                                      //   (2026-09-24, adversarial review, F1/F2 — never a
+                                                      //   separate shipped value: 120 never reached main or a
+                                                      //   release before this landed, and this codebase's caches
+                                                      //   are per-worktree, so no reader anywhere could have a
+                                                      //   cache written under the brief-lived intermediate 121
+                                                      //   this fix once used; collapsing back to 120 is honest,
+                                                      //   not a hidden bump). cppDefinitionRootsStd
+                                                      //   (ingest_names.h) trusted ts_node_parent(nameNode) to
+                                                      //   always be the OUTERMOST qualified_identifier of a
+                                                      //   definition's written chain; for a 3+-segment OUT-OF-LINE
+                                                      //   definition (`std::detail::f(){}`, `std::hash<Foo>::mix`)
+                                                      //   it is only the INNERMOST link (ingest.cpp re-seats a
+                                                      //   definition's @name there), so the fix ADDS a climb to
+                                                      //   the true outermost node before reading the root, and OR's
+                                                      //   in the enclosing-namespace walk (fixes a second shape,
+                                                      //   `namespace std { int detail::innerHelper(){} }`, whose
+                                                      //   PARTIAL written qualifier never reached that walk at
+                                                      //   all). Also graph.h::keepStdQualifiedCandidates: the "has
+                                                      //   a body" test now applies to function-like kinds only, so
+                                                      //   a std-rooted VARIABLE (a niebloid) is no longer refused
+                                                      //   for having no body. See test/stdqualcheck.sh §14.
+                                                      //   SECOND same-train fix, folded in on the same terms
+                                                      //   (2026-09-24, CodeRabbit on #331; 120 still unmerged):
+                                                      //   cppDefinitionRootsStd no longer marks a qualified
+                                                      //   `std::…` def written inside a NAMED namespace
+                                                      //   (`namespace vendor { void std::ranges::f(){} }` defines
+                                                      //   vendor::std::ranges::f) as std-rooted. A 120 cache from
+                                                      //   before it can only over-mark that one perverse shape.
+                                                      //   See test/stdqualcheck.sh §15.
+                                                      // #310/#325/#320 (open PRs that also bump kParserVer): take
+                                                      //   the next free value above whatever lands after this on
+                                                      //   integration; do not reuse 120.
+                                                      // 119 = 2026-09-20 (T13/fix3): queries/java/tags.scm
+                                                      //   and queries/kotlin/tags.scm's import captures were
+                                                      //   @reference.call — an import is a dependency edge,
+                                                      //   not a call, and since #60 gave top-level statements
+                                                      //   a <file-scope> owner, an import line got a REAL
+                                                      //   caller edge: --callers=/--impact= fan-in on a
+                                                      //   Java/Kotlin symbol was inflated by one phantom
+                                                      //   "caller" per importing file. Both now spell
+                                                      //   @reference.import (RefRole::Import), the same
+                                                      //   mechanism C++'s `using ns::name;` already uses —
+                                                      //   still a role="import" --uses site, never a call-
+                                                      //   graph edge (graph.h isResolvableCallReference is
+                                                      //   Call+Macro only). A cache written before this
+                                                      //   double-counts every JVM import as a caller.
+                                                      // 118 = 2026-09-19 (CodeRabbit follow-up, thread
+                                                      //   4053600599: isJsxIntrinsicTagIdentifier
+                                                      //   (src/ingest_names.h) tested `!isUppercase`, which kept
+                                                      //   any non-uppercase-first-letter tag as intrinsic — so
+                                                      //   `<_Widget/>`/`<$Widget/>` were wrongly treated as
+                                                      //   intrinsic tags and lost their call edge, exactly like
+                                                      //   `<div/>`. Fixed to test ASCII-lowercase directly: only
+                                                      //   `a`-`z` is intrinsic now, so `_Widget`/`$Widget` are
+                                                      //   kept as components. A cache written before this
+                                                      //   under-counts their callers.
+                                                      // 117 = 2026-09-19 (train 7: one bump past main's 116 for
+                                                      //   both members; each lane had bumped 114 -> 115)
+                                                      //   (a) 2026-09-19 lane/disclose-sink-form (degrade disclosure, test/skipreasoncheck.sh
+                                                      //    arm 10): a PARTIALLY extracted file (an ExtractShortfall — a
+                                                      //    nesting bound, an unavailable tags query, a throw part-way) is
+                                                      //    itemized why="extract-partial" and written to the cache as
+                                                      //    UNKNOWN. A cache written before this stored such a file's
+                                                      //    partial facts under its real hash, which a warm run would
+                                                      //    serve as whole: every such cache must be re-extracted.
+                                                      //   (b) 2026-09-18 lane/jsx-element-calls (#285 JSX element invocation:
+                                                      //    queries/typescript/tags.scm's `<Foo/>`/`<Foo.Bar/>`
+                                                      //    patterns moved to a NEW queries/tsx/tags.scm — plain
+                                                      //    .ts's grammar has no jsx_*_element node types, so a
+                                                      //    shared query with them fails to compile AT ALL for
+                                                      //    .ts — kLangTable's .tsx row now uses querySub "tsx",
+                                                      //    not "typescript"; queries/javascript/tags.scm gained
+                                                      //    the same patterns in place, since .js/.jsx/.mjs/.cjs
+                                                      //    already share one grammar that has the nodes. New
+                                                      //    isJsxIntrinsicTagIdentifier (src/ingest_names.h) drops
+                                                      //    an intrinsic tag (`<div>`) at capture time.
+                                                      // 116 = 2026-09-18 (issue #287 round 2, review
+                                                      //   rv-p6.md HIGH: capturePythonRebindShadowDecls
+                                                      //   emits a LocalBindKind::VarDecl RawBind for every
+                                                      //   Python name-rebinding form — plain/augmented
+                                                      //   assignment, for-target, with/except-as, walrus,
+                                                      //   del, a nested def/class name, global/nonlocal —
+                                                      //   so Rule 2d's alias-receiver narrow can no longer
+                                                      //   mistake a rebound name for the still-live import)
+                                                      // 115 = 2026-09-18 (issue #287: capturePythonImportBinds
+                                                      //   now sets RawBind::importedName="module" iff the bound
+                                                      //   name IS the imported module (`import a.b`/`import
+                                                      //   a.b as c`), empty for `from m import x [as y]` — the
+                                                      //   module-alias receiver narrow reads this bit)
+                                                      // 114 = 2026-09-17 (reference-returning definitions,
+                                                      //    test/narrowcheck.sh arms 61-63, test/shadowcheck.sh arms am
+                                                      //    and q8): a C++/ObjC function definition returning `T&` or
+                                                      //    `T&&` records its parameters (VarDecl + ParamType; it recorded
+                                                      //    none — the declarator walk stopped at reference_declarator),
+                                                      //    and an attributed declarator records its VarDecl. No record
+                                                      //    layout changes (kCacheVersion stays 24). The lane declared 112
+                                                      //    over #282's 104; integration/train-5 assigns 114 after #282's 113.
+                                                      // 113 = 2026-09-17 (smart-pointer members, PR #282,
+                                                      //    test/fieldnarrowcheck.sh arm p): a C++ member written
+                                                      //    `std::unique_ptr<T>` / `std::shared_ptr<T>` records T with
+                                                      //    viaArrow set (it recorded nothing), and a call ref records
+                                                      //    whether its member access was `->`. The ref record grows by
+                                                      //    one u8 (kCacheVersion 23 -> 24 in the same commit). The PR
+                                                      //    declared 104 over main's 103; integration/train-5 assigns
+                                                      //    113 over main's 112.
+                                                      // 112 = 2026-09-17 (type aliases, PR #280, test/fieldnarrowcheck.sh
+                                                      //    arm t): a C/C++/ObjC `typedef` / `using` alias of a named class
+                                                      //    emits a compose-shaped RawRef (composeRel "alias", empty
+                                                      //    fieldName) that the base walk follows to its target. Format
+                                                      //    unchanged (kCacheVersion stays 23); an older blob holds no such
+                                                      //    records and would dead-end the walk at the alias on a warm run:
+                                                      //    content change, bump required. The PR declared 105 over main's
+                                                      //    99; re-declared 111 over main's 110 when train 3 merged;
+                                                      //    integration/train-4 assigns 112 after irbuilder-local's 111.
+                                                      // 111 = 2026-09-17 (block-scope direct-initialized locals,
+                                                      //    test/narrowcheck.sh arms 52-60): a C++ function_declarator
+                                                      //    inside a function/lambda body that an argument list also
+                                                      //    produces (`IRBuilder<> Builder(Rem);`) mints no function
+                                                      //    symbol (ingest_names.h cppBlockScopeDirectInit), so the
+                                                      //    local's type binding is attributed to the enclosing function.
+                                                      //    Symbols and fact attribution change; no record layout changes
+                                                      //    (kCacheVersion unchanged). Claimed 111; integration/train-4 keeps it over main 110.
+                                                      // 110 = 2026-09-17 (Java catch/enhanced-for/resource shadows, PR #235
+                                                      //    follow-up from CodeRabbit on #281, test/javamethodrefcheck.sh):
+                                                      //    a catch parameter, an enhanced-for variable and a try-with-
+                                                      //    resources resource now emit Java VarDecl shadow binds, so a
+                                                      //    `Widget` declared there vetoes `Widget::m` inside that scope.
+                                                      //    The extracted bind SET changes; no record changes shape.
+                                                      // 109 = 2026-09-17 (Ruby constant receivers narrow calls, PR #267,
+                                                      //    test/rubyrecvnarrowcheck.sh): classifyReceiver classifies a
+                                                      //    Ruby (constant)/(scope_resolution) receiver as NamedVar with
+                                                      //    the FINAL constant segment, so `Calc.add(…)` /
+                                                      //    `Outer::Engine.run(…)` reach resolve.h's Rule 2c instead of
+                                                      //    the §2a name spray. RECORD LAYOUT unchanged — recv/recvVar
+                                                      //    are fields RawRef already had (kCacheVersion stays 23) — but
+                                                      //    their VALUES change, so old Ruby extraction facts must be
+                                                      //    re-parsed. quality.h's kIngestParserVerMirror bumped in the
+                                                      //    SAME commit. The PR declared 96 -> 97 over main; assigned
+                                                      //    109 on integration/train-3 after #233's 108.
+                                                      // 108 = 2026-09-17 (GDScript, PR #233, test/gdscriptcheck.sh): a
+                                                      //    new grammar (third_party/deps/gdscript) and queries/gdscript/
+                                                      //    tags.scm, `.gd` a kLangTable row, and NodeField::Op appended:
+                                                      //    a tree with `.gd` files yields new files, symbols and edges.
+                                                      //    The PR declared 96 -> 98 over main; assigned 108 on
+                                                      //    integration/train-3 after #235's 107. kCacheVersion stays 23.
+                                                      // 107 = 2026-09-17 (Java Type::method, issue #74, PR #235): the PR's
+                                                      //    two steps below, declared 97 and 98 over main's 96, land as one;
+                                                      //    assigned 107 on integration/train-3 after #278's 106.
+                                                      //    RecvKind::JavaTypeCandidate is appended after train 2b's Lit*
+                                                      //    kinds (kRecvKindCount follows it); kCacheVersion stays 23.
+                                                      //    PR step 98, 2026-09-15 (Java Type::method review,
+                                                      //    test/javamethodrefcheck.sh): Java shadow binds carry
+                                                      //    lexical spans (block / lambda / method body) and inferred
+                                                      //    lambda parameters (`Widget ->`, `(Widget) ->`) are captured.
+                                                      //    Extracted bind SET and span values change, so a v97 blob
+                                                      //    must be rejected. kCacheVersion stays 22 — Binding already
+                                                      //    has spans; RecvKind and record shapes are unchanged.
+                                                      //    PR step 97, 2026-09-15 (Java Type::method candidates,
+                                                      //    test/javamethodrefcheck.sh): method_reference member names
+                                                      //    after `::` plus declaration-aware resolver gating. The query
+                                                      //    cannot distinguish a type identifier from a value identifier.
+                                                      //    #216 already spent 96 on internalLinkage, so this RE-BUMPS
+                                                      //    (never-reuse / collision). kCacheVersion stays 22 — RecvKind
+                                                      //    is appended, record shapes are unchanged.
+                                                      // 106 = 2026-09-17 (assignment types, PR #278, test/narrowcheck.sh arms
+                                                      //    44-51): a C++ ASSIGNMENT's Type RawBind is marked
+                                                      //    isFromAssignment, and buildGraph keeps its callee-read name
+                                                      //    only when a class of that name exists (`t = llvm::cast<T>( y )`
+                                                      //    recorded `cast` and tombstoned `T* t`). The bind record grows
+                                                      //    one u8 (kCacheVersion 22 -> 23 in the same commit). The PR
+                                                      //    declared 104 over main's 99; assigned 106 on integration/
+                                                      //    train-3 after small-fixes' 105.
+                                                      // 105 = 2026-09-17 (A4, found-items 2026-09-17,
+                                                      //    test/filerootcheck.sh arm 4): `.hxx` gained a kLangTable row
+                                                      //    (Lang::Cpp, same as `.hpp`/`.hh`) — the crawl previously
+                                                      //    skipped every `.hxx` file outright (unindexed), so a repo
+                                                      //    that spells its headers `.hxx` now yields NEW files,
+                                                      //    symbols and edges a pre-bump cache never saw: content
+                                                      //    change, bump required. The lane declared 100 over main's
+                                                      //    99; assigned 105 on integration/train-3 after #276's 104.
+                                                      // 104 = 2026-09-17 (template arguments in a receiver's written type,
+                                                      //    test/narrowcheck.sh arms 39-43): a C++ declaration's Type/ParamType
+                                                      //    record takes its type's LAST NAME through the grammar's fields.
+                                                      //    An unqualified template-id (`Vec<Decl *>& v`, `Vec<T> v;`)
+                                                      //    recorded nothing and now records `Vec`; `Outer<int>::Inner`
+                                                      //    recorded `Outer` (finalSegment cut at the first `<`) and now
+                                                      //    records `Inner`, written or constructed (`Outer<int>::Inner()`,
+                                                      //    and `Foo<T>::create()` records `create`, not `Foo`); an
+                                                      //    unqualified `Vec<T>()` stays unread (ingest_binds.h
+                                                      //    ctorNameNode's floor); `Vec<std::string>` no longer records a
+                                                      //    qualified text for its argument's `::`. No record changes shape
+                                                      //    (kCacheVersion stays 22). The PR declared 103 over main's 99;
+                                                      //    assigned 104 on integration/train-3 over train 1b's 103.
+                                                      //    quality.h's kIngestParserVerMirror moves in the SAME commit.
+                                                      // 103 = 2026-09-17 (TS/JS signed numeric literal receivers, train 1b
+                                                      //    #277): `(-1).toFixed()` is a Number receiver, not an unrelated
+                                                      //    `toFixed`. An extraction change on #244's literal receivers;
+                                                      //    no record changes shape.
+                                                      // 102 = 2026-09-17 (C++ template scopes, test/cpptmplscopecheck.sh,
+                                                      //    PR #256): a primary template's out-of-line member keys the bare
+                                                      //    template name (`void Box<T>::grow()` joins `Box::grow`); a
+                                                      //    specialization keeps its canonical template-id; a reference
+                                                      //    keeps the template-id it writes (3+ segments too); and a class
+                                                      //    specialization HEADER's base clause is captured as inherit
+                                                      //    refs (tags.scm @definition.specialization). Symbol scopes,
+                                                      //    RawRef::qualifier and the extracted refs change; no record
+                                                      //    layout changes (kCacheVersion stays 22). The PR declared 100;
+                                                      //    assigned 102 on integration/train-2b after #243's 101.
+                                                      // 101 = 2026-09-17 (member template calls, test/cppqualcheck.sh
+                                                      //    §12, PR #243): a C++ member call with explicit template arguments
+                                                      //    (`r.f<T>()`, `p->f<T>()`, `x.template f<T>()`) mints a
+                                                      //    call reference with its receiver, where it minted none;
+                                                      //    a `template` disambiguator no longer leaks into a qualified
+                                                      //    call's name (`template f`) or qualifier (`template Rebind`).
+                                                      //    The extracted SET and names change; no record changes shape
+                                                      //    (kCacheVersion stays 22). The PR declared 99; assigned 101 on
+                                                      //    integration/train-2b in merge order after #244's 100.
+                                                      //    quality.h's kIngestParserVerMirror moves in the SAME commit.
+                                                      // 100 = 2026-09-17 (TS/JS literal receivers, issue #163, PR #244): RecvKind
+                                                      //    gains LitString/LitArray/LitRegex/LitNumber/LitBoolean
+                                                      //    (appended u8, no RawRef field, kCacheVersion stays 22).
+                                                      //    A `"x".replace()` call no longer takes the bare-name ladder.
+                                                      //    The PR declared 97; assigned 100 on integration/train-2b in
+                                                      //    merge order over train 2's 99.
+                                                      // 99 = 2026-09-16 (std-typed member fields, test/fieldnarrowcheck.sh
+                                                      //    arm q): a C++ field's compose RawRef records the namespace its
+                                                      //    type was written in as `qualifier` (`std` for `std::string
+                                                      //    name_;`). Format unchanged; a 98 blob holds "" there and would
+                                                      //    let Rule 2b and the HAS-A edges read `string` as an in-repo
+                                                      //    class on a warm run: content change, bump required.
+                                                      // 98 = 2026-09-16 (std-qualified receivers, test/narrowcheck.sh
+                                                      //    arm 21): a C++ ASSIGNMENT from a constructor (`x = std::
+                                                      //    map<K, V>()`) records the constructor's qualified text in
+                                                      //    importedName, like a declaration's record. Format unchanged;
+                                                      //    a 97 blob holds "" there and would let Rule 2 narrow `x` to
+                                                      //    an in-repo `map` on a warm run: content change, bump required.
+                                                      // 97 = 2026-09-16 (parameter receivers, test/narrowcheck.sh arm
+                                                      //    17): a declaration's Type/ParamType RawBind records its
+                                                      //    written type WHOLE in importedName when the type is
+                                                      //    QUALIFIED (`std::map<K, V>`). Record FORMAT unchanged (the
+                                                      //    field was already serialised, empty on these kinds), but a
+                                                      //    96 blob holds "" there and would let Rule 2's lexical lookup
+                                                      //    narrow a qualified parameter type to an unrelated same-named
+                                                      //    in-repo class on a warm run: content change, bump required.
+                                                      //    (Binding::startByte, same lane, is re-derived from the cached
+                                                      //    RawBind::startByte and needed none.)
+                                                      // 96 = 2026-09-13 (internal linkage, test/decltodefcheck.sh arm
+                                                      //    B2): every C/C++ def carries a new syntactic
+                                                      //    `internalLinkage` bit — inside an anonymous namespace at any
+                                                      //    depth, or a namespace-scope `static`. The def record grows
+                                                      //    by one u8 (kCacheVersion 21 -> 22 in the same commit). Next
+                                                      //    free number over the merged tip (main at 95 after #81);
+                                                      //    quality.h's kIngestParserVerMirror and
+                                                      //    kIngestCacheVersionMirror bumped in the SAME commit.
+                                                      // 95 = 2026-09-12 (Elixir module/name/arity resolution, PR #81,
+                                                      //    test/elixirsemanticcheck.sh): module/name/arity identities,
+                                                      //    lexical aliases, filtered imports, default arguments, pipes,
+                                                      //    captures, delegates, attributes and protocol/behaviour
+                                                      //    contracts. Existing bind/ref record layouts are unchanged
+                                                      //    (kCacheVersion stays #139's 21; the same PR's kQSnapCacheScheme
+                                                      //    10 -> 11 is quality.h's arity-key fold, not an extraction change);
+                                                      //    old Elixir extraction facts must be re-parsed. The branch
+                                                      //    carried 87; main spent 87..92 while it was open, #139 takes
+                                                      //    93 and #172 takes 94 in the 0.6.1 round, so this lands on
+                                                      //    the next free number over the merged tip (the 78/80/88/91
+                                                      //    rule). quality.h's kIngestParserVerMirror bumped in the
+                                                      //    SAME commit.
+                                                      //    Three pre-merge follow-ups on the same PR move extraction
+                                                      //    OUTPUT within 95 (test/elixirnamearitycheck.sh H, I, J): a
+                                                      //    dotted nested defmodule binds its first segment (ref
+                                                      //    qualifiers), an alias of __MODULE__ classifies its receiver
+                                                      //    ElixirSelfModule (RawRef::recv), and `&_seed/0` is captured
+                                                      //    (the extracted SET). No second bump: the never-reuse rule is
+                                                      //    about TWO LANES shipping one in-flight number with different
+                                                      //    sets, and 95 is this lane's alone — minted here over the
+                                                      //    merged tip, written by no released binary. Record shapes are
+                                                      //    unchanged (kCacheVersion stays 21). A blob a pre-follow-up
+                                                      //    build of this branch wrote is the one exposure, and it is
+                                                      //    local to whoever built that branch: --no-cache, or let the
+                                                      //    stat gate re-parse the edited files.
+                                                      // 94 = 2026-09-11 (#62/#72 follow-up, all roles + definitions):
+                                                      //    the decided-dead `#if 0` filter moved from captureTagsFacts'
+                                                      //    @reference.call/@reference.import arm to a window post-pass
+                                                      //    over every fact family a C-family file produces. FIVE more
+                                                      //    emitters now honour it — the value-use pass (role=read/write),
+                                                      //    the type-mention pass (role=type), captureBases (role=extends),
+                                                      //    captureIncludes' directive site (role=import, plus the Include
+                                                      //    FILE-dependency record the same directive minted) and the
+                                                      //    blanked member-macro use — and a DEFINITION whose name sits in
+                                                      //    a dead range is no longer indexed at all, so it can no longer
+                                                      //    split resolution (overloads=/amb=/prov="split"/graph_ambiguous=
+                                                      //    against a definition that cannot compile). The extracted SET
+                                                      //    SHRINKS on any C-family tree carrying a literal `#if 0`/`#if 1`,
+                                                      //    so a v93 blob replays rows this binary refuses. Record shapes
+                                                      //    are untouched, so kCacheVersion stays #139's 21. quality.h's
+                                                      //    kIngestParserVerMirror carries the same value (gated). Gate:
+                                                      //    test/ppdeadrolescheck.sh, one live/dead pair per --uses role.
+                                                      //    RENUMBERED 93 -> 94 on the merge with main 558a2e03: the
+                                                      //    branch spent 93 while main spent it on #139 (Ruby arguments).
+                                                      // 93 = 2026-09-11 (Ruby argument + rescue constants,
+                                                      //    test/rubyargcheck.sh): a constant chain that is a direct
+                                                      //    argument of a call/super/yield (or a keyword pair's value
+                                                      //    there) and every class in a rescue list are symbolic
+                                                      //    Include records, deduped with receivers per (file, open,
+                                                      //    written); a rescue class is lazy always. An older blob
+                                                      //    holds none of them, so it is stale rather than wrong — the
+                                                      //    header version is what rejects it. RENUMBERED 89 -> 93 on
+                                                      //    the merge with main 40a1895b: the branch spent 89 while main
+                                                      //    spent 89..92 (extent, Kotlin, yaml). quality.h's mirror
+                                                      //    bumped in the SAME commit.
+                                                      // 92 = 2026-09-11 (yaml unsigned-char, PR #140): vendor patch
+                                                      //    yaml/003-scan-status-enum gives tree-sitter-yaml's scan status
+                                                      //    (SCN_SUCC 1, SCN_STOP 0, SCN_FAIL -1) a real `ScanStatus` enum
+                                                      //    type instead of returning it through plain `char`. `char` is
+                                                      //    UNSIGNED on aarch64 Linux — the platform the linux-arm64 release
+                                                      //    asset is built for — and there SCN_FAIL came back as 255, which
+                                                      //    no `case SCN_FAIL:` label matched: a malformed %-escape in a tag
+                                                      //    or a %TAG prefix was swallowed into the token rather than ending
+                                                      //    it, so `a: !<tag:x%zz> b` parsed as ERROR under a signed `char`
+                                                      //    and as a clean tagged scalar under an unsigned one. The patch
+                                                      //    makes the unsigned-`char` build parse as the signed one always
+                                                      //    did — byte-identical on a signed-`char` host, CHANGED on an
+                                                      //    unsigned one. kArtifactArch cannot tell an aarch64 cache blob
+                                                      //    from an x86-64 one, so only this version can reject a blob
+                                                      //    written by the pre-patch unsigned-`char` binary. Record shapes
+                                                      //    are untouched, so kCacheVersion stays #135's 20. quality.h's
+                                                      //    kIngestParserVerMirror carries the same value (gated). Live
+                                                      //    tripwire: vendorpatchcheck arm K, which compiles the vendored
+                                                      //    grammar -fsigned-char and -funsigned-char on any host.
+                                                      // 91 = 2026-09-11 (Kotlin, PR #126): a 24th grammar joins kLangTable
+                                                      //    (.kt), so the crawl admits files a v90 blob never saw — ABSENT,
+                                                      //    not stale, and only the header version can reject that blob.
+                                                      //    91 and not 89/90: #135 spent both, and main stands at 90. Also
+                                                      //    under 91: vendor patch kotlin/002-triple-dollar-escape changes a
+                                                      //    real parse (a triple-quoted string ending right after an escaped
+                                                      //    `\$`, e.g. """a\$""", lost its first closing quote);
+                                                      //    kotlin/003-dollar-run-saturate changes the parse of a run of
+                                                      //    65,536 or more `$`, where upstream's counter wrapped; and the
+                                                      //    ingest nesting guard refuses a .kt file whose string templates
+                                                      //    nest past kMaxKotlinStringNestDepth before the parse, which
+                                                      //    changes WHICH .kt files are extracted. kotlin/001-stack-push-
+                                                      //    no-abort alone would not need a bump: it only changes input that
+                                                      //    used to abort (the yaml/001 and markdown/001 precedent). A
+                                                      //    refused file's cache record is written UNKNOWN with the existing
+                                                      //    hash-0 encoding, so record SHAPES are unchanged and kCacheVersion
+                                                      //    stays #135's 20. The bodyless-Kotlin-type and own-JVM-language rules
+                                                      //    live in graph.h and are recomputed every run. quality.h's
+                                                      //    kIngestParserVerMirror carries the same value (gated). The
+                                                      //    branch's two earlier steps, folded in under their branch numbers
+                                                      //    so no 89/90 label collides with #135:
+                                                      //    (branch 90, 2026-09-08, adversarial-corpus follow-up)
+                                                      //    measureFileHealth now also validates UTF-8 in the leading
+                                                      //    sample (a file that only trips this check needs a cold
+                                                      //    re-measure to pick up the new degraded-parse disclosure —
+                                                      //    a cached FileHealth from before this version predates the
+                                                      //    check and would read as healthy); enum_class_body added to
+                                                      //    the Kotlin positional body-fallback (an `enum class` was
+                                                      //    read as bodyless, same collapse bug as 89's class_body
+                                                      //    fix, just for the enum-class node shape). RE-BUMPED from
+                                                      //    87 on rebase: main independently spent 86 (Ruby receiver),
+                                                      //    87 (markdown scanner counter saturation) and 88 (Dart)
+                                                      //    while this branch was in progress, and 86/87 collided
+                                                      //    EXACTLY with this branch's own prior use of those numbers.
+                                                      //    quality.h's kIngestParserVerMirror bumped in the SAME
+                                                      //    commit.
+                                                      //    (branch 89, 2026-09-08) grammar + queries/kotlin/tags.scm;
+                                                      //    positional body/scope lookups (function_body, class_body and
+                                                      //    type_identifier are children, not fields — a def read as
+                                                      //    bodyless is deleted by graph.h's decl/def collapse);
+                                                      //    captureBases reads delegation_specifier; when_entry/
+                                                      //    when_expression/do_while_statement/catch_block count as
+                                                      //    decisions; function_value_parameters counts `parameter`
+                                                      //    children. Originally 86, RE-BUMPED for the same
+                                                      //    collision reason as 90 above.
+                                                      // 90 = 2026-09-11 (member-macro re-parse, test/macroreparsecheck.sh):
+                                                      //    a C-family file whose first parse holds error bytes may be
+                                                      //    extracted from a re-parse with its semicolon-less member macro
+                                                      //    invocations blanked (src/macroreparse.h) — different defs,
+                                                      //    scopes, complexity and health for exactly those files, plus
+                                                      //    one role=Type use per blanked invocation on the rich family.
+                                                      //    A v89 record cannot say which parse it came from, and the
+                                                      //    file record grows a u32, so kCacheVersion moves 19 -> 20.
+                                                      // 89 = 2026-09-11 (extent honesty, test/extentcheck.sh): every
+                                                      //    def carries RawDef::recovered — the parse recovered its
+                                                      //    container (a class whose body holds an error, inside an
+                                                      //    ERROR node) or its kind (a scopeless C++ method inside one),
+                                                      //    set by ingest_names.h parseRecoveredBits. A new extracted
+                                                      //    fact, so a v88 record cannot answer it; the record SHAPE
+                                                      //    grows one u8 too, so kCacheVersion moves 18 -> 19 with it.
+                                                      //    Every symbol, edge and metric is byte-identical (verified
+                                                      //    against the pre-change binary on src/ and the test/ corpus);
+                                                      //    only rows the new check flags gain extent_suspect=.
+                                                      //    quality.h's kIngestParserVerMirror bumped in the SAME commit.
+                                                      // 88 = 2026-09-10 (Dart, test/dartcheck.sh): a 23rd grammar joins
+                                                      //    kLangTable, so the CRAWL ADMITS FILES IT PREVIOUSLY REFUSED —
+                                                      //    a v87 blob has no record for the `.dart` it never saw, so the
+                                                      //    file is ABSENT rather than stale and only the header version
+                                                      //    can reject it. The definition SPAN is also extended for Dart
+                                                      //    only (dartFollowingBody, adopted in ingest_sidecap.h) and
+                                                      //    formal_parameter_list joins cc_isParamList; both are
+                                                      //    extraction identity, which is what parserVer covers, and every
+                                                      //    other language is byte-identical (verified against the
+                                                      //    pre-change binary on src/ and a 1 406-file multi-language
+                                                      //    corpus). Record shapes unchanged, so kCacheVersion stays 18.
+                                                      //    RE-BUMPED from 87 on landing: main spent 82..87 while PR #75
+                                                      //    was open, and 87 collided EXACTLY — the declaration line
+                                                      //    auto-merged clean at the same wrong number while only the
+                                                      //    comment conflicted. quality.h's kIngestParserVerMirror bumped
+                                                      //    in the SAME commit.
+                                                      // 87 = 2026-09-10 (test/vendorpatchcheck.sh arm I,
+                                                      //    third_party/patches/markdown/002-counter-saturate):
+                                                      //    the vendored markdown scanner accumulated consumed
+                                                      //    whitespace, and its fence delimiter count, into
+                                                      //    uint8_t counters with a bare `+=` and WRAPPED. Both
+                                                      //    are read by ordering tests against a FIXED threshold
+                                                      //    (`>= 4` indented chunk; `>= 3` before a fence may
+                                                      //    open), so wrapping did not blur them, it INVERTED
+                                                      //    them — and only inside a narrow window. MEASURED:
+                                                      //    N=255 correct, N=256/257 WRONG at exit 0, N=300
+                                                      //    correct again by luck (300-256=44, still over both
+                                                      //    thresholds). At 256 an indented code block came back
+                                                      //    as a heading, and a fence never opened so its body
+                                                      //    leaked out as live markdown; ripwire minted phantom
+                                                      //    symbols for both. Counters now saturate at 255, which
+                                                      //    is exact for every threshold in that file.
+                                                      //    Map output is byte-identical over 3 538 real files —
+                                                      //    no corpus file reaches 256 columns of indent — but a
+                                                      //    constructed 256-column line does move, so a v86 blob
+                                                      //    can hold a phantom heading and the extraction
+                                                      //    identity must move with it.
+                                                      //    The sibling patches rust|lua|csharp/001-delimiter-
+                                                      //    count-cast take an explicit CAST, not saturation:
+                                                      //    those counters close a token by matching the opening
+                                                      //    count, and measurement found NO extraction difference
+                                                      //    at any width (255/256/257/300), so they contribute
+                                                      //    nothing to this bump.
+                                                      //    Record shapes unchanged, so kCacheVersion stays 18.
+                                                      //    quality.h's kIngestParserVerMirror bumped in the
+                                                      //    SAME commit.
+                                                      // 86 = 2026-09-09 (test/rubyrecvcheck.sh): a Ruby constant
+                                                      //    RECEIVER's lazy bit is the AND over its occurrences —
+                                                      //    a later load-time site clears the bit the first,
+                                                      //    closure-written site set, so the answer no longer
+                                                      //    depends on statement order; and rubyIsConstantChain
+                                                      //    walks the left-nested scope_resolution ITERATIVELY
+                                                      //    (a 5 000-segment chain overflowed a parse worker's
+                                                      //    stack). A cached v85 blob can hold a lazy bit this
+                                                      //    binary would compute as load-time, so the extraction
+                                                      //    identity moves. Record shapes unchanged (Include's
+                                                      //    four fields), so kCacheVersion stays 18. RE-BUMPED
+                                                      //    from 85 on landing: main had already spent 85 on the
+                                                      //    plain-text prose tier below, per the collision rule.
+                                                      //    quality.h's kIngestParserVerMirror bumped in the
+                                                      //    SAME commit.
+                                                      // 85 = 2026-09-09 (test/textdocscheck.sh): the plain-text
+                                                      //    prose tier — .rst/.adoc/.org/.mdx join kLangTable on
+                                                      //    Lang::Markdown and the markdown block grammar. The
+                                                      //    CRAWL ADMITS FILES IT PREVIOUSLY REFUSED, so a v84
+                                                      //    blob describes a strictly smaller corpus: its file
+                                                      //    list has no record for the .rst it never saw, and a
+                                                      //    warm run over it would answer a document query with
+                                                      //    the pre-lane silence. That is the one class of change
+                                                      //    a per-file stat gate cannot self-heal — the file is
+                                                      //    not stale, it is ABSENT — so the header version is
+                                                      //    the only guard. Record shapes are unchanged (a
+                                                      //    markdown file's records already existed), so
+                                                      //    kCacheVersion stays 18. quality.h's
+                                                      //    kIngestParserVerMirror bumped in the SAME commit.
                                                       // 84 = 2026-09-08 (test/rubyrecvcheck.sh): a Ruby constant
                                                       //    RECEIVER (`User.find`, `App::Mailer.deliver`) is a
                                                       //    symbolic directive, one per (file, innermost open,
@@ -808,6 +1482,15 @@ constexpr std::uint32_t kParserVer    = 85;           // bump on any grammar/.sc
                                                       //    kMaxJsonConfigBytes crawl skip + kMaxJsonNestDepth hostile-data guard;
                                                       //    the crawl/parse SET changed; 27: +C (.c); 26: +JSON config keys)
 
+// THE QUALITY-CACHE MIRROR, as a compile error. quality.h keys every qsnap/qbody blob on kIngestCacheVersionMirror and
+// kIngestParserVerMirror, because quality.h cannot see these two constants from every translation unit that includes it.
+// Until now only test/qextractionkeycheck.sh kept the pair equal, by parsing both files. A kParserVer bump that missed
+// the mirror would re-serve quality snapshots computed under the old extraction, which is the poisoned-cache defect the
+// mirror exists for (quality.h's r27 note). This translation unit includes both files, so the equality is a static_assert
+// here. The gate still runs its source-text arm; this makes the same fact fail the build first.
+static_assert( quality::kIngestParserVerMirror == kParserVer && quality::kIngestCacheVersionMirror == kCacheVersion,
+               "quality.h's kIngestParserVerMirror / kIngestCacheVersionMirror must equal kParserVer / kCacheVersion — bump both in one commit" );
+
 // A1 (team-index artifact): architecture/ABI tag for the cache-blob header. The blob is NATIVE-ENDIAN —
 // ByteW/ByteR memcpy raw ints (see ByteW below), no portable varint/LE re-encoding — so it is only safely
 // consumable on a machine with the same integer byte order AND pointer width that WROTE it. This one byte
@@ -819,8 +1502,12 @@ constexpr std::uint32_t kParserVer    = 85;           // bump on any grammar/.sc
 // portable encoding on the hot (de)serialize path that fe47139/PERF.md P2 optimized; a future big-endian
 // target that actually needs a portable re-encode is a separate gated decision,
 // not pre-paid here — the guard already makes such a target CORRECT (self-heal), just not fast.
+// std::endian, not __BYTE_ORDER__/__ORDER_BIG_ENDIAN__: those are GCC/Clang predefined macros that MSVC does
+// not define, so the whole initializer vanished there and left a constexpr object with no value ("error C2737:
+// constexpr object must be initialized", windows-latest CI, 2026-09-20). <bit>'s std::endian is the C++20
+// spelling of exactly this question and needs no compiler condition at all.
 constexpr std::uint8_t kArtifactArch =
-      static_cast<std::uint8_t>( ( __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ ) ? 1u : 0u )   // bit 0: endianness
+      static_cast<std::uint8_t>( ( std::endian::native == std::endian::big ) ? 1u : 0u )  // bit 0: endianness
     | static_cast<std::uint8_t>( sizeof( void* ) << 1 );                                   // bits 1..: pointer width (bytes)
 
 // The lean/rich cache FAMILY split (documented against reality per a reviewer note).
@@ -837,10 +1524,15 @@ constexpr std::uint8_t kArtifactArch =
 //         orientation path" therefore overstates: lean speeds the default map + nav/read + --pr-context;
 //         --for-led sessions need the rich family too. See the ingest-report to the wiring wave for the
 //         measured lean-vs-rich blob sizes and the both-families recommendation.
-inline std::uint32_t parserVerFor( bool captureValueUses ) noexcept
+inline constexpr std::uint32_t parserVerFor( bool captureValueUses ) noexcept
 {
     return kParserVer + ( captureValueUses ? 1u : 0u );   // lean and full-use caches must never cross-hit
 }
+
+// The auto blob's NAME carries the same pair its header does (quality.h rootBlobTail): a build tag that disagreed
+// with the stamp would put a blob this binary refuses at the path it reads, which is the #334 thrash back again.
+static_assert( quality::ingestParserVerFor( false ) == parserVerFor( false ) && quality::ingestParserVerFor( true ) == parserVerFor( true ),
+               "quality.h's ingestParserVerFor must derive both classes exactly as parserVerFor does — the build tag names what the header stamps" );
 
 // T5: renamed from fnv1a64 to contentHash64 to avoid an ODR clash now that this file also includes
 // arch.h (which defines its OWN fnv1a64 for the baseline-hash path, quality.h's canonId hashing, etc.
@@ -905,8 +1597,8 @@ inline std::uint64_t blobChecksum( std::string_view s ) noexcept
 //     [21:25)  u32  entryCount    file records == offset-table entries; cross-checked against the trailer
 //
 //   RECORD REGION — [ kCacheHeaderBytes, tableOffset ), entryCount records in ASCENDING pathHash order.
-//     Each record is the v14 per-file record, unchanged byte for byte: the root-relative path string,
-//     the content hash, the (size, mtime, ctime) stat-gate triple, the four FileHealth u32s, the rich
+//     Each record is the v14 per-file record plus v20's fifth FileHealth u32: the root-relative path string,
+//     the content hash, the (size, mtime, ctime) stat-gate triple, the five FileHealth u32s, the rich
 //     family's subtoken dictionary, then the seven counted record arrays (defs, refs, includes, binds,
 //     FFI aliases, route defs, route uses). Nothing inside a record moved — that is what lets a carry-
 //     over be a raw byte copy and what will let a future content-addressed store lift a record whole.
@@ -932,7 +1624,7 @@ inline std::uint64_t blobChecksum( std::string_view s ) noexcept
 //   A torn write is caught three ways, in this order: (a) the file is shorter than header+trailer;
 // (b) the EXACT-FIT invariant `fileSize == tableOffset + entryCount*32 + 24` fails, which is what
 // catches a truncation that removes whole records or lands mid-table; (c) `tableSum` mismatches. Any
-// of the three rejects the WHOLE blob with a DEGRADED_PATH_ALERT and self-heals to a full reparse —
+// of the three rejects the WHOLE blob with a DISCLOSE and self-heals to a full reparse —
 // never a partial load. A record that is individually torn while the table survives is caught by its
 // own `recSum`: that one file is dropped (disclosed) and reparsed, and the rest of the blob stands.
 // saveCache still publishes by tmp-then-rename with the write byte-count and fclose both checked, so
@@ -957,6 +1649,12 @@ struct CacheEntry
 };
 static_assert( sizeof( CacheEntry ) == kCacheEntryBytes, "CacheEntry must be the exact 32-byte on-disk row (no padding)" );
 static_assert( alignof( CacheEntry ) == 8, "CacheEntry must stay 8-byte aligned so the table is a raw array copy" );
+// The size pin above does NOT prove "no padding", although its message says so. Narrow recSum from u32 to u16 and the
+// struct still rounds up to 32 bytes, with two indeterminate bytes in every row of a committed, checksummed blob: the
+// determinism contract broken, and a portable cache that differs by build. has_unique_object_representations is the
+// compiler's own answer to "is every byte of this type part of its value", so it refuses padding (and any float).
+static_assert( std::is_trivially_copyable_v<CacheEntry> && std::has_unique_object_representations_v<CacheEntry>,
+               "CacheEntry is copied to disk as raw bytes — it must carry no padding bytes and no float" );
 
 // The per-record digest stored in the table: the low half of the same 8-lane FNV the trailer uses.
 // 32 bits is a detection budget, not a security one — the whole-blob guards above sit in front of it.
@@ -976,15 +1674,15 @@ struct ReadFd
     ReadFd( const ReadFd& )            = delete;
     ReadFd& operator=( const ReadFd& ) = delete;
     ReadFd( ReadFd&& other ) noexcept : fd( other.fd ) { other.fd = -1; }
-    ~ReadFd() { if( fd >= 0 ) { ::close( fd ); } }
+    ~ReadFd() { if( fd >= 0 ) { os::close( fd ); } }
 
     // openOnce, not a move-assignment: the only mutation this type needs is "fill an empty guard", and
     // a move-assign operator here would be a byte-for-byte clone of ingest_sidecap.h's TreeGuard one
     // (--quality-delta's duplication kind says so). One owner, one transfer direction, no reopen.
     bool openOnce( const std::string& path ) noexcept
     {
-        VERIFY( fd < 0 );
-        fd = ::open( path.c_str(), O_RDONLY | O_CLOEXEC );
+        ASSUME( fd < 0 );
+        fd = os::open( path.c_str(), O_RDONLY | O_CLOEXEC );
         return fd >= 0;
     }
     bool valid() const noexcept { return fd >= 0; }
@@ -1027,8 +1725,7 @@ static_assert( std::size( kCacheRejectNames ) == static_cast<std::size_t>( Cache
 
 inline const char* cacheRejectName( CacheReject r ) noexcept
 {
-    const std::size_t i = static_cast<std::size_t>( r );
-    return i < std::size( kCacheRejectNames ) ? kCacheRejectNames[i] : "corrupt-frame";
+    return enumTableAt( kCacheRejectNames, r, "corrupt-frame" );   // infra/enumcount.h: the shared bounded table lookup
 }
 
 // A validated, still-open v15 blob: everything a caller needs to pull records out of it by pathHash.
@@ -1041,6 +1738,7 @@ struct CacheFrame
     long long               mtimeNs     = -1;// the blob's own mtime — the warm-run racy-rule reference
     bool                    ok          = false;
     CacheReject             reason      = CacheReject::Absent;   // meaningful only while ok == false
+    std::uint32_t           foundStamp  = 0; // FormatVersion: the blob's kCacheVersion; ParserVersion: its parserVer
 };
 
 // pread the whole of [ off, off+n ) into `dst`. Short reads are retried (a pread on a regular file can
@@ -1050,7 +1748,7 @@ inline bool preadExact( int fd, void* dst, std::size_t n, std::uint64_t off ) no
     char* out = static_cast<char*>( dst );
     while( n > 0 )
     {
-        const ssize_t got = ::pread( fd, out, n, ::off_t( off ) );
+        const os::ssize_t got = os::pread( fd, out, n, os::off_t( off ) );
         if( got <= 0 )
         {
             return false;
@@ -1083,8 +1781,8 @@ inline CacheFrame openCacheFrame( const std::string& path, bool captureValueUses
         return frame;
     }
 
-    struct stat st;
-    if( ::fstat( frame.blob.fd, &st ) != 0 || !S_ISREG( st.st_mode ) )
+    os::stat_t st;
+    if( os::fstat( frame.blob.fd, &st ) != 0 || !S_ISREG( st.st_mode ) )
     {
         frame.reason = CacheReject::NotRegular;
         return frame;
@@ -1122,19 +1820,24 @@ inline CacheFrame openCacheFrame( const std::string& path, bool captureValueUses
             // shipped binary reads this. Same for the two guards below, split from one fused test because
             // "your binary's extraction changed" and "this artifact came from another architecture" are
             // different things to be told about a committed artifact.
-            DEGRADED_PATH_ALERT( "ingest: cache blob is a different format version — rejected and rebuilt (full reparse)" );
-            frame.reason = CacheReject::FormatVersion;
+            DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                      "ingest: cache blob is a different format version — rejected and rebuilt (full reparse)" );
+            frame.reason     = CacheReject::FormatVersion;
+            frame.foundStamp = version;
             return frame;
         }
         if( parserVer != parserVerFor( captureValueUses ) )
         {
-            DEGRADED_PATH_ALERT( "ingest: cache blob parserVer mismatch (older binary, or the other lean/rich family) — rejected and rebuilt (full reparse)" );
-            frame.reason = CacheReject::ParserVersion;
+            DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                      "ingest: cache blob parserVer mismatch (older binary, or the other lean/rich family) — rejected and rebuilt (full reparse)" );
+            frame.reason     = CacheReject::ParserVersion;
+            frame.foundStamp = parserVer;
             return frame;
         }
         if( arch != kArtifactArch )
         {
-            DEGRADED_PATH_ALERT( "ingest: cache blob arch mismatch (foreign endianness/pointer width) — rejected and rebuilt (full reparse)" );
+            DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                      "ingest: cache blob arch mismatch (foreign endianness/pointer width) — rejected and rebuilt (full reparse)" );
             frame.reason = CacheReject::ArtifactArch;
             return frame;
         }
@@ -1156,11 +1859,17 @@ inline CacheFrame openCacheFrame( const std::string& path, bool captureValueUses
     std::memcpy( &entryCount,  trailer +  8, 4 );
     std::memcpy( &tableSum,    trailer + 16, 8 );
 
+    // Every term below is written so it cannot wrap: the file is at least a header plus a trailer (checked above) and the
+    // entry clause bounds the table by the bytes between them, so the right-hand side of the exact-fit compare is never
+    // negative. The earlier `tableOffset + entries + trailer != fileBytes` wrapped for a trailer naming an offset near
+    // 2^64 — still refused, but through a sum the G1 sanitizer build (-fsanitize=integer) aborts on
+    // (test/cachefuzzcheck.sh mutation table_offset_near_u64_max; found by test/fuzz/readers, reader ingestframe).
     if( entryCount != headerEntryCount || tableOffset < kCacheHeaderBytes
         || entryCount > ( fileBytes - kCacheHeaderBytes - kCacheTrailerBytes ) / kCacheEntryBytes
-        || tableOffset + std::uint64_t( entryCount ) * kCacheEntryBytes + kCacheTrailerBytes != fileBytes )
+        || tableOffset != fileBytes - kCacheTrailerBytes - std::uint64_t( entryCount ) * kCacheEntryBytes )
     {
-        DEGRADED_PATH_ALERT( "ingest: cache blob trailer does not describe the file (torn write) — cache treated as corrupt" );
+        DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                  "ingest: cache blob trailer does not describe the file (torn write) — cache treated as corrupt" );
         frame.reason = CacheReject::CorruptFrame;
         return frame;
     }
@@ -1177,7 +1886,8 @@ inline CacheFrame openCacheFrame( const std::string& path, bool captureValueUses
     }
     if( blobChecksum( std::string_view( hdrTable.data(), hdrTable.size() ) ) != tableSum )
     {
-        DEGRADED_PATH_ALERT( "ingest: cache offset-table checksum mismatch — cache treated as corrupt (full reparse)" );
+        DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                  "ingest: cache offset-table checksum mismatch — cache treated as corrupt (full reparse)" );
         frame.reason = CacheReject::Checksum;
         return frame;
     }
@@ -1195,10 +1905,11 @@ inline CacheFrame openCacheFrame( const std::string& path, bool captureValueUses
     {
         const CacheEntry& e = frame.entries[i];
         if( e.recOffset < kCacheHeaderBytes || e.recLength == 0
-            || e.recOffset + e.recLength > tableOffset
+            || e.recLength > tableOffset || e.recOffset > tableOffset - e.recLength   // recOffset + recLength > tableOffset, without the wrap
             || ( i != 0 && frame.entries[ i - 1 ].pathHash > e.pathHash ) )
         {
-            DEGRADED_PATH_ALERT( "ingest: cache offset-table entry out of bounds or out of order — cache treated as corrupt" );
+            DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                      "ingest: cache offset-table entry out of bounds or out of order — cache treated as corrupt" );
             frame.entries.clear();
             frame.reason = CacheReject::CorruptFrame;
             return frame;
@@ -1283,6 +1994,43 @@ struct ByteR
     std::string      str () { const std::string_view s = view(); return ok ? std::string( s ) : std::string{}; }
     bool rawInto( void* dst, std::size_t n )   // B0.2: bulk array read — overflow-safe bound, memcpy into caller storage
     { if( !ok || std::size_t( end - p ) < n ) { ok = false; return false; } if( n ) { std::memcpy( dst, p, n ); p += n; } return true; }
+    // A decoded value that must lie below `count`. The blob is external input — a committed team artifact, a copied
+    // cache directory, a file whose digests were rebuilt around an edit — so a value at or past its bound is
+    // corruption, never a value this binary forgot. It folds into `ok` exactly like a short read, so the record
+    // takes readFileRecord's one refusal path: that file reparses and the rest of the blob stands. One compare on the
+    // warm path; never an assumption, because nothing upstream makes it true.
+    bool fitsBelow( std::uint64_t v, std::uint64_t count )
+    {
+        if( !VALIDATE( v < count ) )
+        {
+            DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                      "ingest: cache record carries a field past its range (an enum byte past its last enumerator, or a 16-bit field wider than 16 bits) — cache treated as corrupt" );
+            ok = false;
+            return false;
+        }
+        return true;
+    }
+    // An ENUM byte. Accepting one past the count was never harmless downstream: symTag/refRoleTag serve such a value
+    // as "other"/"read", and clones.h shifts a 32-bit language mask by the Lang (UB at 32 and up). model.h proves
+    // each k*Count exact at compile time.
+    template<class E>
+    E enumU8( std::size_t enumCount )
+    {
+        const std::uint8_t v = u8();
+        return fitsBelow( v, enumCount ) ? E( v ) : E{};
+    }
+    // A 16-bit field the writer stores in a u32 slot (writeDef's ppAlt/humps/deepLoc/ev/params, writeRef's argCount).
+    // The writer only ever holds a uint16_t there; a plain `std::uint16_t( u32() )` kept the low bits of a wider value
+    // and believed them (test/hazardpatterncheck.sh rule D, test/cachefuzzcheck.sh Part 3).
+    std::uint16_t u16Of32()
+    {
+        std::uint32_t v = u32();
+        if( !fitsBelow( v, 0x10000u ) )
+        {
+            v = 0;
+        }
+        return std::uint16_t( v );
+    }
 };
 
 // withLex (B0.2 / v10 H3): the RICH family (captureValueUses=true) persists each def's doc/body subtoken
@@ -1298,11 +2046,11 @@ inline unsigned lexDictIndexWidth( std::size_t dictCount ) noexcept
 }
 inline void writeDef( ByteW& w, const RawDef& d, bool withLex, std::size_t fileDictCount, const std::uint32_t* rowDictIndex )
 {
-    w.u32( d.line ); w.u32( d.startByte ); w.u32( d.endByte ); w.u32( d.nameByte ); w.u32( d.bodyByte ); w.u32( d.cx ); w.u32( d.ccx ); w.u32( d.loc ); w.u32( d.locals ); w.u32( d.ppAlt ); w.u32( d.humps ); w.u32( d.deepLoc ); w.u32( d.ev ); w.u32( d.params ); w.u8( d.maxNest ); w.u8( d.arityExact ); w.u8( d.testScope ); w.u8( std::uint8_t( d.kind ) ); w.u8( std::uint8_t( d.lang ) ); w.str( d.name ); w.str( d.scope );
+    w.u32( d.line ); w.u32( d.startByte ); w.u32( d.endByte ); w.u32( d.nameByte ); w.u32( d.bodyByte ); w.u32( d.cx ); w.u32( d.ccx ); w.u32( d.loc ); w.u32( d.locals ); w.u32( d.ppAlt ); w.u32( d.humps ); w.u32( d.deepLoc ); w.u32( d.ev ); w.u32( d.params ); w.u8( d.maxNest ); w.u8( d.arityExact ); w.u8( d.testScope ); w.u8( d.recovered ); w.u8( d.internalLinkage ); w.u8( d.scopeRootsStd ); w.u32( d.fnScopeStart ); w.u32( d.fnScopeEnd ); w.u8( std::uint8_t( d.kind ) ); w.u8( std::uint8_t( d.lang ) ); w.str( d.name ); w.str( d.scope );
     for( const std::uint8_t tagCount : d.evWhy ) { w.u8( tagCount ); }   // 8×u8, fixed order (model.h kEvWhyTagTable)
     if( withLex )
     {
-        VERIFY( d.lex.tokenHashes.size() == d.lex.tokenTfs.size() );
+        ASSUME( d.lex.tokenHashes.size() == d.lex.tokenTfs.size() );
         w.u32( d.lex.dlWeighted );
         w.u32( std::uint32_t( d.lex.tokenHashes.size() ) );
         std::uint32_t maxTf = 0;
@@ -1321,6 +2069,7 @@ inline void writeDef( ByteW& w, const RawDef& d, bool withLex, std::size_t fileD
         // specialized fill loops per width — no per-byte push_back on this multi-million-pair seam.
         const std::size_t count = d.lex.tokenTfs.size();
         char*             p     = w.extend( count * ( idxWidth + tfWidth ) );
+        ASSUME( count == 0 || rowDictIndex != nullptr );   // null only with an empty row: verifyCacheRecordMinimaTripwire's probe
         if( idxWidth == 1 )
         {
             for( std::size_t k = 0; k < count; ++k )
@@ -1382,7 +2131,7 @@ inline void writeDef( ByteW& w, const RawDef& d, bool withLex, std::size_t fileD
         }
     }
 }
-inline void   writeRef( ByteW& w, const RawRef& r ) { w.u32( r.startByte ); w.u8( std::uint8_t( r.lang ) ); w.str( r.name ); w.u8( r.isInherit ? 1 : 0 ); w.u8( r.isDocLink ? 1 : 0 ); w.str( r.qualifier ); w.u8( std::uint8_t( r.recv ) ); w.str( r.recvVar ); w.u8( r.isCompose ? 1 : 0 ); w.str( r.fieldName ); w.str( r.composeRel ); w.u8( std::uint8_t( r.role ) ); w.u32( r.line ); w.u32( r.argCount ); w.u8( r.argCountKnown ? 1 : 0 ); }
+inline void   writeRef( ByteW& w, const RawRef& r ) { w.u32( r.startByte ); w.u8( std::uint8_t( r.lang ) ); w.str( r.name ); w.u8( r.isInherit ? 1 : 0 ); w.u8( r.isDocLink ? 1 : 0 ); w.str( r.qualifier ); w.u8( std::uint8_t( r.recv ) ); w.str( r.recvVar ); w.u8( r.isCompose ? 1 : 0 ); w.str( r.fieldName ); w.str( r.composeRel ); w.u8( std::uint8_t( r.role ) ); w.u32( r.line ); w.u32( r.argCount ); w.u8( r.argCountKnown ? 1 : 0 ); w.u8( r.viaArrow ? 1 : 0 ); w.u8( r.qualifierRootsStd ? 1 : 0 ); w.u8( r.memberCall ? 1 : 0 ); w.str( r.memberRoot ); }
 
 // loadCache's countFits() bounds a corrupt on-disk record COUNT against remaining bytes /
 // minRecordBytes BEFORE reserve() — the guard that keeps a hostile blob's 0xFFFFFFFF count from reaching
@@ -1393,14 +2142,21 @@ inline void   writeRef( ByteW& w, const RawRef& r ) { w.u32( r.startByte ); w.u8
 // written as a u32 — 10 -> 11; the nesting profile then added `humps` and `deepLoc`, written as u32 each —
 // 11 -> 13; essential complexity then added `ev` as a u32 in the run plus the 8×u8 evWhy tag counters
 // after the strings — 13 -> 14 u32 and 4 -> 12 u8, so 56 + 12 + 8 = 76; L8's in-file `testScope` then
-// added one u8 in the run — 12 -> 13 u8, so 56 + 13 + 8 = 77); the RICH (withLex) extra is
-// dlWeighted u32 + tokenCount u32 + tfWidth u8 = 9 bytes. A ref record is 3 u32 + 7 u8 + 5 empty
-// str(len u32) fields = 3*4 + 7*1 + 5*4 = 39 bytes. verifyCacheRecordMinimaTripwire() below derives these
+// added one u8 in the run — 12 -> 13 u8, so 56 + 13 + 8 = 77; the extent-honesty `recovered` bit then added
+// one more u8 in the run — 13 -> 14 u8, so 56 + 14 + 8 = 78; the internal-linkage bit then added one more u8 in
+// the run — 14 -> 15 u8, so 56 + 15 + 8 = 79; #150's `scopeRootsStd` bit then added one more u8 in the run —
+// 15 -> 16 u8, so 56 + 16 + 8 = 80; the function-local scope span then added two u32 after the u8 run — 14 -> 16
+// u32, so 64 + 16 + 8 = 88); the RICH (withLex) extra is
+// dlWeighted u32 + tokenCount u32 + tfWidth u8 = 9 bytes. A ref record is 3 u32 + 8 u8 + 5 empty
+// str(len u32) fields = 3*4 + 8*1 + 5*4 = 40 bytes (39 until the `viaArrow` u8, kCacheVersion 23; #150's
+// `qualifierRootsStd` u8 then added a 9th u8 — 40 -> 41, kCacheVersion 25; FE-A's `memberCall` u8 and `memberRoot`
+// str then added a 10th u8 and a 6th str — 41 -> 46, kCacheVersion 28).
+// verifyCacheRecordMinimaTripwire() below derives these
 // same numbers from the REAL writer functions at runtime so the next field added to writeDef/writeRef
 // can't silently stale them.
-inline constexpr std::size_t kMinDefRecordBytesLean      = 77;   // 14×u32 + 13×u8 + 2×str(len u32, empty)
+inline constexpr std::size_t kMinDefRecordBytesLean      = 88;   // 16×u32 + 16×u8 + 2×str(len u32, empty)
 inline constexpr std::size_t kMinDefRecordBytesRichExtra =  9;   // v10 rich withLex extra: dlWeighted u32 + tokenCount u32 + tfWidth u8
-inline constexpr std::size_t kMinRefRecordBytes          = 39;   // 3×u32 + 7×u8 + 5×str(len u32, empty)
+inline constexpr std::size_t kMinRefRecordBytes          = 46;   // 3×u32 + 10×u8 + 6×str(len u32, empty)
 
 inline std::size_t minDefRecordBytes( bool captureValueUses ) noexcept
 {
@@ -1408,27 +2164,27 @@ inline std::size_t minDefRecordBytes( bool captureValueUses ) noexcept
 }
 
 // runtime tripwire: serialize a DEFAULT-CONSTRUCTED (all-empty) RawDef/RawRef through the real
-// writer functions and VERIFY the byte count matches the hand-pinned constants above. This is the runtime
+// writer functions and ASSUME the byte count matches the hand-pinned constants above. This is the runtime
 // equivalent of the house `static_assert( sizeof(X) == N )` layout tripwire — ByteW's size is only known at
-// runtime (strings, not a POD struct), so it can't be a compile-time static_assert. VERIFY is a no-op
+// runtime (strings, not a POD struct), so it can't be a compile-time static_assert. ASSUME is a no-op
 // optimizer hint in release (never costs a shipped run anything); in any debug/ASan build or CI it fires the
 // moment a field is added to writeDef/writeRef without updating the matching constant above.
 inline void verifyCacheRecordMinimaTripwire() noexcept
 {
     ByteW probe;
     writeDef( probe, RawDef{}, false, 0, nullptr );
-    VERIFY( probe.b.size() == kMinDefRecordBytesLean );
+    ASSUME( probe.b.size() == kMinDefRecordBytesLean );
     probe.b.clear();
     writeDef( probe, RawDef{}, true, 0, nullptr );
-    VERIFY( probe.b.size() == kMinDefRecordBytesLean + kMinDefRecordBytesRichExtra );
+    ASSUME( probe.b.size() == kMinDefRecordBytesLean + kMinDefRecordBytesRichExtra );
     probe.b.clear();
     writeRef( probe, RawRef{} );
-    VERIFY( probe.b.size() == kMinRefRecordBytes );
+    ASSUME( probe.b.size() == kMinRefRecordBytes );
 }
 
 inline RawDef readDef( ByteR& r, bool withLex, const std::vector<std::uint64_t>& fileDict )
 {
-    RawDef d; d.line = r.u32(); d.startByte = r.u32(); d.endByte = r.u32(); d.nameByte = r.u32(); d.bodyByte = r.u32(); d.cx = r.u32(); d.ccx = r.u32(); d.loc = r.u32(); d.locals = r.u32(); d.ppAlt = std::uint16_t( r.u32() ); d.humps = std::uint16_t( r.u32() ); d.deepLoc = std::uint16_t( r.u32() ); d.ev = std::uint16_t( r.u32() ); d.params = std::uint16_t( r.u32() ); d.maxNest = r.u8(); d.arityExact = r.u8(); d.testScope = r.u8(); d.kind = SymKind( r.u8() ); d.lang = Lang( r.u8() ); d.name = r.str(); d.scope = r.str();
+    RawDef d; d.line = r.u32(); d.startByte = r.u32(); d.endByte = r.u32(); d.nameByte = r.u32(); d.bodyByte = r.u32(); d.cx = r.u32(); d.ccx = r.u32(); d.loc = r.u32(); d.locals = r.u32(); d.ppAlt = r.u16Of32(); d.humps = r.u16Of32(); d.deepLoc = r.u16Of32(); d.ev = r.u16Of32(); d.params = r.u16Of32(); d.maxNest = r.u8(); d.arityExact = r.u8(); d.testScope = r.u8(); d.recovered = r.u8(); d.internalLinkage = r.u8(); d.scopeRootsStd = r.u8(); d.fnScopeStart = r.u32(); d.fnScopeEnd = r.u32(); d.kind = r.enumU8<SymKind>( kSymKindCount ); d.lang = r.enumU8<Lang>( kLangCount ); d.name = r.str(); d.scope = r.str();
     for( std::uint8_t& tagCount : d.evWhy ) { tagCount = r.u8(); }   // mirrors writeDef's fixed 8×u8 order
     if( withLex && r.ok )
     {
@@ -1508,17 +2264,17 @@ inline RawDef readDef( ByteR& r, bool withLex, const std::vector<std::uint64_t>&
     }
     return d;
 }
-inline RawRef readRef ( ByteR& r ) { RawRef x; x.startByte = r.u32(); x.lang = Lang( r.u8() ); x.name = r.str(); x.isInherit = r.u8() != 0; x.isDocLink = r.u8() != 0; x.qualifier = r.str(); x.recv = RecvKind( r.u8() ); x.recvVar = r.str(); x.isCompose = r.u8() != 0; x.fieldName = r.str(); x.composeRel = r.str(); x.role = RefRole( r.u8() ); x.line = r.u32(); x.argCount = std::uint16_t( r.u32() ); x.argCountKnown = r.u8() != 0; return x; }
-inline void   writeBind( ByteW& w, const RawBind& b ) { w.u32( b.startByte ); w.u8( std::uint8_t( b.lang ) ); w.u8( std::uint8_t( b.kind ) ); w.u32( b.spanStart ); w.u32( b.spanEnd ); w.str( b.var ); w.str( b.typeName ); w.str( b.importedName ); }
-inline RawBind readBind( ByteR& r ) { RawBind b; b.startByte = r.u32(); b.lang = Lang( r.u8() ); b.kind = LocalBindKind( r.u8() ); b.spanStart = r.u32(); b.spanEnd = r.u32(); b.var = r.str(); b.typeName = r.str(); b.importedName = r.str(); return b; }
+inline RawRef readRef ( ByteR& r ) { RawRef x; x.startByte = r.u32(); x.lang = r.enumU8<Lang>( kLangCount ); x.name = r.str(); x.isInherit = r.u8() != 0; x.isDocLink = r.u8() != 0; x.qualifier = r.str(); x.recv = r.enumU8<RecvKind>( kRecvKindCount ); x.recvVar = r.str(); x.isCompose = r.u8() != 0; x.fieldName = r.str(); x.composeRel = r.str(); x.role = r.enumU8<RefRole>( kRefRoleCount ); x.line = r.u32(); x.argCount = r.u16Of32(); x.argCountKnown = r.u8() != 0; x.viaArrow = r.u8() != 0; x.qualifierRootsStd = r.u8() != 0; x.memberCall = r.u8() != 0; x.memberRoot = r.str(); return x; }
+inline void   writeBind( ByteW& w, const RawBind& b ) { w.u32( b.startByte ); w.u8( std::uint8_t( b.lang ) ); w.u8( std::uint8_t( b.kind ) ); w.u8( b.isFromAssignment ? 1 : 0 ); w.u32( b.spanStart ); w.u32( b.spanEnd ); w.str( b.var ); w.str( b.typeName ); w.str( b.importedName ); }
+inline RawBind readBind( ByteR& r ) { RawBind b; b.startByte = r.u32(); b.lang = r.enumU8<Lang>( kLangCount ); b.kind = r.enumU8<LocalBindKind>( kLocalBindKindCount ); b.isFromAssignment = r.u8() != 0; b.spanStart = r.u32(); b.spanEnd = r.u32(); b.var = r.str(); b.typeName = r.str(); b.importedName = r.str(); return b; }
 inline void   writeFfi( ByteW& w, const BindingAlias& a ) { w.u8( std::uint8_t( a.kind ) ); w.u8( a.lowConf ? 1 : 0 ); w.str( a.aliasName ); w.str( a.targetName ); w.str( a.targetScope ); }
-inline BindingAlias readFfi( ByteR& r ) { BindingAlias a; a.kind = BindKind( r.u8() ); a.lowConf = r.u8() != 0; a.aliasName = r.str(); a.targetName = r.str(); a.targetScope = r.str(); return a; }
+inline BindingAlias readFfi( ByteR& r ) { BindingAlias a; a.kind = r.enumU8<BindKind>( kBindKindCount ); a.lowConf = r.u8() != 0; a.aliasName = r.str(); a.targetName = r.str(); a.targetScope = r.str(); return a; }
 // B6.3: RouteDef needs no startByte (its handler is resolved by NAME in buildGraph); RawRouteUse mirrors
 // RawBind (startByte for the enclosing-def byte-span attribution done in the ingest() model-build below).
 inline void   writeRouteDef( ByteW& w, const RouteDef& d ) { w.u32( d.line ); w.u8( std::uint8_t( d.method ) ); w.str( d.path ); w.str( d.handlerName ); }
-inline RouteDef readRouteDef( ByteR& r ) { RouteDef d; d.line = r.u32(); d.method = HttpMethod( r.u8() ); d.path = r.str(); d.handlerName = r.str(); return d; }
+inline RouteDef readRouteDef( ByteR& r ) { RouteDef d; d.line = r.u32(); d.method = r.enumU8<HttpMethod>( kHttpMethodCount ); d.path = r.str(); d.handlerName = r.str(); return d; }
 inline void   writeRouteUse( ByteW& w, const RawRouteUse& u ) { w.u32( u.startByte ); w.u32( u.line ); w.u8( std::uint8_t( u.method ) ); w.str( u.path ); }
-inline RawRouteUse readRouteUse( ByteR& r ) { RawRouteUse u; u.startByte = r.u32(); u.line = r.u32(); u.method = HttpMethod( r.u8() ); u.path = r.str(); return u; }
+inline RawRouteUse readRouteUse( ByteR& r ) { RawRouteUse u; u.startByte = r.u32(); u.line = r.u32(); u.method = r.enumU8<HttpMethod>( kHttpMethodCount ); u.path = r.str(); return u; }
 
 // T5: re-absolutize a cache-stored ROOT-RELATIVE key against the CURRENT invocation's rootDir, producing
 // the exact spelling collectSources() would crawl it as (`<rootDir>/<rel>`, trailing slash on rootDir
@@ -1559,8 +2315,8 @@ inline bool readFileRecord( ByteR& r, bool captureValueUses, std::vector<std::ui
     // (B0.2) a RICH def record additionally carries at least dlWeighted + tokenCount (2×u32) — the pair
     // arrays themselves are bounded per record inside readDef.
     const std::size_t     kMinDefRecordBytes      = minDefRecordBytes( captureValueUses );   // F8: named + tripwire-pinned above
-    constexpr std::size_t kMinIncRecordBytes      = 11;   // 3×u8 (isAngle,isLazy,isSymbolic) + 1×u32 (byte) + 1×str(len u32, empty)
-    constexpr std::size_t kMinBindRecordBytes     = 26;   // 3×u32 + 2×u8 + 3×str(len u32, empty)
+    constexpr std::size_t kMinIncRecordBytes      = 12;   // 4×u8 (isAngle,isLazy,isSymbolic,isValueUse) + 1×u32 (byte) + 1×str(len u32, empty)
+    constexpr std::size_t kMinBindRecordBytes     = 27;   // 3×u32 + 3×u8 (lang,kind,isFromAssignment) + 3×str(len u32, empty)
     constexpr std::size_t kMinFfiRecordBytes      = 14;   // 2×u8 (kind,lowConf) + 3×str(len u32, empty)
     constexpr std::size_t kMinRouteDefRecordBytes = 13;   // B6.3: 1×u32 (line) + 1×u8 (method) + 2×str(len u32, empty)
     constexpr std::size_t kMinRouteUseRecordBytes = 13;   // B6.3: 2×u32 (startByte,line) + 1×u8 (method) + 1×str(len u32, empty)
@@ -1571,7 +2327,8 @@ inline bool readFileRecord( ByteR& r, bool captureValueUses, std::vector<std::ui
         {
             return true;
         }
-        DEGRADED_PATH_ALERT( "ingest: cache record count exceeds remaining bytes — cache treated as corrupt" );
+        DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                  "ingest: cache record count exceeds remaining bytes — cache treated as corrupt" );
         r.ok = false;
         return false;
     };
@@ -1585,6 +2342,7 @@ inline bool readFileRecord( ByteR& r, bool captureValueUses, std::vector<std::ui
     ffOut.health.errBytes  = r.u32();       //   NOT-MEASURED meaning across the round trip
     ffOut.health.fileBytes = r.u32();
     ffOut.health.wsBytes   = r.u32();
+    ffOut.health.macroBlanked = r.u32();   // v20: member-macro re-parse — rides the record so the disclosure survives a warm run
     if( !r.ok )
     {
         return false;
@@ -1607,7 +2365,8 @@ inline bool readFileRecord( ByteR& r, bool captureValueUses, std::vector<std::ui
         {
             if( fileDict[k] <= fileDict[ k - 1 ] )
             {
-                DEGRADED_PATH_ALERT( "ingest: cache file dictionary not strictly ascending — cache treated as corrupt" );
+                DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                          "ingest: cache file dictionary not strictly ascending — cache treated as corrupt" );
                 r.ok = false;
                 return false;
             }
@@ -1645,7 +2404,8 @@ inline bool readFileRecord( ByteR& r, bool captureValueUses, std::vector<std::ui
         const bool          isLazy     = r.u8() != 0;   // kParserVer 72: TS/JS function-body require/import marker; parser version 82: Ruby autoload
         const bool          isSymbolic = r.u8() != 0;   // parser version 82: a Ruby constant target, resolved by index, never by path
         const std::uint32_t byte       = r.u32();       // parser version 82: the directive's start byte (lexical nesting recovery)
-        ffOut.incs.push_back( Include { 0, isAngle, isLazy, isSymbolic, byte, r.str() } );
+        const bool          isValueUse = r.u8() != 0;   // parser version 93 / format 21: argument or rescue origin — not narrow evidence
+        ffOut.incs.push_back( Include { 0, isAngle, isLazy, isSymbolic, byte, isValueUse, r.str() } );
     }
     const std::uint32_t nb = r.u32();
     if( !countFits( nb, kMinBindRecordBytes ) )
@@ -1716,6 +2476,64 @@ struct CacheLoadStats
     std::size_t recordsRead = 0;    // records actually deserialised: how many this crawl asked for and got
 };
 
+// The stderr notice for a blob loadCache refused. 2026-09-06 stranger audit: every reject self-healed to a full
+// reparse with NO signal a Release binary keeps (the debug-only alert compiles out under NDEBUG) — a torn blob, an older
+// binary's blob, a directory passed as --cache: all byte-identical to a healthy run, just slower, every time. The
+// ordinary cold-start miss (absent) stays silent; anything else says what it found, once per run.
+//
+// #334: a Windows tester alternating 0.6.2 and 0.6.3 on one tree saw `format-version — not used` on every run and read
+// it as "the CLI never reuses its cache". The auto path was keyed by root and verb class only, so two builds of
+// different formats refused and rewrote each other's blob every time. The auto path now carries the build tag
+// (quality.h rootBlobTail), so this notice on an AUTO blob means a hand-copied or foreign file; on a --cache file
+// the user named, it still means another build (or the other verb class) wrote that one file. A version refusal
+// names the number it found and the one this binary reads, so the cause is on the line. It is APPENDED: the line up
+// to "rewrites it" is unchanged, and gates grep that prefix (test/localscountcheck.sh, test/cachefuzzcheck.sh).
+//
+// WHO WROTE IT (the #334 review, M1). A parser stamp equal to this build's OTHER verb class is what one --cache file
+// shared by a lean and a rich verb holds, and it used to be blamed on "another ripwire build". The stamp alone
+// cannot tell that apart from an older build whose parserVer was one lower or higher (a rich class of kParserVer-1
+// stamps exactly this build's lean number), so that case names both. The advice then depends on WHO named the file:
+// a --cache file the user named is fixed by giving each class its own file; an automatic file carries this build's
+// own name (quality.h isThisBuildRootBlobName), which no build writes with another stamp, so it was copied in by
+// hand — and "two builds alternating on one cache file" cannot happen to it either.
+inline std::string_view cacheRejectCause( const CacheFrame& frame, bool captureValueUses, bool automaticPath ) noexcept
+{
+    if( frame.reason == CacheReject::ParserVersion && frame.foundStamp == parserVerFor( !captureValueUses ) )
+    {
+        if( automaticPath )
+        {
+            return captureValueUses ? "this build's lean verb class writes that number, or another ripwire build wrote it; an automatic cache file holds it only when copied in by hand"
+                                    : "this build's rich verb class writes that number, or another ripwire build wrote it; an automatic cache file holds it only when copied in by hand";
+        }
+        return captureValueUses ? "this build's lean verb class writes that number, or another ripwire build wrote it; give each verb class its own --cache file"
+                                : "this build's rich verb class writes that number, or another ripwire build wrote it; give each verb class its own --cache file";
+    }
+    return automaticPath ? "another ripwire build wrote it; an automatic cache file holds that only when copied in by hand"
+                         : "another ripwire build wrote it; two builds alternating on one cache file re-parse every run";
+}
+
+inline void noteCacheReject( const std::string& path, const CacheFrame& frame, bool captureValueUses )
+{
+    if( frame.reason == CacheReject::Absent )
+    {
+        return;
+    }
+    const bool format  = frame.reason == CacheReject::FormatVersion;
+    const bool version = format || frame.reason == CacheReject::ParserVersion;
+    char detail[ 256 ] = "";
+    if( version )
+    {
+        const std::size_t slash     = path.find_last_of( "/\\" );
+        const bool        automatic = quality::isThisBuildRootBlobName( std::string_view( path ).substr( slash == std::string::npos ? 0 : slash + 1 ),
+                                                                        quality::ownBuildBlobTails() );
+        rw::formatTo( detail, sizeof( detail ), " (blob {} {}, this binary {}: {})",
+                      format ? "format" : "parser", frame.foundStamp, format ? kCacheVersion : parserVerFor( captureValueUses ),
+                      cacheRejectCause( frame, captureValueUses, automatic ) );
+    }
+    rw::emitTo( stderr, "ripwire: cache {}: {} — not used; this run parses from source and rewrites it{}\n",
+                path.c_str(), cacheRejectName( frame.reason ), rw::cstr( detail ) );
+}
+
 // load cache → map<path, FileFacts>, keyed by the ABSOLUTE-AS-CRAWLED path under `rootDir` (matching
 // result.files' spelling) even though the on-disk record key is root-relative (T5 portability — see
 // kCacheVersion=3 above). Empty on missing / corrupt / version-or-parserVer mismatch.
@@ -1745,15 +2563,7 @@ inline HashMap<std::string, FileFacts> loadCache( const std::string& path, std::
     const CacheFrame frame = openCacheFrame( path, captureValueUses );
     if( !frame.ok )
     {
-        // 2026-09-06 stranger audit: every reject here self-healed to a full reparse with NO signal a Release
-        // binary keeps (the debug-only alert compiles out under NDEBUG) — a torn blob, an older binary's blob, a
-        // directory passed as --cache: all byte-identical to a healthy run, just slower, every time. The
-        // ordinary cold-start miss (absent) stays silent; anything else says what it found, once per run.
-        if( frame.reason != CacheReject::Absent )
-        {
-            std::fprintf( stderr, "ripwire: cache %s: %s — not used; this run parses from source and rewrites it\n",
-                          path.c_str(), cacheRejectName( frame.reason ) );
-        }
+        noteCacheReject( path, frame, captureValueUses );
         return out;
     }
     stats.blobWriteNs = frame.mtimeNs;
@@ -1816,7 +2626,8 @@ inline HashMap<std::string, FileFacts> loadCache( const std::string& path, std::
             fileBuf.resize( std::size_t( spanEnd - spanStart ) );
             if( !preadExact( frame.blob.fd, fileBuf.data(), fileBuf.size(), spanStart ) )
             {
-                DEGRADED_PATH_ALERT( "ingest: cache blob read failed mid-load — the unread records are reparsed" );
+                DISCLOSE( Diagnostics::answerUnchanged, "the affected files are reparsed from source: the answer is byte-identical, only slower",
+                          "ingest: cache blob read failed mid-load — the unread records are reparsed" );
                 break;
             }
 
@@ -1828,7 +2639,8 @@ inline HashMap<std::string, FileFacts> loadCache( const std::string& path, std::
                 {
                     // A record torn on its own while the table survived: drop THIS file (it reparses) and
                     // keep the rest of the blob. The table is what must be trusted whole, not each record.
-                    DEGRADED_PATH_ALERT( "ingest: cache record checksum mismatch — that file is reparsed, the rest of the blob stands" );
+                    DISCLOSE( Diagnostics::answerUnchanged, "the affected files are reparsed from source: the answer is byte-identical, only slower",
+                              "ingest: cache record checksum mismatch — that file is reparsed, the rest of the blob stands" );
                     continue;
                 }
                 ByteR       r{ rec, rec + e.recLength };
@@ -1842,7 +2654,8 @@ inline HashMap<std::string, FileFacts> loadCache( const std::string& path, std::
                 {
                     // The pathHash matched but the record is for a DIFFERENT file — a 64-bit collision.
                     // Serving it would be a wrong answer, so the file reparses instead.
-                    DEGRADED_PATH_ALERT( "ingest: cache path-hash collision — the colliding file is reparsed" );
+                    DISCLOSE( Diagnostics::answerUnchanged, "the affected files are reparsed from source: the answer is byte-identical, only slower",
+                              "ingest: cache path-hash collision — the colliding file is reparsed" );
                     continue;
                 }
                 // T5: the on-disk key is ROOT-RELATIVE; re-absolutize against the CURRENT rootDir so the
@@ -1960,6 +2773,7 @@ inline std::vector<CacheWriteRow> buildCacheWritePlan( const std::vector<std::ui
                                                        const std::vector<CacheEntry>&    prevEntries,
                                                        std::vector<CacheEntry>&          carryOut )
 {
+    ASSUME_NO_ALIAS( prevEntries, carryOut );
     carryOut.clear();
     carryOut.reserve( prevEntries.size() );
     {
@@ -2009,7 +2823,8 @@ inline bool appendCarryRecord( ByteW& w, int fd, const CacheEntry& src, std::str
     if( !preadExact( fd, scratch.data(), scratch.size(), src.recOffset )
         || recordSum32( std::string_view( scratch.data(), scratch.size() ) ) != src.recSum )
     {
-        DEGRADED_PATH_ALERT( "ingest: cache carry-over record failed its checksum — dropped (that file reparses)" );
+        DISCLOSE( Diagnostics::answerUnchanged, "a carry-over record for a file this run did not crawl: this answer never reads it",
+                  "ingest: cache carry-over record failed its checksum — dropped (that file reparses)" );
         return false;
     }
     w.raw( scratch.data(), scratch.size() );
@@ -2045,7 +2860,7 @@ inline void finishCacheBlob( ByteW& w, const std::vector<CacheEntry>& table )
     w.u32( entryCount );
     w.u32( 0 );   // reserved
     w.u64( blobChecksum( std::string_view( hdrTable.data(), hdrTable.size() ) ) );
-    VERIFY( w.b.size() == tableOffset + std::uint64_t( entryCount ) * kCacheEntryBytes + kCacheTrailerBytes );
+    ASSUME( w.b.size() == tableOffset + std::uint64_t( entryCount ) * kCacheEntryBytes + kCacheTrailerBytes );
 }
 
 // write the cache atomically (path.tmp → rename); groups the merged raw facts back by file.
@@ -2068,7 +2883,8 @@ inline void saveCache( const std::string& path, std::string_view rootDir, const 
     // directory at `path` costs no wasted pass and temp write before rename(tmp,dir) fails EISDIR.
     if( shapeOfPath( path ) == PathShape::Other )
     {
-        DEGRADED_PATH_ALERT( "ingest: cache path is not a regular file (directory/device/fifo) — cache not written" );
+        DISCLOSE( Diagnostics::answerUnchanged, "this answer is already computed in memory: only the next run starts cold",
+                  "ingest: cache path is not a regular file (directory/device/fifo) — cache not written" );
         return;
     }
 
@@ -2111,7 +2927,7 @@ inline void saveCache( const std::string& path, std::string_view rootDir, const 
     w.u8( kArtifactArch );
     w.u64( (std::uint64_t)blobWriteNs );
     w.u32( 0 );   // entryCount — patched in place below, once the carry-over verification has settled it
-    VERIFY( w.b.size() == kCacheHeaderBytes );
+    ASSUME( w.b.size() == kCacheHeaderBytes );
     {
         PROFILE_SCOPE_DESCRIBE( "ingest/saveCache: serialize records" );
         std::vector<std::uint64_t> fileDict;                                   // per-file subtoken dictionary, reused across files
@@ -2144,6 +2960,7 @@ inline void saveCache( const std::string& path, std::string_view rootDir, const 
                 // NOT MEASURED — no sentinel of its own, and no way to mistake it for "clean".
                 const FileHealth fh = f < fileHealth.size() ? fileHealth[f] : FileHealth{};
                 w.u32( fh.errNodes );  w.u32( fh.errBytes );  w.u32( fh.fileBytes );  w.u32( fh.wsBytes );
+                w.u32( fh.macroBlanked );   // v20: the member-macro re-parse's per-file count (0 ⇒ the first parse was kept)
             }
             if( captureValueUses )
             {
@@ -2236,6 +3053,7 @@ inline void saveCache( const std::string& path, std::string_view rootDir, const 
                 w.u8( incs[i].isLazy     ? 1 : 0 );
                 w.u8( incs[i].isSymbolic ? 1 : 0 );
                 w.u32( incs[i].byte );
+                w.u8( incs[i].isValueUse ? 1 : 0 );
                 w.str( incs[i].target );
             }
             w.u32( std::uint32_t( ix.bindIndex[f].size() ) );
@@ -2289,29 +3107,45 @@ inline void saveCache( const std::string& path, std::string_view rootDir, const 
     // cache should never be clobbered without a peep). Mirrors mcpedit::atomicWrite's discipline
     // (src/mcp.h): check the write byte-count AND fclose's return, and on any failure unlink the temp
     // and leave the prior on-disk cache (if any) untouched.
-    const std::string tmp = path + "." + std::to_string( getpid() ) + ".tmp";
-    std::FILE* fp = std::fopen( tmp.c_str(), "wb" );
+    // Round 5 (rw::pathguard): the temp is created EXCLUSIVELY and WITHOUT following a link, under an
+    // unpredictable name beside the cache blob, refusing an existing entry at that name. The name keeps its
+    // `.tmp` tail (a *.tmp residue glob still
+    // matches) and 0666 preserves the fopen("wb") default mode. The RAII holder owns the temp NAME and removes
+    // it on every early return below; fdopen adopts the descriptor so fwrite/fclose keep their bookkeeping.
+    rw::pathguard::ExclTempFile temp  = rw::pathguard::createExclTempFile( path + ".", ".tmp", 0666 );
+    const int                   rawFd = temp.ok() ? temp.releaseFd() : -1;
+    std::FILE*                  fp    = rawFd >= 0 ? os::fdopen( rawFd, "wb" ) : nullptr;
     if( !fp )
     {
-        DEGRADED_PATH_ALERT( "ingest: saveCache could not open temp file for write — cache left unchanged" );
-        std::fprintf( stderr, "ripwire: cache %s: cannot write (%s) — every run parses from source until this is fixed\n",
-                      path.c_str(), std::strerror( errno ) );   // 2026-09-06: Release kept no signal for this
+        const int openErr = errno;
+        if( rawFd >= 0 )
+        {
+            os::close( rawFd );   // fdopen did not adopt the descriptor; the holder still removes the temp name
+        }
+        DISCLOSE( Diagnostics::answerUnchanged, "this answer is already computed in memory: only the next run starts cold",
+                  "ingest: saveCache could not open temp file for write — cache left unchanged" );
+        rw::emitTo( stderr, "ripwire: cache {}: cannot write ({}) — every run parses from source until this is fixed\n",
+                      path.c_str(), std::strerror( openErr )  );   // 2026-09-06: Release kept no signal for this
         return;
     }
-    const std::size_t wrote = std::fwrite( w.b.data(), 1, w.b.size(), fp );
-    const bool wErr = wrote != w.b.size() || std::fclose( fp ) != 0;
+    // The stream owns the descriptor since releaseFd(), so it closes on every path: the write and the close
+    // are evaluated separately, never short-circuited into one expression.
+    const std::size_t wrote  = std::fwrite( w.b.data(), 1, w.b.size(), fp );
+    const bool        closed = std::fclose( fp ) == 0;
+    const bool        wErr   = wrote != w.b.size() || !closed;
     if( wErr )
     {
-        std::remove( tmp.c_str() );   // never rename a short/torn write over a good cache
-        DEGRADED_PATH_ALERT( "ingest: saveCache write failed (short write or fclose error) — old cache preserved" );
-        std::fprintf( stderr, "ripwire: cache %s: write failed (short write; disk full?) — old cache kept, this run was parsed from source\n", path.c_str() );
+        // never rename a short/torn write over a good cache — the holder removes the temp on return
+        DISCLOSE( Diagnostics::answerUnchanged, "this answer is already computed in memory: only the next run starts cold",
+                  "ingest: saveCache write failed (short write or fclose error) — old cache preserved" );
+        rw::emitTo( stderr, "ripwire: cache {}: write failed (short write; disk full?) — old cache kept, this run was parsed from source\n", path.c_str() );
         return;
     }
-    if( std::rename( tmp.c_str(), path.c_str() ) != 0 )
+    if( !temp.commit( path ) )
     {
-        std::remove( tmp.c_str() );   // clean up on failure
-        DEGRADED_PATH_ALERT( "ingest: saveCache rename(tmp -> cache) failed — old cache preserved" );
-        std::fprintf( stderr, "ripwire: cache %s: cannot replace (%s) — old cache kept, this run was parsed from source\n",
+        // the holder removes the temp on return
+        DISCLOSE( Diagnostics::answerUnchanged, "this answer is already computed in memory: only the next run starts cold", "ingest: saveCache rename(tmp -> cache) failed — old cache preserved" );
+        rw::emitTo( stderr, "ripwire: cache {}: cannot replace ({}) — old cache kept, this run was parsed from source\n",
                       path.c_str(), std::strerror( errno ) );
         return;
     }

@@ -17,10 +17,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"   # BOTH seams: `bash test/editcheckcheck.sh asan/ripwire` and RIPWIRE_BIN=
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -37,7 +38,9 @@ EOF
 
 echo "editcheckcheck: BIN=$BIN  (temp git repo)"
 
-ec(){ ( cd "$WORK" && "$BIN" . --edit-check="$1" --no-cache 2>/dev/null ); }
+# L1 (2026-09-19): the CLI default legend is compact (its root also carries schema= before sym=); these arms read the FULL
+# legend's prose and pin the full-default <edit-check sym= spelling, so ec()/sec() ask for the full legend.
+ec(){ ( cd "$WORK" && "$BIN" . --edit-check="$1" --no-cache --legend=full 2>/dev/null ); }
 ecrc(){ ( cd "$WORK" && "$BIN" . --edit-check="$1" --no-cache >/dev/null 2>&1; echo $? ); }
 
 # ── (1) clean tree -> unchanged, exit 0, and lists the one known caller ────────────────────────────────
@@ -80,7 +83,7 @@ printf '%s' "$OUTB" | grep -q 'public_was="0" public_now="0"' \
     && ok "(b) publicness reported, unchanged (0 -> 0)" || { no "(b) publicness was/now missing/wrong"; printf '%s\n' "$OUTB"; }
 rows "$OUTB" | grep -q 'n="useit".*incompatible="1"' \
     && ok "(b) the now-incompatible caller useit() is flagged" || { no "(b) incompatible caller not flagged"; printf '%s\n' "$OUTB"; }
-[ "$( ecrc helper )" = 0 ] && ok "(b) contract-change still exits 0 (a report, not a gate)" || no "(b) unexpected nonzero exit"
+if [ "$( ecrc helper )" = 0 ]; then ok "(b) contract-change still exits 0 (a report, not a gate)"; else no "(b) unexpected nonzero exit"; fi
 
 # ── (c) brand-new symbol -> new-symbol, zero callers ─────────────────────────────────────────────────
 cat >> "$WORK/src/a.cpp" <<'EOF'
@@ -109,7 +112,7 @@ D1="$( ec helper )"; D2="$( ec helper )"; D3="$( ec helper )"
 
 # ── xml well-formed ──────────────────────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    printf '%s' "$D1" | xmllint --noout - 2>/dev/null && ok "xml well-formed" || no "xml malformed"
+    if printf '%s' "$D1" | xmllint --noout - 2>/dev/null; then ok "xml well-formed"; else no "xml malformed"; fi
 else
     printf '  SKIP  xml well-formed (no xmllint)\n'
 fi
@@ -246,7 +249,7 @@ int callerTwo( void ) { return widget( 1, 2 ); }
 EOF
 ( cd "$SHRINK" && git init -q && git config user.email t@t && git config user.name t \
   && git add -A && git commit -qm init >/dev/null 2>&1 )
-sec(){ ( cd "$SHRINK" && "$BIN" . --edit-check="$1" --no-cache 2>/dev/null ); }
+sec(){ ( cd "$SHRINK" && "$BIN" . --edit-check="$1" --no-cache --legend=full 2>/dev/null ); }
 
 OUTG0="$( sec widget )"
 { printf '%s' "$OUTG0" | grep -q 'status="unchanged"' && [ "$( defs_of "$OUTG0" )" = 'defs="2"' ] \

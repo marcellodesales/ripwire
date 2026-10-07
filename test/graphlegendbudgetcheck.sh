@@ -37,7 +37,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 info(){ printf '  INFO  %s\n' "$*"; }
 
@@ -94,15 +94,40 @@ budgetFor(){
         # tokens of slack under its 8000-token default budget) from going over a ceiling it would then have
         # had to disclose. Two earlier drafts that were UNCONDITIONAL, at 135 B and at 57 B folded into the
         # gauge sentence, both broke that fixture; the conditional form is why this one does not.
+        # RE-PINNED uses +81 (2026-09-20, issue #60): the in_id= clause CORRECTED a now-false sentence. It read
+        # "absent at file scope", which stopped being true when ingest_model.h mintModuleScopeOwners started
+        # giving a top-level statement and an anonymous callback body a caller node — those sites now carry
+        # in_id=<file-scope>, and a legend that says an attribute is absent where the document emits it is the
+        # same false claim as a legend defining one the document cannot emit. Measured 4035 B against 3979;
+        # 4060 leaves 25 B, the exact headroom the #66 re-pin left this verb. Same shape as every re-pin above:
+        # a correction stated in the shortest honest form (the clause that went is 22 B, the clause that came
+        # is 78 B), not the essay re-inflating — and 4060 still sits below the 4303 B pre-fix number cited at
+        # the top, so this gate is still RED on the 1dc7b01 binary.
+        # RE-PINNED impact +75 and uses +54 (2026-09-23, cut-fix C, lane/cutfix-navlists): two sentences restate what
+        # CHANGED about the rows, compressed to their shortest honest form first (the drafts were +55 and +54 B over the
+        # base). uses: "by path within a tier" -> "within a tier by the enclosing symbol's callers, then path" (+37 B) —
+        # the rows are ranked before the cap now, and a legend that still says "by path" is the false claim. impact: the
+        # import-tier clause "limit=/offset= window the symbol rows only" -> "most-imported first; limit= sizes it, offset=
+        # windows the symbol rows only" (+32 B) — --limit now reaches that tier, and the old sentence said it could not.
+        # Measured on the base binary 3894 / 4052 B, on this lane 3926 / 4089 B; each keeps the headroom its #66 re-pin
+        # left (impact 48 B, uses 25 B). callers' own sentence (+28 B) fits its 3429 unchanged. uses 4114 still sits below
+        # the 4303 B pre-fix number at the top, so the gate stays RED on the 1dc7b01 binary.
+        # RE-PINNED impact +362 (2026-09-27, lane impact-depth-065, depth-labelled --impact): the full legend gains
+        # graphlegend.h kImpactDepthLegend, the one definition of the rows' d= (run-length hop depth), the root's
+        # by_depth= and the new depth-first row order a cut relies on — attributes the answer now emits, present only
+        # when reaches>0. Measured on this probe: 3926 B on main (3fcd515f), 4288 B on this lane (+362 B, exactly the
+        # clause); 4336 keeps impact's 48 B headroom. The gate's RED-on-1dc7b01 property rests on the uses pin (4114 <
+        # 4303), which does not move.
         callers) echo 3429 ;;
-        impact)  echo 3899 ;;
-        uses)    echo 3979 ;;
+        impact)  echo 4336 ;;
+        uses)    echo 4114 ;;
     esac
 }
 VERBS="callers impact uses"
 
 for v in $VERBS; do
-    "$BIN" "$ROOT" "--$v=rootRelPathsLegend" >"$TMP/$v.xml" 2>/dev/null
+    # L1 (2026-09-19): the CLI default legend is compact; (a) budgets and (b) reads the FULL legend, so it is asked for.
+    "$BIN" "$ROOT" "--$v=rootRelPathsLegend" --legend=full >"$TMP/$v.xml" 2>/dev/null
     read -r total legend payload <<<"$( measure "$TMP/$v.xml" )"
     budget="$( budgetFor "$v" )"
     if [ "$legend" -le "$budget" ]; then
@@ -145,10 +170,10 @@ esac
 # ── (c) well-formed + deterministic, unchanged by a prose-only edit. ──────────────────────────────────
 for v in $VERBS; do
     if command -v xmllint >/dev/null 2>&1; then
-        xmllint --noout "$TMP/$v.xml" 2>/dev/null && ok "(c) --$v is well-formed XML" || no "(c) --$v fails xmllint"
+        if xmllint --noout "$TMP/$v.xml" 2>/dev/null; then ok "(c) --$v is well-formed XML"; else no "(c) --$v fails xmllint"; fi
     fi
-    "$BIN" "$ROOT" "--$v=rootRelPathsLegend" >"$TMP/$v.2.xml" 2>/dev/null
-    diff -q "$TMP/$v.xml" "$TMP/$v.2.xml" >/dev/null && ok "(c) --$v deterministic (byte-identical twice)" || no "(c) --$v differs across two runs"
+    "$BIN" "$ROOT" "--$v=rootRelPathsLegend" --legend=full >"$TMP/$v.2.xml" 2>/dev/null
+    if diff -q "$TMP/$v.xml" "$TMP/$v.2.xml" >/dev/null; then ok "(c) --$v deterministic (byte-identical twice)"; else no "(c) --$v differs across two runs"; fi
 done
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"

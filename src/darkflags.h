@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // darkflags.h — `--flags`, the DARK-CONTENT DASHBOARD.
 // Evidence: twice in one day an owner asked "why don't I see X?" and the answer both times was that X ships
@@ -11,7 +14,7 @@
 //   compile — `#ifndef NAME` immediately followed by `#define NAME VALUE` (the build-dark-then-flip idiom:
 //             the guard is what lets `-DNAME=1` win from the command line without editing the header).
 //   cmake   — `option( NAME "doc" ON|OFF )` in CMakeLists.txt / *.cmake.
-//   env     — `getenv("NAME")` / `std::getenv` / Python `os.environ.get` / `os.getenv`. Default: unset.
+//   env     — `getenv("NAME")` / `std::getenv` / Python `os.environ.get` / `os.getenv` / JS/TS `process.env.NAME`. Default: unset.
 //
 // ── the override rule (the actual bug this verb catches) ─────────────────────────────────────────────────
 // A name is routinely BOTH a header gate defaulting to 0 AND a CMake option defaulting to ON — the header
@@ -32,15 +35,19 @@
 #include "arch.h"               // relForHash
 #include "serialize.h"          // escapeXml
 #include "docparse.h"           // lowerExtOf / isDocExtension — which files are PROSE, not code
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT
+#include "pageview.h"           // §P8: pageWindow / effectiveRowCap / secondaryCutAttrs — the ONE paging contract
+#include "nextverb.h"           // P3: nextAttrXml — the ONE pasteable follow-up a cut root carries
+#include "infra/Diagnostics.h"  // DISCLOSE
 
 #include "btree.hpp"      // gtl::btree_map — sorted iteration (house rule: never std::map)
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,16 +58,17 @@ namespace darkflags
 {
 
 constexpr std::size_t kMaxFlagFileBytes = 4u << 20;   // 4 MB — past this a "source" file is generated data
-constexpr std::size_t kMaxSitesShown    = 8;          // per gate, per list; the rest are counted in a <more/>
+constexpr std::size_t kMaxSitesShown    = 8;          // <read> sites per gate; a DEFAULT, raisable by --limit=N (effectiveRowCap), lifted by --detail
 constexpr std::size_t kMaxEnvNameLen    = 128;        // longest plausible environment-variable name
 
 enum class GateKind : std::uint8_t { Compile = 0, CMake, Env };
+inline constexpr std::size_t kGateKindCount = static_cast<std::size_t>( GateKind::Env ) + 1;
+static_assert( enumCountIsExact<GateKind, kGateKindCount>(), "kGateKindCount must name the LAST GateKind — move it with the append" );
 
-inline const char* gateKindTag( GateKind k ) noexcept
-{
-    static const char* kTag[] = { "compile", "cmake", "env" };
-    return kTag[ std::size_t( k ) ];
-}
+inline constexpr const char* kGateKindTag[] = { "compile", "cmake", "env" };
+static_assert( std::size( kGateKindTag ) == kGateKindCount, "kGateKindTag is indexed by GateKind — one tag per enumerator" );
+
+inline const char* gateKindTag( GateKind k ) noexcept { return kGateKindTag[ std::size_t( k ) ]; }
 
 struct Site
 {
@@ -425,7 +433,18 @@ struct LineSyntax
                                      //   shift in Python and Ruby and mistaking one for a heredoc would blind
                                      //   the rest of the file
     bool isProse          = false;   // markdown or an extracted-doc format: the env lane skips it entirely
+    bool hasTemplates     = false;   // 0.6.6 D5: a backtick template literal — JavaScript / TypeScript ONLY (a shell `…` is
+                                     //   a command substitution, a Go `…` a raw string: neither changes here)
 };
+
+inline constexpr std::string_view kTemplateLiteralExtTable[] = { ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts" };
+
+// 0.6.6 D5 (review B1): the per-file state of the JS/TS template literals that are open at a line boundary. Each entry
+// is one open construct, innermost last: kTemplateText = inside a template's TEXT (a string), n >= 0 = inside a `${…}`
+// substitution (CODE) with n unclosed `{` of its own. Empty = plain code. A template spans lines, so the caller keeps
+// this per file, like the block-comment flag.
+using TemplateStack = std::vector<std::int32_t>;
+inline constexpr std::int32_t kTemplateText = -1;
 
 inline constexpr std::string_view kShellExtTable[] = { ".sh", ".bash", ".zsh" };
 
@@ -453,18 +472,54 @@ inline LineSyntax lineSyntaxFor( std::string_view path )
             return syn;
         }
     }
-    if( ext == ".md" || ext == ".markdown" || ext == ".rst" || ext == ".txt" || docparse::isDocExtension( ext ) )
+    if( docparse::isProseExtension( ext ) )   // the shared prose vocabulary, not a fifth private list
     {
         syn.isProse = true;
     }
+    syn.hasTemplates = std::find( std::begin( kTemplateLiteralExtTable ), std::end( kTemplateLiteralExtTable ), ext ) != std::end( kTemplateLiteralExtTable );
     return syn;
+}
+
+// 0.6.6 D5 (review B1): one byte of a JS/TS template construct. Returns true when the byte was consumed as template
+// TEXT or template punctuation (never code), false when it is code the caller classifies as usual. `i` may advance
+// past an escaped byte or the `{` of `${`.
+inline bool stepTemplate( std::string_view line, std::size_t& i, TemplateStack& templates )
+{
+    const char c = line[i];
+    if( !templates.empty() && templates.back() == kTemplateText )
+    {
+        if( c == '\\' ) { ++i; }                                            // an escaped byte closes nothing
+        else if( c == '`' ) { templates.pop_back(); }                        // the template ends
+        else if( c == '$' && i + 1 < line.size() && line[ i + 1 ] == '{' ) { templates.push_back( 0 ); ++i; }   // `${` opens code
+        return true;
+    }
+    if( c == '`' )
+    {
+        templates.push_back( kTemplateText );
+        return true;
+    }
+    if( !templates.empty() && c == '{' )
+    {
+        ++templates.back();
+    }
+    else if( !templates.empty() && c == '}' )
+    {
+        if( templates.back() == 0 )
+        {
+            templates.pop_back();                                            // `}` closes the `${`: back to the text
+            return true;
+        }
+        --templates.back();
+    }
+    return false;
 }
 
 // Visit every byte of `line` that is CODE — outside every comment and outside every string literal — handing
 // its index to `onCode`. `isInBlockComment` carries `/* … */` across lines, so it is the caller's per-file
 // state, not a per-line local. Classification and probing are fused so no per-line buffer is allocated.
+// `templates` (JS/TS only, syn.hasTemplates) carries open template literals the same way — see TemplateStack.
 template<class OnCode>
-inline void forEachCodeByte( std::string_view line, const LineSyntax& syn, bool& isInBlockComment, OnCode&& onCode )
+inline void forEachCodeByte( std::string_view line, const LineSyntax& syn, bool& isInBlockComment, TemplateStack& templates, OnCode&& onCode )
 {
     char quote = 0;
     for( std::size_t i = 0; i < line.size(); ++i )
@@ -473,6 +528,10 @@ inline void forEachCodeByte( std::string_view line, const LineSyntax& syn, bool&
         if( isInBlockComment )
         {
             if( c == '*' && i + 1 < line.size() && line[ i + 1 ] == '/' ) { isInBlockComment = false; ++i; }
+            continue;
+        }
+        if( syn.hasTemplates && quote == 0 && stepTemplate( line, i, templates ) )
+        {
             continue;
         }
         if( quote != 0 )
@@ -519,6 +578,28 @@ inline constexpr std::string_view kEnvProbeTable[] = { "getenv", "environ.get", 
 // leaves the ONE call (the old reader crossed a `"` that closed one literal and entered the next, which is
 // how the commas separating kEnvProbeTable's own spellings became gates named `,` and `, `), and the name it
 // finds must be identifier-shaped.
+// The identifier-shaped name inside ONE quoted literal that opens at `i` (after optional whitespace), with an opening
+// quote from `quotes`, closed by the same quote; "" otherwise (a computed name, an unclosed literal, a non-name).
+// Shared by the getenv-family call shape and Node's `process.env[...]` subscript.
+inline std::string_view quotedEnvNameAt( std::string_view line, std::size_t i, std::string_view quotes )
+{
+    while( i < line.size() && std::isspace( (unsigned char)line[i] ) )
+    {
+        ++i;
+    }
+    if( i >= line.size() || quotes.find( line[i] ) == std::string_view::npos )
+    {
+        return {}; // computed name — cannot be named
+    }
+    const std::size_t close = line.find( line[i], i + 1 );
+    if( close == std::string_view::npos )
+    {
+        return {};
+    }
+    const std::string_view name = line.substr( i + 1, close - i - 1 );
+    return isIdentShaped( name, 1, kMaxEnvNameLen ) ? name : std::string_view{};
+}
+
 inline std::string_view envNameAt( std::string_view line, std::size_t at, std::string_view probe )
 {
     if( line.compare( at, probe.size(), probe ) != 0 )
@@ -539,29 +620,38 @@ inline std::string_view envNameAt( std::string_view line, std::size_t at, std::s
         }
         ++i;
     }
-    while( i < line.size() && std::isspace( (unsigned char)line[i] ) )
-    {
-        ++i;
-    }
-    if( i >= line.size() || line[i] != '"' )
-    {
-        return {}; // computed name — cannot be named
-    }
+    return quotedEnvNameAt( line, i, "\"" );
+}
 
-    const std::size_t close = line.find( '"', i + 1 );
-    if( close == std::string_view::npos )
+// 0.6.6 D5: Node's environment read — `process.env.NAME`, `process.env["NAME"]`, `process.env['NAME']` — is the getenv of
+// JavaScript and TypeScript, and a TS repo whose switches are all `process.env.X === "1"` answered gates="0" env="0".
+// The name after the dot (or the one quoted literal in the brackets) must be identifier-shaped; `process.env` alone
+// (`const env = process.env`, a spread) names nothing and is not a read. Same CODE-only filter as the probes above.
+inline std::string_view processEnvNameAt( std::string_view line, std::size_t at )
+{
+    constexpr std::string_view probe = "process.env";
+    if( line.compare( at, probe.size(), probe ) != 0 )
     {
         return {};
     }
-
-    const std::string_view name = line.substr( i + 1, close - i - 1 );
-    return isIdentShaped( name, 1, kMaxEnvNameLen ) ? name : std::string_view{};
+    std::size_t i = at + probe.size();
+    if( i < line.size() && line[i] == '.' )
+    {
+        std::size_t end = i + 1;
+        while( end < line.size() && identByte( (unsigned char)line[end] ) )
+        {
+            ++end;
+        }
+        const std::string_view name = line.substr( i + 1, end - i - 1 );
+        return isIdentShaped( name, 1, kMaxEnvNameLen ) ? name : std::string_view{};
+    }
+    return ( i < line.size() && line[i] == '[' ) ? quotedEnvNameAt( line, i + 1, "\"'`" ) : std::string_view{};
 }
 
 inline void harvestEnvReads( std::string_view line, std::uint32_t lineNo, FileHarvest& fh,
-                             const LineSyntax& syn, bool& isInBlockComment )
+                             const LineSyntax& syn, bool& isInBlockComment, TemplateStack& templates )
 {
-    forEachCodeByte( line, syn, isInBlockComment, [ & ]( std::size_t at )
+    forEachCodeByte( line, syn, isInBlockComment, templates, [ & ]( std::size_t at )
                      {
         if( at > 0 && identByte( (unsigned char)line[ at - 1 ] ) ) { return;   // mid-identifier — not a call of ours
 }
@@ -573,6 +663,11 @@ inline void harvestEnvReads( std::string_view line, std::uint32_t lineNo, FileHa
             fh.reads.push_back( FileHarvest::Read{ std::string( name ), lineNo } );
             fh.defs.push_back( FileHarvest::Def{ std::string( name ), "unset", lineNo, GateKind::Env } );
             return;
+        }
+        if( const std::string_view nodeName = processEnvNameAt( line, at ); !nodeName.empty() )   // 0.6.6 D5
+        {
+            fh.reads.push_back( FileHarvest::Read{ std::string( nodeName ), lineNo } );
+            fh.defs.push_back( FileHarvest::Def{ std::string( nodeName ), "unset", lineNo, GateKind::Env } );
         } } );
 }
 
@@ -676,6 +771,7 @@ inline FileHarvest harvestFile( std::string_view bytes, std::string_view path, b
     std::string           pendingIfndef;
     std::string           heredocDelimiter;              // non-empty ⇒ this line is heredoc BODY, i.e. data
     bool                  isInBlockComment = false;
+    TemplateStack         templates;                     // 0.6.6 D5: open JS/TS template literals across lines
 
     forEachLine( bytes, [ & ]( std::string_view line, std::uint32_t lineIndex )
     {
@@ -707,7 +803,7 @@ inline FileHarvest harvestFile( std::string_view bytes, std::string_view path, b
         // The block-comment state must be read BEFORE the env lane advances it, so a `#define` on the first
         // line of a `/* … */` block is judged by the state the line OPENED in.
         const bool wasInBlockComment = isInBlockComment;
-        harvestEnvReads( line, lineIndex, fh, syn, isInBlockComment );
+        harvestEnvReads( line, lineIndex, fh, syn, isInBlockComment, templates );
 
         // The opener line itself IS code (it can carry a real call); only what follows it is data. A `#`
         // comment mentioning a heredoc must not open one, or the rest of the file goes dark.
@@ -734,70 +830,153 @@ inline FileHarvest harvestFile( std::string_view bytes, std::string_view path, b
 
 // ── tree walk + resolution ───────────────────────────────────────────────────────────────────────────────
 
-inline bool readWhole( const std::string& path, std::string& out )
+// The whole file, or nullopt when it cannot be opened or grows past kMaxFlagFileBytes. A read error part-way
+// through keeps what was read, and an empty file is an engaged empty string.
+inline std::optional<std::string> readWhole( const std::string& path )
 {
     std::FILE* fp = std::fopen( path.c_str(), "rb" );
     if( !fp )
     {
-        return false;
+        return std::nullopt;
     }
-    out.clear();
+    std::string out;
     char        buf[ 65536 ];
     std::size_t n = 0;
     while( ( n = std::fread( buf, 1, sizeof( buf ), fp ) ) > 0 )
     {
         out.append( buf, n );
-        if( out.size() > kMaxFlagFileBytes ) { out.clear(); std::fclose( fp ); return false; }
+        if( out.size() > kMaxFlagFileBytes ) { std::fclose( fp ); return std::nullopt; }
     }
     std::fclose( fp );
-    return true;
+    return out;
 }
 
-// The CMake files under `root`, sorted. ingest() never collects these (CMake is not one of the indexed
-// grammars), so this is the ONE crawl this module owns; every other file it reads comes from the caller's
-// already-crawled, already-excluded ingest file list.
-inline std::vector<std::string> collectCMakeFiles( const std::string& root, const std::vector<std::string>& excludes )
+// §SEC1 — what the CMake walk found, and what it refused. Two fields rather than an out-param because the
+// refusal is not an error the caller can ignore: it has to reach the report.
+struct CMakeScan
+{
+    std::vector<std::string> files;        // sorted
+    std::uint64_t            escaped = 0;  // links whose target left the root — EXACT count
+    // The root itself could not be walked (permission denied, missing, …). `files` and `escaped` then read
+    // exactly like a healthy repo with zero CMake presence — that is the lie this flag exists to prevent:
+    // the caller must disclose that cmake= and escaped_root= are floors, not totals, for this run.
+    bool                      rootWalkFailed = false;
+
+    // rv-s2 review LOW-4: CMakeScan IS the field the caller already reads for this answer, so it models
+    // Diagnostics::DisclosureSink directly rather than the flag being set beside a sink-less DISCLOSE — the
+    // flag-setting becomes the disclosure itself, and disclose() is the ONE place rootWalkFailed and escaped are written.
+    enum class DisclosureWhy : std::uint8_t
+    {
+        RootWalkFailed,
+        SymlinkEscapesRoot,
+    };
+    void disclose( DisclosureWhy why ) noexcept   // the DISCLOSE sink: the fields the emitter reads
+    {
+        rootWalkFailed = rootWalkFailed || why == DisclosureWhy::RootWalkFailed;
+        escaped += why == DisclosureWhy::SymlinkEscapesRoot ? 1u : 0u;
+    }
+};
+
+// Can the root itself be LISTED? libc++ AND libstdc++ swallow EACCES on the root under skip_permission_denied (the flag is
+// meant for entries met mid-walk, not the walk's own starting point), so a recursive walk of an unlistable root reads as
+// an EMPTY SUCCESSFUL walk with its error_code clear (measured: `ec=0 atEnd=1` with the flag, `ec=13` without it, on both
+// libraries). A walker that must not mistake that for an empty tree probes here first, without the flag.
+inline bool crawlRootIsListable( const std::string& root )
+{
+    std::error_code                             ec;
+    const std::filesystem::directory_iterator  probe( root, ec );
+    return !ec;
+}
+
+// THE prune-aware file walk the two non-ingest walkers share (collectCMakeFiles below, docdrift.h collectRepoPaths):
+// every entry under `root` in readdir order, a directory pruned when `isPrunedDir( base )` holds or it holds a
+// CMakeCache.txt (a build-output tree), a path containing any non-empty `excludes` substring skipped, and each remaining
+// non-directory handed to `onFile( entry, fullPath, base )`. A per-entry error is skipped, as the walk always did. Returns
+// false — having visited nothing — when the root itself cannot be walked (crawlRootIsListable, or the iterator's own
+// error): the caller discloses that through its own sink, because an empty walk and a failed one must not read alike.
+template<class PruneDir, class OnFile>
+inline bool walkCrawlFiles( const std::string& root, const std::vector<std::string>& excludes, PruneDir&& isPrunedDir, OnFile&& onFile )
 {
     namespace fs = std::filesystem;
-    std::vector<std::string> out;
-    std::error_code          ec;
+    std::error_code ec;
+    const bool      isListable = crawlRootIsListable( root );   // checked together with `ec` below: one verdict, no TOCTOU gap
     fs::recursive_directory_iterator it( root, fs::directory_options::skip_permission_denied, ec );
-    if( ec ) { DEGRADED_PATH_ALERT( "flags: cannot walk root for CMake files — cmake gates omitted" ); return out; }
-
+    if( !isListable || ec )
+    {
+        return false;
+    }
     const fs::recursive_directory_iterator end;
     for( ; it != end; it.increment( ec ) )
     {
         if( ec ) { ec.clear(); continue; }
         const std::string base = it->path().filename().string();
-
-        // Prune with ingest's OWN denylist (ingest.h kCrawlSkipDirs), plus a CMakeCache.txt sentinel for
-        // build-output trees. Without this the walk finds every nested agent worktree's and build dir's copy
-        // of CMakeLists.txt, and a stale copy declaring `option(X … OFF)` shadows the real `ON` — measured on
-        // the motivating repo, where a worktree copy inverted CANYON_SPHERE_FIRE's reported default.
         if( it->is_directory( ec ) )
         {
             std::error_code sec;
-            if( isSkippedCrawlDir( base ) || std::filesystem::exists( it->path() / "CMakeCache.txt", sec ) )
-            { it.disable_recursion_pending(); continue; }
+            if( isPrunedDir( base ) || fs::exists( it->path() / "CMakeCache.txt", sec ) )
+            {
+                it.disable_recursion_pending();
+            }
             continue;
         }
-
-        const std::string p = it->path().string();
-        bool skip = false;
-        for( const std::string& x : excludes )
+        const std::string full = it->path().string();
+        const bool isExcluded = std::any_of( excludes.begin(), excludes.end(),
+                                             [ & ]( const std::string& x ) { return !x.empty() && full.find( x ) != std::string::npos; } );
+        if( !isExcluded )
         {
-            if( !x.empty() && p.find( x ) != std::string::npos ) { skip = true; break; }
-        }
-        if( skip )
-        {
-            continue;
-        }
-        if( base == "CMakeLists.txt" || ( base.size() > 6 && base.compare( base.size() - 6, 6, ".cmake" ) == 0 ) )
-        {
-            out.push_back( p );
+            onFile( *it, full, base );
         }
     }
-    std::sort( out.begin(), out.end() );
+    return true;
+}
+
+// The CMake files under `root`, sorted. ingest() never collects these (CMake is not one of the indexed
+// grammars), so this is the ONE crawl this module owns; every other file it reads comes from the caller's
+// already-crawled, already-excluded ingest file list — which is exactly why this walk needs the crawl
+// boundary applied HERE and not inherited: the reporter who found the ingest-side symlink escape found this
+// second copy of it in the same pass, and a linked CMakeLists.txt outside the root had its option() names and
+// defaults parsed and reported. ingest.h owns the rule (crawlPathStaysInRoot); this is the second caller, for
+// the same reason kCrawlSkipDirs is shared — a boundary two walkers disagreed about is not a boundary.
+inline CMakeScan collectCMakeFiles( const std::string& root, const std::vector<std::string>& excludes )
+{
+    CMakeScan       out;
+    // libc++ AND libstdc++ swallow EACCES on the ROOT itself under skip_permission_denied below (the flag is
+    // meant for subdirectories encountered mid-walk, not the root the walk starts from): an unreadable root
+    // then reads as an EMPTY successful walk with `ec` clear — exactly the false zero rootWalkFailed exists
+    // to disclose (measured: `ec=0 atEnd=1` with the flag, `ec=13 Permission denied` without it, both libc++
+    // and libstdc++). Probe the root without the flag first, mirroring main.cpp's rootIsReadable shape, which
+    // this walk cannot rely on: `--flags` reaches this walk on a warm index even after the root's mode
+    // changed out from under it, a path rootIsReadable's own one-shot CLI check never revisits. One combined
+    // check (walkCrawlFiles, not two DISCLOSE sites) so a TOCTOU between the two constructions is still caught.
+    const std::string rootReal = canonicalCrawlRoot( root );
+    // Prune with ingest's OWN denylist (ingest.h kCrawlSkipDirs), plus walkCrawlFiles' CMakeCache.txt sentinel for
+    // build-output trees. Without this the walk finds every nested agent worktree's and build dir's copy
+    // of CMakeLists.txt, and a stale copy declaring `option(X … OFF)` shadows the real `ON` — measured on
+    // the motivating repo, where a worktree copy inverted CANYON_SPHERE_FIRE's reported default.
+    const bool isWalked = walkCrawlFiles( root, excludes, []( const std::string& base ) { return isSkippedCrawlDir( base ); },
+                                          [ & ]( const std::filesystem::directory_entry& entry, const std::string& p, const std::string& base )
+    {
+        if( base == "CMakeLists.txt" || ( base.size() > 6 && base.compare( base.size() - 6, 6, ".cmake" ) == 0 ) )
+        {
+            // §SEC1 — the crawl boundary, tested only once the file is one this walk would actually OPEN, so
+            // escaped= counts refusals and nothing else. is_symlink() reads the cached readdir type; only a
+            // symlink pays the realpath.
+            std::error_code lec;
+            const bool      isLink = entry.is_symlink( lec );
+            if( isLink && !rw::crawlPathStaysInRoot( p, rootReal ) )
+            {
+                DISCLOSE( out, CMakeScan::DisclosureWhy::SymlinkEscapesRoot, "flags: a CMake file's symlink target leaves the root — file refused" );
+                return;
+            }
+            out.files.push_back( p );
+        }
+    } );
+    if( !isWalked )
+    {
+        DISCLOSE( out, CMakeScan::DisclosureWhy::RootWalkFailed, "flags: cannot walk root for CMake files — cmake gates omitted" );
+        return out;
+    }
+    std::sort( out.files.begin(), out.files.end() );
     return out;
 }
 
@@ -807,6 +986,15 @@ struct FlagsResult
     std::uint32_t     dark = 0;
     std::uint32_t     compileCount = 0, cmakeCount = 0, envCount = 0;
     std::size_t       filesScanned = 0;
+    // §SEC1 — CMake files this verb's own walk REFUSED to open because a symlink took them out of the root.
+    // Reported (absent when zero, the house rule) rather than dropped in silence: --flags answers "what is
+    // built but dark here", and a switch that vanished because its file was refused is the same shape of lie
+    // as one that was never declared. There is no ROW class here the way --skipped has one — this walk has no
+    // drop taxonomy at all (its --exclude and denylist prunes are silent too) — so the count is the disclosure.
+    std::uint64_t     escapedRoot  = 0;
+    // The CMake sub-walk (§SEC1) never reached the root at all — cmake=/escaped_root= above are a floor for
+    // this run, not a total; see CMakeScan::rootWalkFailed. Absent from the XML when false, same house rule.
+    bool              cmakeScanFailed = false;
     std::string       filter;          // H14/M6: the --flags=SUBSTR this harvest was narrowed by ("" = none)
     // H7 (capture-audit 2026-09-04): true when --flags=SUBSTR names no DECLARED gate at all. `gates="0"`
     // beside `files="1550"` reads exactly like the true and interesting fact "this repo has no dark gates",
@@ -925,13 +1113,13 @@ inline FlagsResult computeFlags( const IngestResult& ing, const std::string& roo
 
     const auto scan = [ & ]( const std::string& full, bool isCMake )
     {
-        std::string bytes;
-        if( !readWhole( full, bytes ) )
+        const std::optional<std::string> bytes = readWhole( full );
+        if( !bytes )
         {
             return;
         }
         std::string rel( relForHash( full, root ) );
-        FileHarvest fh = harvestFile( bytes, full, isCMake );
+        FileHarvest fh = harvestFile( *bytes, full, isCMake );
         harvest.push_back( Harvested{ std::move( rel ), std::move( fh ) } );
     };
 
@@ -939,7 +1127,8 @@ inline FlagsResult computeFlags( const IngestResult& ing, const std::string& roo
     {
         scan( f, false );
     }
-    for( const std::string& f : collectCMakeFiles( root, excludes ) )
+    const CMakeScan cmakeScan = collectCMakeFiles( root, excludes );   // §SEC1: .files plus what the boundary refused
+    for( const std::string& f : cmakeScan.files )
     {
         scan( f, true );
     }
@@ -987,6 +1176,8 @@ inline FlagsResult computeFlags( const IngestResult& ing, const std::string& roo
 
     FlagsResult res;
     res.filesScanned = harvest.size();
+    res.escapedRoot  = cmakeScan.escaped;   // §SEC1 — a refusal this verb made is this verb's to disclose
+    res.cmakeScanFailed = cmakeScan.rootWalkFailed;
     std::size_t filterNameHits = 0;
     for( auto& [ name, g ] : gates )
     {
@@ -1055,54 +1246,84 @@ inline FlagsResult computeFlags( const IngestResult& ing, const std::string& roo
 
 using XmlEscaper = std::function<std::string( std::string_view )>;
 
-inline void writeGate( std::FILE* out, const Gate& g, const XmlEscaper& ex, std::size_t maxSites )
+// C1 F-07 (2026-09-10): the <read> site list was cut at 8 and this file emitted no shown=/total=/capped=
+// token anywhere — a reporting verb dropping rows in silence, with only the <more reads=> remainder to say
+// so and no flag that could lift it. The GATE rows are the answer here ("what is built but dark") and are
+// never windowed; the SITES under one gate are context, so they are what pages. reads= on the same element
+// is already this listing's rule-2 total, so the disclosure is rule 1's pair alone (pageview.h).
+inline std::size_t gateReadWindow( const Gate& g, std::size_t maxSites, int pageOffset, PageWindow& window ) noexcept
 {
-    std::fprintf( out, "<gate name=\"%s\" kind=\"%s\" default=\"%s\" dark=\"%d\" regions=\"%u\" loc=\"%u\" reads=\"%zu\" p=\"%s\" l=\"%u\">",
+    // maxSites == SIZE_MAX is --detail ("every row"), which pageWindow spells as limit <= 0.
+    const int limit = maxSites >= std::size_t( INT_MAX ) ? 0 : int( maxSites );
+    window = pageWindow( g.reads.size(), limit, pageOffset );
+    return window.end - window.begin;
+}
+
+inline void writeGate( std::FILE* out, const Gate& g, const XmlEscaper& ex, std::size_t maxSites, int pageOffset = 0 )
+{
+    PageWindow        readPage{ 0, 0 };
+    const std::size_t shownCount = gateReadWindow( g, maxSites, pageOffset, readPage );
+    rw::emitTo( out, "<gate name=\"{}\" kind=\"{}\" default=\"{}\" dark=\"{}\" regions=\"{}\" loc=\"{}\" reads=\"{}\" p=\"{}\" l=\"{}\"{}>",
                   ex( g.name ).c_str(), gateKindTag( g.kind ), ex( g.def ).c_str(), isDarkDefault( g.def ) ? 1 : 0,
-                  g.regions, g.guardedLines, g.reads.size(), ex( g.defSite.path ).c_str(), g.defSite.line );
+                  g.regions, g.guardedLines, g.reads.size(), ex( g.defSite.path ).c_str(), g.defSite.line,
+                  secondaryCutAttrs( "reads", shownCount, g.reads.size() ).c_str() );
     if( !g.aliasOf.empty() )
     {
-        std::fprintf( out, "<alias-of name=\"%s\"/>", ex( g.aliasOf ).c_str() );
+        rw::emitTo( out, "<alias-of name=\"{}\"/>", ex( g.aliasOf ).c_str() );
     }
     if( g.aliasCount )
     {
-        std::fprintf( out, "<aliases n=\"%u\" regions=\"%u\" loc=\"%u\"/>", g.aliasCount, g.aliasRegions, g.aliasLines );
+        rw::emitTo( out, "<aliases n=\"{}\" regions=\"{}\" loc=\"{}\"/>", g.aliasCount, g.aliasRegions, g.aliasLines );
     }
     if( g.hasAlso )
     {
-        std::fprintf( out, "<also kind=\"%s\" default=\"%s\" p=\"%s\" l=\"%u\"/>",
+        rw::emitTo( out, "<also kind=\"{}\" default=\"{}\" p=\"{}\" l=\"{}\"/>",
                       gateKindTag( g.alsoKind ), ex( g.alsoDef ).c_str(), ex( g.alsoSite.path ).c_str(), g.alsoSite.line );
     }
     // "Nothing is dropped without a number": shownCount is what the loop will PRINT, so the <more/> remainder
     // is exactly what it will not. The `shown++ >= cap` form got this wrong twice over — it left the counter
     // at cap+1, so <more/> under-reported the drop by one, and at exactly cap+1 reads the element vanished
     // entirely and one row disappeared unmarked. abicheck.h::writeAbiRef is the shape this follows.
-    const std::size_t shownCount = std::min( g.reads.size(), maxSites );
-    for( std::size_t readIndex = 0; readIndex < shownCount; ++readIndex )
+    for( std::size_t readIndex = readPage.begin; readIndex < readPage.end; ++readIndex )
     {
-        std::fprintf( out, "<read p=\"%s\" l=\"%u\"/>", ex( g.reads[ readIndex ].path ).c_str(), g.reads[ readIndex ].line );
+        rw::emitTo( out, "<read p=\"{}\" l=\"{}\"/>", ex( g.reads[ readIndex ].path ).c_str(), g.reads[ readIndex ].line );
     }
     if( g.reads.size() > shownCount )
     {
-        std::fprintf( out, "<more reads=\"%zu\"/>", g.reads.size() - shownCount );
+        rw::emitTo( out, "<more reads=\"{}\"/>", g.reads.size() - shownCount );
     }
-    std::fprintf( out, "</gate>" );
+    rw::emitRaw( out, "</gate>" );
 }
 
-inline void writeFlags( std::FILE* out, const FlagsResult& res, std::size_t maxSites )
+inline void writeFlags( std::FILE* out, const FlagsResult& res, std::size_t maxSites, int pageOffset = 0 )
 {
     std::vector<char> esc;
     const XmlEscaper  ex = [ & ]( std::string_view s ) { return std::string( escapeXml( s, esc ) ); };
 
-    std::fprintf( out, "<!-- ripwire flags: what is BUILT but DARK here. Three gate patterns in one report: ifndef/define "
+    rw::emitRaw( out, "<!-- ripwire flags: what is BUILT but DARK here. Three gate patterns in one report: ifndef/define "
                        "header gates (kind=\"compile\"), CMake option() switches (kind=\"cmake\"), and getenv reads "
-                       "(kind=\"env\", default unset). dark=\"1\" means the default keeps the guarded code out of the build; "
-                       "regions/loc size what it turns off. When one name is BOTH a header gate and a CMake option the CMake "
+                       "(kind=\"env\", default unset; os.environ in Python, process.env in JavaScript/TypeScript). dark=\"1\" means the default keeps the guarded code out of the build; "
+                       "regions/loc size what it turns off, and are measured only for #if/#ifdef regions: an env gate (getenv, "
+                       "os.environ, process.env) guards a runtime branch this verb does not size, so it reads regions=0 loc=0. When one name is BOTH a header gate and a CMake option the CMake "
                        "default wins (that is what the build passes) and the header shows as an also row. Lexical, not "
                        "preprocessed: this reports the in-repo default, never the value your build used. dark_gates on this root "
                        "is the COUNT of dark gates; it was spelled dark until that collided with the child bool. files= is THIS "
                        "verb's own harvest scan (source + CMakeLists files it read looking for gates) — a wider crawl than the "
                        "map's indexed corpus, so it will not equal the map's files= -->" );
+    // C1 F-07: the site listing's own vocabulary, DEFINED where the reader meets it (legendcoveragecheck's
+    // rule). Emitted unconditionally because it describes a listing every run carries, unlike the attributes
+    // themselves, which appear only on a gate that was actually cut.
+    rw::emitRaw( out, "<!-- ROWS AND WHAT IS NEVER CUT: the gate rows ARE the answer this verb was asked for "
+                       "and are never windowed, capped or paged, and gates/dark_gates/compile/cmake/env/files "
+                       "on the root plus regions/loc/reads/dark on every gate are counted over the FULL set "
+                       "before any cap exists. What pages is the read SITES under one gate, at 8 a gate by "
+                       "default: a gate whose sites were cut says shown_reads= (the rows this run printed) "
+                       "with reads_capped=\"1\", against the reads= total already on the same element, and the "
+                       "more reads= child keeps naming the remainder. The pair is emitted ONLY on a gate that "
+                       "was cut, never as a capped=\"0\" on the gates that fit. limit=N raises the per gate "
+                       "cap (offset=M skips that many sites in every gate), detail lifts it entirely, and "
+                       "next= on the root is the exact pasteable invocation that shows every site this run "
+                       "dropped. -->" );
     // §P8 collision: `dark=` was a COUNT here and a BOOL on the <gate/> children beneath — indistinguishable
     // to a parser. The count is renamed (index-vs-count rule) and reads correctly beside its
     // gates=/compile=/cmake=/env= siblings; it had ZERO parsers, so the bool half keeps its name.
@@ -1111,14 +1332,32 @@ inline void writeFlags( std::FILE* out, const FlagsResult& res, std::size_t maxS
     std::vector<char> fgEsc;
     const std::string fgFilterAttr = res.filter.empty() ? std::string()
                                                         : ( " filter=\"" + std::string( rw::escapeXml( res.filter, fgEsc ) ) + "\"" );
-    std::fprintf( out, "<flags gates=\"%zu\" dark_gates=\"%u\" compile=\"%u\" cmake=\"%u\" env=\"%u\" files=\"%zu\"%s>",
-                  res.gates.size(), res.dark, res.compileCount, res.cmakeCount, res.envCount, res.filesScanned,
-                  fgFilterAttr.c_str() );
+    // P3 (nextverb.h): the ONE pasteable follow-up, and it is EXACT — the smallest --limit that cuts no
+    // gate's site list. Empty when nothing was cut, so an uncut root is byte-identical to what it was.
+    std::size_t widestCut = 0;
     for( const Gate& g : res.gates )
     {
-        writeGate( out, g, ex, maxSites );
+        PageWindow probe{ 0, 0 };
+        if( gateReadWindow( g, maxSites, pageOffset, probe ) < g.reads.size() )
+        {
+            widestCut = std::max( widestCut, g.reads.size() );
+        }
     }
-    std::fprintf( out, "</flags>" );
+    const std::string flagsNext = widestCut == 0 ? std::string()
+                                                 : nextAttrXml( "--flags --limit=" + std::to_string( widestCut ) );
+    // §SEC1 — absent when zero, so every repository without a hostile symlink keeps a byte-identical report.
+    const std::string fgEscapedAttr = res.escapedRoot == 0 ? std::string()
+                                                           : " escaped_root=\"" + std::to_string( res.escapedRoot ) + "\"";
+    // Absent when false: a repo whose CMake sub-walk always succeeds keeps a byte-identical report.
+    const std::string fgCmakeFailedAttr = res.cmakeScanFailed ? " cmake_scan_failed=\"1\"" : std::string();
+    rw::emitTo( out, "<flags gates=\"{}\" dark_gates=\"{}\" compile=\"{}\" cmake=\"{}\" env=\"{}\" files=\"{}\"{}{}{}{}>",
+                  res.gates.size(), res.dark, res.compileCount, res.cmakeCount, res.envCount, res.filesScanned,
+                  fgEscapedAttr.c_str(), fgCmakeFailedAttr.c_str(), fgFilterAttr.c_str(), flagsNext.c_str() );
+    for( const Gate& g : res.gates )
+    {
+        writeGate( out, g, ex, maxSites, pageOffset );
+    }
+    rw::emitRaw( out, "</flags>" );
 }
 
 }}   // namespace rw::darkflags

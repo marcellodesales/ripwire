@@ -26,7 +26,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"   # house convention: the suite passes the binary via RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 echo "jsonrefusallegendcheck: BIN=$BIN"
@@ -44,7 +44,7 @@ PY
 
 # ─────────────────────────── §B1.4: the --json refusal ───────────────────────────────────────────────────
 "$BIN" "$SBX" --regex="bet.*" --json > "$TMP/regex.out" 2>"$TMP/regex.err"; RC=$?
-[ $RC -eq 1 ] && ok "--regex --json refuses with exit 1" || no "--regex --json exited $RC, want 1"
+if [ $RC -eq 1 ]; then ok "--regex --json refuses with exit 1"; else no "--regex --json exited $RC, want 1"; fi
 [ -s "$TMP/regex.err" ] || { no "the refusal wrote nothing to stderr"; echo "FAILURES ABOVE"; exit 1; }
 MSG="$( cat "$TMP/regex.err" )"
 
@@ -68,7 +68,7 @@ fi
 
 # (3) a SHAPE MODIFIER must not be described as a verb
 "$BIN" "$SBX" --callers=beta --format=columnar --json > /dev/null 2>"$TMP/shape.err"; RC=$?
-[ $RC -eq 1 ] && ok "--callers --format=columnar --json refuses with exit 1" || no "--callers --format=columnar --json exited $RC, want 1"
+if [ $RC -eq 1 ]; then ok "--callers --format=columnar --json refuses with exit 1"; else no "--callers --format=columnar --json exited $RC, want 1"; fi
 SHAPE="$( cat "$TMP/shape.err" )"
 case "$SHAPE" in *--format=columnar*) ok "the shape-modifier refusal names --format=columnar" ;;
                  *)                   no "the shape-modifier refusal does not name --format=columnar: $SHAPE" ;; esac
@@ -89,7 +89,8 @@ printf '%s' "$MSG" | grep -q -- '--pack-task' \
 
 # ─────────────────────────── §B1.5: the columnar legend ──────────────────────────────────────────────────
 for verb in "--callers=beta" "--callees=alpha" "--uses=beta" "--impact=beta"; do
-    OUT="$( "$BIN" "$SBX" "$verb" --format=columnar 2>/dev/null )"
+    # L1 (2026-09-19): the CLI default legend is compact; this arm reads the FULL legend's separate columnar comment, so it asks for it.
+    OUT="$( "$BIN" "$SBX" "$verb" --format=columnar --legend=full 2>/dev/null )"
     [ -n "$OUT" ] || { no "$verb --format=columnar produced no output"; continue; }
     # extract the columnar legend by delimiter, not by a `[^>]*` class: the legend legitimately NAMES the
     # elements it describes (<paths>, <cols>), and --uses ships its own verb legend ahead of it
@@ -120,7 +121,7 @@ case "$EMPTY" in *'n="0"'*) ok "an out-of-range page really does emit n=\"0\" (t
                  *)         no "an out-of-range page does not emit n=\"0\": $( printf '%s' "$EMPTY" | tail -c 200 )" ;; esac
 
 # ── --help's --format one-liner must name --uses' REAL columns ───────────────────────────────────────────
-HELP="$( "$BIN" --help 2>&1 )"
+HELP="$( "$BIN" --help=all 2>&1 )"
 [ -n "$HELP" ] || { no "--help produced nothing"; echo "FAILURES ABOVE"; exit 1; }
 FMTLINE="$( printf '%s\n' "$HELP" | grep -A 6 -- '--format=xml|columnar' )"
 [ -n "$FMTLINE" ] || { no "could not locate the --format one-liner in --help"; echo "FAILURES ABOVE"; exit 1; }
@@ -151,7 +152,7 @@ check_json_refuses()
     local want="$1"; shift
     OUT="$( "$BIN" "$dir" "$@" --json 2>"$TMP/arm.err" )"; RC=$?
     ERRTXT="$( cat "$TMP/arm.err" )"
-    [ "$RC" -eq 1 ] && ok "$desc: --json exits 1" || no "$desc: --json exited $RC (want 1): $ERRTXT"
+    if [ "$RC" -eq 1 ]; then ok "$desc: --json exits 1"; else no "$desc: --json exited $RC (want 1): $ERRTXT"; fi
     case "$ERRTXT" in *"$want"*) ok "$desc: refusal names $want" ;;
                       *)         no "$desc: refusal does not name $want: $ERRTXT" ;; esac
     [ -z "$OUT" ] && ok "$desc: stdout stayed empty (no XML leaked before the refusal)" \

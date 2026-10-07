@@ -9,7 +9,7 @@
 #   --hotspots --since="2 weeks ago" -> window="2 weeks ago" but the header comment still said (window=12mo)
 #
 # A false NON-zero: the churn numbers are real, the window they are labelled with is not, and the only
-# honest signal was a DEGRADED_PATH_ALERT on stderr — invisible to every MCP client.
+# honest signal was a DISCLOSE on stderr — invisible to every MCP client.
 #
 #   RIPWIRE_BIN=build/ripwire      bash test/hotspotsincecheck.sh
 #   RIPWIRE_BIN=build_base/ripwire bash test/hotspotsincecheck.sh   # must FAIL (pre-fix binary)
@@ -22,7 +22,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -33,7 +33,7 @@ echo "hotspotsincecheck: BIN=$BIN  ROOT=$ROOT"
 refuseCase(){
     local value="$1"
     "$BIN" "$ROOT" --hotspots --since="$value" >"$TMP/out" 2>"$TMP/err"; local rc=$?
-    [ "$rc" -eq 1 ] && ok "--since='$value': exit 1" || no "--since='$value': exit $rc (expected 1)"
+    if [ "$rc" -eq 1 ]; then ok "--since='$value': exit 1"; else no "--since='$value': exit $rc (expected 1)"; fi
     grep -q -- "$value" "$TMP/err" && ok "--since='$value': refusal names the value" \
         || no "--since='$value': refusal does not name the value: $( head -c 200 "$TMP/err" )"
     grep -q '<hotspots' "$TMP/out" && no "--since='$value': still emitted a <hotspots> element" \
@@ -43,8 +43,10 @@ refuseCase nonsense
 refuseCase notaref9z          # the digit used to slip past looksLikeDate and become an arbitrary window
 
 # ── 2. a VALID window is reported honestly in BOTH places — attribute and header comment (§P9 N7)
-"$BIN" "$ROOT" --hotspots --since="2 weeks ago" >"$TMP/ok" 2>/dev/null; rc=$?
-[ "$rc" -eq 0 ] && ok '--since="2 weeks ago": exit 0' || no "--since=\"2 weeks ago\": exit $rc (expected 0)"
+# L1 (2026-09-19): the CLI default legend is compact (root leads with schema=, no (window=...) header clause); these
+# arms read the full-default root start-tag and the FULL legend's prose, so they ask for --legend=full.
+"$BIN" "$ROOT" --hotspots --since="2 weeks ago" --legend=full >"$TMP/ok" 2>/dev/null; rc=$?
+if [ "$rc" -eq 0 ]; then ok '--since="2 weeks ago": exit 0'; else no "--since=\"2 weeks ago\": exit $rc (expected 0)"; fi
 grep -q '<hotspots window="2 weeks ago"' "$TMP/ok" && ok 'window= says "2 weeks ago"' \
     || no "window= is not \"2 weeks ago\": $( grep -oE '<hotspots [^>]*' "$TMP/ok" | head -c 120 )"
 grep -q '(window=2 weeks ago)' "$TMP/ok" && ok 'header comment says (window=2 weeks ago) — agrees with the attribute' \
@@ -53,13 +55,13 @@ grep -q '(window=12mo)' "$TMP/ok" && no 'header comment still hardcodes (window=
     || ok 'header comment no longer hardcodes 12mo'
 
 # a revision boundary is the deterministic form and must keep working
-"$BIN" "$ROOT" --hotspots --since=HEAD~5 >"$TMP/rev" 2>/dev/null; rcr=$?
+"$BIN" "$ROOT" --hotspots --since=HEAD~5 --legend=full >"$TMP/rev" 2>/dev/null; rcr=$?
 [ "$rcr" -eq 0 ] && grep -q '<hotspots window="HEAD~5"' "$TMP/rev" \
     && ok "--since=HEAD~5 (revision) still scopes and exits 0" \
     || no "--since=HEAD~5: exit $rcr without window=\"HEAD~5\""
 
 # ── 3. no --since at all: the default window, in both places, unchanged
-"$BIN" "$ROOT" --hotspots >"$TMP/def" 2>/dev/null; rcd=$?
+"$BIN" "$ROOT" --hotspots --legend=full >"$TMP/def" 2>/dev/null; rcd=$?
 # F1 (round C): the default window is HEAD-anchored and its label says so, in BOTH places — the attribute
 # and the header comment must still agree, which is the property this arm exists for.
 [ "$rcd" -eq 0 ] && grep -q '<hotspots window="12mo@HEAD"' "$TMP/def" && grep -q '(window=12mo@HEAD)' "$TMP/def" \
@@ -97,20 +99,23 @@ HS="$( "$BIN" "$ROOT" --hotspots 2>/dev/null | grep -oE '<hotspots [^>]*' )"
 hsattr(){ printf '%s' "$HS" | grep -oE " $1=\"[0-9]+\"" | grep -oE '[0-9]+'; }
 HS_FILES="$( hsattr files )"; HS_RANKED="$( hsattr ranked )"
 HS_NOCHURN="$( hsattr unranked_no_churn )"; HS_NOCX="$( hsattr unranked_no_complexity )"
+# extent honesty (test/extentcheck.sh arm G): a FOURTH bucket, absent when 0 — files whose every scorable function
+# failed a containment check. This repo holds two such fixtures (test/extentfix), so the identity needs the term.
+HS_SUSPECT="$( hsattr unranked_extent_suspect )"; HS_SUSPECT="${HS_SUSPECT:-0}"
 if [ -z "$HS_FILES" ] || [ -z "$HS_RANKED" ] || [ -z "$HS_NOCHURN" ] || [ -z "$HS_NOCX" ]; then
     no "--hotspots does not carry the ranked= denominator + both exclusion counts: $HS"
 else
-    SUM=$(( HS_RANKED + HS_NOCHURN + HS_NOCX ))
+    SUM=$(( HS_RANKED + HS_NOCHURN + HS_NOCX + HS_SUSPECT ))
     [ "$SUM" = "$HS_FILES" ] \
-        && ok "--hotspots: ranked($HS_RANKED) + no_churn($HS_NOCHURN) + no_complexity($HS_NOCX) = files($HS_FILES) — the partition is exact" \
-        || no "--hotspots partition does not reconcile: $HS_RANKED + $HS_NOCHURN + $HS_NOCX = $SUM, files=$HS_FILES"
+        && ok "--hotspots: ranked($HS_RANKED) + no_churn($HS_NOCHURN) + no_complexity($HS_NOCX) + extent_suspect($HS_SUSPECT) = files($HS_FILES) — the partition is exact" \
+        || no "--hotspots partition does not reconcile: $HS_RANKED + $HS_NOCHURN + $HS_NOCX + $HS_SUSPECT = $SUM, files=$HS_FILES"
     MAP_FILES="$( "$BIN" "$ROOT" --top-k=1 2>/dev/null | grep -oE 'files=[0-9]+' | head -1 | grep -oE '[0-9]+' )"
     [ -n "$MAP_FILES" ] && [ "$MAP_FILES" = "$HS_FILES" ] \
         && ok "--hotspots files=\"$HS_FILES\" is the same denominator the default map reports" \
         || no "--hotspots files=$HS_FILES disagrees with the map's files=${MAP_FILES:-<unread>}"
     # the legend must SAY that no_churn conflates a quiet file with one the git-path join never bound —
     # otherwise the number reads as a measure of quietness, which it is not.
-    "$BIN" "$ROOT" --hotspots 2>/dev/null | grep -oE '<!--[^>]*-->' | head -1 | grep -q 'join never bound' \
+    "$BIN" "$ROOT" --hotspots --legend=full 2>/dev/null | grep -oE '<!--[^>]*-->' | head -1 | grep -q 'join never bound' \
         && ok "--hotspots legend states that unranked_no_churn conflates quiet files with unbound ones" \
         || no "--hotspots legend does not disclose what unranked_no_churn conflates"
 fi

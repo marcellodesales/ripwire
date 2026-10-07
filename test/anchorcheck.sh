@@ -9,6 +9,13 @@
 # words never touch. This gate asserts:
 #   * GOLDEN NEUTRALITY — --for WITHOUT --anchor is byte-identical to the pre-change golden capture
 #     (test/anchorfix/golden_for.xml, captured from the pre---anchor binary).
+# NOT RE-PINNED 2026-09-13 (lane/sc-legend, PR #215), and the round trip is the point. The sc= composition rule
+# first joined this legend (+29 B, est_tokens 1349 -> 1361); the review round then made BOTH identity readings
+# present-only, and every row this fixture serves is a free function with no enclosing scope, so the reading has
+# nothing to define here and does not ride. The golden is byte-identical to its pre-lane self at 3,557 B. That is
+# the present-only rule working: a corpus with no scoped symbols pays nothing for the vocabulary of scope, and a
+# corpus with them pays 29 B once. This probe is also --no-route, so the route= reading is absent too -- the
+# control on the other half of the same rule.
 #   * the targeted expansion case — frobnicateWidgetCache (the lexical anchor) directly calls
 #     flushEvictionQueue, which shares NO token with the query: it must appear in the ANCHORED top-4
 #     and must NOT appear in the plain lexical top-4.
@@ -25,7 +32,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 # L5: --anchor is dropped from --help and gated behind RIPWIRE_DEV=1 (negative-result
@@ -101,7 +108,8 @@ QUERY="frobnicate widget cache"
 # ladder trimmed used to appear in neither section), and the clause defining the tail says so. Verified before
 # re-pinning: with every comment and est_tokens= normalized out, old and new documents are byte-identical —
 # this fixture's head covers every file, so its tail is unchanged and every ranking byte is unmoved.
-"$BIN" anchorfix --no-cache --for="$QUERY" --no-route >"$TMP/plain_full.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; this arm compares against a golden recorded from the full default, so it asks for it.
+"$BIN" anchorfix --no-cache --for="$QUERY" --no-route --legend=full >"$TMP/plain_full.xml" 2>/dev/null
 diff -q "$TMP/plain_full.xml" "$ROOT/test/anchorfix/golden_for.xml" >/dev/null \
     && ok "golden-neutral: plain --for --no-route byte-identical to the pre---anchor golden" \
     || no "plain --for --no-route drifted from test/anchorfix/golden_for.xml (--anchor leaked into the default lens)"
@@ -129,11 +137,12 @@ printf '%s' "$ANCH_SIGS" | grep -q 'frobnicateWidgetCache' \
     || no "anchored rank drowned the top lexical anchor — blend is broken"
 
 # ── 3) determinism + well-formed XML on the anchored bundle ───────────────────────────────────────────
-"$BIN" anchorfix --no-cache --for="$QUERY" --anchor >"$TMP/a1" 2>/dev/null
-"$BIN" anchorfix --no-cache --for="$QUERY" --anchor >"$TMP/a2" 2>/dev/null
-diff -q "$TMP/a1" "$TMP/a2" >/dev/null && ok "determinism (--for --anchor byte-identical run-to-run)" || no "non-deterministic --anchor output"
+# L1 (2026-09-19): the EXPERIMENTAL marker below is FULL-legend prose, so both runs ask for the full legend.
+"$BIN" anchorfix --no-cache --for="$QUERY" --anchor --legend=full >"$TMP/a1" 2>/dev/null
+"$BIN" anchorfix --no-cache --for="$QUERY" --anchor --legend=full >"$TMP/a2" 2>/dev/null
+if diff -q "$TMP/a1" "$TMP/a2" >/dev/null; then ok "determinism (--for --anchor byte-identical run-to-run)"; else no "non-deterministic --anchor output"; fi
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/a1" 2>/dev/null && ok "xml well-formed (--for --anchor)" || no "xml malformed (--for --anchor)"
+    if xmllint --noout "$TMP/a1" 2>/dev/null; then ok "xml well-formed (--for --anchor)"; else no "xml malformed (--for --anchor)"; fi
 else
     ok "xml well-formed (xmllint absent — skipped)"
 fi

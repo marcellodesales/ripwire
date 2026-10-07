@@ -60,7 +60,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -115,7 +115,9 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (1) the floor fires: the bundle holds the anchor's file and nothing else ==="
 # ═══════════════════════════════════════════════════════════════════════════
-A_OUT="$( rw --for=FLOORANCHOR_uniquefn )"
+# L1 (2026-09-19): the CLI default legend is compact (it spells the floor as "[floor: kept N of M]"); (3)/(5b) read
+# the FULL header's "relevance floor: kept" wording, so these runs ask for --legend=full, the pre-change default.
+A_OUT="$( rw --for=FLOORANCHOR_uniquefn --legend=full )"
 a_files="$( bundleFiles "$A_OUT" )"
 a_rows="$( printf '%s' "$A_OUT" | grep -o '<d ' | wc -l | tr -d ' ' )"
 if [ "$( printf '%s\n' "$a_files" | grep -c . )" = "1" ] && printf '%s' "$a_files" | grep -q '^src/anchor\.c$'; then
@@ -177,7 +179,7 @@ a_bytes="$( printf '%s' "$A_OUT" | wc -c | tr -d ' ' )"
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (5) nothing matched ⇒ nothing claimed ==="
 # ═══════════════════════════════════════════════════════════════════════════
-Z_OUT="$( rw --for=ZZQQNOSUCHTOKENXYZ )"
+Z_OUT="$( rw --for=ZZQQNOSUCHTOKENXYZ --legend=full )"
 z_rows="$( printf '%s' "$Z_OUT" | grep -o '<d ' | wc -l | tr -d ' ' )"
 z_bytes="$( printf '%s' "$Z_OUT" | wc -c | tr -d ' ' )"
 if [ "$z_rows" = "0" ] && printf '%s' "$Z_OUT" | grep -q '<sigs></sigs>'; then
@@ -215,8 +217,8 @@ printf '%s' "$JZ_OUT" | grep -q '"sigs":\[\]' \
     && ok "(7b) --json answers a no-match query with an empty sigs array" \
     || no "(7b) --json still answered a no-match query with rows"
 if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$J_OUT"  | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null && ok "(7c) the floored --json bundle parses" || no "(7c) the floored --json bundle is not valid JSON"
-    printf '%s' "$JZ_OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null && ok "(7d) the empty --json bundle parses"  || no "(7d) the empty --json bundle is not valid JSON"
+    if printf '%s' "$J_OUT"  | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then ok "(7c) the floored --json bundle parses"; else no "(7c) the floored --json bundle is not valid JSON"; fi
+    if printf '%s' "$JZ_OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then ok "(7d) the empty --json bundle parses"; else no "(7d) the empty --json bundle is not valid JSON"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -243,9 +245,9 @@ echo "=== (9) determinism + well-formed XML on every floored surface ==="
 for q in FLOORANCHOR_uniquefn ZZQQNOSUCHTOKENXYZ "unrelated alpha"; do
     r1="$( rw --for="$q" )"
     r2="$( rw --for="$q" )"
-    [ "$r1" = "$r2" ] && ok "(9) --for=$q is byte-identical across runs" || no "(9) --for=$q is nondeterministic"
+    if [ "$r1" = "$r2" ]; then ok "(9) --for=$q is byte-identical across runs"; else no "(9) --for=$q is nondeterministic"; fi
     if command -v xmllint >/dev/null 2>&1; then
-        printf '%s' "$r1" | xmllint --noout - 2>/dev/null && ok "(9b) --for=$q is well-formed XML" || no "(9b) --for=$q is not well-formed XML"
+        if printf '%s' "$r1" | xmllint --noout - 2>/dev/null; then ok "(9b) --for=$q is well-formed XML"; else no "(9b) --for=$q is not well-formed XML"; fi
     fi
 done
 

@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // scip.h — the SCIP precision overlay (Wave 4 #15): consume a Sourcegraph
 // SCIP index (`--scip=index.scip`) as an OPTIONAL, zero-dependency precision layer over the name-based
@@ -10,7 +13,8 @@
 // delimited fields, and field-skipping — walking only the ~4 message paths that matter:
 //   Index    { documents = 2 }                                            (repeated Document)
 //   Document { relative_path = 1, occurrences = 2, symbols = 3 }
-//   Occurrence { range = 1 (repeated int32, packed), symbol = 2, symbol_roles = 3 }
+//   Occurrence { range = 1 (repeated int32, packed, DEPRECATED), symbol = 2, symbol_roles = 3,
+//                single_line_range = 8, multi_line_range = 9 }
 //   SymbolInformation { symbol = 1, display_name = 6 }                     (display only; optional)
 // Field numbers VERIFIED against https://raw.githubusercontent.com/sourcegraph/scip/main/scip.proto
 // (fetched during implementation): Index.documents=2, Document.relative_path=1/occurrences=2/symbols=3,
@@ -20,14 +24,14 @@
 // 1-based, so we map scipStartLine + 1 ↔ symbol.line.
 //
 // Degrade, never throw (house style): a missing / unreadable / corrupt / truncated / mismatched-tree
-// index emits ONE DEGRADED_PATH_ALERT and returns an EMPTY overlay — the pipeline proceeds name-based,
+// index emits ONE DISCLOSE and returns an EMPTY overlay — the pipeline proceeds name-based,
 // byte-identical to a run with no --scip. The wire reader is bounds-checked on every read so a hostile
 // or truncated blob can never over-read (the fuzz gate flips/truncates bytes and asserts no crash).
 
 #include "model.h"
 #include "scipoverlay.h"        // ScipEdge / ScipCover / ScipOverlay — the data struct (also used by graph.h)
 #include "gitmine.h"            // resolveFileSuffix — map a SCIP relative_path to a ripwire fileId
-#include "infra/Diagnostics.h"   // DEGRADED_PATH_ALERT
+#include "infra/Diagnostics.h"   // DISCLOSE
 
 #include <algorithm>
 #include <cstdint>
@@ -36,6 +40,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "infra/os.h"   // os::open + O_NONBLOCK + os::fcntl — scipReadFile's own non-blocking open of the index; os::fstat + S_ISREG —
+                        // it reads a regular file only; os::close — a descriptor stdio never adopted
 
 namespace rw
 {
@@ -54,7 +61,9 @@ namespace scipwire
         bool atEnd()  const noexcept { return p >= end; }
         bool ok()     const noexcept { return p <= end; }
 
-        // LEB128 varint (≤ 10 bytes). Returns false on truncation / overlong encoding.
+        // LEB128 varint (≤ 10 bytes). Returns false on truncation / overlong encoding. The 10th byte (shift 63) may carry
+        // ONE payload bit: anything more does not fit a uint64, so it is a malformed field, never a value to keep the low
+        // bit of (the shift that dropped it was also a G1 `integer` abort — test/scipcheck.sh arm 5c).
         bool varint( std::uint64_t& out ) noexcept
         {
             std::uint64_t v = 0;
@@ -65,6 +74,10 @@ namespace scipwire
                     return false; // truncated
                 }
                 const std::uint8_t b = *p++;
+                if( shift == 63 && ( b & 0x7F ) > 1 )
+                {
+                    return false; // payload past bit 63 → corrupt
+                }
                 v |= std::uint64_t( b & 0x7F ) << shift;
                 if( ( b & 0x80 ) == 0 ) { out = v; return true; }
             }
@@ -138,7 +151,7 @@ namespace scipwire
 // One occurrence as the wire yields it: 0-based start line + the SCIP symbol string + the role bitfield.
 struct ScipOccurrence
 {
-    std::int64_t startLine = -1;    // range[0]; -1 if the range was absent / malformed
+    std::int64_t startLine = -1;    // start line from range[0] or typed_range; -1 if absent / malformed
     std::string  symbol;            // the SCIP symbol string (e.g. "scip-clang … `A::f`().")
     std::uint32_t roles = 0;        // symbol_roles bitfield; bit 0 (0x1) = Definition
 };
@@ -163,10 +176,41 @@ inline std::int64_t scipDecodeRangeStart( const std::uint8_t* q, std::size_t len
     return std::int64_t( first );
 }
 
+// parse a SingleLineRange / MultiLineRange sub-message -> its start line. Both messages carry the
+// start line in field 1 (SingleLineRange.line, MultiLineRange.start_line). proto3 omits a zero, so a
+// sub-message that carries no field 1 is line 0, not a malformed range.
+inline std::int64_t scipDecodeTypedRangeStart( const std::uint8_t* q, std::size_t len ) noexcept
+{
+    scipwire::Reader r{ q, q + len };
+    while( !r.atEnd() )
+    {
+        std::uint32_t field = 0, wire = 0;
+        if( !r.tag( field, wire ) )
+        {
+            return -1;
+        }
+        if( field == 1 && wire == 0 )
+        {
+            std::uint64_t v;
+            if( !r.varint( v ) )
+            {
+                return -1;
+            }
+            return std::int64_t( v );
+        }
+        if( !r.skip( wire ) )
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 // decode one Occurrence sub-message.
 inline bool scipDecodeOccurrence( const std::uint8_t* q, std::size_t len, ScipOccurrence& occ ) noexcept
 {
     scipwire::Reader r{ q, q + len };
+    bool             typed = false;   // a typed_range outranks the deprecated `range`, per scip.proto
     while( !r.atEnd() )
     {
         std::uint32_t field = 0, wire = 0;
@@ -181,7 +225,10 @@ inline bool scipDecodeOccurrence( const std::uint8_t* q, std::size_t len, ScipOc
             {
                 return false;
             }
-            occ.startLine = scipDecodeRangeStart( rp, rn );
+            if( !typed )
+            {
+                occ.startLine = scipDecodeRangeStart( rp, rn );
+            }
         }
         else if( field == 1 && wire == 0 )                              // range (unpacked): first int = start line
         {
@@ -190,10 +237,20 @@ inline bool scipDecodeOccurrence( const std::uint8_t* q, std::size_t len, ScipOc
             {
                 return false;
             }
-            if( occ.startLine < 0 )
+            if( !typed && occ.startLine < 0 )
             {
                 occ.startLine = std::int64_t( v );
             }
+        }
+        else if( ( field == 8 || field == 9 ) && wire == 2 )            // typed_range: single_line_range | multi_line_range
+        {
+            const std::uint8_t* rp; std::size_t rn;
+            if( !r.lenDelim( rp, rn ) )
+            {
+                return false;
+            }
+            occ.startLine = scipDecodeTypedRangeStart( rp, rn );
+            typed         = true;
         }
         else if( field == 2 && wire == 2 )                              // symbol (string)
         {
@@ -299,12 +356,26 @@ inline bool scipDecodeIndex( const std::uint8_t* data, std::size_t size, std::ve
 // ---- load the whole file (bounded) -----------------------------------------------------------------
 // Read a .scip file into a byte buffer. Empty on any I/O failure (caller degrades). Bounded at 256 MiB
 // — a SCIP index larger than that on a repo ripwire can parse is almost certainly the wrong file.
+// The open is checked HERE, on its own descriptor: main.cpp's probe closed the descriptor it judged, so by now the path may
+// name something else, and a FIFO put there would block a plain fopen waiting for a writer. So the path is opened O_NONBLOCK
+// (a read-only open of a FIFO returns at once) and fstat on THAT descriptor admits a regular file only; anything else yields
+// no bytes, and loadScipOverlay degrades exactly as for a file emptied after the probe. For a regular file O_NONBLOCK is then
+// cleared (fcntl) before fdopen hands the descriptor to stdio, so everything below is the blocking stdio read the plain
+// fopen gave — the same size bound, the same short-read rule — even on a filesystem that honours O_NONBLOCK for a file.
 inline std::vector<std::uint8_t> scipReadFile( const char* path )
 {
     std::vector<std::uint8_t> bytes;
-    std::FILE* f = std::fopen( path, "rb" );
+    const int indexFd = os::open( path, O_RDONLY | O_NONBLOCK | O_CLOEXEC );
+    if( indexFd < 0 )
+    {
+        return bytes;
+    }
+    os::stat_t indexStat;
+    const int   statusFlags = ( os::fstat( indexFd, &indexStat ) == 0 && S_ISREG( indexStat.st_mode ) ) ? os::fcntl( indexFd, F_GETFL ) : -1;
+    std::FILE*  f           = ( statusFlags >= 0 && os::fcntl( indexFd, F_SETFL, statusFlags & ~O_NONBLOCK ) == 0 ) ? os::fdopen( indexFd, "rb" ) : nullptr;
     if( !f )
     {
+        os::close( indexFd );   // not a regular file, or fcntl/fdopen failed — stdio never adopted the descriptor
         return bytes;
     }
     if( std::fseek( f, 0, SEEK_END ) != 0 ) { std::fclose( f ); return bytes; }
@@ -666,25 +737,30 @@ inline ScipOverlay buildScipOverlay( const IngestResult& ing, const std::vector<
 }
 
 // ---- top-level entry: path → overlay (degrade to empty on any failure) -----------------------------
-// The ONE seam main.cpp calls. Missing / unreadable / corrupt / truncated / mismatched-tree index →
-// exactly one DEGRADED_PATH_ALERT + an empty overlay (the pipeline proceeds name-based, byte-identical
-// to a no---scip run). Never throws.
+// The ONE seam main.cpp calls, and only after main.cpp has REFUSED (exit 1) every path that cannot be read as an index at
+// all: one that cannot be opened, an empty regular file, and anything that is not a regular file (a directory, a FIFO, a
+// device) (scipIndexUnreadableReason, owner decision 2026-09-12). Only a path that was a regular, non-empty file at that
+// probe reaches this seam. It degrades with exactly one DISCLOSE and an empty overlay, and the pipeline proceeds
+// name-based, byte-identical to a no---scip run, when the read yields no bytes (an index over the 256 MiB bound, a short
+// read, a file emptied after main.cpp's probe, or a path replaced after it by something that is not a regular file, which
+// scipReadFile's own non-blocking open never reads) or the index is corrupt, truncated or built from a mismatched tree.
+// Never throws.
 inline ScipOverlay loadScipOverlay( std::string_view path, const IngestResult& ing )
 {
     const std::string             p( path );
     const std::vector<std::uint8_t> bytes = scipReadFile( p.c_str() );
     if( bytes.empty() )
     {
-        DEGRADED_PATH_ALERT( "--scip: index missing or unreadable — proceeding name-based" );
-        std::fprintf( stderr, "ripwire --scip: cannot read index '%s' — proceeding name-based\n", p.c_str() );
+        DISCLOSE( "--scip: index missing or unreadable — proceeding name-based" );
+        rw::emitTo( stderr, "ripwire --scip: cannot read index '{}' — proceeding name-based\n", p.c_str() );
         return {};
     }
 
     std::vector<ScipDocument> docs;
     if( !scipDecodeIndex( bytes.data(), bytes.size(), docs ) )
     {
-        DEGRADED_PATH_ALERT( "--scip: corrupt/truncated index — proceeding name-based" );
-        std::fprintf( stderr, "ripwire --scip: corrupt or truncated index '%s' — proceeding name-based\n", p.c_str() );
+        DISCLOSE( "--scip: corrupt/truncated index — proceeding name-based" );
+        rw::emitTo( stderr, "ripwire --scip: corrupt or truncated index '{}' — proceeding name-based\n", p.c_str() );
         return {};
     }
 
@@ -701,8 +777,8 @@ inline ScipOverlay loadScipOverlay( std::string_view path, const IngestResult& i
     {
         // decoded fine, but nothing mapped AND no occurrence was even examined: the index describes a
         // DIFFERENT tree than the one ripwire parsed (wrong index / wrong root). Say so, proceed name-based.
-        DEGRADED_PATH_ALERT( "--scip: index covers no parsed file/line — proceeding name-based" );
-        std::fprintf( stderr, "ripwire --scip: index '%s' matched no parsed (file,line) — proceeding name-based\n", p.c_str() );
+        DISCLOSE( "--scip: index covers no parsed file/line — proceeding name-based" );
+        rw::emitTo( stderr, "ripwire --scip: index '{}' matched no parsed (file,line) — proceeding name-based\n", p.c_str() );
     }
     else if( sawOccurrences )
     {
@@ -729,8 +805,8 @@ inline ScipOverlay loadScipOverlay( std::string_view path, const IngestResult& i
         // append the older-commit hint ONLY when a staleness signal is present: refs were dropped (matched <
         // internal occurrences seen) or defs did not map. At a clean 100%/0-unmatched the hint would be misleading.
         const bool        stale = matchedOccurrencesPreDedup < internalOccurrences || ov.defsUnmatched > 0;
-        std::fprintf( stderr,
-            "ripwire: SCIP matched %d%% of occurrences (%zu/%zu), %zu defs unmatched, %zu external (unmatchable) occurrences skipped%s\n",
+        rw::emitTo( stderr,
+            "ripwire: SCIP matched {}% of occurrences ({}/{}), {} defs unmatched, {} external (unmatchable) occurrences skipped{}\n",
             pct, matchedOccurrencesPreDedup, internalOccurrences, ov.defsUnmatched, externalOccurrences,
             stale ? " — index may be from an older commit" : "" );
     }

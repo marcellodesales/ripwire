@@ -14,7 +14,7 @@ set -u
 BIN="${1:-${RIPWIRE_BIN:-./build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$PWD/$BIN"
 fail=0
-ok(){ echo "  PASS  $1"; }
+ok(){ echo "  PASS  $1" || { fail=1; echo "  FAIL  could not write the PASS line for: $1"; }; return 0; }
 no(){ echo "  FAIL  $1"; fail=1; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
@@ -122,7 +122,7 @@ if printf '%s' "$cl" | xmllint --noout - 2>/dev/null; then ok "--clones output i
 # determinism
 c1="$("$BIN" "$FIX" --clones --no-cache 2>/dev/null)"
 c2="$("$BIN" "$FIX" --clones --no-cache 2>/dev/null)"
-[ "$c1" = "$c2" ] && ok "--clones deterministic run-to-run" || no "--clones not deterministic"
+if [ "$c1" = "$c2" ]; then ok "--clones deterministic run-to-run"; else no "--clones not deterministic"; fi
 
 # ── 2) --quality-delta flags a NEWLY-introduced Type-3 near-clone as a duplication regression ─────────────────
 QD="$WORK/qd"; mkdir -p "$QD"
@@ -170,13 +170,13 @@ if printf '%s' "$d1" | grep -qE '<r kind="duplication"[^>]*members="[^"]*alpha[^
 else
   no "--quality-delta should flag the new alpha/beta Type-3 near-clone as duplication"; echo "     got: $d1"
 fi
-[ "$drc" -eq 2 ] && ok "--quality-delta exits 2 on the new duplication regression" || no "--quality-delta should exit 2 (got $drc)"
+if [ "$drc" -eq 2 ]; then ok "--quality-delta exits 2 on the new duplication regression"; else no "--quality-delta should exit 2 (got $drc)"; fi
 
 # XML well-formed + determinism of the delta
 if printf '%s' "$d1" | xmllint --noout - 2>/dev/null; then ok "--quality-delta output is well-formed XML"; else no "--quality-delta output is not well-formed XML"; fi
 q1="$("$BIN" "$QD" --quality-delta --no-cache 2>/dev/null)"
 q2="$("$BIN" "$QD" --quality-delta --no-cache 2>/dev/null)"
-[ "$q1" = "$q2" ] && ok "--quality-delta deterministic run-to-run" || no "--quality-delta not deterministic"
+if [ "$q1" = "$q2" ]; then ok "--quality-delta deterministic run-to-run"; else no "--quality-delta not deterministic"; fi
 
 # §P10.5: clones and the quality-delta verb share the detector but not the POLICY — groups whose every
 # member is fixture-class or a shell test-runner now carry exempt= (same predicates, one policy source),
@@ -206,7 +206,8 @@ CLTOTAL="$(  printf '%s' "$CL" | grep -oE '<clones[^>]*>' | grep -oE ' total="[0
 
 # a --limit run reaching every row: total= (from the paging half) must equal the SAME value, and the
 # row count it walks toward must equal groups+type3 too (the "true row total" the audit item names).
-CLPAGED="$( "$BIN" . --clones --limit=100000 --no-cache 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact and spells `<group …>` inside its comment; CLP_ROWS counts real rows, so it asks for the full legend.
+CLPAGED="$( "$BIN" . --clones --limit=100000 --no-cache --legend=full 2>/dev/null )"
 CLP_TOTAL="$( printf '%s' "$CLPAGED" | grep -oE '<clones[^>]*>' | grep -oE ' total="[0-9]+"' | grep -oE '"[0-9]+"' | tr -d '"' )"
 CLP_SHOWN="$( printf '%s' "$CLPAGED" | grep -oE '<clones[^>]*>' | grep -oE ' shown="[0-9]+"' | grep -oE '"[0-9]+"' | tr -d '"' )"
 CLP_ROWS="$(  printf '%s' "$CLPAGED" | grep -o '<group '  | wc -l | tr -d ' ' )"

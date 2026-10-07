@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>   // std::any_of (H8: findings_capped over the emitted rules)
+#include <charconv>    // std::from_chars — parseProfTsv's line column (never std::atoi: undefined past INT_MAX)
+#include <system_error> // std::errc — from_chars' result
 #include <cstdio>      // stdout / stderr — the two streams the shims below name
 #include <format>      // std::format_string — the shims' format contract (see test/printffmtparitycheck.sh)
 #include "infra/emit.h" // rw::emitTo — THE emitter: std::print where the library has <print>, std::format+fputs
@@ -579,10 +581,20 @@ std::optional<std::vector<ProfScopeRow>> parseProfTsv( const std::string& path )
         {
             continue;   // a short row carries nothing joinable; skip it rather than invent columns
         }
+        // std::from_chars, not std::atoi: atoi is undefined past INT_MAX, and libc kept the low 32 bits, so a line of
+        // 4294967329 read as 33 and joined a finding to a site that is not there. A column that is not wholly a number
+        // in range is a row that carries nothing joinable, like the short row above (test/withprofilecheck.sh arm 8).
+        int                             parsedLine = 0;
+        const std::string&              lineCell   = cells[2];
+        const auto [ lineEnd, lineErr ] = std::from_chars( lineCell.data(), lineCell.data() + lineCell.size(), parsedLine );
+        if( lineErr != std::errc{} || lineEnd != lineCell.data() + lineCell.size() || parsedLine <= 0 )
+        {
+            continue;
+        }
         ProfScopeRow row;
         row.scope = cells[0];
         row.file  = cells[1];
-        row.line  = std::atoi( cells[2].c_str() );
+        row.line  = parsedLine;
         for( std::size_t cellIndex = 3; cellIndex < cells.size() && cellIndex < header.size(); ++cellIndex )
         {
             row.cols.emplace_back( header[cellIndex], cells[cellIndex] );
@@ -1035,6 +1047,8 @@ struct MatchQueryOutcome
     std::size_t                eligibleFiles = 0;
     std::string                nearestKind;     // octocode F3: "" when no candidate was close enough
     std::string                nearestGrammar;  // "" alongside a "" nearestKind
+    std::vector<std::string>   regexRefused;    // src/regexguard.h: "'PATTERN' refused: REASON" per refused #match? pattern
+    rw::AstRegexUndecidedReport regexUndecided;      // #match? evaluations that could not be decided, by cause, first site named
 };
 
 // Runs a --match query and reports the grammar-applicability disclosure (see AstQueryGroup::grammarsOut/
@@ -1055,11 +1069,104 @@ static MatchQueryOutcome runMatchQuery( const rw::IngestResult& ing, const std::
     grp.eligibleFilesOut  = &out.eligibleFiles;
     grp.nearestKindOut    = &nearestKinds;      // octocode F3: parallel to uncompiledOut — a one-spec caller
     grp.nearestGrammarOut = &nearestGrammars;   // ever gets at most one entry in either
+    rw::AstRegexUndecided      regexUndecided;
+    grp.regexRefusedOut   = &out.regexRefused;  // the query is the user's, so its #match? patterns are too
+    grp.regexUndecidedOut = &regexUndecided;
     out.matches = std::move( rw::astQueryGrouped( ing, { grp } )[0] );
+    out.regexUndecided = regexUndecided.report();
     out.grammarsAttr = rw::mcprefuse::joinClauses( std::vector<std::string_view>( grammarsOut.begin(), grammarsOut.end() ), "," );
     if( !nearestKinds.empty() )    { out.nearestKind    = std::move( nearestKinds[0] ); }
     if( !nearestGrammars.empty() ) { out.nearestGrammar = std::move( nearestGrammars[0] ); }
     return out;
+}
+
+// src/regexguard.h, applied to a user's tree-sitter query: a #match?/#not-match? predicate the guard could not
+// DECIDE used to filter nothing — a refused pattern kept every row, an abandoned match kept that one — and the
+// verb printed the rows as the query's answer at exit 0 (on libstdc++ the catastrophic pattern backtracked
+// without end instead). A user wrote the pattern, so the verb refuses by name, the way --regex does: a pattern
+// refusal is decided when the query compiles, whatever the files hold; the undecided count is what the walk met.
+// `verb` is the flag the user typed; `where` is the closing clause that locates the pattern (the query echoed, or
+// the rules directory).
+//
+// An undecided evaluation is reported BY CAUSE, and the first site (lowest file, then byte) is named with the text
+// that caused it: "the regex engine abandoned the match" is the right sentence only for an abandoned match, and a
+// captured string literal that the screen refused, or that does not parse, needs the reader to see THAT text.
+static std::string undecidedPredicateCauses( const rw::AstRegexUndecidedReport& u )
+{
+    std::vector<std::string> parts;
+    if( u.textScreened != 0 )     { parts.push_back( std::to_string( u.textScreened ) + " captured text(s) the structural screen refused as a pattern" ); }
+    if( u.textUncompilable != 0 ) { parts.push_back( std::to_string( u.textUncompilable ) + " captured text(s) that do not compile as a pattern" ); }
+    if( u.abandoned != 0 )        { parts.push_back( std::to_string( u.abandoned ) + " match(es) the regex engine abandoned" ); }
+    if( u.skipped != 0 )          { parts.push_back( std::to_string( u.skipped ) + " match(es) whose captured text was too long to reach the regex engine" ); }
+    std::string joined;
+    for( const std::string& part : parts )
+    {
+        joined += joined.empty() ? part : ", " + part;
+    }
+    return joined;
+}
+
+static std::string undecidedPredicateFirstSite( const rw::Config& cfg, const rw::IngestResult& ing, const rw::AstRegexUndecidedReport& u )
+{
+    if( !u.hasFirst )
+    {
+        return {};
+    }
+    const bool             singleRoot = ing.realPaths.empty() && cfg.roots.size() == 1;
+    const std::string      rootPrefix = singleRoot ? rw::sarif::rootPrefixOf( std::string( cfg.roots[0] ) ) : std::string();
+    const std::string_view path       = singleRoot ? rw::sarif::rootRelativeUri( ing.files[ u.firstFileId ], rootPrefix ) : std::string_view( ing.files[ u.firstFileId ] );
+    const std::string      at         = std::string( path ) + ":" + std::to_string( u.firstLine );
+    if( u.firstCause == rw::AstRegexUndecidedCause::Abandoned )
+    {
+        return "the first, at " + at + ", ran the pattern '" + u.firstPattern + "': " + u.firstReason;
+    }
+    if( u.firstCause == rw::AstRegexUndecidedCause::Skipped )
+    {
+        return "the first, at " + at + ", never ran the pattern '" + u.firstPattern + "': " + u.firstReason;
+    }
+    const char* const verdict = ( u.firstCause == rw::AstRegexUndecidedCause::TextScreened ) ? "which the structural screen refused" : "which does not compile";
+    return "the first, at " + at + ", used the captured text '" + u.firstPattern + "' as its pattern, " + verdict + ": " + u.firstReason;
+}
+
+// `firstSite` is undecidedPredicateFirstSite's clause for this report (empty when nothing was undecided).
+static bool refuseUndecidedMatchRegex( std::string_view verb, const std::vector<std::string>& refused, const rw::AstRegexUndecidedReport& undecided,
+                                       std::string_view firstSite, std::string_view where )
+{
+    if( !refused.empty() )
+    {
+        lintPrintErr( "ripwire: {}: the #match? pattern {}, nothing was reported ({} refused pattern(s); a predicate that cannot be compiled "
+                      "would filter nothing, so the rows would not be the query's answer — fix the pattern) ({})\n",
+                      verb, refused.front(), refused.size(), where );
+        return true;
+    }
+    if( undecided.total() != 0 && undecided.hasFirst )
+    {
+        lintPrintErr( "ripwire: {}: {} #match?/#not-match? evaluation(s) could not be decided ({}); {} — refusing rather than reporting rows no "
+                      "predicate judged ({})\n",
+                      verb, undecided.total(), undecidedPredicateCauses( undecided ), firstSite, where );
+        return true;
+    }
+    return false;
+}
+
+// The ids of the user rules any of whose queries (main or combinator) carries a #match?/#not-match? predicate, in
+// load order — the rules an undecided-predicate refusal can be about, so the refusal names them rather than only the
+// directory (the per-evaluation counter is kept per group, not per rule).
+static std::string rulesWithMatchPredicate( const std::vector<rw::LintRule>& rules )
+{
+    const auto hasPredicate = []( const std::string& query ) { return query.find( "match?" ) != std::string::npos; };
+    std::string ids;
+    for( const rw::LintRule& r : rules )
+    {
+        const bool any = hasPredicate( r.query ) || std::any_of( r.inside.begin(), r.inside.end(), hasPredicate )
+                      || std::any_of( r.notInside.begin(), r.notInside.end(), hasPredicate )
+                      || std::any_of( r.notMatches.begin(), r.notMatches.end(), hasPredicate );
+        if( any )
+        {
+            ids += ids.empty() ? r.id : "," + r.id;
+        }
+    }
+    return ids;
 }
 
 // Join owned strings through the ONE joiner the refusal surfaces already use, so a list this file prints
@@ -1080,8 +1187,8 @@ inline constexpr std::string_view kPatternLegend =
                          "resolved for and shapes= the node KIND it became in each, so what was actually searched for is auditable; "
                          "unsupported= names the families this verb does not serve at all (a zero there would be a lie, so it never "
                          "reports one). Every grammar name here is per grammar OBJECT, so a dialect that borrows another's templates "
-                         "is spelled apart from it (cpp/cu = the CUDA grammar, typescript/tsx = the TSX one); a bare cpp NEVER stands "
-                         "for its dialects. eligible_files= = corpus files whose grammar the pattern resolved for, i.e. the files "
+                         "is spelled apart from it (cpp/cu = the CUDA grammar); a bare cpp NEVER stands for its dialects. "
+                         "eligible_files= = corpus files whose grammar the pattern resolved for, i.e. the files "
                          "actually SCANNED; skipped_files= = files in a served language it did NOT resolve for, which were never read "
                          "at all; of_files= = total indexed files. $NAME binds one node and the same $NAME twice must match "
                          "structurally; $_ binds nothing; the ellipsis is matched by a single first-match-wins probe (never an "
@@ -1093,7 +1200,9 @@ inline constexpr std::string_view kPatternLegend =
                          "counts_floor=\"1\" and capped=\"1\" — rows exist that no page holds) or ellipsis_capped=\"1\"; "
                          "the latter means an ellipsis probe gave up on ellipsis_skipped= candidate nodes whose sibling run exceeded "
                          "ellipsis_bound, so a node that would have matched can be missing (ellipsis_skipped= counts ABANDONS and is "
-                         "itself a floor on those nodes). raise the default cap with limit=N (offset=M pages; a cut listing carries total=/has_more=/next_offset= so a paging loop can continue from it) -->";
+                         "itself a floor on those nodes). nest_refused= (absent if 0) counts corpus files a pre-parse nesting guard "
+                         "refused before this walk could reach them, excluded from both eligible_files= and skipped_files=; see the "
+                         "skipped verb's why=\"nest-refused\" rows for which. raise the default cap with limit=N (offset=M pages; a cut listing carries total=/has_more=/next_offset= so a paging loop can continue from it) -->";
 
 // R2 — everything ONE pattern run answers with before a byte is emitted, as one structured return (the
 // same shape, and the same reason, as MatchQueryOutcome above). A non-empty `refusal` is the whole result:
@@ -1110,7 +1219,14 @@ struct PatternSearchOutcome
     std::size_t               skippedFiles  = 0;   // served-language files this pattern never scanned (V-3)
     bool                      ellipsisCapped = false;   // an ellipsis probe abandoned a node at the bound (V-2)
     std::uint64_t             ellipsisSkipped = 0;      // how many times — a floor on the nodes left unevaluated
+    std::uint64_t             qualifiedUnmatched = 0;   // nodes only a qualified spelling of a pattern leaf matches (not hits)
 };
+
+// unmatched_qualified= (present only when non-zero): its reading rides the answer that carries it, beside the root.
+inline constexpr std::string_view kPatternQualifiedLegend =
+    "<!-- unmatched_qualified=N: N more nodes match only when a name in q= is read as the last segment of a "
+    "scope-qualified name (ns::name, a::b::name) - NOT in hits=; spell the qualifier in the pattern to match them. "
+    "A floor when the hit budget stops the walk (hits_capped=1): nodes past the stop are not counted -->";
 
 // Compile the pattern for every served grammar, decide refusal-or-proceed, run the walk, and assemble the
 // disclosures. The refusal path is the load-bearing half: §P0.1's rule one level out — a pattern nothing
@@ -1131,16 +1247,19 @@ static PatternSearchOutcome runPatternSearch( const rw::IngestResult& ing, std::
     const rw::pattern::PatternProgramSet& progs = compiled.set;
 
     std::atomic<std::uint64_t> ellipsisCapped{ 0 };
+    std::atomic<std::uint64_t> qualifiedUnmatched{ 0 };
 
     rw::AstQueryGroup grp;
     grp.walk              = rw::AstWalk::Pattern;
     grp.patternPrograms   = &progs;
     grp.maxMatches        = rw::pattern::kMaxHits;
     grp.ellipsisCappedOut = &ellipsisCapped;
+    grp.qualifiedUnmatchedOut = &qualifiedUnmatched;
     out.matches           = std::move( rw::astQueryGrouped( ing, { grp } )[0] );
 
     out.ellipsisSkipped = ellipsisCapped.load( std::memory_order_relaxed );
     out.ellipsisCapped  = out.ellipsisSkipped != 0;
+    out.qualifiedUnmatched = qualifiedUnmatched.load( std::memory_order_relaxed );
 
     out.grammarsAttr                 = joinOwned( rw::pattern::resolvedNames( progs ), "," );
     out.shapesAttr                   = joinOwned( rw::pattern::resolvedShapes( progs ), "," );
@@ -1307,6 +1426,11 @@ std::optional<int> runLint( const MainDispatch& d )
                             cfg.match, matchNearestKindClause( mq.nearestKind, mq.nearestGrammar ) );
                 return 1;
             }
+            if( refuseUndecidedMatchRegex( "--match", mq.regexRefused, mq.regexUndecided, undecidedPredicateFirstSite( cfg, ing, mq.regexUndecided ),
+                                           "query as received: " + std::string( cfg.match ) ) )
+            {
+                return 1;
+            }
             // §P8 G3: --match was missed when its sibling --grep got paging — `--limit=5` still emitted the
             // full 100-row cap, so the two structurally identical search verbs disagreed about whether
             // --limit meant anything. Same window, same disclosure, same default cap (--pack-top-n, else
@@ -1317,14 +1441,22 @@ std::optional<int> runLint( const MainDispatch& d )
             char              mpab[ kPageDisclosureCap ];
             // §L3: no `attr="value"` spelled out below for grammars=/eligible_files=/of_files= — a naive
             // whole-line grep (matchcapturecheck.sh's own idiom) would match the WORDED example first.
+            // #157: a file the nesting guard refused is excluded from eligible_files= and never reaches this
+            // walk, so a reader must be told the corpus held one rather than reading a clean match answer as
+            // proof the pattern does not occur there too. Same reused why token the skipped verb's rows carry.
+            const std::string matchNestRefusedAttr = ing.crawlSkips.nestRefusedFiles > 0
+                ? " nest_refused=\"" + std::to_string( ing.crawlSkips.nestRefusedFiles ) + "\""
+                : std::string();
             lintPrintOut( "<!-- ripwire match: tree-sitter structural query; each hit = a captured node + its enclosing symbol. "
                         "shown=/capped= = rows printed vs found; hits_capped=\"1\" ⇒ hits= is a FLOOR (engine match limit reached) and the "
                         "root then also carries counts_floor=\"1\" and capped=\"1\" — rows exist that NO page holds (the engine cap, not the "
                         "window, dropped them; narrow the query), while has_more= keeps its window meaning so a loop still terminates. "
                         "auto_captured=\"1\" ⇒ the query bound no @capture and ripwire appended `@m` to its single top-level pattern. "
                         "grammars= names every grammar the query compiled against; eligible_files=/of_files= are corpus files in that "
-                        "language set vs total indexed files. raise the default cap with limit=N (offset=M pages; a cut listing carries total=/has_more=/next_offset= so a paging loop can continue from it) -->" );
-            lintPrintOut( "<match hits=\"{}\"{} hits_capped=\"{}\"{} grammars=\"{}\" eligible_files=\"{}\" of_files=\"{}\"{}>",
+                        "language set vs total indexed files. nest_refused= (absent if 0) counts corpus files a pre-parse nesting guard "
+                        "refused before this walk could reach them, excluded from eligible_files=; see the skipped verb's why=\"nest-refused\" "
+                        "rows for which. raise the default cap with limit=N (offset=M pages; a cut listing carries total=/has_more=/next_offset= so a paging loop can continue from it) -->" );
+            lintPrintOut( "<match hits=\"{}\"{} hits_capped=\"{}\"{} grammars=\"{}\" eligible_files=\"{}\" of_files=\"{}\"{}{}>",
                         ms.size(),
                         pageDisclosure( mpab, sizeof( mpab ), matchShown, ms.size(), matchPage.end,
                                         cfg.pageLimit, cfg.pageOffset, true, kXmlPageSyntax,
@@ -1334,7 +1466,8 @@ std::optional<int> runLint( const MainDispatch& d )
                         ex( grammarsAttr ),
                         eligibleFiles,
                         ing.files.size(),
-                        lintRootAttr );
+                        lintRootAttr,
+                        matchNestRefusedAttr );
             for( std::size_t hitIndex = matchPage.begin; hitIndex < matchPage.end; ++hitIndex )
             {
                 const AstMatch&         m  = ms[ hitIndex ];
@@ -1366,12 +1499,22 @@ std::optional<int> runLint( const MainDispatch& d )
             const std::size_t patShown = patPage.end - patPage.begin;
             char              ppab[ kPageDisclosureCap ];
             lintPrintOut( "{}", kPatternLegend );
+            if( ps.qualifiedUnmatched > 0 )
+            {
+                lintPrintOut( "{}", kPatternQualifiedLegend );
+            }
             // unresolved_in= is withheld only when it could not mislead: a run that found matches AND read
             // every file it serves. The moment a served-language file went unscanned (skipped_files>0), the
             // partial resolution is exactly what explains it, hits>0 or not — V-3's second case, where a
             // matched .tsx sat beside a silently unread .ts.
             const bool tellUnresolved = ps.matches.empty() || ps.skippedFiles > 0;
-            lintPrintOut( "<pattern hits=\"{}\"{} hits_capped=\"{}\" q=\"{}\" grammars=\"{}\" shapes=\"{}\" unsupported=\"{}\"{}{} eligible_files=\"{}\" skipped_files=\"{}\" of_files=\"{}\"{}>",
+            // #157: same disclosure as --match, over the same shared walk (AstWalk::Pattern reaches the
+            // identical per-file skip). Absent when nothing was refused.
+            const std::string patNestRefusedAttr = ( ing.crawlSkips.nestRefusedFiles > 0
+                ? " nest_refused=\"" + std::to_string( ing.crawlSkips.nestRefusedFiles ) + "\""
+                : std::string() )
+                + ( ps.qualifiedUnmatched > 0 ? " unmatched_qualified=\"" + std::to_string( ps.qualifiedUnmatched ) + "\"" : std::string() );
+            lintPrintOut( "<pattern hits=\"{}\"{} hits_capped=\"{}\" q=\"{}\" grammars=\"{}\" shapes=\"{}\" unsupported=\"{}\"{}{} eligible_files=\"{}\" skipped_files=\"{}\" of_files=\"{}\"{}{}>",
                         ps.matches.size(),
                         pageDisclosure( ppab, sizeof( ppab ), patShown, ps.matches.size(), patPage.end, cfg.pageLimit, cfg.pageOffset, true,
                                         kXmlPageSyntax, /*collectionCapped=*/ ps.matches.size() >= rw::pattern::kMaxHits ),   // H8
@@ -1385,7 +1528,8 @@ std::optional<int> runLint( const MainDispatch& d )
                         ps.eligibleFiles,
                         ps.skippedFiles,
                         ing.files.size(),
-                        lintRootAttr );
+                        lintRootAttr,
+                        patNestRefusedAttr );
             for( std::size_t hitIndex = patPage.begin; hitIndex < patPage.end; ++hitIndex )
             {
                 const rw::AstMatch&    m  = ps.matches[ hitIndex ];
@@ -1528,7 +1672,7 @@ std::optional<int> runLint( const MainDispatch& d )
         {
             if( !magicFileRead[fileId] )
             {
-                darkflags::readWhole( diskPath( ing, fileId ), magicFileBytes[fileId] );
+                magicFileBytes[fileId] = darkflags::readWhole( diskPath( ing, fileId ) ).value_or( std::string() );
                 magicFileRead[fileId] = 1;
             }
             return magicFileBytes[fileId];
@@ -1695,7 +1839,13 @@ std::optional<int> runLint( const MainDispatch& d )
                 lintPrintErr( "ripwire: --lint-rules={}: no rules loaded\n", cfg.lintRulesDir );
                 return 1;
             }
-            const auto [ userFindings, saturatedUserRuleIds, uncompiledIds ] = runLintRules( ing, userRules );
+            const auto [ userFindings, saturatedUserRuleIds, uncompiledIds, regexRefused, regexUndecided ] = runLintRules( ing, userRules );
+            if( refuseUndecidedMatchRegex( "--lint-rules", regexRefused, regexUndecided, undecidedPredicateFirstSite( cfg, ing, regexUndecided ),
+                                           "rules loaded from " + std::string( cfg.lintRulesDir ) + " whose queries carry a #match?/#not-match? predicate: "
+                                               + rulesWithMatchPredicate( userRules ) ) )
+            {
+                return 1;
+            }
             for( const LintFinding& f : userFindings )
             {
                 outs.push_back( { f.fileId, f.startByte, f.line, f.id, f.severity, f.message } );
@@ -1737,7 +1887,7 @@ std::optional<int> runLint( const MainDispatch& d )
         // ("trims to fit") kept and no way for a caller to see it coming; every other verb in the catalog has
         // a display default (--hotspots 40, --grep 100, …), --lint alone had none. Measured HERE before
         // choosing the cap: this repo prints 367,924 B / 3,213 findings (~114 B/finding); a second, larger
-        // polyglot fixture (ctxpack, 1,033 tracked files) prints 254,445 B / 2,312 findings (~110 B/finding).
+        // polyglot fixture (ripwire's pre-cutover ancestor, 1,033 tracked files) prints 254,445 B / 2,312 findings (~110 B/finding).
         // kLintDefaultPayloadBytes=100,000 lands an order of magnitude under E6's pathological case while
         // staying multiples of every other capped verb's default payload on this repo (--hotspots ~5.5 KB,
         // --clones ~17 KB, --grep(100 hits) ~57 KB) — --lint's own facts are individually smaller so it earns
@@ -1764,7 +1914,7 @@ std::optional<int> runLint( const MainDispatch& d )
                 const LintOut& m = outs[i];
                 const Symbol*  e = enclosing( m.fileId, m.startByte );
                 const std::size_t rowBytes = m.text.size() + m.rule.size() + m.sev.size()
-                                            + ing.files[ m.fileId ].size()
+                                            + rootRelPath( ing, m.fileId ).size()   // #228: the row prints p= root-relative, so the cap charges that
                                             + ( e ? e->name.size() : 0 ) + 80;
                 if( lintDefaultShown > 0 && bytesUsed + rowBytes > kLintDefaultPayloadBytes )
                 {
@@ -1860,6 +2010,15 @@ std::optional<int> runLint( const MainDispatch& d )
         {
             lintRootExtra += " naming_locals=\"1\"";
         }
+        // #157 (CodeRabbit on #331): the rule walk is astQueryGrouped, which skips every file ingest's nesting guard
+        // refused — the same skip --match and --pattern disclose as nest_refused=, and the one the --skipped legend
+        // says all three share. Without it here a refused .kt file vanished from every rule's count with no trace.
+        // Absent when 0, like inert_rules=, so every lint answer over a corpus with no refusal is byte-identical.
+        const bool lintNestRefused = ing.crawlSkips.nestRefusedFiles > 0;
+        if( lintNestRefused )
+        {
+            lintRootExtra += std::format( " nest_refused=\"{}\"", ing.crawlSkips.nestRefusedFiles );
+        }
 
         // §P8 collision, documented not renamed — see the --grep legend above for the full reasoning.
         lintPrintOut( "<!-- ripwire lint: [AST]-only checks (descriptive facts, not gates). rule=the check; sev=user-rule severity; "
@@ -1889,6 +2048,13 @@ std::optional<int> runLint( const MainDispatch& d )
                     "malformed or misspelled pattern) — its count=\"0\" never ran at all, a different claim from applicable=\"0\" above "
                     "(a well-formed query whose declared language just is not in this corpus) and from an ordinary count=\"0\" (a "
                     "well-formed query that ran and found nothing); absent ⇒ the query compiled. -->" );
+        if( lintNestRefused )
+        {
+            lintPrintOut( "<!-- lint nest_refused= on the root counts corpus files a pre-parse nesting guard refused before any rule's walk "
+                        "could reach them, so no count= includes them; the count is corpus-wide, not narrowed to a language any rule here "
+                        "declares, so some of it was never going to be read by lint regardless; see the skipped verb's why=\"nest-refused\" "
+                        "rows for which. -->" );
+        }
         if( !cfg.withProfile.empty() )
         {
             lintPrintOut( "<!-- with-profile: heat_* on a finding = MEASURED inclusive totals of the joined #PROF_TSV scope — the nearest "

@@ -1,9 +1,24 @@
 ; ripwire TypeScript tags — written for ripwire.
 ; The upstream tree-sitter-typescript tags.scm targets .d.ts declaration files
 ; (function_signature / method_signature) and ships no @reference.call, so it extracts
-; almost nothing from ordinary .ts/.tsx source. This set covers real source: concrete
-; declarations + arrow-function-bound consts + call/new references. Used for BOTH
-; typescript and tsx (the tsx grammar is a superset).
+; almost nothing from ordinary .ts source. This set covers real source: concrete
+; declarations + arrow-function-bound consts + call/new references.
+;
+; .ts/.mts/.cts ONLY. tree-sitter-typescript ships two grammars: plain "typescript" (this
+; one — a .ts file cannot contain JSX, by the TypeScript language's own rule) and "tsx" (a
+; real superset that adds jsx_self_closing_element/jsx_opening_element/…). Until #285 the
+; plain grammar really was a strict subset of tsx for every node THIS file names, so one
+; query text served both (kLangTable's .tsx row pointed at this same "typescript" querySub,
+; the CUDA-on-cpp precedent: tree-sitter-cuda is a generated superset of tree-sitter-cpp and
+; the two share querySub "cpp" the same way). #285's JSX patterns broke that: tree-sitter's
+; ts_query_new refuses the WHOLE query when even one pattern names a node type the grammar
+; does not have (measured — adding jsx_self_closing_element here made `[ripwire] tags.scm
+; compile error for typescript at byte N (err 2) — skipping language` and took EVERY .ts
+; symbol/reference with it, not just the JSX ones). queries/tsx/tags.scm is this file's
+; content plus the JSX additions, kept in its own file for the grammar that actually has
+; those nodes — see its header. Keep the two in sync by hand for every pattern below, the
+; same duplication precedent queries/c/tags.scm vs queries/cpp/tags.scm already carries for
+; two related-but-diverging grammars.
 
 ; ---- definitions ----
 
@@ -116,6 +131,67 @@
 (call_expression
   function: (member_expression
     property: (private_property_identifier) @name)) @reference.call
+
+; `await f<T>(x)` — tree-sitter-typescript parses an await before an explicit type-argument call as
+; `(await f)<T>(x)`: a call_expression whose function: is the await_expression, so the three patterns
+; above never see the callee and the site was no reference at all (no edge, no declined or unresolved
+; count). `await f(x)` without type arguments parses the other way round and is already covered. The
+; @name's parent is the await_expression for the bare form (a bare call to receiverOf) and the
+; member_expression for the member forms (the same receiver reading as the patterns above).
+(call_expression
+  function: (await_expression
+    (identifier) @name)) @reference.call
+
+(call_expression
+  function: (await_expression
+    (member_expression
+      property: (property_identifier) @name))) @reference.call
+
+(call_expression
+  function: (await_expression
+    (member_expression
+      property: (private_property_identifier) @name))) @reference.call
+
+; The same precedence quirk for the unary operators: `!f<T>(x)`, `typeof f<T>(x)`, `void f<T>(x)` and `-f<T>(x)`
+; parse as `(!f)<T>(x)`, a call whose function: is the unary_expression. Same three forms, same receiver
+; reading (the bare form's @name parent is the unary_expression, which receiverOf reads as a bare call).
+(call_expression
+  function: (unary_expression
+    argument: (identifier) @name)) @reference.call
+
+(call_expression
+  function: (unary_expression
+    argument: (member_expression
+      property: (property_identifier) @name))) @reference.call
+
+(call_expression
+  function: (unary_expression
+    argument: (member_expression
+      property: (private_property_identifier) @name))) @reference.call
+
+; One level deeper, the two stacked forms real code writes: `!await f<T>(x)` (the call's function: is
+; unary(await f)) and `await await f<T>(x)` (await(await f)). Deeper stacks stay unextracted (a disclosed floor).
+(call_expression
+  function: (unary_expression
+    argument: (await_expression
+      (identifier) @name))) @reference.call
+
+(call_expression
+  function: (unary_expression
+    argument: (await_expression
+      (member_expression
+        property: (property_identifier) @name)))) @reference.call
+
+(call_expression
+  function: (await_expression
+    (await_expression
+      (identifier) @name))) @reference.call
+
+(call_expression
+  function: (await_expression
+    (await_expression
+      (member_expression
+        property: (property_identifier) @name)))) @reference.call
 
 (new_expression
   constructor: (identifier) @name) @reference.call

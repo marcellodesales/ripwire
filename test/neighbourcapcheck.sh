@@ -61,7 +61,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 attr(){ printf '%s' "$2" | grep -oE "(^|[^_a-z])$1=\"[^\"]*\"" | head -1 | sed -E "s/.*$1=\"//; s/\"$//"; }
 
@@ -103,7 +103,9 @@ CAP_USES=100     # kUseSiteRowCap — use SITES are the unit --grep caps at 100,
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (0) presence guard: more neighbours than the cap, and source sorts LAST by path ==="
 # ═══════════════════════════════════════════════════════════════════════════
-FULL="$( rw --callers=neighbourHubFn --limit=500 )"
+# L1 (2026-09-19): the CLI default legend is compact and spells row shapes (<s t= n= p=>) inside its comment; the arms below
+# count real rows and read the FULL legend prose (9/9b), so every counted/read answer asks for the full legend.
+FULL="$( rw --callers=neighbourHubFn --limit=500 --legend=full )"
 full_count="$( attr count "$FULL" )"
 [ "${full_count:-0}" -gt "$CAP_CALL" ] \
     && ok "(0) the fixture has $full_count callers, over the $CAP_CALL cap" \
@@ -136,7 +138,7 @@ printf '%s' "$lastRow" | grep -q 'tests/' \
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (2) the cap fires and is disclosed ==="
 # ═══════════════════════════════════════════════════════════════════════════
-DEF="$( rw --callers=neighbourHubFn )"
+DEF="$( rw --callers=neighbourHubFn --legend=full )"
 def_rows="$( rowCount "$DEF" s )"
 def_shown="$( attr shown "$DEF" )"
 def_capped="$( attr capped "$DEF" )"
@@ -172,7 +174,7 @@ echo "=== (4) escape hatch: --limit raises it, --offset pages it ==="
 [ "$( rowCount "$FULL" s )" = "$full_count" ] \
     && ok "(4) --limit=500 serves every one of the $full_count rows" \
     || no "(4) --limit=500 served $( rowCount "$FULL" s ) of $full_count rows"
-PAGE2="$( rw --callers=neighbourHubFn --limit=10 --offset=10 )"
+PAGE2="$( rw --callers=neighbourHubFn --limit=10 --offset=10 --legend=full )"
 p2_rows="$( rowCount "$PAGE2" s )"
 p2_next="$( attr next_offset "$PAGE2" )"
 p2_more="$( attr has_more "$PAGE2" )"
@@ -181,7 +183,9 @@ if [ "$p2_rows" = "10" ] && [ "$p2_next" = "20" ] && [ "$p2_more" = "1" ]; then
 else
     no "(4b) paging is wrong: rows=$p2_rows next_offset=$p2_next has_more=$p2_more"
 fi
-# the page seam is exact — page 2 must be the rows the full list holds at [10,20)
+# the page seam is exact — page 2 must be the rows the full list holds at [10,20) (cut-fix C: the list is ranked
+# most-called first, and every row here ties at 0 callers, so the ranked order IS the path order; arm 11d asserts the
+# seam on a list whose weights differ)
 if [ "$( rows "$PAGE2" | head -1 )" = "$( rows "$FULL" | sed -n '11p' )" ]; then
     ok "(4c) the page seam is exact: page 2 starts at the full list's row 11"
 else
@@ -191,7 +195,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (5) inert under the cap: an uncapped, unpaged answer says nothing ==="
 # ═══════════════════════════════════════════════════════════════════════════
-SMALL="$( rw --callers=neighbourHubCallee )"
+SMALL="$( rw --callers=neighbourHubCallee --legend=full )"
 small_rows="$( rowCount "$SMALL" s )"
 if [ "$small_rows" -gt 0 ] && [ "$small_rows" -lt "$CAP_CALL" ]; then
     if printf '%s' "$SMALL" | grep -qE ' shown="| capped="'; then
@@ -209,11 +213,11 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (6) --callees is the same code path and the same contract ==="
 # ═══════════════════════════════════════════════════════════════════════════
-CE="$( rw --callees=neighbourHubCaller )"
+CE="$( rw --callees=neighbourHubCaller --legend=full )"
 printf '%s' "$CE" | grep -q '<callees ' \
     && ok "(6) --callees still answers" \
     || no "(6) --callees stopped answering"
-CE_CAP="$( rw --callees=neighbourHubCaller --limit=1 )"
+CE_CAP="$( rw --callees=neighbourHubCaller --limit=1 --legend=full )"
 if [ "$( rowCount "$CE_CAP" s )" = "1" ] && [ "$( attr capped "$CE_CAP" )" = "1" ]; then
     ok "(6b) --callees windows and discloses exactly as --callers does"
 else
@@ -223,9 +227,9 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (7) --uses: same ordering, its own cap ==="
 # ═══════════════════════════════════════════════════════════════════════════
-U_FULL="$( rw --uses=neighbourHubFn --limit=500 )"
+U_FULL="$( rw --uses=neighbourHubFn --limit=500 --legend=full )"
 u_count="$( attr count "$U_FULL" )"
-U_DEF="$( rw --uses=neighbourHubFn )"
+U_DEF="$( rw --uses=neighbourHubFn --legend=full )"
 u_rows="$( rowCount "$U_DEF" u )"
 # the fixture has 63 call sites + 1 def-site-adjacent row or so — under 100, so the cap must NOT fire here,
 # and that is the arm: --uses keeps its own unit (sites), so the SYMBOL cap must not leak onto it.
@@ -234,14 +238,14 @@ if [ "${u_count:-0}" -lt "$CAP_USES" ]; then
         && ok "(7) --uses has $u_count sites, under its own $CAP_USES cap, and serves all of them (the symbol cap did not leak onto the site unit)" \
         || no "(7) --uses served $u_rows of $u_count sites while under its own cap"
 else
-    [ "$u_rows" = "$CAP_USES" ] && ok "(7) --uses capped at $CAP_USES" || no "(7) --uses expected $CAP_USES rows, got $u_rows"
+    if [ "$u_rows" = "$CAP_USES" ]; then ok "(7) --uses capped at $CAP_USES"; else no "(7) --uses expected $CAP_USES rows, got $u_rows"; fi
 fi
 # ordering: --uses rows carry p= only, so assert the source sites lead
 u_first="$( printf '%s' "$U_DEF" | grep -oE '<u role="[^"]*" p="[^"]*"' | head -1 )"
 printf '%s' "$u_first" | grep -q 'zsrc/' \
     && ok "(7b) --uses leads with the source-tier site, against the path order" \
     || no "(7b) --uses is still in plain path order: first row is $u_first"
-U_CAP="$( rw --uses=neighbourHubFn --limit=5 )"
+U_CAP="$( rw --uses=neighbourHubFn --limit=5 --legend=full )"
 if [ "$( rowCount "$U_CAP" u )" = "5" ] && [ "$( attr capped "$U_CAP" )" = "1" ] && [ "$( attr count "$U_CAP" )" = "$u_count" ]; then
     ok "(7c) --uses windows with shown=/capped= and leaves count= at the true total"
 else
@@ -260,7 +264,7 @@ if [ "$js_rows" = "$CAP_CALL" ] && [ "$js_shown" = "$CAP_CALL" ] && [ "$js_count
 else
     no "(8) --json diverged: rows=$js_rows shown=$js_shown count=$js_count (expected $CAP_CALL/$CAP_CALL/$full_count)"
 fi
-command -v python3 >/dev/null 2>&1 && { printf '%s' "$JS" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null && ok "(8b) the capped --json answer parses" || no "(8b) the capped --json answer is not valid JSON"; }
+command -v python3 >/dev/null 2>&1 && { if printf '%s' "$JS" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null; then ok "(8b) the capped --json answer parses"; else no "(8b) the capped --json answer is not valid JSON"; fi; }
 COL="$( rw --callers=neighbourHubFn --format=columnar )"
 col_shown="$( attr shown "$COL" )"
 [ "$col_shown" = "$CAP_CALL" ] \
@@ -285,11 +289,121 @@ echo "=== (10) determinism + well-formed XML ==="
 # ═══════════════════════════════════════════════════════════════════════════
 for v in "--callers=neighbourHubFn" "--callees=neighbourHubCaller" "--uses=neighbourHubFn"; do
     r1="$( rw "$v" )"; r2="$( rw "$v" )"
-    [ "$r1" = "$r2" ] && ok "(10) $v is byte-identical across runs" || no "(10) $v is nondeterministic"
+    if [ "$r1" = "$r2" ]; then ok "(10) $v is byte-identical across runs"; else no "(10) $v is nondeterministic"; fi
     if command -v xmllint >/dev/null 2>&1; then
-        printf '%s' "$r1" | xmllint --noout - 2>/dev/null && ok "(10b) $v is well-formed XML" || no "(10b) $v is not well-formed XML"
+        if printf '%s' "$r1" | xmllint --noout - 2>/dev/null; then ok "(10b) $v is well-formed XML"; else no "(10b) $v is not well-formed XML"; fi
     fi
 done
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "=== (11) RANK BEFORE THE CAP (cut-fix C): the cap drops the least-called rows, not the last path ==="
+# ═══════════════════════════════════════════════════════════════════════════
+# docs/METHODOLOGY.md §9: the ceiling bounds the tail, never the head. Before cut-fix C every list here cut in
+# PATH order, so the rows that survived a cap were the alphabetically-first files. The second sandbox is built so
+# path order and relevance DISAGREE: 100 leaf callers (nobody calls them) in asrc/, which sorts first, and 5 heavy
+# callers (each called by 3 drivers) in zsrc/, which sorts last. 105 callers > the 40 cap, 105 call sites > the
+# 100 cap. On the base binary the default --callers page is 40 leaves and --uses drops exactly the 5 heavy sites.
+# RED on 60b65f02 (arms 11b 11c 11e 12 12b 13c; recorded 2026-09-23); GREEN on cut-fix C. 11d 13 13b 13d 13e are guards, green on both.
+RB="$TMP/ranksandbox"
+mkdir -p "$RB/asrc" "$RB/zsrc"
+python3 - "$RB" <<'PY'
+import sys, os
+d = sys.argv[1]
+open( os.path.join( d, "zsrc", "core.py" ), "w" ).write( "def rankHubFn( x ):\n    return x\n" )
+with open( os.path.join( d, "asrc", "leaves.py" ), "w" ) as fh:
+    for i in range( 100 ):
+        fh.write( "def leaf_%03d( ):\n    return rankHubFn( %d )\n\n" % ( i, i ) )
+with open( os.path.join( d, "zsrc", "heavy.py" ), "w" ) as fh:
+    for i in range( 5 ):
+        fh.write( "def heavy_%d( ):\n    return rankHubFn( %d )\n\n" % ( i, i ) )
+with open( os.path.join( d, "zsrc", "drivers.py" ), "w" ) as fh:
+    for j in range( 3 ):
+        fh.write( "def driver_%d( ):\n    return %s\n\n" % ( j, " + ".join( "heavy_%d( )" % i for i in range( 5 ) ) ) )
+PY
+rr(){ "$BIN" "$RB" --no-cache "$@" 2>/dev/null; }
+R_FULL="$( rr --callers=rankHubFn --limit=500 )"
+R_DEF="$( rr --callers=rankHubFn )"
+heavyIn(){ printf '%s' "$1" | grep -oE '<s t="[^"]*" n="heavy_[0-9]"' | wc -l | tr -d ' '; }
+if [ "$( attr count "$R_FULL" )" = 105 ] && [ "$( heavyIn "$R_FULL" )" = 5 ] && [ "asrc/leaves.py" \< "zsrc/heavy.py" ]; then
+    ok "(11) presence guard: 105 callers, all 5 heavy ones in the uncapped list, and they sort LAST by path"
+else
+    no "(11) fixture broken: count=$( attr count "$R_FULL" ) heavy=$( heavyIn "$R_FULL" )"
+fi
+[ "$( heavyIn "$R_DEF" )" = 5 ] && [ "$( rows "$R_DEF" | wc -l | tr -d ' ' )" = "$CAP_CALL" ] \
+    && ok "(11b) the default $CAP_CALL-row page keeps all 5 heavy callers (the cut dropped leaves)" \
+    || no "(11b) the default page kept $( heavyIn "$R_DEF" ) of 5 heavy callers in $( rows "$R_DEF" | wc -l | tr -d ' ' ) rows — the cap cut the head"
+[ "$( rows "$R_DEF" | head -5 | grep -c 'n="heavy_' )" = 5 ] \
+    && ok "(11c) the most-called rows lead the page (rows 1-5 are the heavy callers)" \
+    || no "(11c) the page does not lead with the most-called rows: $( rows "$R_DEF" | head -2 | tr '\n' ' ' )"
+# ONE total order for the cap, the rows and the paging: page[0:k] + page[k:2k] + … == the uncapped list.
+: > "$TMP/pages"
+for off in 0 20 40 60 80 100; do rows "$( rr --callers=rankHubFn --limit=20 --offset=$off )" >> "$TMP/pages"; done
+if rows "$R_FULL" | diff -q - "$TMP/pages" >/dev/null && [ "$( sort -u "$TMP/pages" | wc -l | tr -d ' ' )" = 105 ]; then
+    ok "(11d) six --limit=20 pages concatenate to the uncapped list exactly — one total order, no row dropped or repeated"
+else
+    no "(11d) the pages do not partition the uncapped order ($( sort -u "$TMP/pages" | wc -l | tr -d ' ' ) distinct rows)"
+fi
+R_JS="$( rr --callers=rankHubFn --json )"
+R_COL="$( rr --callers=rankHubFn --format=columnar )"
+{ [ "$( printf '%s' "$R_JS" | grep -oE '"n":"heavy_[0-9]"' | wc -l | tr -d ' ' )" = 5 ] \
+  && [ "$( printf '%s' "$R_COL" | grep -oE 'heavy_[0-9]' | sort -u | wc -l | tr -d ' ' )" = 5 ]; } \
+    && ok "(11e) --json and --format=columnar keep the same 5 heavy callers (one order, every dialect)" \
+    || no "(11e) a dialect cut the head: json=$( printf '%s' "$R_JS" | grep -oE '"n":"heavy_[0-9]"' | wc -l | tr -d ' ' )"
+r1="$( rr --callers=rankHubFn )"
+if [ "$r1" = "$R_DEF" ]; then
+    ok "(11f) the ranked answer is byte-identical across runs"
+else
+    no "(11f) the ranked answer is nondeterministic"
+fi
+
+echo "=== (12) --uses: the same rule at its own cap ==="
+U_R="$( rr --uses=rankHubFn )"
+heavySites="$( printf '%s' "$U_R" | grep -oE '<u role="call" p="zsrc/heavy.py:[0-9]+"' | wc -l | tr -d ' ' )"
+uRows="$( printf '%s' "$U_R" | grep -oE '<u role="' | wc -l | tr -d ' ' )"
+{ [ "$( attr count "$U_R" )" = 105 ] && [ "$uRows" = "$CAP_USES" ] && [ "$heavySites" = 5 ]; } \
+    && ok "(12) the default $CAP_USES-site page of 105 keeps all 5 sites inside the heavy callers" \
+    || no "(12) --uses kept $heavySites of 5 heavy sites (count=$( attr count "$U_R" ), rows=$uRows)"
+printf '%s' "$U_R" | grep -oE '<u role="[^"]*" p="[^"]*"' | head -1 | grep -q 'zsrc/heavy.py' \
+    && ok "(12b) --uses leads with a site in the most-called enclosing symbol" \
+    || no "(12b) --uses does not lead with the heaviest site"
+
+echo "=== (13) MCP: the same order, and find_symbol's calledBy cut is disclosed ==="
+MCP_OUT="$( python3 - "$BIN" "$RB" <<'PY'
+import json, subprocess, sys, threading
+p = subprocess.Popen( [ sys.argv[1], sys.argv[2], "--mcp" ], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.DEVNULL )
+watchdog = threading.Timer( 300, p.kill ); watchdog.daemon = True; watchdog.start()   # a hung server ends readline() below, not the gate
+def tool( n, name, args ):
+    p.stdin.write( ( json.dumps( { "jsonrpc": "2.0", "id": n, "method": "tools/call", "params": { "name": name, "arguments": args } } ) + "\n" ).encode() )
+    p.stdin.flush()
+    return json.loads( json.loads( p.stdout.readline() )[ "result" ][ "content" ][ 0 ][ "text" ] )
+ref = tool( 1, "find_referencing_symbols", { "symbol": "rankHubFn" } )
+fs  = tool( 2, "find_symbol", { "symbol": "rankHubFn" } )
+sm  = tool( 3, "find_symbol", { "symbol": "heavy_0" } )
+p.stdin.close(); p.wait( 20 )
+print( "REF " + " ".join( r[ "name" ] for r in ref[ "calledBy" ] ) )
+print( "FSCB " + " ".join( r[ "name" ] for r in fs[ "calledBy" ] ) )
+print( "FSKEYS %s %s %s %s" % ( fs.get( "calledBy_total" ), fs.get( "shown_calledBy" ), fs.get( "calledBy_capped" ), fs.get( "calledBy_next" ) ) )
+print( "SMKEYS %s" % ( "calledBy_total" in sm ) )
+PY
+)"
+CLI_NAMES="$( printf '%s' "$R_JS" | grep -oE '"n":"[^"]*"' | sed 's/"n":"//; s/"$//' | tr '\n' ' ' | sed 's/ $//' )"
+[ "$( printf '%s\n' "$MCP_OUT" | sed -n 's/^REF //p' )" = "$CLI_NAMES" ] \
+    && ok "(13) find_referencing_symbols serves the CLI --callers page, row for row" \
+    || no "(13) MCP and CLI disagree on the page: $( printf '%s\n' "$MCP_OUT" | sed -n 's/^REF //p' | cut -c1-80 )"
+[ "$( printf '%s\n' "$MCP_OUT" | sed -n 's/^FSCB //p' )" = "$CLI_NAMES" ] \
+    && ok "(13b) find_symbol's calledBy array is the same ranked page (it kept the 5 heavy callers)" \
+    || no "(13b) find_symbol's calledBy page differs from --callers: $( printf '%s\n' "$MCP_OUT" | sed -n 's/^FSCB //p' | cut -c1-80 )"
+FSK="$( printf '%s\n' "$MCP_OUT" | sed -n 's/^FSKEYS //p' )"
+[ "$FSK" = "105 40 True --callers=rankHubFn --offset=40" ] \
+    && ok "(13c) find_symbol discloses its calledBy cut: calledBy_total=105 shown_calledBy=40 calledBy_capped=true calledBy_next=--callers=rankHubFn --offset=40" \
+    || no "(13c) find_symbol's calledBy cut is silent or wrong: $FSK"
+NEXT_NAMES="$( rr --callers=rankHubFn --offset=40 --json | grep -oE '"n":"[^"]*"' | head -1 )"
+[ "$NEXT_NAMES" = "$( rows "$R_FULL" | sed -n '41p' | grep -oE 'n="[^"]*"' | sed 's/^n="/"n":"/' )" ] \
+    && ok "(13d) the pasted calledBy_next continues at row 41 of the one order" \
+    || no "(13d) calledBy_next does not continue the order: got $NEXT_NAMES"
+[ "$( printf '%s\n' "$MCP_OUT" | sed -n 's/^SMKEYS //p' )" = "False" ] \
+    && ok "(13e) an uncut calledBy array pays no bytes for the disclosure (absent, rule 3's --skill-scan shape)" \
+    || no "(13e) an uncut calledBy array still carries calledBy_total"
 
 echo
 [ "$fail" = 0 ] && { echo "neighbourcapcheck: PASS"; exit 0; } || { echo "neighbourcapcheck: FAIL"; exit 1; }

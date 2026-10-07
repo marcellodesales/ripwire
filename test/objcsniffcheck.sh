@@ -32,7 +32,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/objcsnifffix"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -41,7 +41,8 @@ echo "objcsniffcheck: BIN=$BIN  FIX=$FIX"
 MAP="$( "$BIN" "$FIX" --no-cache 2>/dev/null )"
 
 # ── (a) the victim class of symbol: a struct METHOD in an anonymous namespace in a HEADER ───────────
-printf '%s' "$MAP" | grep -q 'id="cpp_mentions_objc.h::SniffVictim::sniffVictimMethod"' \
+# row 6 (2026-09-12): a scoped row prints n= then sc= (the short id); the canonical id composes as <f p=>::sc::n
+printf '%s' "$MAP" | grep -q 'n="sniffVictimMethod" sc="SniffVictim"' \
     && ok "(a) sniffVictimMethod indexed with its SniffVictim scope (the symbol class that vanished pre-74)" \
     || { no "(a) sniffVictimMethod missing or unscoped — the comment-mention header is misrouted again"; printf '%s\n' "$MAP" | tr '>' '>\n' | grep 'cpp_mentions_objc' | head -6; }
 

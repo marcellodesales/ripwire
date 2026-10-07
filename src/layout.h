@@ -1,4 +1,8 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/platform.h" // infra::platform::{add,sub,mul}Overflow — the checked constant-expression arithmetic
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // layout.h — `--layout=STRUCT`, the CPU/GPU CONTRACT verb.
 // Evidence: dual-compile uniform structs (AudioUniforms 24 B, MusicPulseUniforms 192→208 B in one day)
@@ -54,9 +58,10 @@
 #include "graphlegend.h"   // R-E fix (2026-08-19): rw::rootRelPathsLegend — the ONE root= definition
 #include "arch.h"               // fnv1a64
 #include "infra/hashutil.h"     // fnv1aMultiply — the sanitizer-safe wrapping multiply (G1 runs -fsanitize=integer)
+#include "infra/namesplit.h"    // afterLast — the ONE base-name cut (lastSegment's `::` segment)
 #include "serialize.h"          // escapeXml
 #include "darkflags.h"          // readWhole — the same 4 MB-capped whole-file read the sibling field-notes verb owns
-#include "infra/Diagnostics.h"  // VERIFY / DEGRADED_PATH_ALERT
+#include "infra/Diagnostics.h"  // ASSUME / DISCLOSE
 
 #include "btree.hpp"      // gtl::btree_map — sorted iteration (house rule: never std::map)
 
@@ -64,6 +69,7 @@
 #include <cctype>
 #include <cstdio>
 #include <functional>
+#include <limits>       // std::numeric_limits — IntEval::apply refuses the one quotient int64 cannot hold
 #include <string>
 #include <string_view>
 #include <utility>
@@ -78,6 +84,7 @@ namespace layout
 
 constexpr std::size_t   kMaxNestDepth   = 8;          // nested-aggregate resolution depth (a cycle stops here)
 constexpr std::size_t   kMaxMacroDepth  = 4;          // object-like macro expansion depth for a type name
+constexpr std::size_t   kMaxExtentParens = 64;        // `(` nesting DEPTH an extent expression may reach (IntEval recurses per level)
 constexpr std::size_t   kMaxDefScan     = 1u << 20;   // bytes scanned forward from a def start looking for its body
 constexpr std::size_t   kMaxAssertChars = 220;        // the displayed prefix of a static_assert's text
 constexpr std::uint32_t kMaxArrayElems  = 1u << 24;   // refusal bound: past this the extent is a parse artefact
@@ -262,7 +269,7 @@ inline std::string withoutComments( std::string_view s )
 // when the bracket never closes inside the buffer — a truncated/garbled file degrades, never hangs.
 inline std::size_t matchBracket( std::string_view src, std::size_t from, char open, char close )
 {
-    VERIFY( from < src.size() && src[ from ] == open );
+    ASSUME( from < src.size() && src[ from ] == open );
     int depth = 0;
     for( std::size_t i = from; i < src.size(); )
     {
@@ -628,6 +635,7 @@ struct IntEval
     const ConstTable& table;
     std::size_t       depth = 0;
     bool              ok    = true;
+    std::size_t       parenDepth = 0;   // `(` levels OPEN at this point of the parse — kMaxExtentParens bounds the recursion
 
     std::int64_t parse( std::string_view s )
     {
@@ -655,16 +663,30 @@ private:
         }
     }
 
+    // Every operator is checked: an extent is source text, so `(0-1099511627776)*8388608` reaches INT64_MIN and a
+    // following `/(0-1)` is the one quotient int64 cannot hold (SIGFPE on x86-64), and a plain `1<<40 * 1<<40`
+    // product is signed overflow (an abort in the sanitizer build). An expression that leaves the range is not a
+    // knowable extent, so it un-sizes the field exactly like any other expression this evaluator cannot read.
     std::int64_t apply( char op, std::int64_t a, std::int64_t b )
     {
-        if( ( op == '/' ) && b == 0 ) { ok = false; return 0; }        // never divide by zero under G1
+        std::int64_t r = 0;
+        bool         outOfRange = false;
         switch( op )
         {
-            case '+': return a + b;
-            case '-': return a - b;
-            case '*': return a * b;
-            default:  return a / b;
+            case '+': outOfRange = infra::platform::addOverflow( a, b, &r ); break;
+            case '-': outOfRange = infra::platform::subOverflow( a, b, &r ); break;
+            case '*': outOfRange = infra::platform::mulOverflow( a, b, &r ); break;
+            default:
+                outOfRange = b == 0 || ( b == -1 && a == std::numeric_limits<std::int64_t>::min() );   // never divide by zero under G1
+                r          = outOfRange ? 0 : a / b;
+                break;
         }
+        if( outOfRange )
+        {
+            ok = false;
+            return 0;
+        }
+        return r;
     }
 
     std::int64_t level( std::string_view s, std::size_t& i, std::size_t rank )
@@ -689,8 +711,14 @@ private:
         if( i >= s.size() || !ok ) { ok = false; return 0; }
         if( s[i] == '(' )
         {
+            // A bounded recursion: `#define N ((((…1))))` 200,000 levels deep overflowed the stack (SIGSEGV, exit 139).
+            // The bound is the DEPTH of open parentheses, restored when this level closes: `(A)+(B)+…` with sixty-six
+            // sibling terms nests one level, and must size exactly as it did before the bound existed.
+            if( parenDepth >= kMaxExtentParens ) { ok = false; return 0; }
+            ++parenDepth;
             ++i;
             const std::int64_t v = level( s, i, 0 );
+            --parenDepth;
             skipWs( s, i );
             if( i < s.size() && s[i] == ')' ) { ++i; }
             else
@@ -868,8 +896,7 @@ inline std::vector<std::string_view> typeWords( std::string_view spec, bool& saw
 // simd/Metal headers spell it both ways in the same tree. The LAST segment is what the table keys on.
 inline std::string_view lastSegment( std::string_view s )
 {
-    const std::size_t at = s.rfind( "::" );
-    return ( at == std::string_view::npos ) ? s : s.substr( at + 2 );
+    return rw::namesplit::afterLast( s, "::" );
 }
 
 inline bool primLookup( std::string_view spelling, TypeSize& out )
@@ -999,6 +1026,18 @@ struct LayoutResult
     // the refusal can say "this is an enum, --layout models structs" instead of silently degrading to a
     // confident modeled="1" zero-field struct, or falling through to the generic bodiless-candidate message.
     std::size_t             enumCandidates = 0;
+    // Definitions whose FILE could not be read when the verb ran (removed, or unreadable since it was indexed). They
+    // are absent from defs=/mirror=, so the root says so with unreadable="N" — a mirror="single" beside it is one
+    // definition READ, not one definition that exists. This struct is the DISCLOSE sink for that degrade.
+    std::size_t             unreadableDefs = 0;
+    enum class DisclosureWhy : std::uint8_t
+    {
+        UnreadableFile,
+    };
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        ++unreadableDefs;
+    }
 };
 
 // The verb's own verdict. A definition that could NOT be modelled is not a break — there is no number to
@@ -1164,6 +1203,7 @@ struct Declarator
     std::string_view              typeSpec;        // empty on a follow-on declarator (inherits the first's)
     std::string_view              name;
     std::vector<std::string_view> extents;         // one entry per `[…]`, left to right
+    std::vector<std::string_view> attrGroups;      // A3: peeled `__attribute__((…))` inner text, source order
     bool                          isPointer  = false;
     bool                          isRef      = false;
     bool                          isBitfield = false;
@@ -1190,6 +1230,118 @@ inline bool cutAtTopLevel( std::string_view& s, std::string_view stops )
     return false;
 }
 
+// `s` with the CONTENTS of every string literal, character literal and comment blanked to spaces — same length, the
+// delimiters kept. The attribute scans below read this mask and slice the ORIGINAL at the same offsets, so an argument
+// such as `deprecated( ")" )` cannot unbalance a group and `deprecated( "packed" )` cannot spell a layout keyword
+// (CodeRabbit on #281, test/layoutcheck.sh AttributeString*Case). An unterminated literal blanks to the end.
+inline std::string lexicalMask( std::string_view s )
+{
+    std::string mask( s );
+    for( std::size_t i = 0; i < mask.size(); ++i )
+    {
+        const char c = mask[i];
+        if( c == '"' || c == '\'' )
+        {
+            for( ++i; i < mask.size() && mask[i] != c; ++i )
+            {
+                if( mask[i] == '\\' && i + 1 < mask.size() )
+                {
+                    mask[i++] = ' ';   // the escape and the byte it escapes are both content
+                }
+                mask[i] = ' ';
+            }
+        }
+        else if( c == '/' && i + 1 < mask.size() && ( mask[ i + 1 ] == '/' || mask[ i + 1 ] == '*' ) )
+        {
+            const bool line = mask[ i + 1 ] == '/';
+            for( i += 2; i < mask.size() && !( line ? mask[i] == '\n' : ( mask[i] == '*' && i + 1 < mask.size() && mask[ i + 1 ] == '/' ) ); ++i )
+            {
+                mask[i] = ' ';
+            }
+            i += line ? 0 : 1;   // leave a block comment's `*/` in place
+        }
+    }
+    return mask;
+}
+
+// A3 (found-items 2026-09-17): peel trailing `__attribute__((…))` groups off the RIGHT of `s` — GNU/GCC
+// postfix attribute syntax, placed after the declarator name or (per the standard grammar) after its array
+// extents. `int x __attribute__((aligned(8)))` used to reach parseDeclarator's last-identifier scan with the
+// attribute still attached: the scan took "8" (the last identifier-looking token before the attribute's own
+// closing parens) as the field NAME and left `)))` as unparsed trailing junk, so `d.ok` came back false and
+// the whole declaration was refused as "unparsed-member" with no `<f n="x">` row at all — candidateParen
+// already keeps `__attribute__(( … ))` from being misread as a member-function's parameter list (see its own
+// comment above), but nothing removed the group before the name/type split ran. Mirrors peelExtents: balanced
+// parens, returns the peeled groups' INNER text (the attribute-list bytes between the doubled parens, e.g.
+// "aligned(8)") in source order, so the caller can tell an attribute that changes layout (aligned/packed)
+// from one that is purely a hint (deprecated/unused/…) and does not need to touch modeled= at all.
+inline std::vector<std::string_view> peelAttributeGroups( std::string_view& s )
+{
+    static constexpr std::string_view kAttr = "__attribute__";
+    std::vector<std::string_view>     reversed;
+    for( ;; )
+    {
+        s = trimView( s );
+        const std::string mask = lexicalMask( s );   // parens and the keyword are read here; slices come from `s`
+        if( mask.empty() || mask.back() != ')' )
+        {
+            break;
+        }
+        int         depth = 0;
+        std::size_t open  = std::string_view::npos;
+        // Cursor counts down to 1, index = cursor - 1: the `i-- > 0` idiom wraps the unsigned to SIZE_MAX when no
+        // `(` balances the trailing `)` (`int b );`), which G1's -fsanitize=integer aborts on (abicheck arm 11).
+        for( std::size_t cursor = mask.size(); cursor > 0; --cursor )
+        {
+            const std::size_t i = cursor - 1;
+            if( mask[i] == ')' )      { ++depth; }
+            else if( mask[i] == '(' ) { --depth; if( depth == 0 ) { open = i; break; } }
+        }
+        if( open == std::string_view::npos )
+        {
+            break; // unbalanced — degrade rather than misclassify (same rule matchBracket's callers use)
+        }
+        const std::string_view before = trimView( s.substr( 0, open ) );
+        if( !trimView( std::string_view( mask ).substr( 0, open ) ).ends_with( kAttr ) )
+        {
+            break; // the trailing (...) group is not an attribute specifier — leave it for the caller
+        }
+        std::string_view inner = trimView( s.substr( open + 1, s.size() - open - 2 ) );
+        if( inner.size() >= 2 && inner.front() == '(' && inner.back() == ')' )
+        {
+            inner = trimView( inner.substr( 1, inner.size() - 2 ) ); // the doubled-paren wrapper `((…))`
+        }
+        reversed.push_back( inner );
+        s = trimView( before.substr( 0, before.size() - kAttr.size() ) );
+    }
+    return { reversed.rbegin(), reversed.rend() };
+}
+
+// A3 (review round, found-items 2026-09-17): a GNU attribute keyword may be spelled bare (`aligned`) OR
+// wrapped in the reserved-namespace double underscore (`__aligned__` — what system headers reach for so
+// the name cannot collide with a macro of the same bare word); the two spell the SAME attribute, but
+// `containsWord` alone cannot see it: `_` counts as an identifier byte, so the underscores that correctly
+// wall "aligned" off from a longer word are exactly what makes `__aligned__` fail to match at all. Checked
+// as two containsWord calls (the bare spelling, then the wrapped one) rather than a hand-rolled tokenizer:
+// a fresh identifier-scanning loop here duplicated gitoracle.h::forEachIdentifier closely enough that
+// quality-delta gated on it (found-items 2026-09-17 review round) — two bounded word checks reuse the
+// primitive layout.h already leans on everywhere else (static/virtual/operator, above) instead of
+// re-deriving a general tokenizer for a two-keyword, fixed-alphabet job.
+inline bool attrHasKeyword( std::string_view attr, std::string_view bare ) noexcept
+{
+    const std::string code = lexicalMask( attr );   // a keyword spelled inside a string argument is not the keyword
+    if( containsWord( code, bare ) )
+    {
+        return true;
+    }
+    std::string wrapped;
+    wrapped.reserve( bare.size() + 4 );
+    wrapped += "__";
+    wrapped += bare;
+    wrapped += "__";
+    return containsWord( code, wrapped );
+}
+
 // Peel trailing array extents off the RIGHT of `s`: `slots[ 4 ][ 2 ]` → {"4","2"}, leaving `Slot slots`.
 inline std::vector<std::string_view> peelExtents( std::string_view& s )
 {
@@ -1203,8 +1355,9 @@ inline std::vector<std::string_view> peelExtents( std::string_view& s )
         }
         int         depth = 0;
         std::size_t open  = std::string_view::npos;
-        for( std::size_t i = s.size(); i-- > 0; )
+        for( std::size_t cursor = s.size(); cursor > 0; --cursor )   // cursors, not `i-- > 0`: an unbalanced `]` wrapped it
         {
+            const std::size_t i = cursor - 1;
             if( s[i] == ']' )
             {
                 ++depth;
@@ -1240,6 +1393,15 @@ inline Declarator parseDeclarator( std::string_view text )
 
     d.isBitfield = cutAtTopLevel( s, ":" );        // a bitfield WIDTH — refused later, but recognised here
     cutAtTopLevel( s, "={" );                      // a default member initializer (`= 0`, `= {}`, `{0}`)
+    if( s.empty() )
+    {
+        return d;
+    }
+
+    // A3: peel a trailing `__attribute__((…))` BEFORE the array extents — the standard grammar (and this
+    // fixture's own `int x[4] __attribute__((packed));` shape) places the attribute AFTER any array bounds,
+    // so it must come off first for peelExtents below to still find `]` at the end of `s`.
+    d.attrGroups = peelAttributeGroups( s );
     if( s.empty() )
     {
         return d;
@@ -1353,10 +1515,7 @@ inline bool ensureFileLoaded( ModelCtx& ctx, std::uint32_t fileId )
     if( !ctx.bytesLoaded[ fileId ] )
     {
         ctx.bytesLoaded[ fileId ] = 1;
-        if( !darkflags::readWhole( diskPath( ctx.ing, fileId ), ctx.bytes[fileId] ) )
-        {
-            ctx.bytes[fileId].clear();
-        }
+        ctx.bytes[fileId] = darkflags::readWhole( diskPath( ctx.ing, fileId ) ).value_or( std::string() );
         ctx.stripped[ fileId ] = withoutComments( ctx.bytes[ fileId ] );
         ctx.consts[ fileId ]   = harvestConstants( ctx.stripped[ fileId ] );
     }
@@ -1684,6 +1843,23 @@ inline void appendField( BodyWalk& w, const Declarator& d, std::string_view type
         addCaveat( w.def, "reference-member", f.name + ": a reference member's storage is unspecified" );
     }
 
+    // A3: a PER-FIELD `__attribute__((aligned(N)))` / `((packed))` (bare OR the GNU reserved-namespace
+    // `__aligned__` / `__packed__` spelling — attrHasKeyword normalises both to one classification, review
+    // round 2026-09-17) changes this field's own placement, and the model has no argument evaluator for
+    // it — degrade to unknown-type exactly like resolveFieldType's own refusal for `alignas(N) int x`
+    // (AlignasFieldCase), an unknown size/align rather than a confidently wrong one. Every OTHER attribute
+    // (deprecated/unused/…) is a pure hint that changes no byte of the layout, so peelAttributeGroups
+    // already dropped it from typeSpec above with no caveat at all — this is the one place that distinction
+    // is made, deliberately narrow to keep a silent attribute silent.
+    for( std::string_view attr : d.attrGroups )
+    {
+        if( attrHasKeyword( attr, "aligned" ) || attrHasKeyword( attr, "packed" ) )
+        {
+            t.known = false;
+            break;
+        }
+    }
+
     for( std::string_view e : d.extents )
     {
         std::uint32_t n = 0;
@@ -1729,8 +1905,83 @@ inline void appendField( BodyWalk& w, const Declarator& d, std::string_view type
     w.def.fields.push_back( std::move( f ) );
 }
 
+// True when the word immediately before `s[at]` — the `(` at `at` — spells `alignas` / `__attribute__` /
+// `decltype`: that `(` opens the specifier's own argument list, not a member's parameter list.
+inline bool opensAttrSpecifier( std::string_view s, std::size_t at )
+{
+    static constexpr std::string_view kAttrKeywords[] = { "alignas", "__attribute__", "decltype" };
+    std::size_t wordEnd = at;
+    while( wordEnd > 0 && std::isspace( (unsigned char)s[wordEnd - 1] ) != 0 ) { --wordEnd; }
+    std::size_t wordStart = wordEnd;
+    while( wordStart > 0 && identByte( (unsigned char)s[wordStart - 1] ) ) { --wordStart; }
+    const std::string_view word = s.substr( wordStart, wordEnd - wordStart );
+    for( std::string_view kw : kAttrKeywords )
+    {
+        if( word == kw ) { return true; }
+    }
+    return false;
+}
+
 // The statement forms that contribute NO storage and are simply skipped, plus the ones that withdraw the
 // numbers. Returns true when the statement was consumed here and holds no field declarators.
+// The first `(` that is a CANDIDATE for a member declaration's parameter list: skip one that instead
+// belongs to an `alignas( … )` / `__attribute__( ( … ) )` / `decltype( … )` specifier, or that sits inside a
+// template argument list's `<…>` (`std::function< void(int) >`). None of those opens a parameter list, and
+// counting one anyway silently dropped the field it decorates while the aggregate still reported
+// modeled="1": `alignas(8) int x`, `int x __attribute__((aligned(8)))`, `decltype(1) x` and
+// `std::function<void(int)> cb` each lost their field this way. Returns npos when no candidate remains.
+inline std::size_t candidateParen( std::string_view s )
+{
+    int angle = 0;
+    for( std::size_t i = 0; i < s.size(); )
+    {
+        const char c = s[i];
+        if( c == '<' ) { ++angle; ++i; continue; }
+        if( c == '>' && angle > 0 ) { --angle; ++i; continue; }
+        if( c != '(' ) { ++i; continue; }
+        if( angle > 0 ) { ++i; continue; }   // a template argument's own parens — not a parameter list
+        if( !opensAttrSpecifier( s, i ) )
+        {
+            return i;
+        }
+        const std::size_t close = matchBracket( s, i, '(', ')' );
+        if( close == std::string_view::npos )
+        {
+            return std::string_view::npos;   // unbalanced — degrade rather than misclassify
+        }
+        i = close;
+    }
+    return std::string_view::npos;
+}
+
+// Where a member declaration's parameter list opens, or npos when it has none. Only a `(` that comes BEFORE the first
+// `[`, `=`, `{` or bitfield `:` can open one: `char a[(4)];`, `int x = (3);` and `int x{ (3) };` are data members whose
+// parenthesis sits in an extent or an initializer. Reading those as member functions dropped the field from the layout
+// while the struct still reported modeled="1" and a size four bytes short. `operator=`, `operator[]` and `operator()`
+// are functions whose own name holds one of those characters, so an `operator` word decides first.
+inline std::size_t parameterListParen( std::string_view s )
+{
+    if( containsWord( s, "operator" ) )
+    {
+        return s.find( '(' );
+    }
+    const std::size_t paren = candidateParen( s );
+    if( paren == std::string_view::npos )
+    {
+        return paren;
+    }
+    for( std::size_t i = 0; i < paren; ++i )
+    {
+        const char c = s[i];
+        const bool scopeColon = c == ':' && ( ( i + 1 < s.size() && s[i + 1] == ':' ) || ( i > 0 && s[i - 1] == ':' ) );
+        if( c == '[' || c == '=' || c == '{' || ( c == ':' && !scopeColon ) )
+        {
+            return std::string_view::npos;
+        }
+    }
+    return paren;
+}
+
 inline bool modelNonFieldStatement( BodyWalk& w, std::string_view s )
 {
     // Access specifiers change nothing this model computes, but MIXED access makes the class non-standard-
@@ -1773,7 +2024,7 @@ inline bool modelNonFieldStatement( BodyWalk& w, std::string_view s )
     // storage, so it is simply skipped. A function POINTER member does contribute — but a pointer to a
     // MEMBER function is 16 bytes, not 8, and the two are not reliably distinguishable here, so the
     // aggregate withdraws its numbers rather than pick.
-    const std::size_t paren = s.find( '(' );
+    const std::size_t paren = parameterListParen( s );
     if( paren == std::string_view::npos )
     {
         return false;
@@ -1817,8 +2068,9 @@ inline void modelStatement( BodyWalk& w, std::string_view stmt )
 // A `#` that opens a preprocessor DIRECTIVE (only whitespace between it and the line start).
 inline bool atDirectiveStart( std::string_view body, std::size_t at )
 {
-    for( std::size_t i = at; i-- > 0; )
+    for( std::size_t cursor = at; cursor > 0; --cursor )   // cursors, not `i-- > 0`: a `#` with no newline before it wrapped it
     {
+        const std::size_t i = cursor - 1;
         if( body[i] == '\n' )
         {
             return true;
@@ -2010,7 +2262,7 @@ inline LayoutDef modelDefFromSource( ModelCtx& ctx, std::string_view src, std::s
     def.path = ( fileId < ctx.ing.files.size() ) ? ctx.ing.files[ fileId ] : std::string();
     def.line = lineOf( src, site.headStart );
 
-    VERIFY( site.braceStart < site.braceEnd && site.braceEnd <= src.size() );
+    ASSUME( site.braceStart < site.braceEnd && site.braceEnd <= src.size() );
     const std::string_view whole    = src;
     const std::string      headText = withoutComments( whole.substr( site.headStart, site.braceStart - site.headStart ) );
     readHeadAttributes( def, headText, name );
@@ -2198,23 +2450,23 @@ inline void scanFileForAsserts( std::string_view src, const std::string& path, s
 inline std::vector<AssertRow> collectAsserts( const IngestResult& ing, std::string_view name, std::size_t& filesScanned )
 {
     std::vector<AssertRow> rows;
-    std::string            bytes;
     for( std::uint32_t fileId = 0; fileId < ing.files.size(); ++fileId )
     {
         if( !isCFamilyPath( ing.files[fileId] ) )
         {
             continue;
         }
-        if( !darkflags::readWhole( diskPath( ing, fileId ), bytes ) )
+        const std::optional<std::string> bytes = darkflags::readWhole( diskPath( ing, fileId ) );
+        if( !bytes )
         {
             continue;
         }
         ++filesScanned;
-        if( bytes.find( name ) == std::string::npos )
+        if( bytes->find( name ) == std::string::npos )
         {
             continue; // cheap reject before the keyword walk
         }
-        scanFileForAsserts( bytes, ing.files[ fileId ], name, rows );
+        scanFileForAsserts( *bytes, ing.files[ fileId ], name, rows );
     }
 
     std::sort( rows.begin(), rows.end(), []( const AssertRow& a, const AssertRow& b )
@@ -2393,7 +2645,7 @@ inline LayoutResult computeLayout( const IngestResult& ing, std::string_view spe
             const std::string& src = fileBytes( ctx, s.fileId );
             if( src.empty() )
             {
-                DEGRADED_PATH_ALERT( "layout: cannot read a definition's file — that definition is omitted" );
+                DISCLOSE( result, LayoutResult::DisclosureWhy::UnreadableFile, "layout: cannot read a definition's file — that definition is omitted" );
                 continue;
             }
             if( !findDefBody( src, name, s.sigStartByte, site ) )
@@ -2457,65 +2709,65 @@ using XmlEscaper = std::function<std::string( std::string_view )>;
 inline void writeLayoutDef( std::FILE* out, const LayoutDef& def, const XmlEscaper& ex, std::string_view rootPrefix = {} )
 {
     const std::string_view rp = rootPrefix.empty() ? std::string_view( def.path ) : rw::sarif::rootRelativeUri( def.path, rootPrefix );
-    std::fprintf( out, "<def p=\"%s\" l=\"%u\" agg=\"%s\" modeled=\"%d\" fields=\"%zu\"",
+    rw::emitTo( out, "<def p=\"{}\" l=\"{}\" agg=\"{}\" modeled=\"{}\" fields=\"{}\"",
                   ex( rp ).c_str(), def.line, def.aggregate, def.modeled ? 1 : 0, def.fields.size() );
     if( def.modeled )
     {
-        std::fprintf( out, " size=\"%u\" align=\"%u\" tail_pad=\"%u\"", def.size, def.align, def.tailPad );
+        rw::emitTo( out, " size=\"{}\" align=\"{}\" tail_pad=\"{}\"", def.size, def.align, def.tailPad );
     }
     if( def.declaredAlign )
     {
-        std::fprintf( out, " alignas=\"%u\"", def.declaredAlign );
+        rw::emitTo( out, " alignas=\"{}\"", def.declaredAlign );
     }
     if( def.packedAttr )
     {
-        std::fprintf( out, " packed=\"1\"" );
+        rw::emitRaw( out, " packed=\"1\"" );
     }
-    std::fprintf( out, ">" );
+    rw::emitRaw( out, ">" );
 
     for( const FieldRow& f : def.fields )
     {
         if( f.padBefore )
         {
-            std::fprintf( out, "<pad bytes=\"%u\"/>", f.padBefore );
+            rw::emitTo( out, "<pad bytes=\"{}\"/>", f.padBefore );
         }
-        std::fprintf( out, "<f n=\"%s\" ty=\"%s\"", ex( f.name ).c_str(), ex( f.type ).c_str() );
+        rw::emitTo( out, "<f n=\"{}\" ty=\"{}\"", ex( f.name ).c_str(), ex( f.type ).c_str() );
         if( !f.resolved.empty() )
         {
-            std::fprintf( out, " as=\"%s\"", ex( f.resolved ).c_str() );
+            rw::emitTo( out, " as=\"{}\"", ex( f.resolved ).c_str() );
         }
         if( f.elems != 1 )
         {
-            std::fprintf( out, " x=\"%u\"", f.elems );
+            rw::emitTo( out, " x=\"{}\"", f.elems );
         }
         if( f.sized )
         {
-            std::fprintf( out, " sz=\"%u\" al=\"%u\"", f.size, f.align );
+            rw::emitTo( out, " sz=\"{}\" al=\"{}\"", f.size, f.align );
         }
         else
         {
-            std::fprintf( out, " sized=\"0\"" );
+            rw::emitRaw( out, " sized=\"0\"" );
         }
         if( f.placed )
         {
-            std::fprintf( out, " off=\"%u\"", f.offset );
+            rw::emitTo( out, " off=\"{}\"", f.offset );
         }
-        std::fprintf( out, "/>" );
+        rw::emitRaw( out, "/>" );
     }
     if( def.modeled && def.tailPad )
     {
-        std::fprintf( out, "<pad tail=\"%u\"/>", def.tailPad );
+        rw::emitTo( out, "<pad tail=\"{}\"/>", def.tailPad );
     }
     for( const Caveat& c : def.caveats )
     {
-        std::fprintf( out, "<caveat k=\"%s\" d=\"%s\"", ex( c.kind ).c_str(), ex( c.detail ).c_str() );
+        rw::emitTo( out, "<caveat k=\"{}\" d=\"{}\"", ex( c.kind ).c_str(), ex( c.detail ).c_str() );
         if( c.count > 1 )
         {
-            std::fprintf( out, " count=\"%u\"", c.count ); // §P6.12: how many sites this ONE row stands for
+            rw::emitTo( out, " count=\"{}\"", c.count ); // §P6.12: how many sites this ONE row stands for
         }
-        std::fprintf( out, "/>" );
+        rw::emitRaw( out, "/>" );
     }
-    std::fprintf( out, "</def>" );
+    rw::emitRaw( out, "</def>" );
 }
 
 // `rootArg` — R-E (2026-08-17 harvest), same single-root-only root argument serialize() takes.
@@ -2560,7 +2812,7 @@ inline void writeLayout( std::FILE* out, const LayoutResult& res, std::string_vi
 
     // G4: an XML comment may not contain a double hyphen, so this text names flags WITHOUT their leading
     // dashes. Keep it that way when editing.
-    std::fprintf( out, "<!-- ripwire layout: field offsets COMPUTED from the source text under standard-layout "
+    rw::emitTo( out, "<!-- ripwire layout: field offsets COMPUTED from the source text under standard-layout "
                        "assumptions on a 64-bit Apple/LP64 target (natural alignment, interior padding, trailing pad to "
                        "the aggregate's own alignment). NOT the ABI: pragma pack, bitfields, virtuals, base classes, "
                        "nested aggregates, preprocessor-conditional members and unsized field types are DETECTED and set "
@@ -2570,12 +2822,15 @@ inline void writeLayout( std::FILE* out, const LayoutResult& res, std::string_vi
                        "exits non-zero); kind=\"stub\" is an empty placeholder aggregate and kind=\"spelling\" is the two "
                        "arms of one ifdef block naming the same bytes differently (simd::float4 vs float4) — both reported, "
                        "neither a break. agree=\"0\" on an assert row means a sizeof tripwire contradicts the computed size. "
-                       "Definitions and asserts come from the INDEXED files. -->%s",
-                 rw::rootRelPathsLegend( !rootArg.empty() ) );   // R-E fix (2026-08-19): defines root= (graphlegend.h)
+                       "Definitions and asserts come from the INDEXED files.{} -->{}",
+                 res.unreadableDefs != 0 ? " unreadable=\"N\": N same-name definitions whose file could not be read when this ran —"
+                                           " absent from defs= and from the mirror comparison, so mirror= compares only what was read (exit 3: not verified)." : "",
+                 rw::rootRelPathsLegend( !rootArg.empty() )  );   // R-E fix (2026-08-19): defines root= (graphlegend.h)
     const std::string layoutRootAttr = rootArg.empty() ? std::string() : ( " root=\"" + ex( rootArg ) + "\"" );
-    std::fprintf( out, "<layout sym=\"%s\" found=\"%d\" defs=\"%zu\" mirror=\"%s\" asserts=\"%zu\" conflicts=\"%u\" scanned=\"%zu\"%s>",
+    const std::string unreadableAttr = res.unreadableDefs != 0 ? ( " unreadable=\"" + std::to_string( res.unreadableDefs ) + "\"" ) : std::string();
+    rw::emitTo( out, "<layout sym=\"{}\" found=\"{}\" defs=\"{}\" mirror=\"{}\" asserts=\"{}\" conflicts=\"{}\" scanned=\"{}\"{}{}>",
                   ex( res.sym ).c_str(), res.found ? 1 : 0, res.defsFound, mirror, res.asserts.size(),
-                  res.assertConflicts, res.filesScanned, layoutRootAttr.c_str() );
+                  res.assertConflicts, res.filesScanned, unreadableAttr.c_str(), layoutRootAttr.c_str() );
 
     for( const LayoutDef& d : res.defs )
     {
@@ -2583,36 +2838,36 @@ inline void writeLayout( std::FILE* out, const LayoutResult& res, std::string_vi
     }
     if( res.defsFound > res.defs.size() )
     {
-        std::fprintf( out, "<more defs=\"%zu\"/>", res.defsFound - res.defs.size() );
+        rw::emitTo( out, "<more defs=\"{}\"/>", res.defsFound - res.defs.size() );
     }
 
     for( const MirrorDiff& m : res.mirrors )
     {
-        std::fprintf( out, "<mismatch kind=\"%s\" a=\"%s\" b=\"%s\" size_a=\"%u\" size_b=\"%u\" size_differs=\"%d\" diffs=\"%zu\">",
+        rw::emitTo( out, "<mismatch kind=\"{}\" a=\"{}\" b=\"{}\" size_a=\"{}\" size_b=\"{}\" size_differs=\"{}\" diffs=\"{}\">",
                       m.kind, ex( relPathLine( m.a ) ).c_str(), ex( relPathLine( m.b ) ).c_str(),
                       m.sizeA, m.sizeB, m.sizeDiffers ? 1 : 0, m.fields.size() );
         for( const FieldDiff& f : m.fields )
         {
-            std::fprintf( out, "<d n=\"%s\" a=\"%s\" b=\"%s\"/>", ex( f.name ).c_str(), ex( f.inA ).c_str(), ex( f.inB ).c_str() );
+            rw::emitTo( out, "<d n=\"{}\" a=\"{}\" b=\"{}\"/>", ex( f.name ).c_str(), ex( f.inA ).c_str(), ex( f.inB ).c_str() );
         }
-        std::fprintf( out, "</mismatch>" );
+        rw::emitRaw( out, "</mismatch>" );
     }
 
     for( const AssertRow& a : res.asserts )
     {
         const std::string_view arp = rootPrefix.empty() ? std::string_view( a.path ) : rw::sarif::rootRelativeUri( a.path, rootPrefix );
-        std::fprintf( out, "<assert p=\"%s\" l=\"%u\" kind=\"%s\"", ex( arp ).c_str(), a.line, a.kind );
+        rw::emitTo( out, "<assert p=\"{}\" l=\"{}\" kind=\"{}\"", ex( arp ).c_str(), a.line, a.kind );
         if( a.hasWant )
         {
-            std::fprintf( out, " want=\"%u\"", a.want );
+            rw::emitTo( out, " want=\"{}\"", a.want );
         }
         if( a.compared )
         {
-            std::fprintf( out, " got=\"%u\" agree=\"%d\"", a.got, a.agree ? 1 : 0 );
+            rw::emitTo( out, " got=\"{}\" agree=\"{}\"", a.got, a.agree ? 1 : 0 );
         }
-        std::fprintf( out, " t=\"%s\"/>", ex( a.text ).c_str() );
+        rw::emitTo( out, " t=\"{}\"/>", ex( a.text ).c_str() );
     }
-    std::fprintf( out, "</layout>" );
+    rw::emitRaw( out, "</layout>" );
 }
 
 }}   // namespace rw::layout

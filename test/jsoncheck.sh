@@ -27,13 +27,14 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
 # NOTE: ok/no print to STDERR (not stdout) — several checks below capture a verb's raw --json output via
 # `x="$( parses ... )"` and ok/no are called from inside that same command substitution (parses() reports
 # AND returns the payload); stdout must stay reserved for the payload or the PASS/FAIL lines corrupt it.
-ok(){ printf '  PASS  %s\n' "$*" >&2; }
+ok(){ printf '  PASS  %s\n' "$*" >&2 || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*" >&2; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*" >&2; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -319,6 +320,7 @@ probeFor()
         --limit=)        printf '%s' '--limit=3' ;;
         --offset=)       printf '%s' '--offset=1' ;;
         --max-file-size=) printf '%s' '--max-file-size=1M' ;;
+        --max-memory=)   printf '%s' '--max-memory=8G' ;;
         --pack-budget-bytes=) printf '%s' '--pack-budget-bytes=1000' ;;
         --cache=)        printf '%s' "--cache=$TMP/probe.cache" ;;
         --index-out=)    printf '%s' "--index-out=$TMP/probe.idx" ;;
@@ -358,7 +360,7 @@ done < "$UNIV"
 [ "$nRefuse" -ge 150 ] && ok "#8b: $nRefuse flags refused --json loudly, naming themselves" \
                        || no "#8b: only $nRefuse flags refused (want >= 150) — the sweep is not covering the universe"
 # --help's supported-set sentence must name every JSON verb the sweep found (it omitted --metrics for a round).
-HELPJSON="$( "$BIN" --help 2>&1 | sed -n '/^    --json /,/refuses loudly/p' | tr '\n' ' ' )"
+HELPJSON="$( "$BIN" --help=all 2>&1 | sed -n '/^    --json /,/refuses loudly/p' | tr '\n' ' ' )"
 for v in $jsonVerbs; do
     case "$v" in --for|--pack-task|--callers|--callees|--impact|--quality-delta|--test-gate|--metrics)
         printf '%s' "$HELPJSON" | grep -q -- "$v" || no "#8b: --help's --json paragraph does not name $v, which answers in JSON" ;;

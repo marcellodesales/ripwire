@@ -91,7 +91,7 @@ TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 mutants=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -388,7 +388,7 @@ grep -q 'data-module-card' "$PAGE" && ok "(M2) control: the data-module-card ATT
 # ── (N) every langTag value has a swatch — DERIVED from model.h's own switch ─────────────────────────
 #     langColor had 9 keys and the static legend 8, against langTag's 19 tags: eleven languages fell
 #     through to an unlabelled #999 that the legend never explained.
-awk '/^inline const char\* langTag\(/,/^}/' "$ROOT/src/model.h" \
+awk '/^inline (constexpr )?const char\* langTag\(/,/^}/' "$ROOT/src/model.h" \
     | grep -oE 'return "[a-z]+";' | grep -oE '"[a-z]+"' | tr -d '"' | sort -u > "$TMP/tags.txt"
 NTAGS="$( grep -c . "$TMP/tags.txt" )"
 if [ "$NTAGS" -lt 15 ]; then
@@ -778,9 +778,22 @@ else
                           || no "(S1) symTag kinds with no shape:$missing — they would fall back to the function circle"
     fi
 fi
+# (S2) is (S1)'s CONVERSE: (S1) says every kind symTag emits has a shape, (S2) says the roster is not a
+# SUPERSET of that — no shape for a kind that does not exist, and none missing either. It carried the
+# literal 10 and #60's `modscope` made it 11, which is the second hand-maintained list this arm's own
+# header forbids ("ONE TABLE, indexed by the enum"). DERIVED now, from the enum declaration itself, so an
+# appended SymKind moves this arm the way it moves kSymKindCount's static_assert: by construction.
 nshape="$( printf '%s' "$shapesLine" | grep -oE '"[a-z]+":"[a-z]+"' | wc -l | tr -d ' ' )"
-[ "$nshape" = "10" ] && ok "(S2) control: the roster is one entry per SymKind enumerator, not a subset ($nshape)" \
-                     || no "(S2) control: the emitted shape roster has $nshape entries, not the 10 SymKind enumerators"
+nkind="$( sed -n 's/.*enum class SymKind[^{]*{\([^}]*\)}.*/\1/p' "$ROOT/src/model.h" | tr ',' '\n' | grep -cE '[A-Za-z]' )"
+if [ "$nkind" -lt 10 ]; then
+    no "(S2) derived only $nkind SymKind enumerators from model.h — the sed broke and this arm asserts nothing"
+elif [ "$ntags" != "$nkind" ]; then
+    no "(S2) model.h::symTag emits $ntags distinct tags for $nkind SymKind enumerators — two enumerators share a tag, or one is unhandled"
+elif [ "$nshape" = "$nkind" ]; then
+    ok "(S2) control: the roster is one entry per SymKind enumerator, not a subset and not a superset ($nshape of $nkind)"
+else
+    no "(S2) control: the emitted shape roster has $nshape entries, not the $nkind SymKind enumerators model.h declares"
+fi
 # (S3)/(S4) the roster is actually WHAT IS DRAWN. A payload nothing reads is the FILES array's old defect
 #      (2241 bytes emitted and never looked at), and the absence control is the arc that used to draw
 #      every node regardless of kind.
@@ -1053,7 +1066,7 @@ absent 'LCONF|LOW_CONF' "(V12) the superseded LCONF/LOW_CONF derivation is gone 
 #     strictly-increasing arrangement, therefore the same edges always emit in the same order and always
 #     settle to the same layout. Relax it to allow duplicates and the ties come back, and every failure
 #     above returns with the check still green. src/htmlexport.h::writeEdgePayload carries the same fence
-#     as a VERIFY; these arms hold it on the emitted BYTES, at a scale where the sensitivity is real and
+#     as an ASSUME; these arms hold it on the emitted BYTES, at a scale where the sensitivity is real and
 #     in a build where NDEBUG has compiled the assert away.
 #
 #     It cannot catch a change to which edges are SELECTED, and must not: that is meant to move the

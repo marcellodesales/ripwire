@@ -53,10 +53,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # absolutize BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -296,8 +297,8 @@ QD1b="$( cd "$A1" && "$BIN" . --quality-delta --no-cache 2>/dev/null )"
 [ "$QD1" = "$QD1b" ] && ok "arm6: --quality-delta deterministic (byte-identical run-to-run)" \
     || no "arm6: --quality-delta non-deterministic output"
 if command -v xmllint >/dev/null 2>&1; then
-    printf '%s' "$QD1" | xmllint --noout - 2>/dev/null && ok "arm6: --quality-delta xml well-formed" || no "arm6: --quality-delta xml malformed"
-    printf '%s' "$DC2" | xmllint --noout - 2>/dev/null && ok "arm6: --dead-code xml well-formed" || no "arm6: --dead-code xml malformed"
+    if printf '%s' "$QD1" | xmllint --noout - 2>/dev/null; then ok "arm6: --quality-delta xml well-formed"; else no "arm6: --quality-delta xml malformed"; fi
+    if printf '%s' "$DC2" | xmllint --noout - 2>/dev/null; then ok "arm6: --dead-code xml well-formed"; else no "arm6: --dead-code xml malformed"; fi
 else
     ok "arm6: xml well-formed (xmllint absent — skipped)"
 fi
@@ -317,7 +318,8 @@ printf '%s' "$DC7_ERR" | grep -q 'register_macrs' \
 printf '%s' "$DC7" | grep -q 'config-warnings="1"' \
     && ok "arm7: --dead-code root carries config-warnings=\"1\"" \
     || { no "arm7: no config-warnings= disclosure on the root"; printf '%s\n' "$DC7" | grep -oE '<dead-code[^>]*>'; }
-DC7_COMMENT="$( printf '%s' "$DC7" | sed -n 's/-->.*$//p' )"
+# L1 (2026-09-19): the CLI default legend is compact; this arm reads the FULL legend's definition of config-warnings=, so it asks for it.
+DC7_COMMENT="$( "$BIN" "$A7" --dead-code --no-cache --legend=full 2>/dev/null | sed -n 's/-->.*$//p' )"
 printf '%s' "$DC7_COMMENT" | grep -q 'config-warnings=' \
     && ok "arm7: the leading comment defines config-warnings=" \
     || no "arm7: the leading comment never defines config-warnings="

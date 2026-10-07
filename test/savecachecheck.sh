@@ -5,7 +5,7 @@
 # checked. On a short write (e.g. ENOSPC) the truncated temp file still got rename()'d over the
 # previous good cache — silently destroying it. The checksum trailer self-heals on next load (full
 # reparse), so this was perf-only, but a good cache should never be clobbered with zero alert, unlike
-# every neighboring degrade path in ingest.cpp (all of which fire DEGRADED_PATH_ALERT).
+# every neighboring degrade path in ingest.cpp (all of which fire DISCLOSE).
 #
 # This gate simulates a write failure the portable way: after populating a good cache, we make the
 # CACHE FILE ITSELF read-only (chmod 0444) and its parent directory read-only too (chmod 0555) so a
@@ -27,7 +27,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'chmod -R u+w "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }

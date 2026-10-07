@@ -23,7 +23,8 @@
 #   (7)  unsupported-language refusal: exit 1, "not served for" (never an empty success)
 #   (8)  unknown-symbol refusal: exit 1, the shared not-found message
 #   (9)  determinism (x3, byte-identical)
-#   (10) xmllint well-formedness (both modes)
+#   (10) xmllint well-formedness (both modes); (10d) the FULL tier specifically, plain and
+#        --slice-flow=both — the tier the default-tier-only arms above never exercise
 #   (11) keyword-local exclusion: a degraded parse must never offer a reserved word as a sliceable
 #        local (inventory clean of it, slicing it refuses) — the ugrep matcher.cpp misparse shape
 #   (12) C++ condition declaration `if( int k = x )`: tree-sitter-cpp emits a `declaration` whose
@@ -32,6 +33,8 @@
 #   (13) JS/TS destructuring binders are sliceable locals whose def is the pattern line: object,
 #        array, renamed (`y: yy`), defaulted (`z = 3`, its right side a read), rest, a destructured
 #        parameter, `for (const { k } of xs)`, and `({ x } = o)` as an assign
+#   (order) VAR-mode rows emit in the declared order (def-use coverage desc, then line) and the root says
+#        order="defuse" — the legend (both tiers) and --help define it; a flow run's seed rows keep that order
 #   (14) Python `global X` / `nonlocal X` row k="scope" t="global"|"nonlocal" — a scope declaration,
 #        neither read nor write — and introduce the name in the inventory with that role
 #
@@ -42,7 +45,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -213,7 +216,9 @@ attr(){ printf '%s' "$( elem "$1" )" | grep -oE "^<slice [^>]*" | grep -oE "$2=\
 row(){ printf '%s' "$( elem "$1" )" | grep -oE "<s l=\"$2\"[^>]*>"; }
 
 # ── (1) C++ def/use classification on accumulate:count ──────────────────────────────────────────────
-OUT1="$( sl accumulate:count )"
+# L1 (2026-09-19): the CLI default legend is compact; (1) reads the FULL legend's prose off $OUT1, so this run asks for it
+# (the sl helper's exact invocation, plus --legend=full).
+OUT1="$( cd "$WORK" && "$BIN" . --slice=accumulate:count --no-cache --legend=full 2>/dev/null )"
 [ "$( attr "$OUT1" var )" = 'var="count"' ] \
     && ok "(1) accumulate:count — <slice var=\"count\"> element present" \
     || { no "(1) expected a <slice var=\"count\"> element"; printf '%s\n' "$OUT1"; }
@@ -338,6 +343,17 @@ if command -v xmllint >/dev/null 2>&1; then
     ( cd "$WORK" && "$BIN" . --slice=accumulate --no-cache 2>/dev/null | xmllint --noout - ) \
         && ok "(10) xmllint: --slice=accumulate inventory output is well-formed XML" \
         || no "(10) xmllint: --slice=accumulate inventory output is NOT well-formed XML"
+    # (10d) the full-tier legend is its own XML comment (never the compact dictionary's shorter one);
+    # an inline flag mention with its dashes ("--at=") is a double-hyphen INSIDE that comment, which
+    # xmllint --noout rejects outright — a pre-existing G4 violation on origin/main 15a20855 too, not
+    # caught before because every other well-formedness arm here and in sliceflowcheck.sh/
+    # sliceflowsenscheck.sh only lints the DEFAULT (compact) tier.
+    ( cd "$WORK" && "$BIN" . --slice=accumulate:count --legend=full --no-cache 2>/dev/null | xmllint --noout - ) \
+        && ok "(10d) xmllint: --slice=accumulate:count --legend=full output is well-formed XML" \
+        || no "(10d) xmllint: --slice=accumulate:count --legend=full output is NOT well-formed XML (a '--' inside the legend comment?)"
+    ( cd "$WORK" && "$BIN" . --slice=accumulate:count --slice-flow=both --legend=full --no-cache 2>/dev/null | xmllint --noout - ) \
+        && ok "(10d) xmllint: --slice=accumulate:count --slice-flow=both --legend=full output is well-formed XML" \
+        || no "(10d) xmllint: --slice=accumulate:count --slice-flow=both --legend=full output is NOT well-formed XML (a '--' inside the legend comment?)"
 else
     echo "  SKIP  (10) xmllint not installed — well-formedness not checked"
 fi
@@ -412,6 +428,141 @@ OUT14N="$( sl inner:acc )"
 printf '%s' "$( row "$OUT14N" 11 )" | grep -q 'k="scope" t="nonlocal"' && printf '%s' "$( row "$OUT14N" 12 )" | grep -q 'k="both"' \
     && ok "(14) inner:acc — 'nonlocal acc' rows k=scope t=nonlocal, 'acc += k' rows k=both" \
     || { no "(14) expected l=11 k=\"scope\" t=\"nonlocal\" and l=12 k=\"both\""; printf '%s\n' "$OUT14N"; }
+
+# ── (15) deep nesting: answered in linear time up to the guard, refused by name past it ──────────────────────────
+#    The walk used to climb to each occurrence's statement anchor through ts_node_parent, which descends from the root
+#    every time, so its cost grew with the cube of the nesting: 2,000 chained `if (x)` took 48 s and 4,000 did not
+#    finish in two minutes (an MCP `slice` call on such a file wedged the server). It now reads parents from a table
+#    built in one cursor pass and memoizes the anchor, so the occurrence scan is linear. lane/slice-iterative then made
+#    both walks run on an explicit heap work stack instead of recursing, so the 2,048-level bound is a TIME/MEMORY
+#    guard now, not a stack one: the reaching-definitions fixpoint is inherently super-linear in nesting (measured:
+#    8,192 nested `for` loops, 48 s), and that cost — not any stack frame — is what the guard protects against.
+#    (a) 2,000 nested ifs are ANSWERED inside a 30 s bound (base: killed).
+#    (b) 2,040 nested `for` loops — the shape whose fixpoint redo costs the most per level — are ANSWERED just under
+#        the guard. This arm now passes even with the caller's stack held to 1 MB (`ulimit -s 1024`: the walk no
+#        longer needs any stack margin, only time), where the pre-fix binary SIGSEGV'd here (rc 139), un-sanitized —
+#        run this gate with RIPWIRE_BIN=asan/ripwire too, which no longer needs the wider sanitizer frame margin either.
+#    (c) a CPython-shaped chained assignment ~808 levels deep — Lib/test/test_traceback.py:3256, the deepest function in
+#        47,795 parsed files — is ANSWERED: a real file must never meet the guard.
+#    (d) 6,000 nested blocks are REFUSED by name, in bounded time, before any walk.
+DEEPDIR="$( mktemp -d )"
+python3 - "$DEEPDIR" <<'PYDEEP'
+import sys
+d = sys.argv[1]
+open(d + "/deep.c", "w").write("int deep( int x )\n{\n    int y = 0;\n    " + "if (x) " * 2000 + "y = x;\n    return y;\n}\n"
+                                "int loops( int x )\n{\n    int y = 0;\n    " + "for (;;) " * 2040 + "y = x;\n    return y;\n}\n"
+                                "int blocks( int x )\n{\n    int y = 0;\n    " + "{ " * 6000 + "y = x;" + " }" * 6000 + "\n    return y;\n}\n")
+open(d + "/chain.py", "w").write("def chained():\n    " + " = ".join("a%d" % i for i in range(1, 807)) + " = 1\n    return a1\n")
+PYDEEP
+bounded(){ if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else perl -e 'alarm 60; exec @ARGV' "$@"; fi; }
+( cd "$DEEPDIR" && bounded "$BIN" . --slice=deep:y --no-cache >"$DEEPDIR/deep.out" 2>"$DEEPDIR/deep.err" ); rc15=$?
+[ "$rc15" -eq 0 ] && grep -q '<s l="4"' "$DEEPDIR/deep.out" \
+    && ok "(15a) deep:y — 2,000 nested ifs slice in bounded time (exit 0, the assignment row at l=4)" \
+    || no "(15a) deep:y exit $rc15 (expected 0 with the l=4 row; 124/142 is the cubic walk, 1 a guard set below real depth): $( head -c 200 "$DEEPDIR/deep.err" )"
+( cd "$DEEPDIR" && bounded "$BIN" . --slice=loops:y --no-cache >"$DEEPDIR/loops.out" 2>"$DEEPDIR/loops.err" ); rc15l=$?
+[ "$rc15l" -eq 0 ] && grep -q '<s l="10"' "$DEEPDIR/loops.out" \
+    && ok "(15b) loops:y — 2,040 nested for loops (the fixpoint's costliest shape per level) slice just under the guard (exit 0, the assignment row at l=10)" \
+    || no "(15b) loops:y exit $rc15l (expected 0; 139/138 below the guard would mean the walk is recursing again — it should not be): $( head -c 200 "$DEEPDIR/loops.err" )"
+( cd "$DEEPDIR" && bounded "$BIN" . --slice=chained:a1 --no-cache >"$DEEPDIR/chain.out" 2>"$DEEPDIR/chain.err" ); rc15b=$?
+[ "$rc15b" -eq 0 ] && grep -q '<s l="2"' "$DEEPDIR/chain.out" \
+    && ok "(15c) chained:a1 — an 806-name, ~808-level chained assignment (CPython test_traceback.py's shape) is answered" \
+    || no "(15c) chained:a1 exit $rc15b — a real-world depth must be answered: $( head -c 200 "$DEEPDIR/chain.err" )"
+( cd "$DEEPDIR" && bounded "$BIN" . --slice=blocks:y --no-cache >"$DEEPDIR/blocks.out" 2>"$DEEPDIR/blocks.err" ); rc15c=$?
+[ "$rc15c" -eq 1 ] && grep -q 'nests deeper than 2048 syntax levels' "$DEEPDIR/blocks.err" \
+    && ok "(15d) blocks:y — 6,000 nested blocks refuse by name at the 2,048-level guard" \
+    || no "(15d) blocks:y exit $rc15c (expected 1 with the stack-guard refusal): $( head -c 200 "$DEEPDIR/blocks.err" )"
+rm -rf "$DEEPDIR"
+
+# ── (rd-bound) an UNSETTLED reaching-definition fixpoint is disclosed on the root, in every build flavour ─────────
+# The loop fixpoint stops at kSliceRdMaxIter; no input reaches it (it settles in one round on every measured corpus),
+# so the arm LOWERS the bound with RIPWIRE_TEST_SLICE_RD_MAXITERS — pagerank's RIPWIRE_TEST_PR_MAXITERS pattern, honoured
+# in every flavour. The walk used to keep reach="cfg" and a one-argument DISCLOSE (a debug trace, nothing in Release);
+# the scan's DISCLOSE sink now puts reach_converged="0" on the root, defined in the same header.
+RD="$WORK/rdbound"; mkdir -p "$RD"
+printf 'int loopy( int n )\n{\n    int x = 0;\n    while( n > 0 )\n    {\n        n = n - x;\n        x = x + 1;\n    }\n    return x;\n}\n' >"$RD/a.c"
+"$BIN" "$RD" --slice=loopy:x --no-cache >"$RD/ctl.xml" 2>/dev/null
+RIPWIRE_TEST_SLICE_RD_MAXITERS=1 "$BIN" "$RD" --slice=loopy:x --no-cache >"$RD/hit.xml" 2>/dev/null
+RDCTL="$( grep -o '<slice [^>]*>' "$RD/ctl.xml" )"; RDHIT="$( grep -o '<slice [^>]*>' "$RD/hit.xml" )"
+{ printf '%s' "$RDCTL" | grep -q ' reach="cfg"' && ! grep -q 'reach_converged' "$RD/ctl.xml"; } \
+    && ok "(rd-bound) control: the settled slice reads reach=\"cfg\" with no reach_converged=" \
+    || no "(rd-bound) control: the unhooked slice is not the settled cfg shape: $RDCTL"
+printf '%s' "$RDHIT" | grep -q ' reach="cfg" reach_converged="0"' \
+    && ok "(rd-bound) a fixpoint stopped at its bound says so on the root: reach_converged=\"0\" (every build flavour)" \
+    || no "(rd-bound) a fixpoint stopped at its bound still reads as a finished flow analysis: $RDHIT"
+grep -q 'reach_converged="0": ' "$RD/hit.xml" \
+    && ok "(rd-bound) reach_converged= is defined in the same document" || no "(rd-bound) reach_converged= rides with no definition"
+command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$RD/hit.xml" 2>/dev/null \
+    && ok "(rd-bound) the disclosing document is well-formed" || no "(rd-bound) the disclosing document fails xmllint"; }
+rdbad=0
+for v in 64 65 1000 1x '' 0 ' 1'; do
+    RIPWIRE_TEST_SLICE_RD_MAXITERS="$v" "$BIN" "$RD" --slice=loopy:x --no-cache >"$RD/v.xml" 2>/dev/null
+    cmp -s "$RD/v.xml" "$RD/ctl.xml" || { no "(rd-bound) RIPWIRE_TEST_SLICE_RD_MAXITERS='$v' changed the document — the hook is not lower-only/strict"; rdbad=1; }
+done
+[ "$rdbad" = 0 ] && ok "(rd-bound) the hook cannot raise the bound and parses strictly: 7 non-lowering values are byte-identical to unset"
+"$BIN" --help=all 2>&1 | grep -q 'RIPWIRE_TEST_SLICE_RD_MAXITERS' \
+    && no "(rd-bound) the arming hook is advertised in --help — it is a gate's hook, not a user surface (G5)" \
+    || ok "(rd-bound) the arming hook appears in no --help text (G5)"
+
+# ── (order) --slice=SYM:VAR rows emit in the DECLARED order, and the root states it ─────────────────────────────
+# Measured (LocBench py, 478 (instance, variable) pairs): source order pinpoints a gold line WORSE than a random
+# shuffle of the same rows (MRR 0.525 vs 0.602), def-use coverage beats it (0.628). So the rows rank by coverage —
+# how many distinct sliceable locals share the line — descending, then line, then binding line, and the root says
+# order="defuse" so the reader never mistakes a ranking for source order (or the reverse). Fixture: l=4 names FOUR
+# locals, l=2 and l=5 name one each; source order is 2,4,5, the declared order is 4,2,5. A flow run keeps the same
+# seed rows in the same order (the flow rows keep their own stated (d=, l=, v=) order).
+ORD="$WORK/order"; mkdir -p "$ORD"
+printf 'def mix(a):\n    x = 1\n    y = 2\n    z = x + y + a\n    return x\n' >"$ORD/m.py"
+"$BIN" "$ORD" --slice=mix:x --no-cache >"$ORD/o.xml" 2>/dev/null
+"$BIN" "$ORD" --slice=mix:x --slice-flow=back --no-cache >"$ORD/f.xml" 2>/dev/null
+OROOT="$( grep -o '<slice [^>]*>' "$ORD/o.xml" )"
+OLINES="$( grep -o '<s l="[0-9]*"' "$ORD/o.xml" | tr -dc '0-9\n' | tr '\n' ',' )"
+FLINES="$( grep -o '<s l="[0-9]*" k="[a-z]*" t="[a-z-]*"[ a-z="0-9,-]*><' "$ORD/f.xml" | grep -v ' v="' | grep -o 'l="[0-9]*"' | tr -dc '0-9\n' | tr '\n' ',' )"
+[ "$OLINES" = "4,2,5," ] \
+    && ok "(order) mix:x rows emit 4,2,5 — coverage descending (l=4 names four locals), then line" \
+    || { no "(order) mix:x rows emit '$OLINES', expected 4,2,5 (coverage desc, then line)"; printf '%s\n' "$OROOT"; }
+printf '%s' "$OROOT" | grep -q ' order="defuse"' \
+    && ok "(order) the root states the row order: order=\"defuse\"" \
+    || no "(order) the root does not state the row order (expected order=\"defuse\"): $OROOT"
+# the legend is everything before the root (a legend spells <s …> rows, so a [^>]* comment match would stop short)
+grep -q 'order="defuse"' "$ORD/o.xml" && sed 's/<slice .*//' "$ORD/o.xml" | grep -q 'order=defuse\|order=\\"defuse\\"\|order="defuse"' \
+    && ok "(order) order= is defined in the same document's legend" || no "(order) order= rides with no legend definition"
+"$BIN" "$ORD" --slice=mix:x --legend=compact --no-cache 2>/dev/null | sed 's/<slice .*//' | grep -q 'order=defuse' \
+    && ok "(order) the compact legend defines order= too" || no "(order) the compact legend does not define order="
+"$BIN" "$ORD" --slice=mix:x --legend=full --no-cache 2>/dev/null | sed 's/<slice .*//' | grep -q 'order=\\\?"defuse' \
+    && ok "(order) the full legend defines order= too" || no "(order) the full legend does not define order="
+[ "$FLINES" = "4,2,5," ] \
+    && ok "(order) a flow run's seed rows keep the same declared order" \
+    || no "(order) a flow run's seed rows emit '$FLINES', expected 4,2,5"
+"$BIN" --help=all 2>&1 | grep -q 'order="defuse"' \
+    && ok "(order) --help documents order=\"defuse\"" || no "(order) --help does not document order=\"defuse\""
+
+# ── (disclosure) the ARISE line-ranking pre-registration FAILed over the whole function span
+# (docs/EVALS.md, "row order over the WHOLE function span"): order="defuse" stays the shipped rule (it
+# still beats random among the rows it already emits), but nothing here may read as claiming it finds the
+# most relevant line in a function it has not narrowed down first. RED on a binary built before that
+# disclosure landed (no "whole-function" scoping anywhere in the compact legend, the full legend, or
+# --help=slice): every clause below is new text, so this arm fails on the pre-disclosure binary by
+# construction and is the red-first proof for this lane.
+DCOMPACT="$( "$BIN" "$ORD" --slice=mix:x --legend=compact --no-cache 2>/dev/null )"
+DFULL="$( "$BIN" "$ORD" --slice=mix:x --legend=full --no-cache 2>/dev/null )"
+DHELP="$( "$BIN" --help=slice 2>&1 )"
+for pair in "compact:$DCOMPACT" "full:$DFULL" "help:$DHELP"; do
+    dname="${pair%%:*}"; dtext="${pair#*:}"
+    printf '%s' "$dtext" | grep -qi 'whole-function' \
+        && ok "(disclosure) --legend=$dname / --help=slice scopes the ranking claim to \"whole-function\"" \
+        || no "(disclosure) --legend=$dname / --help=slice does not scope order=\"defuse\" away from a whole-function ranking claim"
+done
+printf '%s' "$DHELP" | grep -qi 'docs/EVALS.md' \
+    && ok "(disclosure) --help=slice points the whole-function disclosure at docs/EVALS.md, not an unmerged branch" \
+    || no "(disclosure) --help=slice must cite docs/EVALS.md for the whole-function result"
+# Grep the section heading and the verdict words, not a result sha: the sha names one signed head of
+# `lane/arise-result` and moves every time that branch is re-reviewed (611ed7ab -> 13292db7 already,
+# after the result review's conditions A/B landed) — a gate pinned to one sha goes stale on the NEXT
+# honest correction to that branch, which is exactly the kind of drift this arm must not itself commit.
+grep -q 'row order over the WHOLE function span' "$ROOT/docs/EVALS.md" \
+    && grep -q 'MEASURED 2026-09-23.*FAIL' "$ROOT/docs/EVALS.md" \
+    && ok "(disclosure) docs/EVALS.md carries the whole-function-span section and its FAIL verdict" \
+    || no "(disclosure) docs/EVALS.md must record the whole-function-span section with a FAIL verdict"
 
 [ "$fail" = 0 ] && printf 'ALL PASS\n' || printf 'FAILURES ABOVE\n'
 exit "$fail"

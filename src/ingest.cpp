@@ -5,22 +5,33 @@
 //   collect raw defs/refs -> assign Symbol ids in (file,line,name) order ->
 //   attribute each Reference to its enclosing definition by byte-span containment.
 //
-// Single-threaded (v1). Never throws: every recoverable problem degrades + DEGRADED_PATH_ALERT.
+// Single-threaded (v1). Never throws: every recoverable problem degrades + DISCLOSE.
 
 #include "ingest.h"
 #include "docparse.h"          // P1-B: non-code document ingest (notebooks/html/csv + markitdown bridge)
 #include "arch.h"              // T5: relForHash — root-relative path key, reused for cache portability
 #include "quality.h"           // A5: cacheDirLadder + sweepStaleCacheBlobsOnce — the cache-dir hygiene hook (saveCache)
 #include "embedded_queries.h"  // configure-generated constexpr tags.scm table; no runtime source-tree dependency
+#include "infra/nodekind.h"    // rw::kindIs - the inline node-kind compare the per-AST-node dispatch chains run on (OPTREMARKS F3)
+#include "infra/fieldid.h"     // rw::fieldChild - the same defect one layer down: the field NAME resolved once per grammar, not per node
 #include "infra/hashutil.h"    // sanitizer-clean modulo-2^64 FNV multiplication
+#include "externalnames.h"     // FE-A: the JS/TS global tables the shadow walk keys on (ingest_jsimports.h jsNoteGlobalSpellings)
 #include "infra/namesplit.h"   // H4: stripTemplateArgs for the C++ qualified-call re-split (shared with tracelocus.h)
 #include "infra/jsonesc.h"     // rw::shSingleQuote - the git ignore probe quotes its root the same way every other git popen does
 #include "infra/fixedStr.h"    // rw::findByte — the NEON/SSE2 byte scan buildNewlineOffsets rides
+#include "infra/ownedfile.h"   // rw::OwnedFile — readFile/readFilePrefix own their stream, so no return path skips the close
+#include "infra/statclock.h"   // rw::saturatingNanoseconds — statSizeTimes' stat timestamps without signed overflow past 2262
 #include "lexindex.h"          // B0.1/B0.2: shared subtoken state machine + per-def lexical statistics builder
 #include "didyoumean.h"        // octocode F3: boundedEditDistance/nearestNameByEditDistance — the ONE near-miss
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
                                 // primitive, reused for a --match query's node-kind tokens (see nearestNodeKindHint)
 #include "pattern.h"           // R2: the pattern surface's compiler + matcher — AstWalk::Pattern rides the shared file walk
 #include "preprocdead.h"       // #62: the ONE literal `#if 0` rule (shared with slice.h) — dead call sites never become edges
+#include "extentsuspect.h"     // extent honesty: the containment rules + the recovered/suspect bit vocabulary
+#include "macroreparse.h"      // member-macro re-parse: the scanner, the offset-preserving blank, the adoption rule
+#include "regexguard.h"        // #match?/#not-match?: the screen, the compile and the guarded match (ingest_astquery.h)
+#include "infra/stackthreads.h"   // kCallerStackBytesFloor — #match? bounds a captured node's text the same way skillscan.h/--arch do (F-B4)
 
 #include "infra/Diagnostics.h"
 #include "infra/profileScope.h"  // PROFILE_SCOPE self-profiling — gated by PROFILE_ENABLED (off unless -DRIPWIRE_PROFILE=ON)
@@ -35,10 +46,7 @@
 #include <cstdio>
 #include <cstdlib>             // std::getenv — RIPWIRE_CACHE_STATS drift observable
 #include <cstring>
-#include <limits.h>            // PATH_MAX — single-root realpath for config-backed import resolution
-#include <sys/stat.h>          // A4-P7: stat() for the (size,mtime) warm-run shortcut
-#include <fcntl.h>             // v15: ::open( O_RDONLY ) — the cache blob's own read descriptor (ingest_cache.h)
-#include <unistd.h>            // getpid — unique per-process cache temp name; ::pread — the offset-table record reads
+#include "infra/os.h"          // rw::os — stat for the (size,mtime) warm-run shortcut (A4-P7); open/pread/fstat for the cache blob's own read descriptor (v15); getpid for the per-process cache temp name
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -49,7 +57,6 @@
 #include <span>
 #include <string_view>
 #include <atomic>
-#include <regex>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -73,7 +80,8 @@ namespace fs = std::filesystem;
 namespace fuseprobe
 {
 enum PassId : int { kInc = 0, kFfi = 1, kRoutes = 2, kRustImpls = 3, kBinds = 4, kUses = 5, kPassCount = 6 };
-inline const char* const kPassName[ kPassCount ] = { "captureIncludes", "captureFfi", "captureRoutes", "captureRustImpls", "captureBindings", "captureUses" };
+inline const char* const kPassName[] = { "captureIncludes", "captureFfi", "captureRoutes", "captureRustImpls", "captureBindings", "captureUses" };
+static_assert( std::size( kPassName ) == kPassCount, "kPassName is indexed by PassId — one name per pass" );
 
 inline thread_local std::uint64_t tlNodes[ kPassCount ] = {};   // visitor calls, this thread, cumulative
 inline std::atomic<std::uint64_t> gNodes[ kPassCount ];         // visitor calls per pass, corpus-wide
@@ -96,27 +104,27 @@ struct Dump
         {
             calls += gNodes[ p ].load();
         }
-        std::fprintf( stderr, "\n[fuseprobe] files_with_a_parsed_tree=%llu\n", (unsigned long long) files );
-        std::fprintf( stderr, "[fuseprobe] %-18s %13s %10s %8s\n", "pass", "visitor_calls", "files", "%files" );
+        rw::emitTo( stderr, "\n[fuseprobe] files_with_a_parsed_tree={}\n", (unsigned long long) files );
+        rw::emitTo( stderr, "[fuseprobe] {:<18} {:>13} {:>10} {:>8}\n", "pass", "visitor_calls", "files", "%files" );
         for( int p = 0; p < kPassCount; ++p )
         {
             const std::uint64_t f = gFiles[ p ].load();
-            std::fprintf( stderr, "[fuseprobe] %-18s %13llu %10llu %7.1f%%\n", kPassName[ p ], (unsigned long long) gNodes[ p ].load(),
+            rw::emitTo( stderr, "[fuseprobe] {:<18} {:>13} {:>10} {:7.1f}%\n", kPassName[ p ], (unsigned long long) gNodes[ p ].load(),
                           (unsigned long long) f, files ? 100.0 * double( f ) / double( files ) : 0.0 );
         }
         const std::uint64_t astProxy = gNodesMaxPass.load();
         const std::uint64_t pops     = gStreamPops.load();
-        std::fprintf( stderr, "[fuseprobe] visitor_calls=%llu  ast_size_proxy(sum of per-file max pass)=%llu\n",
+        rw::emitTo( stderr, "[fuseprobe] visitor_calls={}  ast_size_proxy(sum of per-file max pass)={}\n",
                       (unsigned long long) calls, (unsigned long long) astProxy );
-        std::fprintf( stderr, "[fuseprobe] STREAM_POPS=%llu  streams_per_node=%.2fx  <-- the number fusion moves\n",
+        rw::emitTo( stderr, "[fuseprobe] STREAM_POPS={}  streams_per_node={:.2f}x  <-- the number fusion moves\n",
                       (unsigned long long) pops, astProxy ? double( pops ) / double( astProxy ) : 0.0 );
-        std::fprintf( stderr, "[fuseprobe] files by number of passes that SAW a node:\n" );
+        rw::emitRaw( stderr, "[fuseprobe] files by number of passes that SAW a node:\n" );
         for( int k = 0; k <= kPassCount; ++k )
         {
             const std::uint64_t f = gHist[ k ].load();
             if( f != 0 )
             {
-                std::fprintf( stderr, "[fuseprobe]   %d pass%s : %10llu files (%5.1f%%)\n", k, k == 1 ? " " : "es", (unsigned long long) f,
+                rw::emitTo( stderr, "[fuseprobe]   {} pass{} : {:>10} files ({:5.1f}%)\n", k, k == 1 ? " " : "es", (unsigned long long) f,
                               files ? 100.0 * double( f ) / double( files ) : 0.0 );
             }
         }
@@ -158,6 +166,8 @@ extern "C"
     const TSLanguage* tree_sitter_lua( void );
     const TSLanguage* tree_sitter_elixir( void );
     const TSLanguage* tree_sitter_dart( void );
+    const TSLanguage* tree_sitter_kotlin( void );
+    const TSLanguage* tree_sitter_gdscript( void );
 }
 
 // ── the ingest-family sections (2026-08-29 split; ingest() phases followed 2026-08-30) ──────────────
@@ -176,13 +186,15 @@ extern "C"
 #include "ingest_crawl.h"
 #include "ingest_cache.h"
 #include "ingest_metrics.h"
+#include "handlershape.h"   // --quality-delta's handler/placeholder shapes — AstWalk::HandlerShapes rides the shared file walk (reads nodeTextOf above)
 #include "ingest_relations.h"
 #include "ingest_jsimports.h"
 #include "ingest_docs.h"
 #include "ingest_names.h"
 #include "ingest_binds.h"
 #include "ingest_elixir.h"
-#include "ingest_dart.h"
+#include "ingest_importcap.h"
+#include "ingest_valuerefs.h"
 #include "ingest_sidecap.h"
 #include "ingest_prewarm.h"
 #include "ingest_parsepool.h"
@@ -212,8 +224,74 @@ const char* cacheArtifactVerdict( const std::string& path, bool captureValueUses
     return cacheRejectName( inspectCacheArtifact( path, captureValueUses ) );
 }
 
+// Every prefix a cwd-spelled selector path can carry before its root-relative part (IngestResult::crawlRootPrefixes), in
+// the order selectorRootTail tries them: the root as typed, the root relative to the cwd, the root's absolute spellings.
+// $PWD is trusted only when its realpath IS getcwd, so a stale inherited PWD is ignored; a spelling that cannot be
+// computed is left out, never guessed. Lexical throughout, apart from the one realpath of the root and of $PWD.
+static std::vector<std::string> selectorRootPrefixes( const std::string& root )
+{
+    const auto normal = []( const std::filesystem::path& p ) {
+        std::string s = p.lexically_normal().string();
+        while( s.size() > 1 && s.back() == '/' ) { s.pop_back(); }
+        return s;
+    };
+    std::vector<std::string> out;
+    const auto add = [ & ]( std::string s ) {
+        if( !s.empty() && std::find( out.begin(), out.end(), s ) == out.end() ) { out.push_back( std::move( s ) ); }
+    };
+    const std::filesystem::path rootPath( root.empty() ? std::string( "." ) : root );
+    add( normal( rootPath ) );   // as typed: "test/fixture", "../repo", "/abs/repo", "."
+    char cwdBuf[ PATH_MAX ];
+    const char* const cwd = os::getcwd( cwdBuf, sizeof( cwdBuf ) );
+    std::vector<std::string> cwds;   // the cwd's absolute spellings: logical first
+    if( cwd != nullptr )
+    {
+        const char* const pwd = std::getenv( "PWD" );
+        char pwdBuf[ PATH_MAX ];
+        if( pwd != nullptr && pwd[0] == '/' && os::realpath( pwd, pwdBuf ) != nullptr && std::strcmp( pwdBuf, cwd ) == 0 )
+        {
+            cwds.push_back( normal( pwd ) );
+        }
+        cwds.push_back( normal( cwd ) );
+    }
+    std::vector<std::string> absolutes;
+    if( rootPath.is_absolute() )
+    {
+        absolutes.push_back( normal( rootPath ) );
+    }
+    for( const std::string& c : cwds )
+    {
+        if( !rootPath.is_absolute() ) { absolutes.push_back( normal( std::filesystem::path( c ) / rootPath ) ); }
+    }
+    char realBuf[ PATH_MAX ];
+    if( os::realpath( os::path_arg( rootPath ).c_str(), realBuf ) != nullptr )
+    {
+        absolutes.push_back( normal( realBuf ) );
+    }
+    for( const std::string& a : absolutes )
+    {
+        for( const std::string& c : cwds )
+        {
+            if( a == c )
+            {
+                add( "." );
+            }
+            else if( a.size() > c.size() + 1 && a.compare( 0, c.size(), c ) == 0 && ( c == "/" || a[ c.size() ] == '/' ) )
+            {
+                add( a.substr( c == "/" ? 1 : c.size() + 1 ) );   // the root relative to the cwd
+            }
+        }
+    }
+    for( std::string& a : absolutes )
+    {
+        add( std::move( a ) );
+    }
+    return out;
+}
+
 IngestResult ingest( const char* rootDir, const std::vector<std::string>& excludeSubstr, std::string_view cacheFile,
-                     std::size_t maxFileBytes, bool captureValueUses, std::string_view excludeLabel, bool respectGitignore )
+                     std::size_t maxFileBytes, bool captureValueUses, std::string_view excludeLabel, bool respectGitignore,
+                     IngestLayout )
 {
     PROFILE_SCOPE_DESCRIBE( "ingest: total (crawl + parse + model)" );
     // Cheap (a handful of bytes serialized twice) and runs once per invocation — catches a
@@ -222,17 +300,11 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
     verifyCacheRecordMinimaTripwire();
 
     IngestResult result;
-    // A4-F17: rootDir is a runtime-falsifiable input (caller/CLI-supplied), so degrade — never VERIFY here.
-    // In release VERIFY becomes __builtin_assume, which would delete the very guard below (the CLAUDE.md trap).
-    if( rootDir == nullptr )
-    {
-        DEGRADED_PATH_ALERT( "ingest: null root directory — empty result" );
-        return result;
-    }
-    {
-        char resolved[ PATH_MAX ];
-        result.rootReals.push_back( ::realpath( rootDir, resolved ) != nullptr ? std::string{ resolved } : std::string{ rootDir } );
-    }
+    // A4-F17 said the root is a runtime-falsifiable input, and its CONTENT is: the crawl below degrades on a root that does
+    // not exist or cannot be read. Its POINTER is not: every caller hands a std::string's c_str() or an argv entry behind an
+    // argc check (main.cpp, mcpverbs.h, mcpindex.h, quality.h, dmm.h, mergescout.h, editpreview.h, tsprobe.cpp and the
+    // test harnesses, traced 2026-09-19), so a null here is a caller bug, which EXPECTS blames.
+    EXPECTS( rootDir != nullptr, "ingest: the caller passes a root path, never null" );
 
     // a zero/absurd ceiling would silently crawl nothing — clamp to the default (degrade, never trap).
     if( maxFileBytes == 0 )
@@ -240,13 +312,38 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
         maxFileBytes = kDefaultMaxFileBytes;
     }
 
+    // #350 layer 3: one memory watch for this ingest, shared by the crawl and the parse pool (memguard.h)
+    memguard::Watch memWatch;
+
     // 1) deterministic crawl -> sorted file list (this list IS result.files / the fileId space)
     {
         PROFILE_SCOPE_DESCRIBE( "ingest: crawl (collectSources)" );
-        auto [ crawledPaths, oversizeSkipped, taxonomySkips ] = collectSources( rootDir, excludeSubstr, maxFileBytes, excludeLabel, respectGitignore );
+        auto [ crawledPaths, oversizeSkipped, taxonomySkips ] = collectSources( rootDir, excludeSubstr, maxFileBytes, excludeLabel, respectGitignore, &memWatch );
         result.files           = std::move( crawledPaths );
+        // #228: record the root once, for rootRelPath (model.h). A directory crawl joins it onto every path; a
+        // single-file root IS its one path, so the root-relative view anchors at that file's directory instead.
+        const std::string_view rootArg( rootDir );
+        result.crawlRoot = rootArg;
+        if( result.files.size() == 1 && result.files.front() == rootArg )
+        {
+            const std::size_t lastSlash = rootArg.rfind( '/' );
+            result.crawlRoot = ( lastSlash == std::string_view::npos ) ? std::string_view{} : rootArg.substr( 0, std::max<std::size_t>( lastSlash, 1 ) );
+        }
+        result.crawlRootPrefixes = selectorRootPrefixes( result.crawlRoot );   // #281: a selector typed from the cwd (graph.h selectorRootTail)
         result.skippedOversize = std::move( oversizeSkipped );
         result.crawlSkips      = std::move( taxonomySkips );   // §L1: excluded / unsupported-ext / unindexed exts
+        if( memWatch.tripped() )
+        {
+            result.memoryStop.limitBytes = memWatch.hardBytes();
+            if( memWatch.trippedByPressure() )
+            {
+                DISCLOSE( result.memoryStop, MemoryStop::DisclosureWhy::CrawlUnderPressure, "ingest: the memory guard stopped the crawl — files= is what it saw, a floor of the tree" );
+            }
+            else
+            {
+                DISCLOSE( result.memoryStop, MemoryStop::DisclosureWhy::CrawlOverLimit, "ingest: the memory guard stopped the crawl — files= is what it saw, a floor of the tree" );
+            }
+        }
     }
 
     // Win 1 (PERF.md P1) — lazy grammar compilation: load the cache FIRST, then compile only the
@@ -268,6 +365,10 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
     // read+hash (safe). v15: result.files is passed in because the blob's offset table lets the load
     // deserialise ONLY the records for the files THIS crawl asked for — a wider configuration's blob is
     // never walked past its table (docs/EVALS.md, the offset-table retry).
+    // The [grammar][field] TSFieldId table (src/infra/fieldid.h), filled before ANY thread exists. Every
+    // AST walk downstream — the parse pool, --slice, --lint, the preprocessor reader — reads it lock-free.
+    warmFieldIdTable();
+
     CacheLoadStats cacheStats;
     HashMap<std::string, FileFacts> cache =
         cacheFile.empty() ? HashMap<std::string, FileFacts>{}
@@ -284,14 +385,41 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
     // 2) the parallel parse pool — per-thread accumulators, cache-hit reuse, hostile-input guards,
     //    the pending-parsed-tree overlap with the async query compile, the install/gate-open moment,
     //    the deterministic merge, and the dirty-gated saveCache (ingest_parsepool.h).
-    RawFacts raw = runParsePool( result, rootDir, cacheFile, captureValueUses, cache, cacheStats, scan, prewarm );
+    // A crawl the guard stopped is still parsed, under the parse's own (higher) line: the crawl line — an eighth of the
+    // limit — is what leaves the parse that room (memguard.h).
+    memWatch.rearmForParse();
+    RawFacts raw = runParsePool( result, rootDir, cacheFile, captureValueUses, cache, cacheStats, scan, prewarm, &memWatch );
+
+    // Cache facts are only needed by the parse pool. Release their map and bucket storage before the model tail
+    // creates symbols/references, so a warm run does not carry the cache and the assembled model at once.
+    HashMap<std::string, FileFacts>().swap( cache );
 
     result.fileHealth = std::move( scan.health );   // §L1: after saveCache, before the (unmeasured) doc pass
+    collectNestRefusals( scan, result );             // the nesting guards' refusals, as --skipped rows (ingest_prewarm.h)
+    collectExtractPartials( scan, result );          // files whose facts came back partial, as --skipped rows (ingest_prewarm.h)
+
+    // #157: the EXACT per-file twin of the (capped) rows collectNestRefusals just wrote, so a caller that needs
+    // "was THIS fileId refused" (the --match/--pattern/--lint structural-query walk, ingest_astquery.h) can ask
+    // an O(1) array instead of re-running the prescan or scanning a possibly-truncated row list. Cheap: one byte
+    // per file, filled once, right beside the row collection it mirrors.
+    result.nestRefusedFile.assign( scan.nestRefusedBytes.size(), 0u );
+    for( std::size_t nestFileId = 0; nestFileId < scan.nestRefusedBytes.size(); ++nestFileId )
+    {
+        result.nestRefusedFile[ nestFileId ] = scan.nestRefusedBytes[ nestFileId ] != 0 ? 1u : 0u;
+    }
+    // ENSURES, not a degrade: every reader of nestRefusedFile (ingest_astquery.h's structural-query walk)
+    // bounds-checks it defensively against a SHORTER-than-files array from an older/lean IngestResult, but
+    // THIS ingest path must always hand back one flag per crawled file — a silent short array here would
+    // turn every one of those defensive checks into a silent "never refused" for every file past its end.
+    ENSURES( result.nestRefusedFile.size() == result.files.size(), "ingest: nestRefusedFile must be sized one entry per crawled file" );
 
     // ── doc post-pass (P1-B): every collected document file (notebook/html/csv/…) becomes a docText
     //    override + one whole-file Section node — parallel extract, deterministic ascending-fileId merge
     //    (ingest_docpass.h, with the markitdown-bridge byte cache).
-    runDocPostPass( result, raw.defs, !cacheFile.empty(), captureValueUses );
+    if( !result.memoryStop.parseCut )   // #350: a stopped parse runs no second parse
+    {
+        runDocPostPass( result, raw.defs, !cacheFile.empty(), captureValueUses );
+    }
 
     PROFILE_SCOPE_DESCRIBE( "ingest: build model (dedup + symbols/refs)" );
 
@@ -305,22 +433,39 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
     std::vector<RawDef> fieldDefs = partitionFieldDefs( raw.defs );
     assignFields( result, fieldDefs );
 
+    // 3a-quater) module-scope owners (#60) — one synthetic whole-file def per file whose top-level
+    //    statements or anonymous callback bodies hold a call, so those calls have a caller node to hang an
+    //    edge on. Runs AFTER the parse cache is released, so no cached record format changes and a warm run
+    //    mints exactly what a cold run does (ingest_model.h).
+    mintModuleScopeOwners( result, raw.defs, raw.refs );
+
     // 3b) assign Symbol ids in (fileId, line, name) order + the rich-ingest lex-stats CSR (ingest_model.h)
     assignSymbols( result, raw.defs, captureValueUses );
 
     // 4) attribute each reference to its enclosing definition (innermost span containing it) — the
     //    per-file DefSpanIndex + DefSweep cursor every fact family below shares (ingest_model.h).
-    const DefSpanIndex spanIndex = buildDefSpanIndex( result, raw.defs );
+    DefSpanIndex spanIndex = buildDefSpanIndex( result, raw.defs );
+
+    // 4a) extent honesty — the containment rules over the same sorted spans; bits land on Symbol::extentSuspect.
+    markExtentSuspects( result, raw.defs, spanIndex );
 
     // references: order a uint32 index permutation (radix by startByte), then MOVE each RawRef's strings
     // into its Reference while the shared sweep attributes fromSymbol (ingest_model.h).
-    const std::vector<std::uint32_t> refOrder = orderReferences( raw.refs, result.files.size() );
+    std::vector<std::uint32_t> refOrder = orderReferences( raw.refs, result.files.size() );
     emitReferences( result, raw.refs, refOrder, spanIndex );
+    std::vector<std::uint32_t>().swap( refOrder );
+    std::vector<RawRef>().swap( raw.refs );
     dropFieldDefinitionSites( result, fieldDefs );   // member-variable round: a field's defining assignment is not a use of it
+    std::vector<RawDef>().swap( fieldDefs );
+
+    // Symbol names/scopes and the definition spans have been transferred to the model/index; the raw definition
+    // object array is no longer read after this point.
+    std::vector<RawDef>().swap( raw.defs );
 
     // P2-D Rule 2 bindings, A4-R5 FFI aliases, B6.3 route defs/uses — each in its deterministic total
     // order, span-attributed families over the same DefSpanIndex (ingest_model.h).
     emitBindings( result, raw.binds, spanIndex );
+    std::vector<RawBind>().swap( raw.binds );
 
     result.includes = std::move( raw.incs );   // physical dependencies (#include / import), for --deps
     result.constOpens = std::move( raw.constOpens );   // parser version 82: Ruby class/module opens → resolve.h's constant index
@@ -328,11 +473,19 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
     emitBindingAliases( result, raw.ffis );
     emitRouteDefs( result, raw.routeDefs );
     emitRouteUses( result, raw.routeUses, spanIndex );
+    std::vector<RawRouteUse>().swap( raw.routeUses );
+
+    // No later model pass needs the containment index. Drop it before the macro/shadow passes, which operate on
+    // the assembled result and can otherwise overlap its storage with a dead span table.
+    spanIndex = DefSpanIndex{};
 
     // macro-edges round: the corpus-wide role="macro" retag (model.h). AFTER the model is assembled and
     // AFTER saveCache (which stores the per-file truth, role=Call) — a #define added in one file must
     // re-judge every OTHER file's cached call sites on the next run, so the retag can never be persisted.
-    retagMacroCallReferences( result );
+    {
+        PROFILE_SCOPE_DESCRIBE( "ingest/build-model: macro retag (corpus-wide post-pass)" );
+        retagMacroCallReferences( result );
+    }
 
     // r9 shadow suppression (model.h): a reference inside a function whose LOCAL declarations bind the same
     // name as a variable belongs to the local, not to any same-named indexed symbol — erase it here, the one
@@ -341,8 +494,15 @@ IngestResult ingest( const char* rootDir, const std::vector<std::string>& exclud
     // macro retag (role="macro" is preprocessor evidence and stays) and AFTER saveCache (per-file truth is
     // persisted unsuppressed; the collision gate depends on the whole corpus' symbols, so the judgment can
     // never be cached per-file — same reasoning as the retag above).
-    suppressShadowedReferences( result );
+    {
+        PROFILE_SCOPE_DESCRIBE( "ingest/build-model: shadow suppression (r9 post-pass)" );
+        suppressShadowedReferences( result );
+    }
 
+    if( result.memoryStop.isSet() )
+    {
+        memguard::recordStop();   // #350: the caller must answer for this partial ingest (memguard.h, the backstop)
+    }
     return result;
 }
 }   // namespace rw

@@ -16,7 +16,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -57,7 +57,7 @@ CB=$( "$BIN" src "$VERB_USES" --format=columnar --limit=100000 --no-cache 2>/dev
 # xml form: <s ... n="NAME" p="path:LINE"/>  →  NAME<TAB>LINE
 xml_set(){ "$BIN" src "$1" --format=xml --no-cache 2>/dev/null \
     | grep -oE '<s [^>]*n="[^"]*" p="[^"]*:[0-9]+"' \
-    | sed -E 's/.*n="([^"]*)" p="[^"]*:([0-9]+)"/\1\t\2/' | sort; }
+    | sed -E 's/.*n="([^"]*)" p="[^"]*:([0-9]+)"/\1\t\2/' | LC_ALL=C sort; }
 # columnar form: zip the <name> and <line> arrays.
 col_set(){ "$BIN" src "$1" --format=columnar --no-cache 2>/dev/null > "$TMP/col.xml"
     python3 - "$TMP/col.xml" <<'PY'
@@ -102,7 +102,7 @@ if command -v xmllint >/dev/null 2>&1; then
     for V in "$VERB_CALLERS" "$VERB_IMPACT" "$VERB_USES"; do
         "$BIN" src $V --format=columnar --no-cache 2>/dev/null | xmllint --noout - 2>/dev/null || { echo "    malformed: $V"; lint=0; }
     done
-    [ "$lint" = 1 ] && ok "columnar output well-formed XML for all flat verbs" || no "columnar output malformed for some verb"
+    if [ "$lint" = 1 ]; then ok "columnar output well-formed XML for all flat verbs"; else no "columnar output malformed for some verb"; fi
 else
     printf '  SKIP  xml well-formed (no xmllint)\n'
 fi
@@ -127,7 +127,7 @@ fi
 # LARGER (the paths/cols scaffold has a fixed cost: --callers=parseArgs measured +119.6%). The corrected
 # text names the range, scopes it to multi-row results, and discloses the small-result floor — both
 # halves asserted so neither can silently regress to a one-sided claim.
-HELP="$( "$BIN" --help 2>&1 )"
+HELP="$( "$BIN" --help=all 2>&1 )"
 printf '%s' "$HELP" | grep -q '15-60% fewer tokens on multi-row results' \
     && ok "--help states the measured 15-60% range for --format=columnar, not a flat 50%+ floor (§A10.10)" \
     || no "--help still claims a flat ~50%+ savings figure for --format=columnar"

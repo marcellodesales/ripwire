@@ -18,12 +18,13 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 # Both seams: a positional argument wins, then RIPWIRE_BIN, then the dev build. The positional form is what
 # a red-first run uses (`bash test/notescheck.sh <scratch>/base_w3`) and this gate only had the env one.
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -49,9 +50,22 @@ run(){ ( cd "$WORK" && "$BIN" . --no-cache "$@" 2>/dev/null ); }
 # them so the gate is independent of how ing spells the root prefix.
 MAP0="$( run )"
 FILE_TARGET="$( printf '%s' "$MAP0" | grep -oE '<f p="[^"]*a\.cpp"' | head -1 | sed -E 's/<f p="([^"]*)"/\1/' )"
-COMPUTE_ID="$( printf '%s' "$MAP0" | grep -oE 'id="[^"]*compute"' | head -1 | sed -E 's/id="([^"]*)"/\1/' )"
-[ -n "$FILE_TARGET" ] && ok "discovered file target: $FILE_TARGET" || no "could not discover the a.cpp file path"
-[ -n "$COMPUTE_ID" ]  && ok "discovered scoped canonical id: $COMPUTE_ID" || no "could not discover Widget::compute canonical id"
+# row 6 (2026-09-12): the row prints the short id sc=; the canonical id composes as <f p=>::sc::n
+COMPUTE_ID="$( printf '%s' "$MAP0" | python3 -c '
+import re, sys
+doc, name, scope = sys.stdin.read(), sys.argv[1], ( sys.argv[2] if len( sys.argv ) > 2 else None )
+for f in re.finditer( r"<f p=\"([^\"]*)\"[^>]*>(.*?)</f>", doc, re.S ):
+    for row in re.finditer( r"<[sd]\b([^>]*)>", f.group( 2 ) ):
+        a = dict( re.findall( r"\s([\w:.-]+)=\"([^\"]*)\"", row.group( 1 ) ) )
+        if a.get( "n" ) == name and "sc" in a and ( scope is None or a[ "sc" ] == scope ):
+            print( f.group( 1 ) + "::" + a[ "sc" ] + "::" + a[ "n" ] ); sys.exit( 0 )
+for row in re.finditer( r"<d\b([^>]*)>", doc ):
+    a = dict( re.findall( r"\s([\w:.-]+)=\"([^\"]*)\"", row.group( 1 ) ) )
+    if a.get( "n" ) == name and "sc" in a and "p" in a and ( scope is None or a[ "sc" ] == scope ):
+        print( a[ "p" ] + "::" + a[ "sc" ] + "::" + a[ "n" ] ); sys.exit( 0 )
+' compute )"
+if [ -n "$FILE_TARGET" ]; then ok "discovered file target: $FILE_TARGET"; else no "could not discover the a.cpp file path"; fi
+if [ -n "$COMPUTE_ID" ]; then ok "discovered scoped canonical id: $COMPUTE_ID"; else no "could not discover Widget::compute canonical id"; fi
 # D5: --note-add normalizes a target's path component to ROOT-RELATIVE on write, stripping any leading
 # "./" the crawl (root=".") spells its paths with — the NORMALIZED forms are what actually land on disk.
 NORM_FILE_TARGET="${FILE_TARGET#./}"
@@ -76,12 +90,12 @@ MAP_ABSENT="$( run )"
 
 # an EMPTY notes file must be byte-identical to an absent one
 : > "$WORK/.ripwire_notes"
-[ "$FOR_ABSENT" = "$( run --for="widget compute helper lonely" | no_at )" ] && ok "inert: empty notes file → --for byte-identical" || no "empty notes file changed --for output"
-[ "$EXP_ABSENT" = "$( run --expand=helper )" ]                       && ok "inert: empty notes file → --expand byte-identical" || no "empty notes file changed --expand output"
-[ "$MAP_ABSENT" = "$( run )" ]                                       && ok "inert: empty notes file → default map byte-identical" || no "empty notes file changed the default map"
+if [ "$FOR_ABSENT" = "$( run --for="widget compute helper lonely" | no_at )" ]; then ok "inert: empty notes file → --for byte-identical"; else no "empty notes file changed --for output"; fi
+if [ "$EXP_ABSENT" = "$( run --expand=helper )" ]; then ok "inert: empty notes file → --expand byte-identical"; else no "empty notes file changed --expand output"; fi
+if [ "$MAP_ABSENT" = "$( run )" ]; then ok "inert: empty notes file → default map byte-identical"; else no "empty notes file changed the default map"; fi
 # a header-comment-only file is still empty of notes → still inert
 printf '# ripwire field notes v1 — just the header\n' > "$WORK/.ripwire_notes"
-[ "$FOR_ABSENT" = "$( run --for="widget compute helper lonely" | no_at )" ] && ok "inert: comment-only notes file → --for byte-identical" || no "comment-only notes file changed --for output"
+if [ "$FOR_ABSENT" = "$( run --for="widget compute helper lonely" | no_at )" ]; then ok "inert: comment-only notes file → --for byte-identical"; else no "comment-only notes file changed --for output"; fi
 rm -f "$WORK/.ripwire_notes"
 
 # ── --note-add: prints the written line, writes a sorted file, date from git committer clock ───────────────
@@ -94,7 +108,7 @@ printf '%s' "$LINE_F" | grep -qF "$NORM_FILE_TARGET" && printf '%s' "$LINE_F" | 
     && ok "--note-add prints the exact written line (D5-normalized root-relative target + text)" || { no "--note-add did not print the written line"; printf '%s\n' "$LINE_F"; }
 printf '%s' "$LINE_F" | grep -qF "$GIT_DATE" \
     && ok "--note-add dates the note with git's committer clock ($GIT_DATE), not wall time" || { no "--note-add date != git committer date"; printf '%s\n' "$LINE_F"; }
-[ -f "$WORK/.ripwire_notes" ] && ok "--note-add created $WORK/.ripwire_notes" || no "--note-add did not create the notes file"
+if [ -f "$WORK/.ripwire_notes" ]; then ok "--note-add created $WORK/.ripwire_notes"; else no "--note-add did not create the notes file"; fi
 
 # ── provenance stamp: --note-add prints (and .ripwire_notes stores) the writing repo's FULL HEAD sha +
 #    branch, tab-appended after the 3 legacy fields — the printed line is the exact 5-field data line. ──────
@@ -110,10 +124,10 @@ run --note-add="helper: off-by-one lives here" >/dev/null
 run --note-add="$COMPUTE_ID: scoped method note" >/dev/null
 # the DATA lines (strip the '#' header) must be in sorted order
 DATA="$( grep -v '^#' "$WORK/.ripwire_notes" )"
-[ "$DATA" = "$( printf '%s\n' "$DATA" | LC_ALL=C sort )" ] && ok "notes file stays SORTED across appends (merge-friendly round-trip)" || { no "notes file is not sorted"; printf '%s\n' "$DATA"; }
+if [ "$DATA" = "$( printf '%s\n' "$DATA" | LC_ALL=C sort )" ]; then ok "notes file stays SORTED across appends (merge-friendly round-trip)"; else { no "notes file is not sorted"; printf '%s\n' "$DATA"; }; fi
 # idempotence: re-adding an identical triple does not duplicate
 run --note-add="helper: off-by-one lives here" >/dev/null
-[ "$( grep -c 'off-by-one lives here' "$WORK/.ripwire_notes" )" = 1 ] && ok "--note-add is idempotent (no duplicate line for an identical triple)" || no "--note-add duplicated an identical note"
+if [ "$( grep -c 'off-by-one lives here' "$WORK/.ripwire_notes" )" = 1 ]; then ok "--note-add is idempotent (no duplicate line for an identical triple)"; else no "--note-add duplicated an identical note"; fi
 
 # ── surfacing in --for: file note on the file's first ranked <d> row (P7: <note … p="FILE">), symbol note on
 #    <d> — both stamped, so both carry sha=/branch=. RE-PINNED 2026-09-05 (terminality round A, lane R): the
@@ -126,13 +140,13 @@ printf '%s' "$FOR_OUT" | grep -qF "$FILE_NOTE_OPEN"'<![CDATA[watch the arena lif
     && ok "--for surfaces the FILE note as a <note p=\"$NORM_FILE_TARGET\"> child of the file's first ranked row (CDATA-wrapped, dated, sha/branch-stamped)" || { no "--for did not surface the file note"; printf '%s\n' "$FOR_OUT" | head -c 600; echo; }
 printf '%s' "$FOR_OUT" | grep -qF "$NOTE_OPEN"'<![CDATA[off-by-one lives here]]></note>' \
     && ok "--for surfaces the SYMBOL note (helper) as a <note> child, sha/branch-stamped" || { no "--for did not surface the symbol note"; printf '%s\n' "$FOR_OUT" | head -c 600; echo; }
-printf '%s' "$FOR_OUT" | xmllint --noout - 2>/dev/null && ok "--for with notes is xmllint-clean" || no "--for with notes is not well-formed"
+if printf '%s' "$FOR_OUT" | xmllint --noout - 2>/dev/null; then ok "--for with notes is xmllint-clean"; else no "--for with notes is not well-formed"; fi
 
 # ── surfacing in --expand: symbol note on <b> ─────────────────────────────────────────────────────────────
 EXP_OUT="$( run --expand=helper )"
 printf '%s' "$EXP_OUT" | grep -qF "$NOTE_OPEN"'<![CDATA[off-by-one lives here]]></note>' \
     && ok "--expand surfaces the symbol note on the <b> body, sha/branch-stamped" || { no "--expand did not surface the note"; printf '%s\n' "$EXP_OUT" | head -c 600; echo; }
-printf '%s' "$EXP_OUT" | xmllint --noout - 2>/dev/null && ok "--expand with notes is xmllint-clean" || no "--expand with notes is not well-formed"
+if printf '%s' "$EXP_OUT" | xmllint --noout - 2>/dev/null; then ok "--expand with notes is xmllint-clean"; else no "--expand with notes is not well-formed"; fi
 
 # ── dangling: a target with no matching symbol/file — flagged in --notes, surfaces NOWHERE else ────────────
 # RE-PINNED to the H1 contract (capture-audit 2026-09-04, test/notecanoncheck.sh): a SYMBOL-shaped target
@@ -157,19 +171,19 @@ if run --for="ghost vanished dangling helper" | grep -qF 'this dangling target d
 else
     ok "dangling note is inert everywhere except --notes"
 fi
-printf '%s' "$NOTES_OUT" | xmllint --noout - 2>/dev/null && ok "--notes is xmllint-clean" || no "--notes is not well-formed"
+if printf '%s' "$NOTES_OUT" | xmllint --noout - 2>/dev/null; then ok "--notes is xmllint-clean"; else no "--notes is not well-formed"; fi
 
 # ── hostile note text: XML metachars + a "]]>" CDATA-close must emit safely ────────────────────────────────
 run --note-add="helper: danger ]]> <script>alpha & beta --> end" >/dev/null
-run --for="helper" | xmllint --noout - 2>/dev/null && ok "hostile note text (incl. ]]>) keeps --for xmllint-clean" || no "hostile note text broke --for well-formedness"
-run --notes        | xmllint --noout - 2>/dev/null && ok "hostile note text keeps --notes xmllint-clean" || no "hostile note text broke --notes well-formedness"
-run --expand=helper | xmllint --noout - 2>/dev/null && ok "hostile note text keeps --expand xmllint-clean" || no "hostile note text broke --expand well-formedness"
+if run --for="helper" | xmllint --noout - 2>/dev/null; then ok "hostile note text (incl. ]]>) keeps --for xmllint-clean"; else no "hostile note text broke --for well-formedness"; fi
+if run --notes        | xmllint --noout - 2>/dev/null; then ok "hostile note text keeps --notes xmllint-clean"; else no "hostile note text broke --notes well-formedness"; fi
+if run --expand=helper | xmllint --noout - 2>/dev/null; then ok "hostile note text keeps --expand xmllint-clean"; else no "hostile note text broke --expand well-formedness"; fi
 
 # ── determinism ×3 (fixed notes file + fixed HEAD) ─────────────────────────────────────────────────────────
 D1="$( run --for="widget compute helper" )"; D2="$( run --for="widget compute helper" )"; D3="$( run --for="widget compute helper" )"
-{ [ "$D1" = "$D2" ] && [ "$D2" = "$D3" ]; } && ok "--for with notes is deterministic (byte-identical ×3)" || no "--for with notes is non-deterministic"
+if { [ "$D1" = "$D2" ] && [ "$D2" = "$D3" ]; }; then ok "--for with notes is deterministic (byte-identical ×3)"; else no "--for with notes is non-deterministic"; fi
 N1="$( run --notes )"; N2="$( run --notes )"; N3="$( run --notes )"
-{ [ "$N1" = "$N2" ] && [ "$N2" = "$N3" ]; } && ok "--notes is deterministic (byte-identical ×3)" || no "--notes is non-deterministic"
+if { [ "$N1" = "$N2" ] && [ "$N2" = "$N3" ]; }; then ok "--notes is deterministic (byte-identical ×3)"; else no "--notes is non-deterministic"; fi
 
 # ── refuse loudly on a malformed --note-add (no ': ' separator) ────────────────────────────────────────────
 ERR="$( cd "$WORK" && "$BIN" . --no-cache --note-add="noSeparatorHere" 2>&1 >/dev/null )"
@@ -199,7 +213,7 @@ if command -v python3 >/dev/null 2>&1; then
 b=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
 ns=b.get("notes") or []
 print("FOUND" if any("off-by-one lives here"==n.get("text") for n in ns) else "MISSING")' )"
-        [ "$FB" = "FOUND" ] && ok "MCP fetch_body serves the note in its JSON notes array (body-verb parity)" || no "MCP fetch_body did not carry the note ($FB)"
+        if [ "$FB" = "FOUND" ]; then ok "MCP fetch_body serves the note in its JSON notes array (body-verb parity)"; else no "MCP fetch_body did not carry the note ($FB)"; fi
 
         # provenance parity: the same note's JSON entry carries the abbreviated sha + branch (matching the
         # XML <note sha= branch=> shape), never the empty/legacy form for a note THIS run stamped.
@@ -293,8 +307,8 @@ STAMPED_LINE="$( grep -F 'D5 root-relative file note' "$WORK/.ripwire_notes" )"
 # (5) det-gate on an output containing notes in every form this section exercised (root-relative,
 #     normalized-absolute, and re-normalized-legacy targets all resolving to the same live symbol/file).
 DG1="$( runAbs --for="widget compute helper lonely" )"; DG2="$( runAbs --for="widget compute helper lonely" )"; DG3="$( runAbs --for="widget compute helper lonely" )"
-{ [ "$DG1" = "$DG2" ] && [ "$DG2" = "$DG3" ]; } && ok "D5(5): det-gate — --for with mixed-form notes is byte-identical ×3" || no "D5(5): det-gate failed on mixed-form notes"
-printf '%s' "$DG1" | xmllint --noout - 2>/dev/null && ok "D5(5): mixed-form notes output is xmllint-clean" || no "D5(5): mixed-form notes output is not well-formed"
+if { [ "$DG1" = "$DG2" ] && [ "$DG2" = "$DG3" ]; }; then ok "D5(5): det-gate — --for with mixed-form notes is byte-identical ×3"; else no "D5(5): det-gate failed on mixed-form notes"; fi
+if printf '%s' "$DG1" | xmllint --noout - 2>/dev/null; then ok "D5(5): mixed-form notes output is xmllint-clean"; else no "D5(5): mixed-form notes output is not well-formed"; fi
 
 # (6) SYM (bare-name) targets are unaffected by the D5 path normalization — a scope-less free function's
 #     canonical id has no path component at all, so it must round-trip byte-for-byte, exactly as before D5.
@@ -313,7 +327,7 @@ runSplit --note-add="helper: chose refcount over raw pointer because the arena o
 DECISION_OUT="$( cat "$OUT_F" )"; DECISION_ERR="$( cat "$ERR_F" )"
 [ -n "$DECISION_OUT" ] && printf '%s' "$DECISION_OUT" | grep -qF "chose refcount over raw pointer" \
     && ok "R6: decision-shaped note still writes normally (stdout has the written line)" || { no "R6: decision-shaped note-add produced no stdout"; printf '%s\n' "$DECISION_OUT"; }
-[ -z "$DECISION_ERR" ] && ok "R6: decision-shaped note text produces NO nudge on stderr" || { no "R6: decision-shaped note text unexpectedly nudged"; printf '%s\n' "$DECISION_ERR"; }
+if [ -z "$DECISION_ERR" ]; then ok "R6: decision-shaped note text produces NO nudge on stderr"; else { no "R6: decision-shaped note text unexpectedly nudged"; printf '%s\n' "$DECISION_ERR"; }; fi
 
 # (2) a plain-prose note (no marker) produces the nudge on stderr, but still writes (never a refusal) and the
 #     nudge text never lands on stdout.
@@ -329,9 +343,9 @@ printf '%s' "$PROSE_OUT" | grep -qi 'tip:' && no "R6: the nudge leaked into stdo
 #     the nudge is stderr-only, so it can never perturb what a downstream tool consumes on stdout.
 XML_A="$( run --for="widget compute helper lonely" )"
 XML_B="$( run --for="widget compute helper lonely" )"
-[ "$XML_A" = "$XML_B" ] && ok "R6: --for XML is byte-identical regardless of nudge history (det-gate)" || no "R6: --for XML changed across nudge-triggering note-adds"
+if [ "$XML_A" = "$XML_B" ]; then ok "R6: --for XML is byte-identical regardless of nudge history (det-gate)"; else no "R6: --for XML changed across nudge-triggering note-adds"; fi
 printf '%s' "$XML_A" | grep -qi 'tip:' && no "R6: the nudge text leaked into --for XML output" || ok "R6: --for XML carries no nudge text"
-printf '%s' "$XML_A" | xmllint --noout - 2>/dev/null && ok "R6: --for XML after nudge-triggering adds is still xmllint-clean" || no "R6: --for XML after nudge-triggering adds is not well-formed"
+if printf '%s' "$XML_A" | xmllint --noout - 2>/dev/null; then ok "R6: --for XML after nudge-triggering adds is still xmllint-clean"; else no "R6: --for XML after nudge-triggering adds is not well-formed"; fi
 
 > "$OUT_F"; > "$ERR_F"
 
@@ -401,6 +415,45 @@ noteAddBlank "$( printf 'chose a\302\240b over c because d' )"; rc=$?
     || no "§S3 control: a note with real content was refused (exit $rc) — the predicate over-refuses"
 
 rm -f "$OUT_F" "$ERR_F"
+
+# ── SKIPPED LINES: a sidecar line the reader cannot parse is DISCLOSED, and never deleted by a rewrite ─────────
+# readNotes skips a line with no target/date tabs, or an empty target. It used to do that with a one-argument
+# DISCLOSE — a debug trace, nothing at all in a Release binary — so --notes counted notes= without it, and the next
+# --note-add's sorted rewrite silently DELETED the committed text. Now the read's DISCLOSE( sink, why ) counts it into
+# <notes lines_skipped="N"> in every build flavour, and --note-add refuses to rewrite while any remain.
+SK="$( mktemp -d )"
+( cd "$SK" && git init -q && git config user.email t@t && git config user.name t ) >/dev/null 2>&1
+printf 'int helper( int x ) { return x + 1; }\n' >"$SK/a.c"
+( cd "$SK" && git add -A && git commit -qm init ) >/dev/null 2>&1
+printf 'a.c\t2026-01-01\tkept note\nthis line has no tabs at all\n\t2026-01-01\tempty target\n' >"$SK/.ripwire_notes"
+cp "$SK/.ripwire_notes" "$SK/notes.before"
+SKOUT="$( "$BIN" "$SK" --notes --no-cache 2>/dev/null )"; rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$SKOUT" | grep -qF 'kept note' \
+    && ok "skipped-lines (guard): --notes exits 0 and lists the one parseable note" \
+    || no "skipped-lines (guard): --notes exited $rc or lost the parseable note — the arms below are void"
+printf '%s' "$SKOUT" | grep -qF '<notes lines_skipped="2">' \
+    && ok "skipped-lines: <notes lines_skipped=\"2\"> names the two lines the reader could not use (every build flavour)" \
+    || no "skipped-lines: the two unparseable lines are not disclosed on <notes>: $( printf '%s' "$SKOUT" | grep -o '<notes[^>]*>' | head -1 )"
+printf '%s' "$SKOUT" | grep -qF 'lines_skipped= counts' \
+    && ok "skipped-lines: the attribute carries its definition where it is met" \
+    || no "skipped-lines: lines_skipped= appears with no definition in the header"
+command -v xmllint >/dev/null 2>&1 && { printf '%s' "$SKOUT" | xmllint --noout - 2>/dev/null \
+    && ok "skipped-lines: the disclosing document is well-formed" || no "skipped-lines: the disclosing document fails xmllint"; }
+"$BIN" "$SK" --note-add="a.c: a new note" --no-cache >/dev/null 2>"$SK/add.err"; rc=$?
+{ [ "$rc" -ne 0 ] && cmp -s "$SK/.ripwire_notes" "$SK/notes.before"; } \
+    && ok "skipped-lines: --note-add refuses (exit $rc) and leaves the sidecar byte-identical — the unparseable lines survive" \
+    || no "skipped-lines: --note-add exited $rc and/or rewrote the sidecar — committed lines deleted: $( diff "$SK/notes.before" "$SK/.ripwire_notes" | head -3 | tr '\n' ' ' )"
+grep -q 'refusing to rewrite' "$SK/add.err" \
+    && ok "skipped-lines: the refusal says why" || no "skipped-lines: the refusal names no reason: $( head -c 200 "$SK/add.err" )"
+# CONTROL: the same tree with only the parseable line — no attribute, and --note-add writes.
+printf 'a.c\t2026-01-01\tkept note\n' >"$SK/.ripwire_notes"
+"$BIN" "$SK" --notes --no-cache 2>/dev/null | grep -qF '<notes>' \
+    && ok "skipped-lines (control): a clean sidecar prints a bare <notes> — the attribute appears only when true" \
+    || no "skipped-lines (control): a clean sidecar's <notes> carries an attribute"
+"$BIN" "$SK" --note-add="a.c: a new note" --no-cache >/dev/null 2>&1 \
+    && ok "skipped-lines (control): --note-add on a clean sidecar still writes" \
+    || no "skipped-lines (control): --note-add on a clean sidecar was refused"
+rm -rf "$SK"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 # CA4 §B15 / trap #27: this file used to stop at the line above and return 0 — `||`'s echo succeeds, so

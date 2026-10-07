@@ -1,4 +1,9 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os::popen / pclose / realpath — git blame and the file argument
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // planlint.h — `--plan-lint=FILE`, the house PLAN format's STRUCTURE check.
 //
@@ -110,6 +115,7 @@
 // byte-identical.
 
 #include "darkflags.h"    // forEachLine / trimView / identByte / readWhole — the shared lexical + file-read primitives
+#include "infra/namesplit.h" // containsWordBoundedBy — the shared word-boundary scan, shared with jsrunner.h
 #include "gitmine.h"      // gitRepoToplevel
 #include "quality.h"      // quality::gitBlameConfigPins / quality::gitOneLine — the shared git-blame plumbing
 #include "gitstamp.h"     // gitstamp::stampAt — the at="<sha>[+dirty]" anchor
@@ -143,8 +149,9 @@ inline const char* glyphName( Glyph g ) noexcept
         case Glyph::Hourglass: return "hourglass";
         case Glyph::Check:     return "check";
         case Glyph::Cross:     return "cross";
-        default:                return "missing";
+        case Glyph::None:      return "missing";
     }
+    return "missing";
 }
 
 struct CardRow
@@ -352,21 +359,13 @@ inline bool isStatusLedgerHeadingText( std::string_view headingText ) noexcept
     return true;
 }
 
+// rv-test-gate-tsjs: the walk is rw::namesplit::containsWordBoundedBy (shared with jsrunner.h's own
+// word-boundary match, over a DIFFERENT predicate — see that file for why); this caller's boundary stays
+// darkflags::identByte exactly as before, so this function's own behaviour is unchanged byte for byte.
 inline bool containsWholeWord( std::string_view line, std::string_view word ) noexcept
 {
-    std::size_t pos = 0;
-    while( ( pos = line.find( word, pos ) ) != std::string_view::npos )
-    {
-        const bool leftOk  = ( pos == 0 ) || !darkflags::identByte( static_cast<unsigned char>( line[ pos - 1 ] ) );
-        const bool rightOk = ( pos + word.size() >= line.size() )
-                           || !darkflags::identByte( static_cast<unsigned char>( line[ pos + word.size() ] ) );
-        if( leftOk && rightOk )
-        {
-            return true;
-        }
-        ++pos;
-    }
-    return false;
+    return rw::namesplit::containsWordBoundedBy( line, word,
+        []( char c ) { return darkflags::identByte( static_cast<unsigned char>( c ) ); } );
 }
 
 // ── the two new git primitives (see the file header's "reused rather than reinvented" note) ───────────
@@ -385,10 +384,10 @@ inline std::string gitBlameLineSha( const std::string& repoRoot, const std::stri
     {
         return {};
     }
-    const std::string cmd = "git -c core.quotepath=false" + quality::gitBlameConfigPins( repoRoot )
+    const std::string cmd = gitCmd( " -c core.quotepath=false" ) + quality::gitBlameConfigPins( repoRoot )
                            + " -C " + shSingleQuote( repoRoot ) + " blame --porcelain -L "
                            + std::to_string( lineNo1 ) + ",+1 HEAD -- " + shSingleQuote( relPath ) + " 2>/dev/null";
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return {};
@@ -406,7 +405,7 @@ inline std::string gitBlameLineSha( const std::string& repoRoot, const std::stri
             sha.assign( ln.substr( 0, 40 ) );
         }
     }
-    pclose( pipe );
+    os::pclose( pipe );
     return sha;
 }
 
@@ -527,8 +526,8 @@ inline LintResult computePlanLint( const std::string& fileArg )
         return res;
     }
 
-    std::string bytes;
-    if( !darkflags::readWhole( fileArg, bytes ) )
+    const std::optional<std::string> bytes = darkflags::readWhole( fileArg );
+    if( !bytes )
     {
         res.ok = false;
         return res;
@@ -536,7 +535,7 @@ inline LintResult computePlanLint( const std::string& fileArg )
 
     std::vector<std::string_view> lines;
     lines.reserve( 256 );
-    res.totalLines = darkflags::forEachLine( bytes, [ & ]( std::string_view line, std::uint32_t ) { lines.push_back( line ); } );
+    res.totalLines = darkflags::forEachLine( *bytes, [ & ]( std::string_view line, std::uint32_t ) { lines.push_back( line ); } );
 
     // The enclosing git repo is resolved from FILE's OWN directory, never from a caller-supplied root: a
     // plan file handed to this verb need not live inside any indexed root at all (the whole point of taking
@@ -544,8 +543,13 @@ inline LintResult computePlanLint( const std::string& fileArg )
     std::string absFile;
     {
         char        resolved[ PATH_MAX ];
-        const char* rp = ::realpath( fileArg.c_str(), resolved );
-        absFile        = rp ? std::string( resolved ) : std::filesystem::absolute( fileArg ).lexically_normal().string();
+        const char* rp = os::realpath( fileArg.c_str(), resolved );
+        std::error_code absEc;   // the throwing absolute() raised filesystem_error when the working directory could not be read
+        absFile        = rp ? std::string( resolved ) : std::filesystem::absolute( fileArg, absEc ).lexically_normal().string();
+        if( absEc )
+        {
+            absFile = std::filesystem::path( fileArg ).lexically_normal().string();   // as given: the git lookup below then finds no repo
+        }
     }
     const std::string parentDir = std::filesystem::path( absFile ).parent_path().string();
     const std::string repoRoot  = gitRepoToplevel( parentDir );
@@ -761,57 +765,57 @@ inline void writePlanLint( std::FILE* out, const LintResult& res )
 
     const std::uint32_t gating = gatingCount( res );
 
-    std::fprintf( out, "<plan-lint file=\"%s\" dialect=\"%d\" cards=\"%zu\" ledger=\"%d\"",
+    rw::emitTo( out, "<plan-lint file=\"{}\" dialect=\"{}\" cards=\"{}\" ledger=\"{}\"",
                   ex( res.file ).c_str(), res.dialectDetected ? 1 : 0, res.cards.size(), res.hasLedger ? 1 : 0 );
     if( res.hasLedger )
     {
-        std::fprintf( out, " ledger_line=\"%u\"", res.ledgerLine );
+        rw::emitTo( out, " ledger_line=\"{}\"", res.ledgerLine );
     }
     if( !res.atStamp.empty() )
     {
-        std::fprintf( out, " at=\"%s\"", res.atStamp.c_str() );
+        rw::emitTo( out, " at=\"{}\"", res.atStamp.c_str() );
     }
-    std::fprintf( out, " git=\"%d\" stale_commits=\"%u\" gating=\"%u\">",
+    rw::emitTo( out, " git=\"{}\" stale_commits=\"{}\" gating=\"{}\">",
                   res.gitAvailable ? 1 : 0, kStaleCommits, gating );
 
     for( const CardRow& c : res.cards )
     {
-        std::fprintf( out, "<card id=\"%s\" line=\"%u\" status=\"%s\"", ex( c.id ).c_str(), c.line, glyphName( c.terminal ) );
+        rw::emitTo( out, "<card id=\"{}\" line=\"{}\" status=\"{}\"", ex( c.id ).c_str(), c.line, glyphName( c.terminal ) );
         if( c.terminalLine != 0 )
         {
-            std::fprintf( out, " tline=\"%u\"", c.terminalLine );
+            rw::emitTo( out, " tline=\"{}\"", c.terminalLine );
         }
         if( c.fromLedger )
         {
-            std::fprintf( out, " src=\"ledger\"" );
+            rw::emitRaw( out, " src=\"ledger\"" );
         }
         if( c.terminal == Glyph::None )
         {
-            std::fprintf( out, " why=\"%s\"", missingWhy( c, res.hasLedger ) );
+            rw::emitTo( out, " why=\"{}\"", missingWhy( c, res.hasLedger ) );
         }
         if( c.staleComputed )
         {
-            std::fprintf( out, " since=\"%u\"", c.commitsSince );
+            rw::emitTo( out, " since=\"{}\"", c.commitsSince );
         }
         if( cardIsStale( c ) )
         {
-            std::fprintf( out, " stale=\"1\"" );
+            rw::emitRaw( out, " stale=\"1\"" );
         }
         if( cardIsGating( c ) )
         {
-            std::fprintf( out, " gating=\"1\"" );
+            rw::emitRaw( out, " gating=\"1\"" );
         }
-        std::fprintf( out, "/>" );
+        rw::emitRaw( out, "/>" );
     }
 
     for( const LedgerOrphan& lo : res.ledgerOrphans )
     {
-        std::fprintf( out, "<ledger-orphan id=\"%s\" line=\"%u\" gating=\"1\"/>", ex( lo.id ).c_str(), lo.line );
+        rw::emitTo( out, "<ledger-orphan id=\"{}\" line=\"{}\" gating=\"1\"/>", ex( lo.id ).c_str(), lo.line );
     }
 
     for( const OwedRow& o : res.owed )
     {
-        std::fprintf( out, "<owed line=\"%u\"%s>", o.line, o.discharged ? "" : " gating=\"1\"" );
+        rw::emitTo( out, "<owed line=\"{}\"{}>", o.line, o.discharged ? "" : " gating=\"1\"" );
         std::string safe;
         appendCdataSafe( o.text, safe );
         std::fputs( "<![CDATA[", out );

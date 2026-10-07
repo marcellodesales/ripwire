@@ -20,10 +20,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -80,7 +81,9 @@ EOF
 runA(){ ( cd "$WORKA" && "$BIN" . --no-cache "$@" 2>/dev/null ); }
 
 TASKA="anchorAlpha anchorBeta"
-runA --pack-task="$TASKA" --token-budget=6000 > "$TMP/a.xml"
+# L1 (2026-09-19): the CLI default legend is compact and spells `<callers><s rel=caller|callee shared=>` inside its
+# comment; these arms read the real <callers> element, so the --pack-task runs they read ask for the full legend.
+runA --pack-task="$TASKA" --token-budget=6000 --legend=full > "$TMP/a.xml"
 BLOCKA="$( callersBlock "$TMP/a.xml" )"
 
 # arm (1) — RED-FIRST: the two-anchor corroborated rows (sharedHelper, callerOfBoth) must sort AHEAD of the
@@ -179,7 +182,7 @@ EOF
   && git add -A && git commit -qm init >/dev/null 2>&1 )
 runB(){ ( cd "$WORKB" && "$BIN" . --no-cache "$@" 2>/dev/null ); }
 
-runB --pack-task="anchorSolo" --token-budget=6000 > "$TMP/b.xml"
+runB --pack-task="anchorSolo" --token-budget=6000 --legend=full > "$TMP/b.xml"
 BLOCKB="$( callersBlock "$TMP/b.xml" )"
 # the exact pre-lane rendering of this content-stable fixture (captured 2026-08-21 against both a cd30104
 # baseline binary and this lane's binary — byte-identical on both, confirming the re-sort is an inert no-op
@@ -213,7 +216,12 @@ fi
 # section grew by a few dozen bytes and the callers quota moved with it. Swept 1225..1400 on the new binary:
 # section omitted <= 1235, shown="1" on 1240..1270, shown="2" on 1275..1300, fully fit from 1320. 1255 sits
 # mid-window; the PROPERTY (one row admitted, two withheld, no bytes spent on an uninformative shared="1") is unchanged.
-runB --pack-task="anchorSolo" --token-budget=1255 > "$TMP/b_tight.xml"
+# RE-PINNED 1255 -> 1235 (2026-09-12, row 6: sc= on the <d> rows — the path-repeating id= is gone, so the ranking
+# section shrank by a few dozen bytes on this fixture and the callers quota moved with it, the same way P7's
+# p= moved it the other way). Swept 1200..1340 on the new binary, step 5 then 2 at the edges: section omitted
+# <= 1215, shown="1" on 1220..1250, shown="2" from 1252, fully fit from 1290. 1235 sits mid-window; the
+# PROPERTY (one row admitted, two withheld, no bytes spent on an uninformative shared="1") is unchanged.
+runB --pack-task="anchorSolo" --token-budget=1235 --legend=full > "$TMP/b_tight.xml"
 TIGHT_TAG="$( grep -o '<callers[^>]*>' "$TMP/b_tight.xml" )"
 [ "$TIGHT_TAG" = '<callers of_top="1" shown="1" total="3" capped="1">' ] \
     && ok "arm (4b) capped-budget single-anchor callers: shown=\"1\"/total=\"3\"/capped=\"1\" unchanged from the pre-lane rendering" \

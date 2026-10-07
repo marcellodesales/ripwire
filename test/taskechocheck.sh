@@ -31,7 +31,7 @@ TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 CORPUS="$TMP/corpus"
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "taskechocheck: no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -73,8 +73,9 @@ m = re.search( r"ceiling ([0-9]+)", sys.stdin.read() )
 sys.stdout.write( m.group( 1 ) if m else "" )
 ' 2>/dev/null; }
 
-XMLFOR="$(  "$BIN" "$CORPUS" --for="$TASK" 2>/dev/null )"
-XMLPT="$(   "$BIN" "$CORPUS" --pack-task="$TASK" 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact; the lens comment echo and the "ceiling N" budget clause are FULL-legend text, so the XML probes ask for it.
+XMLFOR="$(  "$BIN" "$CORPUS" --for="$TASK" --legend=full 2>/dev/null )"
+XMLPT="$(   "$BIN" "$CORPUS" --pack-task="$TASK" --legend=full 2>/dev/null )"
 JSONFOR="$( "$BIN" "$CORPUS" --for="$TASK" --json 2>/dev/null )"
 JSONPT="$(  "$BIN" "$CORPUS" --pack-task="$TASK" --json 2>/dev/null )"
 
@@ -99,11 +100,14 @@ if [ "$jpt"  = "$xpt"  ]; then ok "--pack-task: the two dialects report the SAME
 
 # ── §B1.7 arm 3: the route note is recoverable verbatim too ────────────────────────────────────────
 rfor="$( printf '%s' "$XMLFOR" | rootAttr route )"
+# row 6 (2026-09-12): route= is a CODE (name-exact(X) / subtoken+body[:broad|:declined(...)]), so the value the
+# router produced is recoverable verbatim when it starts with one of the two codes — the dash-collapse defect
+# this arm was written for cannot recur on a value that never held a flag name, and the arm now asserts the
+# code itself rather than a flag spelling the value no longer carries.
 case "$rfor" in
-    "@@MISSING@@") no "--for XML root has no route= attribute";;
-    *"--for"*)     ok "--for XML root route= keeps its double-hyphen flag names verbatim";;
-    *"-for"*)      no "--for XML root route= is still dash-collapsed ('$rfor')";;
-    *)             no "--for XML root route= names no ranker flag at all ('$rfor')";;
+    "@@MISSING@@")                      no "--for XML root has no route= attribute";;
+    "name-exact("*|"subtoken+body"*)    ok "--for XML root route= carries the ranker code verbatim ('$rfor')";;
+    *)                                  no "--for XML root route= is not a ranker code ('$rfor')";;
 esac
 
 # ── §B1.7 arm 4: the SCRUB itself is untouched — the comment echo is still collapsed and G4-legal ──
@@ -130,7 +134,7 @@ fi
 # fails if the query ever stops anchoring (CONTRIBUTING §2). The task still carries a real
 # double-hyphen flag name, which is the input this whole gate exists for.
 TASK2="ceilingArithmetic --token-budget"
-XMLFOR2="$( "$BIN" "$CORPUS" --for="$TASK2" 2>/dev/null )"
+XMLFOR2="$( "$BIN" "$CORPUS" --for="$TASK2" --legend=full 2>/dev/null )"
 [ -n "$XMLFOR2" ] || no "arm 4b: the auto-shape probe produced nothing — the twin cannot observe its contract"
 printf '%s' "$XMLFOR2" | grep -q 'bundle="auto"' \
     && ok "arm 4b presence: the twin query routes name-exact and serves the AUTO shape" \
@@ -192,7 +196,7 @@ else
 fi
 
 # ── §B1.6 arm 3: an explicit --token-budget moves the ceiling, and both dialects track it together ─
-xc2="$( "$BIN" "$CORPUS" --pack-task="$TASK" --token-budget=2000 2>/dev/null | xmlCeilingOf )"
+xc2="$( "$BIN" "$CORPUS" --pack-task="$TASK" --token-budget=2000 --legend=full 2>/dev/null | xmlCeilingOf )"
 jc2="$( "$BIN" "$CORPUS" --pack-task="$TASK" --token-budget=2000 --json 2>/dev/null | jsonKeyStr budget_ceiling_bytes )"
 if [ -n "$xc2" ] && [ "$xc2" = "$jc2" ] && [ "$xc2" != "$xmlCeiling" ]; then
     ok "--token-budget=2000 moves the ceiling and both dialects report the same new value ($jc2)"
@@ -229,10 +233,10 @@ if command -v xmllint >/dev/null 2>&1; then
     # the scrub is LOSSY BY DESIGN and the note says which bytes it eats: a control byte becomes a space and
     # an invalid sequence becomes '?'. Asserting the substitution (not just well-formedness) is what stops a
     # future "fix" from silently dropping the byte and shortening the user's own token.
-    grep -q 'names a symbol (ceilingArithmetic x)' "$TMP/route.c0.xml" \
+    grep -q 'name-exact(ceilingArithmetic x)' "$TMP/route.c0.xml" \
         && ok "§B4 the C0 byte became a SPACE inside the comment (xmlCommentText rule 2)" \
         || no "§B4 the C0 byte was not replaced by a space: [$( head -c 90 "$TMP/route.c0.xml" )]"
-    grep -q 'names a symbol (ceilingArithmetic?x)' "$TMP/route.utf8.xml" \
+    grep -q 'name-exact(ceilingArithmetic?x)' "$TMP/route.utf8.xml" \
         && ok "§B4 the invalid UTF-8 byte became '?' inside the comment (xmlCommentText rule 3)" \
         || no "§B4 the invalid UTF-8 byte was not replaced by '?': [$( head -c 90 "$TMP/route.utf8.xml" )]"
 else
@@ -240,7 +244,7 @@ else
 fi
 
 # ── determinism ───────────────────────────────────────────────────────────────────────────────────
-if [ "$( "$BIN" "$CORPUS" --for="$TASK" 2>/dev/null )" = "$XMLFOR" ]; then ok "--for XML is byte-identical run-to-run"; else no "--for XML is not deterministic"; fi
+if [ "$( "$BIN" "$CORPUS" --for="$TASK" --legend=full 2>/dev/null )" = "$XMLFOR" ]; then ok "--for XML is byte-identical run-to-run"; else no "--for XML is not deterministic"; fi
 if [ "$( "$BIN" "$CORPUS" --pack-task="$TASK" --json 2>/dev/null )" = "$JSONPT" ]; then ok "--pack-task JSON is byte-identical run-to-run"; else no "--pack-task JSON is not deterministic"; fi
 
 [ "$fail" -eq 0 ] && { echo "ALL PASS"; exit 0; }

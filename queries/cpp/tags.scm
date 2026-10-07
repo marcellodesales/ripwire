@@ -103,6 +103,18 @@
 
 (struct_specifier name: (qualified_identifier) @name body:(_)) @definition.class
 
+; ---- class SPECIALIZATION headers (ripwire addition — C++ template scopes, test/cpptmplscopecheck.sh) ----
+; `template <> struct Info<char> : CharBase {};` and `template <class T> struct Slot<T*> : Base { … };` name their
+; class with a template_type, which none of the class patterns above bind, so a specialization's BASE CLAUSE was
+; never read: a specialization that only inherits its members was invisible, and the resolver's template-family
+; fallback could pin a call to a sibling that does not apply. Captured as @definition.specialization, which ingest
+; never turns into a symbol (the members already carry the specialization's canonical scope): it emits only the
+; header's inherit refs, with the specialization's canonical template-id as the derived name
+; (ingest_names.h captureSpecializationHeader).
+(class_specifier name: (template_type) @name body:(_)) @definition.specialization
+
+(struct_specifier name: (template_type) @name body:(_)) @definition.specialization
+
 ; ---- module-level settings constants (ripwire addition — r3 q10) ----
 ; Same rationale and --match-verified declarator shapes as queries/c/tags.scm (the C++ grammar
 ; extends tree-sitter-c): file-scope `static const char* DEFAULT_HOSTS[] = { … }` tables and
@@ -355,6 +367,28 @@
   function: (template_function
     (identifier) @name)) @reference.call
 
+; MEMBER CALLS WITH EXPLICIT TEMPLATE ARGUMENTS: `r.f<T>( x )` / `p->f<T>( x )` parse as
+; call_expression function: (field_expression field: (template_method name: (field_identifier) arguments: …)),
+; and the disambiguated `x.template f<T>()` / `this->template f<T>()` wrap that template_method in a
+; dependent_name. The member pattern above binds `field: (field_identifier)` and the pattern just above binds
+; a template_function, so neither shape minted a reference (measured 2026-09-16: `--callers=get` count="0"
+; for `r.get<K>( 1 )` beside count="1" for `r.plain( 1 )`, and --quality-delta read a method reached only
+; this way as dead code). test/cppqualcheck.sh §12.
+;
+; @name is the field_identifier, as in the plain member pattern, so the NAME needs no text surgery. What the
+; wrapper does change is every parent walk that starts at @name: receiverOf (ingest_binds.h) climbs through
+; template_method/dependent_name to the field_expression — otherwise `other.f<T>()` reads as a BARE call and
+; the enclosing-class rule pins it to the caller's own same-named method — and callArity's bounded parent
+; walk still reaches the call node (3 hops, 4 behind `template`).
+;
+; One alternation, one pattern: a node matches exactly one branch, so each call is minted once.
+(call_expression
+  function: (field_expression
+    field: [
+      (template_method name: (field_identifier) @name)
+      (dependent_name (template_method name: (field_identifier) @name))
+    ])) @reference.call
+
 ; MACRO-DEFINED TEST BODIES (LB-E, r10 gitnexus harvest 2026-08-20): `TEST_CASE( "title" ) { … }` —
 ; doctest/Catch2's block-forming test macros — cannot be expanded by tree-sitter, so the source parses
 ; as TWO SIBLING nodes: an (expression_statement (call_expression …) (MISSING ";")) and a bare
@@ -377,3 +411,31 @@
     function: (identifier) @name)) @definition.testmacroblock
  .
  (compound_statement))
+
+; ---- import capture (the shared vocabulary of issue #358) ----
+; ONE capture name for every include spelling this grammar has. The node is the path TOKEN as written,
+; delimiters included — `"dep.h"`, `<dep.h>`, or a bare macro name — and the CFamily normaliser turns it
+; into a bare path plus the quote-vs-angle bit. Read off a real parse with `--match`, never predicted
+; (13 hits over the test/importcapcheck.sh fixture: every #include in all three grammars plus the two
+; ObjC #import). The UNANCHORED shape is what reaches an include written inside an #if/#else/#elif guard,
+; which is the union-over-arms posture ingest_relations.h already documents — a spurious edge, never a
+; missing one.
+(preproc_include
+  path: (_) @import.path)
+
+; `#import "x.h"` is `#include` + include-once, so it MUST yield the same Include edge — this is the edge
+; that connects a .metal shader to the FX headers it pulls in (10 of the 45 shaders in the measured
+; reference tree use it). THIS GRAMMAR HAS NO #import RULE, so it lands as the generic preproc_call
+; (`directive:` the spelling, `argument:` the token). Probed, not assumed: under both the C and the C++
+; grammar the `#import` lines match here and NOT the preproc_include pattern above, while under the ObjC
+; grammar the very same lines match preproc_include — which is why queries/objc/tags.scm carries only the
+; pattern above.
+;
+; THE PATTERN IS DELIBERATELY OVER-BROAD, and the C++ gate is what narrows it. Every OTHER preproc_call
+; matches here too — measured on the same fixture, `#pragma once` and `#error "stop"` both land — and none
+; of them is a physical dependency. A tree-sitter query predicate (`#eq? @_d "#import"`) would say so,
+; but the tags pass never evaluates predicates (the same fact that keeps `using namespace ns;` gated in
+; C++, in ingest.cpp). So the CFamily normaliser reads the directive text and drops every spelling that
+; is not `#import`: a dropped row is a floor, and a captured `#pragma` would have been a WRONG edge.
+(preproc_call
+  argument: (preproc_arg) @import.path)

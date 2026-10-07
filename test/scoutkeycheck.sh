@@ -14,16 +14,24 @@
 # positive must be gone AND the true positives must survive.
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN"; exit 2; }
 echo "scoutkeycheck: BIN=$BIN"
 
-pairline(){ "$BIN" "$1" --merge-scout=laneA,laneB 2>/dev/null | grep -oE '<pair [^>]*>' | head -1; }
+# L1 (2026-09-19): the CLI default legend is compact and spells `<pair a= b= conflicts= risks=>` inside its comment; pairline reads the real row, so it asks for the full legend.
+# train-14 (2026-09-20): --legend=full is no longer a hiding place either — merge-scout's own full-legend
+# prose now spells the bare shape "a <pair a= b=> compares two of them pairwise" (src/mergescout.h), so a
+# posture-based selector picked the LEGEND and every attribute read came back empty: three arms failed and
+# one fabricated-conflict arm PASSED for the wrong reason (0 conflicts because there was no row at all).
+# Select on the thing that distinguishes a data row from any prose mention of its shape in either posture —
+# a quoted attribute VALUE — instead of on which legend the run happens to serve.
+pairline(){ "$BIN" "$1" --merge-scout=laneA,laneB --legend=full 2>/dev/null | grep -oE '<pair a="[^"]*"[^>]*>' | head -1; }
 attr(){ printf '%s' "$1" | grep -oE "$2=\"[0-9]+\"" | grep -oE '[0-9]+' | head -1; }
 
 # ── 1) THE NEGATIVE CASE: disjoint files, same scope-less function name ───────────────────────────────
@@ -76,7 +84,7 @@ P3="$( pairline . )"
 cd "$R2"
 "$BIN" . --merge-scout=laneA,laneB >"$TMP/s1" 2>/dev/null
 "$BIN" . --merge-scout=laneA,laneB >"$TMP/s2" 2>/dev/null
-cmp -s "$TMP/s1" "$TMP/s2" && ok "merge-scout output byte-identical run-to-run" || no "merge-scout is non-deterministic"
+if cmp -s "$TMP/s1" "$TMP/s2"; then ok "merge-scout output byte-identical run-to-run"; else no "merge-scout is non-deterministic"; fi
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

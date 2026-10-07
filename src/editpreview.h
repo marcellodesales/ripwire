@@ -24,15 +24,18 @@
 // order elsewhere never matters to it.
 
 #include "editcheck.h"      // editCheckBundleText / editCheckGroups / editCheckAmbiguousMessage
+#include "infra/os.h"   // rw::os::getpid — the per-process preview temp root
 #include "mcpedit.h"        // Op / applyEdit / detectDominantEol / normalizeToCrlf / kBinaryPayloadRefusal
 #include "ingest.h"         // ingest() — the ONE parser path; looksBinary
 #include "graph.h"          // buildGraph / resolveAllByNameQualified
 #include "quality.h"        // cacheDirLadder / TmpTreeGuard
 #include "sarif.h"          // rootPrefixOf / rootRelativeUri — the root-relative identity of the edited file
+#include "infra/ownedfile.h" // rw::OwnedFile — the spliced temp file is closed on every return
 
 #include <array>
 #include <cstdio>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,6 +69,7 @@ inline Outcome refuse( std::string message )
 // kBinaryPayloadRefusal makes is exactly the condition that would drop the file from the index.
 inline bool readPayload( std::string_view spec, std::size_t maxFileBytes, std::string& out, std::string& err )
 {
+    ASSUME_NO_ALIAS( out, err );
     out.clear();
     if( spec == "-" )
     {
@@ -152,6 +156,8 @@ inline IngestResult previewMerge( const IngestResult& ing, std::uint32_t fileId,
     out.rootLabels      = ing.rootLabels;
     out.rootPaths       = ing.rootPaths;
     out.rootReals       = ing.rootReals;
+    out.crawlRoot       = ing.crawlRoot;
+    out.crawlRootPrefixes = ing.crawlRootPrefixes;
     out.skippedOversize = ing.skippedOversize;
     out.crawlSkips      = ing.crawlSkips;
     out.fileHealth      = ing.fileHealth;
@@ -196,6 +202,10 @@ inline IngestResult previewMerge( const IngestResult& ing, std::uint32_t fileId,
         c.id     = NodeId( out.symbols.size() );
         out.symbols.push_back( std::move( c ) );
     }
+    // the function-local scope side table (model.h fnLocalScopes): ascending id, spliced at the same seam
+    for( const FnLocalScope& f : ing.fnLocalScopes ) { if( f.id < lo ) { out.fnLocalScopes.push_back( f ); } }
+    for( FnLocalScope f : one.fnLocalScopes )         { f.id = NodeId( lo + f.id ); out.fnLocalScopes.push_back( f ); }
+    for( FnLocalScope f : ing.fnLocalScopes )         { if( f.id >= hi ) { f.id = shift( f.id ); out.fnLocalScopes.push_back( f ); } }
 
     // The field SIDE TABLE keeps its own index space (a FieldId, never a NodeId), so it is spliced by the
     // same (fileId, …) ordering and its ids are simply re-indexed.
@@ -251,6 +261,16 @@ inline IngestResult previewMerge( const IngestResult& ing, std::uint32_t fileId,
 // A single-file ingest of `bytes` written under `rel` inside a private temp root, so the parse sees the
 // file's real EXTENSION and its real relative directory (both are inputs to language selection). Returns
 // an empty result (files empty) on any I/O failure — a degrade, never a throw.
+//
+// THE INGEST HOLDS THE PROCESS-WIDE INGEST LOCK. ingest() installs compiled tags queries into a process-global
+// cache and deletes the query each install displaces (ingest_prewarm.h), which is single-writer by design; every
+// other ingest a long-lived server runs is serialized on quality::headSnapshotIngestMutex. This one was not: the
+// MCP `edit_check` new_body preview ran its two ingests after the verb's own locked ingest had released, so they
+// raced the detached HEAD-snapshot prefetch worker's ingest — a reader probing the map while it was written, and
+// a query freed under a parse worker still using it (ThreadSanitizer: data race at ingest.cpp's parse-pool call,
+// prefetch worker vs editpreview::ingestOneFile). Taken HERE, around the ingest alone: the caller's
+// editCheckBundleText takes the same (non-recursive) mutex inside computeHeadSnapshot, so a lock held across the
+// whole preview would deadlock. Uncontended on the CLI, where nothing else ingests.
 inline IngestResult ingestOneFile( const std::string& tmpDir, const std::string& rel, const std::string& bytes,
                                    std::size_t maxFileBytes, bool captureValueUses )
 {
@@ -258,22 +278,24 @@ inline IngestResult ingestOneFile( const std::string& tmpDir, const std::string&
     std::error_code   ec;
     const fs::path    target = fs::path( tmpDir ) / fs::path( rel );
     fs::create_directories( target.parent_path(), ec );
-    std::FILE* fp = std::fopen( target.string().c_str(), "wb" );
-    if( fp == nullptr )
     {
-        DEGRADED_PATH_ALERT( "edit-preview: cannot write the spliced file into the temp root" );
-        return {};
-    }
-    const std::size_t written = bytes.empty() ? 0 : std::fwrite( bytes.data(), 1, bytes.size(), fp );
-    const bool        wrote   = ( written == bytes.size() );
-    std::fclose( fp );
-    if( !wrote )
-    {
-        DEGRADED_PATH_ALERT( "edit-preview: short write of the spliced file" );
-        return {};
+        OwnedFile fp = openOwnedFile( target.string().c_str(), "wb" );
+        if( !fp )
+        {
+            DISCLOSE( "edit-preview: cannot write the spliced file into the temp root" );
+            return {};
+        }
+        const std::size_t written  = bytes.empty() ? 0 : std::fwrite( bytes.data(), 1, bytes.size(), fp.file );
+        const bool        closedOk = fp.close();
+        if( written != bytes.size() || !closedOk )
+        {
+            DISCLOSE( "edit-preview: short write of the spliced file" );
+            return {};
+        }
     }
     // No excludes: the ONE file here is the one the caller already resolved through the main index, so a
     // --exclude that would drop it can only produce a false "the payload defines nothing".
+    std::lock_guard<std::mutex> ingestLk( quality::headSnapshotIngestMutex() );
     return ingest( tmpDir.c_str(), {}, {}, maxFileBytes, captureValueUses );
 }
 
@@ -315,7 +337,8 @@ inline std::string overwriteChildXml( const std::string& src, std::size_t a, std
 // preview's choice of definition identical to the post-apply verb's by construction.
 inline Outcome run( const IngestResult& ing, const Graph& g, const std::string& root, std::size_t maxFileBytes,
                     const std::vector<std::string>& excludes, bool captureValueUses, std::string_view selector,
-                    NodeId focus, const std::string& payload, const notes::NoteIndex* ni )
+                    NodeId focus, const std::string& payload, const notes::NoteIndex* ni,
+                    int pageLimit = 0, int pageOffset = 0 )
 {
     namespace fs = std::filesystem;
 
@@ -373,11 +396,12 @@ inline Outcome run( const IngestResult& ing, const Graph& g, const std::string& 
 
     const std::string relPath = std::string( rw::sarif::rootRelativeUri( path, rw::sarif::rootPrefixOf( root ) ) );
     std::error_code   ec;
-    const std::string tmpRoot = quality::cacheDirLadder() + "/ripwire-editpreview-" + std::to_string( ::getpid() );
+    const std::string tmpRoot = quality::cacheDirLadder() + "/ripwire-editpreview-" + std::to_string( os::getpid() );
     fs::remove_all( fs::path( tmpRoot ), ec );                    // a leftover from a crashed prior run
     if( !fs::create_directories( fs::path( tmpRoot ), ec ) && ec )
     {
-        DEGRADED_PATH_ALERT( "edit-preview: cannot create the temp parse root" );
+        DISCLOSE( Diagnostics::answerRefused, "the preview refuses by name (no private temp directory); no preview is served",
+                  "edit-preview: cannot create the temp parse root" );
         return refuse( "cannot create a private temp directory to parse the payload in" );
     }
     quality::TmpTreeGuard guard{ tmpRoot };
@@ -404,7 +428,10 @@ inline Outcome run( const IngestResult& ing, const Graph& g, const std::string& 
     const IngestResult merged = previewMerge( ing, fsym.fileId, headOne );
     const Graph        mg     = buildGraph( merged );
 
-    const std::vector<NodeId> matches = resolveAllByNameQualified( merged, selector );
+    // H1: the residue on the MERGED tree — the one this document measures — so the preview discloses what the post-apply
+    // verb would, whether or not the payload changed which definitions the selector can tie to its file.
+    std::size_t               previewUnprovenDefs = 0;
+    const std::vector<NodeId> matches  = resolveAllByNameQualified( merged, selector, &previewUnprovenDefs );
     bool                      inSplice = false;
     for( NodeId m : matches )
     {
@@ -427,7 +454,12 @@ inline Outcome run( const IngestResult& ing, const Graph& g, const std::string& 
 
     Outcome oc;
     oc.ok  = true;
-    oc.xml = editCheckBundleText( merged, mg, root, maxFileBytes, excludes, groups[0].lowestNode, ni, true );
+    // 2026-09-10: the same window the post-hoc verb takes, from the same flags — a preview that paged
+    // differently from the answer it predicts would be worth nothing (test/editpreviewcheck.sh compares
+    // the two documents).
+    oc.xml = editCheckBundleText( merged, mg, root, maxFileBytes, excludes, groups[0].lowestNode, ni, true,
+                                   pageLimit, pageOffset, previewUnprovenDefs, /*notesDegraded=*/false,
+                                   EditCheckSpliced{ newBytes, fsym.fileId, true } );   // the merged spans index the spliced bytes
     // E3 (terminality round A, 2026-09-05): the CURRENT span an apply would replace, as the bytes are on disk, so
     // the Read an agent makes before an edit "to see what I am about to overwrite" is already in the preview.
     // Appended as the last child of the preview's own root — the post-hoc document cannot carry it (after the
@@ -435,6 +467,11 @@ inline Outcome run( const IngestResult& ing, const Graph& g, const std::string& 
     if( const std::size_t close = oc.xml.rfind( "</edit-check>" ); close != std::string::npos )
     {
         oc.xml.insert( close, overwriteChildXml( src, a, b ) );
+        // M11: the overwrite child lands AFTER the assembler priced the bundle, so the document a caller is
+        // handed is bigger than the one est_tokens= described. Re-price through the assembler's OWN pricing
+        // step (editcheck.h, editCheckPriceRoot — idempotent: it strips the stale attribute first). A second
+        // formula here is precisely the per-payload estimator drift §H7 exists to prevent.
+        editCheckPriceRoot( oc.xml );
     }
     return oc;
 }

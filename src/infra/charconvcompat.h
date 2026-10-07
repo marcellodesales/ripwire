@@ -23,8 +23,9 @@
 //
 // THE FALLBACK IS ALWAYS COMPILED, on every platform, even where the std path is chosen. A shim that
 // only type-checks on the toolchain that cannot be built locally is a shim that rots silently; this
-// way the dev machine's build proves the fallback still compiles, and the macos-14 CI leg proves it
-// still behaves (the lint magic-number gates run straight through it there).
+// way the dev machine's build proves the fallback still compiles, and the macOS CI legs prove it still
+// behaves: they build at the release's 14.0 deployment target, below the macOS 26 where libc++'s
+// floating-point from_chars becomes available (the lint magic-number gates run straight through it there).
 //
 // SEMANTICS: `parseFloating` reproduces `std::from_chars( first, last, value )` with the default
 // `chars_format::general`, which is strtod's grammar MINUS three things. All three are handled below
@@ -48,6 +49,8 @@
 // and the representable/overflow/underflow boundaries.
 
 #include <cerrno>
+#include "platform.h"   // RW_OPAQUE — the opaque-value barrier the infinity test needs under -ffast-math
+#include <bit>          // std::bit_cast — the portable spelling of that test's float/uint pun
 #include <charconv>
 #include <cctype>
 #include <cstdint>
@@ -83,11 +86,11 @@ template<class T> requires std::is_floating_point_v<T>
 {
     using Bits = std::conditional_t<sizeof( T ) == sizeof( std::uint32_t ), std::uint32_t, std::uint64_t>;
     static_assert( sizeof( Bits ) == sizeof( T ), "no same-width unsigned type for this floating format" );
-    constexpr Bits kInfinityBits = __builtin_bit_cast( Bits, std::numeric_limits<T>::infinity() );
+    constexpr Bits kInfinityBits = std::bit_cast<Bits>( std::numeric_limits<T>::infinity() );
     constexpr Bits kExceptSignBit = static_cast<Bits>( ~Bits( 0 ) >> 1 );
 
-    Bits bits = __builtin_bit_cast( Bits, x );
-    asm volatile( "" : "+r"( bits ) );
+    Bits bits = std::bit_cast<Bits>( x );
+    RW_OPAQUE( bits );
     return ( bits & kExceptSignBit ) == kInfinityBits;
 }
 

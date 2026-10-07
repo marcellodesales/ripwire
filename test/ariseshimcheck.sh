@@ -21,7 +21,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 SHIMS="$ROOT/bench/arise-h2h/swe_agent_bundle_ripwire/bin"
 CFG="$ROOT/bench/arise-h2h/swe_agent_bundle_ripwire/config.yaml"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -43,7 +43,7 @@ export RIPWIRE_BIN="$BIN"
 
 # ── (1) inventory: bin/ and config.yaml agree ───────────────────────────────────────────────────────
 expected="rw_at rw_callees rw_callers rw_expand rw_for rw_from_trace rw_impact rw_pack_task rw_slice"
-actual="$( ls "$SHIMS" | sort | tr '\n' ' ' | sed 's/ $//' )"
+actual="$( ls "$SHIMS" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//' )"
 [ "$actual" = "$expected" ] && ok "(1) bin/ holds exactly the nine registered shims" \
     || no "(1) bin/ inventory drifted: got '$actual'"
 missing=0

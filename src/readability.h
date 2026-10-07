@@ -1,14 +1,18 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
 
-// readability.h — `--readability`: the Posnett/Hindle/Devanbu (MSR 2011) readability lens, per function.
+
+// readability.h — `--biggest-first` (was `--readability`): the Posnett/Hindle/Devanbu (MSR 2011) readability lens, per function.
 //
 // Three numbers per function or method, one token pass, all closed-form — no model, no corpus, no network:
 //   V  Halstead volume            V = N * log2(eta),  N = operator+operand tokens, eta = DISTINCT such tokens
 //   E  token entropy              Shannon entropy of the definition's token-frequency distribution, in bits
 //   L  lines                      Symbol::loc, the definition's physical line span (already indexed; not recomputed)
 //   P  Posnett score              P = sigmoid( 8.87 - 0.033*V + 0.40*L - 1.5*E ), the paper's published fit
-// Rows are emitted LEAST readable first (ascending P) — the verb is a RANKING lens, which is the only claim
-// the literature supports for it (Scalabrino ASE'17 and Trockman MSR'18 both find no readability metric
+// Rows are emitted in ascending P, which puts the LARGEST volume/token count/length first — a size proxy:
+// the claim that this order predicts later fixes is WITHDRAWN (docs/EVALS.md §8, 8 of 10 token-count deciles
+// show no association). The verb is a RANKING lens, which is the only claim the literature supports for it (Scalabrino ASE'17 and Trockman MSR'18 both find no readability metric
 // correlates strongly with measured understandability; Fakhoury ICPC'19 finds the classic models miss real
 // readability-improving commits). So P is never a grade, never a gate, and never a verdict — it orders a
 // worklist, and the legend says so where the reader meets it.
@@ -40,7 +44,7 @@
 #include "docparse.h"           // docparse::detail::readWholeFile — the canonical whole-file byte read (reused, not re-rolled)
 #include "pageview.h"           // pageWindow + pageDisclosure — THE TRUNCATION VOCABULARY
 #include "serialize.h"          // escapeXml
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — an unreadable file degrades the scan, never aborts it
+#include "infra/Diagnostics.h"  // DISCLOSE — an unreadable file degrades the scan, never aborts it
 
 #include <algorithm>
 #include <cmath>
@@ -103,6 +107,14 @@ struct ReadabilityScan
 {
     std::vector<ReadabilityRow> rows;
     std::uint32_t               unreadableFileCount;   // >0 ⇒ rows is a FLOOR, disclosed on the root
+    enum class DisclosureWhy : std::uint8_t
+    {
+        UnreadableFile,
+    };
+    void disclose( DisclosureWhy ) noexcept   // the DISCLOSE sink: the field the emitter reads
+    {
+        ++unreadableFileCount;
+    }
 };
 
 inline double posnettScore( double volume, double lineCount, double entropy ) noexcept
@@ -113,7 +125,7 @@ inline double posnettScore( double volume, double lineCount, double entropy ) no
 }
 
 // The measurement pass. Reads each indexed file at most once; a file that cannot be read is counted and
-// skipped (DEGRADED_PATH_ALERT), never fatal — the whole pipeline must survive a malformed repo.
+// skipped (DISCLOSE), never fatal — the whole pipeline must survive a malformed repo.
 inline ReadabilityScan computeReadability( const IngestResult& ing )
 {
     ReadabilityScan scan;
@@ -146,12 +158,13 @@ inline ReadabilityScan computeReadability( const IngestResult& ing )
         if( fileLoaded[s.fileId] == 0 )
         {
             fileLoaded[s.fileId] = 1;
-            if( !docparse::detail::readWholeFile( diskPath( ing, s.fileId ), fileBytes[s.fileId] ) )
+            std::optional<std::string> bytes = docparse::detail::readWholeFile( diskPath( ing, s.fileId ) );
+            if( !bytes )
             {
                 fileFailed[s.fileId] = 1;
-                ++scan.unreadableFileCount;
-                DEGRADED_PATH_ALERT( "readability: an indexed file could not be read — its functions are absent from the report" );
+                DISCLOSE( scan, ReadabilityScan::DisclosureWhy::UnreadableFile, "readability: an indexed file could not be read — its functions are absent from the report" );
             }
+            fileBytes[s.fileId] = std::move( bytes ).value_or( std::string() );
         }
         if( fileFailed[s.fileId] != 0 )
         {
@@ -205,7 +218,7 @@ inline ReadabilityScan computeReadability( const IngestResult& ing )
         scan.rows.push_back( row );
     }
 
-    // Least readable FIRST. Total order: P ascending, then V descending (bigger is harder at equal P), then
+    // Lowest P FIRST (largest bodies first). Total order: P ascending, then V descending (bigger is harder at equal P), then
     // the symbol id — already assigned in (file, line, name) order, so this is byte-stable without a string
     // compare. Tolerance bands do not apply to a SORT (CONTRIBUTING.md §3): the determinism gate does.
     std::sort( scan.rows.begin(), scan.rows.end(),
@@ -229,14 +242,15 @@ inline ReadabilityScan computeReadability( const IngestResult& ing )
 // illegal inside an XML comment, which is why flags are named bare (see src/graphlegend.h).
 inline constexpr const char* kReadabilityLegend =
     "<!-- ripwire readability: the Posnett/Hindle/Devanbu (MSR 2011) closed-form lens, one row per function "
-    "or method, LEAST READABLE FIRST. p=path:line n=symbol name lines=L, the definition's physical line span "
+    "or method, ordered by P ascending, which puts the LARGEST Halstead volume, token count and length first: "
+    "a size proxy, not a readability order (the readability-ordering claim is withdrawn, docs/EVALS.md section 8). p=path:line n=symbol name lines=L, the definition's physical line span "
     "toks=N, the operator+operand tokens of the whole definition (signature included) "
     "ops=N1, the operator half of toks (keywords and punctuation; the rest are identifiers and literals) "
     "vocab=eta, distinct tokens vol=Halstead volume V, N*log2(eta) ent=E, Shannon entropy of the token "
     "frequency distribution, in bits posnett=P, sigmoid(8.87 - 0.033V + 0.40L - 1.5E), the paper's published fit. "
     "ONE token-class table serves every language, so V is a cross-language APPROXIMATION, not a per-grammar "
     "count. P was fitted on snippets of 20 lines or fewer: read the ORDER, not the number, and never as a grade. "
-    "The sigmoid SATURATES at the least-readable extreme (a high-volume function's argument clamps at +/-40), "
+    "The sigmoid SATURATES at its low end (a high-volume function's argument clamps at +/-40), "
     "so several head rows can print posnett=\"0.000\" alike; those ties (and every tie) break by vol= "
     "descending, so the ORDER stays real even where P itself has run out of visible precision. "
     "functions=functions and methods measured (a declaration with no body is not measured) "
@@ -260,12 +274,12 @@ inline int writeReadabilityReport( const IngestResult& ing, int pageLimit, int p
     std::fputs( kReadabilityLegend, stdout );
     // R-E fix (2026-08-19): the shared root-relative clause, emitted exactly when root= is (graphlegend.h).
     std::fputs( rw::rootRelPathsLegend( !rootAttr.empty() ), stdout );
-    std::printf( "<readability functions=\"%zu\"%s", total, disclosure );
+    rw::emitTo( stdout, "<readability functions=\"{}\"{}", total, rw::cstr( disclosure ) );
     if( scan.unreadableFileCount != 0 )
     {
-        std::printf( " unreadable_files=\"%u\"", scan.unreadableFileCount );
+        rw::emitTo( stdout, " unreadable_files=\"{}\"", scan.unreadableFileCount );
     }
-    std::printf( "%s>", rootAttr.c_str() );
+    rw::emitTo( stdout, "{}>", rootAttr.c_str() );
 
     // TWO scratch buffers, not one reused twice in the same call: escapeXml returns a VIEW into its `out`,
     // so a second call with the same buffer invalidates the first view — and argument evaluation order is
@@ -279,12 +293,12 @@ inline int writeReadabilityReport( const IngestResult& ing, int pageLimit, int p
         const std::string_view rel  = rootPrefix.empty() ? std::string_view( ing.files[s.fileId] ) : rw::sarif::rootRelativeUri( ing.files[s.fileId], rootPrefix );
         const std::string      path( escapeXml( rel, escPath ) );
         const std::string     name( escapeXml( s.name, escName ) );
-        std::printf( "<fn p=\"%s:%u\" n=\"%s\" lines=\"%u\" toks=\"%u\" ops=\"%u\" vocab=\"%u\" vol=\"%.1f\" ent=\"%.2f\" posnett=\"%.3f\"/>",
+        rw::emitTo( stdout, "<fn p=\"{}:{}\" n=\"{}\" lines=\"{}\" toks=\"{}\" ops=\"{}\" vocab=\"{}\" vol=\"{:.1f}\" ent=\"{:.2f}\" posnett=\"{:.3f}\"/>",
                      path.c_str(), s.line, name.c_str(),
                      row.lineCount, row.tokenCount, row.operatorCount, row.vocabularyCount,
                      row.volume, row.entropy, row.posnett );
     }
-    std::printf( "</readability>" );
+    rw::emitRaw( stdout, "</readability>" );
     return 0;
 }
 

@@ -1,4 +1,6 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // pincensus.h — the S6-C SILENT-PIN CENSUS: an eval-only, flag-gated record of WHICH mechanism decided
 // each resolved call site, and WHICH target it decided on, by canonical identity.
@@ -19,9 +21,9 @@
 // the index's own pinned target(s) in the SAME canonical-id space — so the census file holds both sides
 // of the join and no protobuf reader is needed downstream.
 //
-// Sites that never reach emission (a name with no in-repo def, a tier-3 non-unique drop, a self-only
-// tier) produce NO row: they made no commitment, so there is nothing to audit. That is a floor on the
-// row count, not a total, and the trailer says so.
+// Sites that never reach emission (a name with no in-repo def, a tier-3 decline, a self-only tier) produce
+// NO row: they made no commitment, so there is nothing to audit. That is a floor on the row count, not a
+// total, and the trailer says so — the `# dispositions` line beside it is the total (CallDisposition below).
 //
 // ── shape (G2) ──────────────────────────────────────────────────────────────────────────────────────
 // SoA over parallel vectors keyed by row index, 32-bit handles throughout, callee names in one flat pool
@@ -32,10 +34,12 @@
 // Populated ONLY when buildGraph is asked for it; empty otherwise, and the writer is the only consumer.
 // The flagless map is byte-identical either way — the census is a side file, never a change to stdout.
 
+#include "infra/strkern.h" // Byteset256 + appendCleanRun — the run-copy skip the field escape is built on, as escapeXml's is
 #include "model.h"
 #include "resolve.h"        // canonicalIdForEmit — the census id must be the map's id= spelling
 #include "scipoverlay.h"    // kScipNonDefExternal / kScipNonDefInIndex — the O-row sentinel kinds
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -91,6 +95,61 @@ inline const char* pinMechName( std::uint8_t m ) noexcept
     return "?";
 }
 
+// ── the CALL DISPOSITIONS — the census's conservation line ────────────────────────────────────────────
+// The `C` rows are a FLOOR: a site that commits to nothing writes no row. The dispositions are the TOTAL.
+// Every reference buildGraph's resolve loop takes up as a call (isResolvableCallReference below) ends in
+// EXACTLY ONE bucket, counted when its loop iteration ends — so a `continue` that names no bucket lands in
+// Unaccounted instead of vanishing. The census writer re-derives the population from ing.references and
+// prints both; test/declinecheck.sh arm (F) asserts they balance. Three buckets are also header gauges
+// (external=, unresolved=, declined=); the others have no header surface on purpose, each for the reason
+// its comment gives.
+enum class CallDisposition : std::uint8_t
+{
+    Bound             = 0,   // at least one non-self edge committed — exactly the sites with a non-external C row
+    Self              = 1,   // every surviving target was the caller itself (recursion), or a SCIP-covered site whose
+                             // targets were all self/out-of-range: the only symbol that could lose a caller is the caller
+    External          = 2,   // a vetoExternal refusal — the Phase-5 veto, an ES import bound outside the tree, super() past the MRO, the C++ std:: guard — header external=
+    Unresolved        = 3,   // an in-repo name the tool refused to answer (every def lang-filtered, an L3 known-indirect
+                             // call, a shadowed/refused/renamed ES import) — header unresolved=
+    Undefined         = 4,   // no in-repo definition of the name at all — a stdlib or third-party call, no gauge by design
+    OtherRoot         = 5,   // multi-root only: every compatible definition lives in ANOTHER root and no include/import
+                             // reaches it — external to this root, which is what that root's solo run would say
+    QualifiedExternal = 6,   // a Rust `Scope::name()` call no in-repo member of `Scope` can answer (the H4 W3 guard)
+    Declined          = 7,   // tier 3: two or more same-language candidates, none in the caller's file or directory, none
+                             // pinned by a qualifier or a receiver rule; or the builtin-method name gate (graph.h
+                             // BuiltinMethodGate) admitted none of a builtin-type method name's candidates — header
+                             // declined=, answers' declined_calls=
+    FileScope         = 8,   // a call outside every symbol with no caller node to hang an edge on. Since issue #60
+                             // ingest_model.h mintModuleScopeOwners gives every such call a module-scope owner over
+                             // exactly isResolvableCallReference's population below, so on a code corpus this bucket
+                             // is UNREACHABLE and a non-zero count means the mint and this loop have drifted apart
+                             // (test/declinecheck.sh arm (F) asserts the zero). Kept, not deleted: it stays the honest
+                             // answer if a lane ever emits a call reference for a non-code language, and a 0 here
+                             // reads "none found", never "none exists".
+    Unaccounted       = 9    // an exit that named no bucket. Always a resolver bug: buildGraph raises a degrade alert
+};
+inline constexpr std::size_t kCallDispositionCount = 10;   // one past Unaccounted — size every per-disposition array with this
+
+using CallDispositionCounts = std::array<std::size_t, kCallDispositionCount>;
+
+// The census spelling of each bucket, indexed by its value: a declarative table (CONTRIBUTING §3), sized by the
+// count so a new bucket without a name does not compile, and pinned at both ends so a reorder cannot misname one.
+inline constexpr std::array<const char*, kCallDispositionCount> kCallDispositionNames = {
+    "bound", "self", "external", "unresolved", "undefined", "other_root", "qualified_external", "declined", "file_scope", "unaccounted"
+};
+static_assert( std::string_view( kCallDispositionNames[ std::size_t( CallDisposition::Bound ) ] ) == "bound" );
+static_assert( std::string_view( kCallDispositionNames[ std::size_t( CallDisposition::Declined ) ] ) == "declined" );
+static_assert( std::string_view( kCallDispositionNames[ std::size_t( CallDisposition::Unaccounted ) ] ) == "unaccounted" );
+
+// The POPULATION the dispositions partition: a reference the call graph could carry. Inheritance, doc-mention
+// and HAS-A references are other relations with their own passes; read/write/import/type use-sites live only in
+// the use-site index (ABS-3). One predicate, read by the resolve loop's filter AND by the census writer's
+// re-derivation, so the two cannot disagree about what a call is — only about what happened to one.
+inline bool isResolvableCallReference( const Reference& r ) noexcept
+{
+    return !r.isInherit && !r.isDocLink && !r.isCompose && ( r.role == RefRole::Call || r.role == RefRole::Macro );
+}
+
 // Per-row provenance bits — every narrowing stage that FIRED on this site, not just the deciding one. A
 // site S6-C narrowed 3→2 is labelled `split` (it is still ambiguous and still counted in `amb=`), and
 // without these bits the fact that locality touched it at all would be invisible. Cheap, and it keeps the
@@ -127,6 +186,9 @@ struct PinCensus
     std::vector<std::uint8_t>  oraSentinel; // 0 = in-repo target(s) in oraTo; kScipNonDefExternal / kScipNonDefInIndex =
                                             //   SCIP resolved the site to something that is not a ripwire definition
                                             //   (no oraTo entries; the writer prints `@external` / `@nondef`)
+
+    // ---- the conservation line's buckets (buildGraph copies Graph::callDispositions in when armed) --------
+    CallDispositionCounts      dispositions{};
 
     bool armed = false;                     // false ⇒ nothing was recorded and nothing will be written
 
@@ -234,6 +296,61 @@ inline std::string pinFlagString( std::uint8_t fl )
     return out;
 }
 
+// THE FIELD ESCAPE (format v3) — why an id or a callee name is never written raw.
+//
+// A census row is one LF-terminated line of TAB-separated fields, and a C/O row's targets field is a list
+// split on `|`. The strings those fields carry are SOURCE TEXT: a C++ out-of-line member of a class template
+// whose template-argument list spans lines has a scope holding that line break verbatim
+// (`SmallVec<T, Alloc, SizeType,\n    GrowingPolicy, N>`), a CRLF file adds a CR, a TAB can sit inside the
+// argument list, and a path may hold a `|`. Written raw, each one splits a row: a C row became a 6-field
+// line plus a continuation line starting with neither C, S, O nor `#` (observed 2026-09-16 on a large private
+// C++ corpus), and `pipe|dir/far.hpp::f#5` read back as two targets. The map never had the defect — escapeXml
+// writes the same scope as `&#10;` — so this is the census catching up with its own sibling surface.
+//
+// The escape is REVERSIBLE and minimal: backslash (the escape's own lead byte) -> `\\`, TAB/LF/CR ->
+// `\t`/`\n`/`\r`, every other C0 control byte and `|` -> `\xHH` (lowercase hex). Nothing else moves, so
+// an id without those bytes is spelled byte-for-byte as in v2, and the three separators can never occur
+// inside a field — a reader splits lines on LF, fields on TAB and targets on `|`, and only then decodes.
+// `|` becomes `\x7c` rather than `\|` for exactly that reason: a naive split must stay exact.
+// Emission side only: the resolver's names and scopes are untouched, and every column spells one symbol
+// the same way, so the caller_id / targets / S-row join is still byte equality.
+inline constexpr strkern::Byteset256 kCensusFieldEscapeByteset = []
+{
+    strkern::Byteset256 set;
+    set.addRange( 0x00, 0x1F );
+    set.add( '\\' );
+    set.add( '|' );
+    return set;
+}();
+
+inline void appendCensusField( std::string& out, std::string_view s )
+{
+    const char*       d = s.data();
+    const std::size_t n = s.size();
+    for( std::size_t i = strkern::appendCleanRun( d, 0, n, kCensusFieldEscapeByteset, out ); i < n;
+         i = strkern::appendCleanRun( d, i, n, kCensusFieldEscapeByteset, out ) )
+    {
+        const unsigned char c = static_cast<unsigned char>( d[ i ] );
+        switch( c )
+        {
+            case '\\': out += "\\\\"; break;
+            case '\t': out += "\\t";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            default:
+            {
+                // Two digits from a table, not a format call into a char[]: there is no buffer to size or classify.
+                static constexpr char kHex[] = "0123456789abcdef";
+                out += "\\x";
+                out.push_back( kHex[ c >> 4 ] );
+                out.push_back( kHex[ c & 0x0F ] );
+                break;
+            }
+        }
+        ++i;
+    }
+}
+
 // THE CENSUS IDENTITY — `path::scope::name#NODEID`, and why it is NOT simply the map's `id=`.
 //
 // `canonicalIdForEmit` degrades an UNSCOPED symbol (a free function, a module-level def) to its BARE NAME
@@ -255,20 +372,23 @@ inline std::string pinFlagString( std::uint8_t fl )
 // exactly as the map's `p=`/`id=`. Returns false if the file cannot be opened.
 // The per-symbol census identity, resolved ONCE per symbol and reused — a row-by-row rebuild would re-make
 // the same strings thousands of times over a real corpus, and every row of a census names two of them.
+// Each identity is composed raw into one reused scratch string and escaped once into its slot (THE FIELD
+// ESCAPE above), so the stored id is already the spelling every column writes.
 inline std::vector<std::string> pinCensusIdentities( const IngestResult& ing, std::string_view root )
 {
     std::vector<std::string> canon( ing.symbols.size() );
+    std::string              raw;
     for( std::size_t i = 0; i < ing.symbols.size(); ++i )
     {
         const Symbol& s = ing.symbols[ i ];
-        const std::string rel( relForHash( ing.files[ s.fileId ], root ) );
-        canon[ i ].reserve( rel.size() + s.scope.size() + s.name.size() + 16 );
-        canon[ i ].append( rel ).append( "::" );
+        raw.assign( relForHash( ing.files[ s.fileId ], root ) ).append( "::" );
         if( !s.scope.empty() )
         {
-            canon[ i ].append( s.scope ).append( "::" );
+            raw.append( s.scope ).append( "::" );
         }
-        canon[ i ].append( s.name ).append( "#" ).append( std::to_string( i ) );
+        raw.append( s.name ).append( "#" ).append( std::to_string( i ) );
+        canon[ i ].reserve( raw.size() );
+        appendCensusField( canon[ i ], raw );
     }
     return canon;
 }
@@ -281,6 +401,7 @@ inline const char* pinCensusIdOf( const std::vector<std::string>& canon, NodeId 
 // `C` rows — one per decided call site; returns the per-mechanism tally the summary line prints.
 inline void writePinCensusDecisionRows( std::FILE* f, const PinCensus& pc, const std::vector<std::string>& canon, std::size_t ( &mechCount )[ kPinMechCount ] )
 {
+    std::string callee;   // the escaped callee name, one buffer reused across rows
     for( std::size_t i = 0; i < pc.rows(); ++i )
     {
         const std::uint8_t m = pc.mech[ i ];
@@ -291,23 +412,28 @@ inline void writePinCensusDecisionRows( std::FILE* f, const PinCensus& pc, const
             // file. Derived from the roster now, so a mechanism added below cannot be dropped again.
             ++mechCount[ m ];
         }
-        std::fprintf( f, "C\t%s\t%u\t%u\t%s\t%s\t%s\t", pinMechName( m ), unsigned( pc.preTier[ i ] ), unsigned( pc.postReal[ i ] ),
-                      pinFlagString( pc.flags[ i ] ).c_str(), pinCensusIdOf( canon, pc.fromSym[ i ] ), pc.nameAt( pc.nameOff[ i ] ) );
+        callee.clear();
+        appendCensusField( callee, pc.nameAt( pc.nameOff[ i ] ) );
+        rw::emitTo( f, "C\t{}\t{}\t{}\t{}\t{}\t{}\t", pinMechName( m ), unsigned( pc.preTier[ i ] ), unsigned( pc.postReal[ i ] ),
+                      pinFlagString( pc.flags[ i ] ).c_str(), pinCensusIdOf( canon, pc.fromSym[ i ] ), callee );
         const std::uint32_t end = pc.rowEnd( i );
         for( std::uint32_t t = pc.tgtStart[ i ]; t < end; ++t )
         {
-            std::fprintf( f, "%s%s", ( t > pc.tgtStart[ i ] ) ? "|" : "", pinCensusIdOf( canon, pc.tgtIds[ t ] ) );
+            rw::emitTo( f, "{}{}", ( t > pc.tgtStart[ i ] ) ? "|" : "", pinCensusIdOf( canon, pc.tgtIds[ t ] ) );
         }
-        std::fprintf( f, "\t%u\n", unsigned( pc.line[ i ] ) );
+        rw::emitTo( f, "\t{}\n", unsigned( pc.line[ i ] ) );
     }
 }
 
 // `O` rows — the SCIP oracle; a sentinel row prints `@external` / `@nondef` and carries no target ids.
 inline void writePinCensusOracleRows( std::FILE* f, const PinCensus& pc, const std::vector<std::string>& canon )
 {
+    std::string callee;   // the escaped callee name, one buffer reused across rows
     for( std::size_t i = 0; i < pc.oraRows(); ++i )
     {
-        std::fprintf( f, "O\t%s\t%s\t", pinCensusIdOf( canon, pc.oraFrom[ i ] ), pc.nameAt( pc.oraNameOff[ i ] ) );
+        callee.clear();
+        appendCensusField( callee, pc.nameAt( pc.oraNameOff[ i ] ) );
+        rw::emitTo( f, "O\t{}\t{}\t", pinCensusIdOf( canon, pc.oraFrom[ i ] ), callee );
         const std::uint8_t sentinel = ( i < pc.oraSentinel.size() ) ? pc.oraSentinel[ i ] : std::uint8_t( 0 );
         if( sentinel != 0 )
         {
@@ -316,7 +442,7 @@ inline void writePinCensusOracleRows( std::FILE* f, const PinCensus& pc, const s
         const std::uint32_t end = pc.oraRowEnd( i );
         for( std::uint32_t t = pc.oraStart[ i ]; t < end; ++t )
         {
-            std::fprintf( f, "%s%s", ( t > pc.oraStart[ i ] ) ? "|" : "", pinCensusIdOf( canon, pc.oraTo[ t ] ) );
+            rw::emitTo( f, "{}{}", ( t > pc.oraStart[ i ] ) ? "|" : "", pinCensusIdOf( canon, pc.oraTo[ t ] ) );
         }
         std::fputc( '\n', f );
     }
@@ -327,7 +453,7 @@ inline void writePinCensusSymbolRows( std::FILE* f, const IngestResult& ing, con
 {
     for( std::size_t i = 0; i < ing.symbols.size(); ++i )
     {
-        std::fprintf( f, "S\t%s\t%s\t%u\n", canon[ i ].c_str(), symTag( ing.symbols[ i ].kind ), unsigned( ing.symbols[ i ].line ) );
+        rw::emitTo( f, "S\t{}\t{}\t{}\n", canon[ i ].c_str(), symTag( ing.symbols[ i ].kind ), unsigned( ing.symbols[ i ].line ) );
     }
 }
 
@@ -342,32 +468,56 @@ inline bool writePinCensus( const char* path, const PinCensus& pc, const IngestR
     }
     const std::vector<std::string> canon = pinCensusIdentities( ing, root );
 
-    std::fprintf( f, "# ripwire pin-census v2\tC=kind\\tmech\\tpre\\tpost\\tflags\\tcaller_id\\tcallee\\ttargets(|-sep)\\tline\n" );
-    std::fprintf( f, "# line is the 1-based call-site line in the caller's file (v2, appended LAST so v1 readers are unchanged):\n" );
-    std::fprintf( f, "#   the key a SCIP occurrence joins on, so a coverage loss can be classified per site instead of guessed.\n" );
-    std::fprintf( f, "# O rows (only under --scip) are the SCIP oracle: O\\tcaller_id\\tcallee\\ttargets(|-sep)\n" );
-    std::fprintf( f, "#   a target of @external (a builtin / another package) or @nondef (an in-index parameter, local or\n" );
-    std::fprintf( f, "#   attribute ripwire extracts no symbol for) means SCIP resolved the site to something that is NOT a\n" );
-    std::fprintf( f, "#   ripwire definition — the index spoke, and disagrees with every in-repo target the C row names.\n" );
-    std::fprintf( f, "# S rows (v2) are the DEFINITION universe, one per symbol: S\\tid\\tkind\\tline — the def side of the\n" );
-    std::fprintf( f, "#   SCIP join (buildScipOverlay maps a SCIP definition to a symbol by exact file+line), listed in full.\n" );
-    std::fprintf( f, "# ids are path::scope::name#NODEID (path::name#NODEID when unscoped) — NEVER a bare name: the\n" );
-    std::fprintf( f, "#   handle is the join key and is stable across runs of one binary on one corpus, --scip or not.\n" );
-    std::fprintf( f, "# mech: unique|qualified|receiver-rule|cone|arity|locality|split|scip|binding|external|import — the stage that DECIDED the site\n" );
-    std::fprintf( f, "#   external (Phase 5): the external-name VETO refused the site — an EMPTY target list, no edge; the row is\n" );
-    std::fprintf( f, "#   scored right iff SCIP's answer is @external (the name was bound outside the indexed tree).\n" );
-    std::fprintf( f, "# flags: q=qualified r=receiver-rule c=cha-cone a=arity l=locality-tiebreak-fired m=es-import-binding (every stage that fired)\n" );
-    std::fprintf( f, "# rows are a FLOOR on call sites, not a total: a site that produced no edge (name undefined in-repo,\n" );
-    std::fprintf( f, "#   tier-3 non-unique drop, self-only tier) made no commitment and is deliberately absent.\n" );
+    rw::emitRaw( f, "# ripwire pin-census v3\tC=kind\\tmech\\tpre\\tpost\\tflags\\tcaller_id\\tcallee\\ttargets(|-sep)\\tline\n" );
+    rw::emitRaw( f, "# v3 field escape: every id and callee field is escaped, so no separator occurs inside one. A backslash is\n" );
+    rw::emitRaw( f, "#   written \\\\, TAB \\t, LF \\n, CR \\r, every other control byte 0x00-0x1f and the targets separator | as \\xHH\n" );
+    rw::emitRaw( f, "#   (lowercase hex). Split lines on LF, fields on TAB and targets on |, THEN decode. Columns are unchanged\n" );
+    rw::emitRaw( f, "#   from v2 and an id without those bytes is spelled exactly as in v2; a C++ out-of-line template member\n" );
+    rw::emitRaw( f, "#   whose template-argument list spans lines keeps its line break as \\n instead of splitting the row.\n" );
+    rw::emitRaw( f, "# line is the 1-based call-site line in the caller's file (v2, appended LAST so v1 readers are unchanged):\n" );
+    rw::emitRaw( f, "#   the key a SCIP occurrence joins on, so a coverage loss can be classified per site instead of guessed.\n" );
+    rw::emitRaw( f, "# O rows (only under --scip) are the SCIP oracle: O\\tcaller_id\\tcallee\\ttargets(|-sep)\n" );
+    rw::emitRaw( f, "#   a target of @external (a builtin / another package) or @nondef (an in-index parameter, local or\n" );
+    rw::emitRaw( f, "#   attribute ripwire extracts no symbol for) means SCIP resolved the site to something that is NOT a\n" );
+    rw::emitRaw( f, "#   ripwire definition — the index spoke, and disagrees with every in-repo target the C row names.\n" );
+    rw::emitRaw( f, "# S rows (v2) are the DEFINITION universe, one per symbol: S\\tid\\tkind\\tline — the def side of the\n" );
+    rw::emitRaw( f, "#   SCIP join (buildScipOverlay maps a SCIP definition to a symbol by exact file+line), listed in full.\n" );
+    rw::emitRaw( f, "# ids are path::scope::name#NODEID (path::name#NODEID when unscoped) — NEVER a bare name: the\n" );
+    rw::emitRaw( f, "#   handle is the join key and is stable across runs of one binary on one corpus, --scip or not.\n" );
+    rw::emitRaw( f, "# mech: unique|qualified|receiver-rule|cone|arity|locality|split|scip|binding|external|import — the stage that DECIDED the site\n" );
+    rw::emitRaw( f, "#   external (Phase 5): the external-name VETO refused the site — an EMPTY target list, no edge; the row is\n" );
+    rw::emitRaw( f, "#   scored right iff SCIP's answer is @external (the name was bound outside the indexed tree).\n" );
+    rw::emitRaw( f, "# flags: q=qualified r=receiver-rule c=cha-cone a=arity l=locality-tiebreak-fired m=es-import-binding (every stage that fired)\n" );
+    rw::emitRaw( f, "# rows are a FLOOR on call sites, not a total: a site that produced no edge (name undefined in-repo,\n" );
+    rw::emitRaw( f, "#   tier-3 decline, self-only tier) made no commitment and is deliberately absent.\n" );
+    rw::emitRaw( f, "# the TOTAL is the `# dispositions` line above the summary: calls= is re-derived from the references, and\n" );
+    rw::emitRaw( f, "#   every call lands in exactly one of bound|self|external|unresolved|undefined|other_root|qualified_external|\n" );
+    rw::emitRaw( f, "#   declined|file_scope|unaccounted, which must sum to it; bound == the non-external C rows, unaccounted == 0.\n" );
 
     std::size_t mechCount[ kPinMechCount ] = {};
     writePinCensusDecisionRows( f, pc, canon, mechCount );
     writePinCensusOracleRows( f, pc, canon );
     writePinCensusSymbolRows( f, ing, canon );
-    std::fprintf( f, "# summary rows=%zu oracle_rows=%zu symbols=%zu", pc.rows(), pc.oraRows(), ing.symbols.size() );
+    // calls= is counted HERE, off the references, never summed from the buckets it is checked against: a sum of
+    // the buckets would balance by construction and catch nothing.
+    std::size_t callCount = 0;
+    for( const Reference& r : ing.references )
+    {
+        if( isResolvableCallReference( r ) )
+        {
+            ++callCount;
+        }
+    }
+    rw::emitTo( f, "# dispositions calls={}", callCount );
+    for( std::size_t d = 0; d < kCallDispositionCount; ++d )
+    {
+        rw::emitTo( f, " {}={}", kCallDispositionNames[ d ], pc.dispositions[ d ] );
+    }
+    std::fputc( '\n', f );
+    rw::emitTo( f, "# summary rows={} oracle_rows={} symbols={}", pc.rows(), pc.oraRows(), ing.symbols.size() );
     for( std::uint8_t m = 0; m < kPinMechCount; ++m )
     {
-        std::fprintf( f, " %s=%zu", pinMechName( m ), mechCount[ m ] );
+        rw::emitTo( f, " {}={}", pinMechName( m ), mechCount[ m ] );
     }
     std::fputc( '\n', f );
     std::fclose( f );

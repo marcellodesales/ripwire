@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os::popen / pclose — the markitdown bridge; open / fdopen / close / fstat — readRegularFile asks a FIFO for an answer instead of waiting on it, and asks the DESCRIPTOR what it opened
+
 
 // docparse.h — P1-B document ingest. Turns non-code documents that live IN a repo
 // (Jupyter notebooks, HTML, CSV — and, via a bridge, PDF/DOCX/PPTX/XLSX) into plain text so `--recall` /
@@ -12,17 +15,26 @@
 // override instead of the raw bytes, so a notebook is indexed + recalled by its prose, not its JSON.
 // Determinism: every parser is a pure function of the file bytes; the post-pass runs each cold OR warm.
 //
-// Style: Allman braces; spaces inside parens; VERIFY/DEGRADED_PATH_ALERT; ~160–200 col wrap.
+// Style: Allman braces; spaces inside parens; ASSUME/DISCLOSE; ~160–200 col wrap.
 
 #include "infra/Diagnostics.h"
 #include "infra/jsonesc.h"   // A4-F27 residual: rw::shSingleQuote — canonical shell single-quote, forwarded
                         // to below instead of carrying a local copy; STL-only, no coupling cost here.
 
+#include "infra/sortutil.h"  // svLess — the memcmp-then-length string_view order the sorted tables below use
+#include "infra/ownedfile.h" // rw::OwnedFile — the whole-file readers own their stream, so every return closes it
+#include "pathguard.h"        // rw::pathguard::NoFollowRead — the owned line stream a fixed-name file is read through
+
+#include <algorithm>   // std::binary_search — the membership test, instead of a hand-rolled scan loop
+#include <iterator>
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <mutex>       // openRegularFileStream discloses a refused path once per process
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>      // openRegularFileStream: the paths already disclosed
 
 namespace rw
 {
@@ -49,8 +61,14 @@ inline DocKind docKindOf( std::string_view extLower ) noexcept
     {
         return DocKind::Csv;
     }
-    // binary formats — handled by the markitdown bridge (NOTE: not collected in v1; the crawl's binary
-    // sniff excludes them. The bridge is reachable once binary-doc collection lands — see §P1-B.)
+    // Binary formats — the markitdown bridge. MEASURED 2026-09-09, correcting the note that stood here: a
+    // .pdf IS collected (recordPreSizeDrop admits any isDocExtension, and the NUL sniff only ever runs on a
+    // file the PARSE POOL reads, which a doc file never enters), so the bridge runs on every invocation.
+    // What it produces without markitdown on PATH is "" — and an empty extraction contributes no Section
+    // node, so the file is counted in files= and is a SILENT ZERO in every doc lens. Closing that is the
+    // extractor-provenance design in LANE_C_REPORT.md §2 (prov="markitdown:<ver>" + a named unindexed
+    // reason), and it is deliberately not turned on here: the owner's 2026-09-08 scope ruling is
+    // text/markdown, not bloated document formats.
     if( extLower == ".pdf" || extLower == ".docx" || extLower == ".pptx" || extLower == ".xlsx" )
     {
         return DocKind::Markitdown;
@@ -83,45 +101,197 @@ inline bool isDocExtension( std::string_view extLower ) noexcept
     return docKindOf( extLower ) != DocKind::None;
 }
 
+// ── the prose vocabulary — ONE place, two questions ─────────────────────────────────────────────────
+//
+// Every extension test in this tree asks one of exactly two things, and conflating them is what let the
+// defect below ship. THE INDEX'S question is "does this build carry the file as a DOCUMENT?"
+// (isIndexedDocExtension). THE READER'S question is "is this file prose?" (isProseExtension) — an
+// ordering key, a comment-syntax verdict, how much a name deleted here proves. The second is a strict
+// SUPERSET of the first, and both live here so a format added to one is visible to the other.
+//
+// THREE TIERS, separated by WHICH MACHINERY reads the file — not by how a reader thinks about it:
+//
+//   • MARKDOWN-GRAMMAR tier (kMarkdownGrammarExts). ingest_crawl.h's kLangTable maps these to
+//     Lang::Markdown and the vendored markdown BLOCK grammar, so they reach the section tier, --recall's
+//     section-granular serving and doc→code mentions with no extractor and no extracted-text copy at
+//     all. Deliberately NOT a DocKind: docKindOf answers "which EXTRACTOR", and these need none. A
+//     compile-time guard in ingest_crawl.h asserts every name here really has a grammar row.
+//   • EXTRACTOR tier (docKindOf). A notebook / exported HTML / CSV is turned into plain text by a parser
+//     below, or by the markitdown bridge, and contributes one whole-file section.
+//   • PROSE THIS BUILD DOES NOT INDEX (kUnindexedProseExts). Prose to a reader, absent from the index —
+//     so every reader-facing lens must still answer "prose", and `unindexed=` must still disclose it.
+//
+// WHY THE THREE LIVE IN ONE HEADER (METHODOLOGY §3, sibling completeness). Five headers spelled their own
+// prose list — filter.h's PathTier, darkflags.h's lineSyntaxFor, gitoracle.h's isProsePath,
+// flipimpact.h's kProseExtTable, docdrift.h's isIndexedDocPath — and no two agreed. `.rst` and `.txt`
+// counted as prose for ORDERING while the crawl indexed neither; `.adoc` counted for one lens and not the
+// next; `.org` for none. Measured 2026-09-09: eight files holding the same ADR text and differing only in
+// extension produced `unindexed="adoc:1,log:1,mdx:1,org:1,rst:1,txt:1"`, so a repository whose decision
+// history lives in `docs/adr/*.rst` got "0 relevant of 0 document files" out of --recall.
+//
+// WHY `.txt` IS PROSE BUT NOT INDEXED — a census, not a taste. `.txt` is the universal "arbitrary bytes"
+// extension. In this repository 69 of 69 crawled `.txt` files are build manifests, gate fixtures or
+// captured output (571,706 B; the largest is 69,729 B = 7.5x the corpus median document) and NONE is prose;
+// across three checkouts on the development machine the commonest `.txt` basenames are requirements.txt
+// (111), meson_options.txt (67) and CMakeLists.txt (50) against README.txt (71) and index.txt (32).
+// Admitting it would hand BM25 half a megabyte of gate dumps that the generated-document demotion does
+// NOT catch — those carry no marker and no ``` fences, the limit classifyGeneratedDoc states itself. So
+// `.txt` stays a reader's prose and an unindexed extension, DISCLOSED in `unindexed=` rather than silently
+// absent. `.tsv` is the same shape one tier further out: a table a reader reads, no extractor for it here.
+// Gate: test/textdocscheck.sh pins both halves — the four admitted formats and the four refused ones.
+// SORT ORDER IS LOAD-BEARING on both tables — they are binary-searched, and an out-of-order entry does not
+// fail to compile on its own, it silently stops matching. The static_asserts are the guard, exactly as
+// ingest.h's kNonTextExts carries one. Two earlier spellings were tried and rejected by measurement rather
+// than taste: a hand-rolled `for( x : table ) if( x == v )` loop is the five-instance clone shape
+// isNonTextExtension's note already records (ripwire's own --quality-delta called the first draft six more
+// instances of it), and a std::find one-liner then cloned abicheck.h's KindCounts::total. The sorted-table
+// + binary_search + is_sorted trio is the shape externalnames.h::isShellBuiltinName settled on for the
+// identical collision, and it is the one this file now carries too.
+inline constexpr std::string_view kMarkdownGrammarExts[] = { ".adoc", ".markdown", ".md", ".mdx", ".org", ".rst" };
+
+static_assert( std::is_sorted( std::begin( kMarkdownGrammarExts ), std::end( kMarkdownGrammarExts ), rw::sortutil::svLess ),
+               "kMarkdownGrammarExts must stay byte-sorted — isMarkdownGrammarExtension binary-searches it" );
+
+inline constexpr std::string_view kUnindexedProseExts[] = { ".tsv", ".txt" };
+
+static_assert( std::is_sorted( std::begin( kUnindexedProseExts ), std::end( kUnindexedProseExts ), rw::sortutil::svLess ),
+               "kUnindexedProseExts must stay byte-sorted — isProseExtension binary-searches it" );
+
+inline bool isMarkdownGrammarExtension( std::string_view extLower ) noexcept
+{
+    return std::binary_search( std::begin( kMarkdownGrammarExts ), std::end( kMarkdownGrammarExts ), extLower, rw::sortutil::svLess );
+}
+
+// THE INDEX'S question: this build carries the file as a document — a markdown-grammar file or an
+// extracted one. Everything that must not treat an indexed document as CODE asks this.
+inline bool isIndexedDocExtension( std::string_view extLower ) noexcept
+{
+    return isMarkdownGrammarExtension( extLower ) || isDocExtension( extLower );
+}
+
+// THE READER'S question: prose, whether or not this build indexes it. Ordering keys, comment-syntax
+// verdicts and evidence weight ask this — they are about the file, not about the index.
+inline bool isProseExtension( std::string_view extLower ) noexcept
+{
+    return isIndexedDocExtension( extLower )
+        || std::binary_search( std::begin( kUnindexedProseExts ), std::end( kUnindexedProseExts ), extLower, rw::sortutil::svLess );
+}
+
 // ── .ipynb (Jupyter) — pull every "source" cell's text out of the JSON ──────────────────────────────
 
 namespace detail
 {
 
-inline bool readWholeFile( const std::string& path, std::string& out )
+// The rest of an open stream from its start, or nullopt when it cannot be sized or read in full. The ONE body both
+// whole-file readers below share; the stream stays owned by the caller, who closes it on every path.
+inline std::optional<std::string> readAllOfStream( std::FILE* fp )
 {
-    std::FILE* fp = std::fopen( path.c_str(), "rb" );
-    if( fp == nullptr )
-    {
-        return false;
-    }
-
     if( std::fseek( fp, 0, SEEK_END ) != 0 )
     {
-        std::fclose( fp );
-        return false;
+        return std::nullopt;
     }
     const long len = std::ftell( fp );
-    if( len < 0 )
+    if( len < 0 || std::fseek( fp, 0, SEEK_SET ) != 0 )
     {
-        std::fclose( fp );
-        return false;
+        return std::nullopt;
     }
-    if( std::fseek( fp, 0, SEEK_SET ) != 0 )
-    {
-        std::fclose( fp );
-        return false;
-    }
-
-    out.resize( std::size_t( len ) );
+    std::string       out( std::size_t( len ), '\0' );
     const std::size_t want = out.size();
     const std::size_t got  = want == 0 ? 0 : std::fread( out.data(), 1, want, fp );
-    const bool ok = ( got == want ) && ( std::fclose( fp ) == 0 );
-    if( !ok )
+    if( got != want )
     {
-        out.clear();
+        return std::nullopt;
     }
-    return ok;
+    return out;
+}
+
+// The whole file, or nullopt when it cannot be opened, sized or read in full. An EMPTY file is an engaged empty
+// string, not a failure — a caller for which empty and unreadable mean the same thing says so with value_or.
+inline std::optional<std::string> readWholeFile( const std::string& path )
+{
+    // Owned, so the close runs on every return: `( got == want ) && ( std::fclose( fp ) == 0 )` short-circuited
+    // past it and leaked the FILE on every short read (clang-analyzer-unix.Stream).
+    OwnedFile fp = openOwnedFile( path.c_str(), "rb" );
+    if( !fp )
+    {
+        return std::nullopt;
+    }
+    std::optional<std::string> out      = readAllOfStream( fp.file );
+    const bool                 closedOk = fp.close();
+    if( !closedOk )
+    {
+        return std::nullopt;
+    }
+    return out;
+}
+
+// A fixed-name file in the tree (.ripwire_config, the quality-acks ledger) whose CONTENT is the repository's to decide
+// but whose SHAPE is not, opened as a line stream only when it is a regular file. Anything else at that name — a
+// FIFO, a directory, a device, or a symlink to one — is refused before a byte is read, and `what` names it on
+// stderr, because each of those shapes used to hold or take down the process:
+//   - a FIFO blocked the open until a writer appeared, so every --quality-delta hung before any output;
+//   - a symlink to /dev/zero or /dev/urandom never reaches end of file;
+//   - a directory opens on Linux, and where its seek reports LLONG_MAX (overlayfs) a whole-file read sizes a string
+//     to that — the shape ingest_crawl.h's PathShape note measured for --cache=<dir>.
+// The open carries O_NONBLOCK so a FIFO answers instead of waiting, and the shape is asked of the DESCRIPTOR (fstat),
+// so nothing can swap the name between the question and the read. A symlink to a regular file is still followed:
+// that is the ordinary way a user-authored file is shared, and refusing it is a different policy with its own owner.
+//
+// The stream comes back inside pathguard's NoFollowRead, the house line reader over a descriptor-checked stream: it
+// owns the FILE from fdopen on, so every return closes it, and readLine streams one line at a time — a large ledger
+// is never held whole. No stream (file == nullptr) means absent, unreadable or refused.
+inline rw::pathguard::NoFollowRead openRegularFileStream( std::string_view what, const std::string& path )
+{
+    rw::pathguard::NoFollowRead stream;
+    const int                   fd = os::open( path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC );
+    if( fd < 0 )
+    {
+        return stream;   // absent or unreadable: the caller's own "no such file" reading
+    }
+    stream.file = os::fdopen( fd, "rb" );   // owned from here: NoFollowRead's destructor fcloses it on every return
+    if( stream.file == nullptr )
+    {
+        os::close( fd );   // fdopen did not take the descriptor, so it is still ours to close
+        return stream;
+    }
+    stream.opened = true;
+    os::stat_t st{};
+    if( os::fstat( os::fileno( stream.file ), &st ) != 0 || !S_ISREG( st.st_mode ) )
+    {
+        // Once per path per process: .ripwire_config is read several times in one --quality-delta, and the same sentence
+        // three times says nothing the first did not.
+        static std::mutex               disclosedMutex;
+        static std::vector<std::string> disclosed;
+        bool                            firstTime = false;
+        {
+            const std::lock_guard<std::mutex> lock( disclosedMutex );
+            if( std::find( disclosed.begin(), disclosed.end(), path ) == disclosed.end() )
+            {
+                disclosed.push_back( path );
+                firstTime = true;
+            }
+        }
+        if( firstTime )
+        {
+            rw::emitTo( stderr, "ripwire: ignoring {} at '{}': it is not a regular file (a FIFO, a directory or a device), "
+                                "so it was not read and counts as absent\n", what, path );
+        }
+        DISCLOSE( "docparse: a fixed-name file in the tree is not a regular file — refused before reading" );
+        return rw::pathguard::NoFollowRead{};   // `stream` closes as it leaves scope; the caller gets no stream
+    }
+    return stream;
+}
+
+// The whole of such a file, for a caller that parses it as one text (.ripwire_config, and --quality-ack's
+// byte-for-byte comparison of a ledger it is about to rewrite). nullopt when openRegularFileStream gave no stream.
+inline std::optional<std::string> readRegularFile( std::string_view what, const std::string& path )
+{
+    const rw::pathguard::NoFollowRead stream = openRegularFileStream( what, path );
+    if( stream.file == nullptr )
+    {
+        return std::nullopt;
+    }
+    return readAllOfStream( stream.file );
 }
 
 // Decode the JSON string starting at s[i]=='"' into `out`, advancing i past the closing quote. Handles the
@@ -451,10 +621,10 @@ inline std::string shellQuote( const std::string& s )
 inline std::string runMarkitdown( const std::string& path )
 {
     const std::string cmd = "markitdown " + detail::shellQuote( path ) + " 2>/dev/null";
-    std::FILE* pipe = ::popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( pipe == nullptr )
     {
-        DEGRADED_PATH_ALERT( "docparse: popen failed for markitdown bridge" );
+        DISCLOSE( "docparse: popen failed for markitdown bridge" );
         return {};
     }
     std::string         out;
@@ -464,7 +634,7 @@ inline std::string runMarkitdown( const std::string& path )
     {
         out.append( buf.data(), n );
     }
-    const int rc = ::pclose( pipe );
+    const int rc = os::pclose( pipe );
     if( rc != 0 )
     { // markitdown absent or errored → degrade to no-doc
         return {};
@@ -485,25 +655,28 @@ inline std::string parseDocFile( const std::string& path, std::string_view extLo
         case DocKind::Html:
         case DocKind::Csv:
         {
-            std::string bytes;
-            if( !detail::readWholeFile( path, bytes ) )
+            const std::optional<std::string> bytes = detail::readWholeFile( path );
+            if( !bytes )
             {
-                DEGRADED_PATH_ALERT( "docparse: cannot read document file" );
-                std::fprintf( stderr, "ripwire: doc %s: cannot read — omitted from the index (the skipped verb counts it as unmeasured)\n", path.c_str() );   // 2026-09-06
+                DISCLOSE( "docparse: cannot read document file" );
+                rw::emitTo( stderr, "ripwire: doc {}: cannot read — omitted from the index (the skipped verb counts it as unmeasured)\n", path.c_str() );   // 2026-09-06
                 return {};
             }
             switch( docKindOf( extLower ) )
             {
-                case DocKind::Ipynb: return extractIpynb( bytes );
-                case DocKind::Html:  return extractHtml( bytes );
-                case DocKind::Csv:   return extractCsv( bytes );
-                default:             return {};
+                case DocKind::Ipynb: return extractIpynb( *bytes );
+                case DocKind::Html:  return extractHtml( *bytes );
+                case DocKind::Csv:   return extractCsv( *bytes );
+                case DocKind::Markitdown:                       // routed by the outer switch, never read here
+                case DocKind::None:  return {};
             }
+            return {};
         }
 
-        default:
+        case DocKind::None:
             return {};
     }
+    return {};
 }
 
 // ── generated-document signals ───────────────────────────────────────────────────────────────────────

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# readabilitycheck.sh — the golden gate for `--readability` (the Posnett/Hindle/Devanbu MSR 2011 lens).
+# readabilitycheck.sh — the golden gate for `--biggest-first` (the Posnett/Hindle/Devanbu MSR 2011 lens).
+# 2026-09-23 (lane/flag-biggest-first): renamed from `--readability`, which stays working as a deprecated
+# alias (arm H below). Arms (A)-(G) exercise the CURRENT spelling; the gate's own name is unchanged because
+# it is the FILE's name, not a flag — renaming it would just move history, not fix anything (readabilitycheck
+# is the gate for THIS lens, whatever its flag is called today).
 #
 # WHY A GOLDEN AND NOT A RE-IMPLEMENTATION. A ranking, a token count and a closed-form score all look
 # plausible whether or not they are correct (CLAUDE.md non-negotiable #1). A python mirror of the same
@@ -43,11 +47,14 @@
 # Arms:
 #   (A) determinism  — two --no-cache runs are byte-identical
 #   (B) golden       — every column of both functions, against the hand-derivation above
-#   (C) order        — the report is LEAST readable first (mix before add)
+#   (C) order        — the report is lowest-P first, i.e. largest body first (mix before add)
 #   (D) mutation     — the SAME assertions run against a mutated fixture must go RED, proving (B) can see
 #                      a wrong number at all
 #   (E) paging       — limit=1 discloses shown/capped/total/has_more/next_offset per pageview.h
-#   (F) additive     — `--readability` changes nothing about the flagless map (G5)
+#   (F) additive     — `--biggest-first` changes nothing about the flagless map (G5)
+#   (H) rename       — `--biggest-first` works, `--readability` still works as a deprecated alias (ONE
+#                      stderr notice per run, never on the new spelling), and stdout is byte-identical
+#                      between the two spellings across several option combinations (lane/flag-biggest-first)
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
@@ -58,7 +65,7 @@ FIXTURE="$TMP/fixture"
 MUTANT="$TMP/mutant"
 mkdir -p "$FIXTURE" "$MUTANT"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -92,17 +99,17 @@ int mix( int a, int b, int c )
 CPP
 
 # ── (A) determinism ────────────────────────────────────────────────────────────────────────────────────
-"$BIN" "$FIXTURE" --readability --no-cache >"$TMP/a" 2>/dev/null
-"$BIN" "$FIXTURE" --readability --no-cache >"$TMP/b" 2>/dev/null
+"$BIN" "$FIXTURE" --biggest-first --no-cache >"$TMP/a" 2>/dev/null
+"$BIN" "$FIXTURE" --biggest-first --no-cache >"$TMP/b" 2>/dev/null
 if [ ! -s "$TMP/a" ]; then
-    no "(A) --readability produced NO output on the fixture — an empty baseline is not a passing determinism run"
+    no "(A) --biggest-first produced NO output on the fixture — an empty baseline is not a passing determinism run"
 elif cmp -s "$TMP/a" "$TMP/b"; then
     ok "(A) two --no-cache runs are byte-identical"
 else
-    no "(A) --readability is not deterministic across two identical runs"
+    no "(A) --biggest-first is not deterministic across two identical runs"
 fi
 
-"$BIN" "$MUTANT" --readability --no-cache >"$TMP/m" 2>/dev/null
+"$BIN" "$MUTANT" --biggest-first --no-cache >"$TMP/m" 2>/dev/null
 
 # ── (B) + (C) + (D) the golden, its order, and its mutation control ───────────────────────────────────
 python3 - "$TMP/a" "$TMP/m" <<'PY'
@@ -147,18 +154,18 @@ for line in bad:
 if not bad:
     print( "  PASS  (B) every column of add/mix matches the hand-derivation (ints exact, floats in band)" )
 
-# (C) least readable FIRST — mix (P=0.050) must precede add (P=0.968), and the printed order must be
+# (C) lowest P FIRST — mix (P=0.050) must precede add (P=0.968), and the printed order must be
 #     monotone non-decreasing in posnett for every adjacent pair.
 order = [ node.get( "n" ) for node in rows ]
 scores = [ float( node.get( "posnett" ) ) for node in rows ]
 if order != [ "mix", "add" ]:
-    print( f"  FAIL  (C) expected least-readable-first order ['mix', 'add'], got {order}" )
+    print( f"  FAIL  (C) expected lowest-P-first order ['mix', 'add'], got {order}" )
     bad.append( "order" )
 elif any( scores[i] > scores[i + 1] + 1e-12 for i in range( len( scores ) - 1 ) ):
     print( f"  FAIL  (C) posnett is not non-decreasing down the rows: {scores}" )
     bad.append( "order" )
 else:
-    print( "  PASS  (C) rows are ranked least readable first (mix before add)" )
+    print( "  PASS  (C) rows are ranked lowest P first, the largest body first (mix before add)" )
 
 # root honesty: functions= is the measured total and matches the rows on an uncapped run
 if root.get( "functions" ) != str( len( rows ) ):
@@ -179,8 +186,8 @@ PY
 [ $? -eq 0 ] || fail=1
 
 # ── (E) paging disclosure (src/pageview.h, THE TRUNCATION VOCABULARY) ─────────────────────────────────
-page="$( "$BIN" "$FIXTURE" --readability --limit=1 --no-cache 2>/dev/null | grep -o '<readability [^>]*>' | head -1 )"
-pageRows="$( "$BIN" "$FIXTURE" --readability --limit=1 --no-cache 2>/dev/null | grep -c '<fn ' )"
+page="$( "$BIN" "$FIXTURE" --biggest-first --limit=1 --no-cache 2>/dev/null | grep -o '<readability [^>]*>' | head -1 )"
+pageRows="$( "$BIN" "$FIXTURE" --biggest-first --limit=1 --no-cache 2>/dev/null | grep -c '<fn ' )"
 wantAttrs='shown="1" capped="1" total="2" has_more="1" next_offset="1"'
 if [ "$pageRows" != "1" ]; then
     no "(E) limit=1 emitted $pageRows row(s), expected 1"
@@ -192,7 +199,7 @@ fi
 
 # ── (F) purely additive (G5): the flagless map is untouched by the new code path ───────────────────────
 "$BIN" "$FIXTURE" --no-cache >"$TMP/map1" 2>/dev/null
-"$BIN" "$FIXTURE" --readability --no-cache >/dev/null 2>&1
+"$BIN" "$FIXTURE" --biggest-first --no-cache >/dev/null 2>&1
 "$BIN" "$FIXTURE" --no-cache >"$TMP/map2" 2>/dev/null
 if cmp -s "$TMP/map1" "$TMP/map2" && ! grep -q 'posnett=' "$TMP/map1"; then
     ok "(F) the flagless map is unchanged and carries no readability attribute"
@@ -201,14 +208,30 @@ else
 fi
 
 # ── §L10: the SATURATION disclosure — on a real, large corpus (this repo's own source), several of the
-# least-readable head rows genuinely print posnett="0.000" alike (the sigmoid has run out of visible
+# lowest-P head rows genuinely print posnett="0.000" alike (the sigmoid has run out of visible
 # precision at 3 decimals for a high-volume function). The legend must say so, AND the ORDER must still be
 # real: among the saturated rows, vol= (the documented tie-break) must be non-increasing — proof the ranking
 # did not collapse into an arbitrary/ID-order tie just because P itself is illegible.
-REAL_OUT="$( "$BIN" "$ROOT" --readability --limit=10 --no-cache 2>/dev/null )"
-printf '%s' "$REAL_OUT" | grep -q 'sigmoid SATURATES at the least-readable extreme' \
-    && ok "(G) legend discloses sigmoid saturation at the least-readable extreme" \
+# L1 (2026-09-19): the CLI default legend is compact; (G) reads the FULL legend's prose, so this run asks for it.
+REAL_OUT="$( "$BIN" "$ROOT" --biggest-first --limit=10 --no-cache --legend=full 2>/dev/null )"
+printf '%s' "$REAL_OUT" | grep -q 'sigmoid SATURATES at its low end' \
+    && ok "(G) legend discloses sigmoid saturation at its low end" \
     || no "(G) legend does not disclose sigmoid saturation"
+# (G2) the ORDER is described as what it is. docs/EVALS.md section 8 withdrew the claim that this order is a
+# readability order (8 of 10 token-count deciles show no later-fix association: a size proxy). Both legends
+# must say so and neither may still call the order "least readable first" — the full legend is REAL_OUT above,
+# the compact one is the default run's. Read into variables first so an empty run fails instead of passing.
+COMPACT_OUT="$( "$BIN" "$ROOT" --readability --limit=1 --no-cache 2>/dev/null )"
+if [ -z "$REAL_OUT" ] || [ -z "$COMPACT_OUT" ]; then
+    no "(G2) a --readability run printed nothing, so the legend wording could not be checked"
+elif printf '%s\n%s\n' "$REAL_OUT" "$COMPACT_OUT" | grep -qi 'least[ -]readable first'; then
+    no "(G2) a --readability legend still describes the order as least readable first (withdrawn, docs/EVALS.md section 8)"
+elif printf '%s' "$REAL_OUT" | grep -q 'a size proxy, not a readability order' \
+     && printf '%s' "$COMPACT_OUT" | grep -q 'largest Halstead volume first (a size proxy)'; then
+    ok "(G2) both legends describe the order as largest-first, a size proxy — never as least readable first"
+else
+    no "(G2) a --readability legend does not state that its order is a size proxy"
+fi
 printf '%s' "$REAL_OUT" | grep -q 'ties (and every tie) break by vol= descending' \
     && ok "(G) legend states the tie-break (vol= descending)" \
     || no "(G) legend does not state the tie-break"
@@ -227,6 +250,79 @@ if [ "$ZERO_ROWS" -ge 2 ]; then
         || no "(G) among the saturated rows, vol= is NOT non-increasing: got [$( printf '%s' "$VOLS" | tr '\n' ' ' )], want [$( printf '%s' "$SORTED_DESC" | tr '\n' ' ' )]"
 else
     ok "(G) fewer than 2 saturated rows in this run (SKIP — the corpus/build moved; not this gate's contract to pin the exact count)"
+fi
+
+# ── (H) the rename (lane/flag-biggest-first, 2026-09-23): --biggest-first is the new spelling,
+# --readability is a deprecated alias for the SAME Config member, kept working. stdout is the
+# agent-facing contract and must be BYTE-IDENTICAL between the two spellings; the deprecation notice is
+# stderr-only, printed exactly once per run no matter how many times the old spelling appears, and never
+# printed at all when only the new spelling is used.
+"$BIN" "$ROOT" --biggest-first --limit=5 --no-cache             >"$TMP/h_new_out"  2>"$TMP/h_new_err"
+"$BIN" "$ROOT" --readability   --limit=5 --no-cache             >"$TMP/h_old_out"  2>"$TMP/h_old_err"
+"$BIN" "$ROOT" --biggest-first --limit=5 --no-cache --json      >"$TMP/h_new_json" 2>"$TMP/h_new_json_err"; h_new_json_rc=$?
+"$BIN" "$ROOT" --readability   --limit=5 --no-cache --json      >"$TMP/h_old_json" 2>"$TMP/h_old_json_err"; h_old_json_rc=$?
+"$BIN" "$ROOT" --biggest-first --limit=5 --no-cache --legend=compact >"$TMP/h_new_lc" 2>/dev/null
+"$BIN" "$ROOT" --readability   --limit=5 --no-cache --legend=compact >"$TMP/h_old_lc" 2>/dev/null
+"$BIN" "$ROOT" --readability --readability --limit=1 --no-cache >/dev/null 2>"$TMP/h_twice_err"
+
+wantNotice='ripwire: --readability is deprecated — use --biggest-first instead'
+
+if [ -s "$TMP/h_new_out" ]; then
+    ok "(H) --biggest-first produced output on a real corpus"
+else
+    no "(H) --biggest-first produced NO output on $ROOT"
+fi
+
+if cmp -s "$TMP/h_new_out" "$TMP/h_old_out"; then
+    ok "(H) stdout is byte-identical between --biggest-first and --readability (default XML)"
+else
+    no "(H) stdout DIFFERS between --biggest-first and --readability (default XML) — the alias must not change the answer"
+fi
+# --json is REFUSED for this lens (not yet supported), on BOTH spellings — so a stdout `cmp` here would
+# be comparing two empty files, which passes regardless of whether the alias behaves correctly (a vacuous
+# assertion, rv-flag-biggest-first F4). Assert the REFUSAL itself is identical instead: same exit code,
+# empty stdout on both, and the refusal SENTENCE on stderr identical once the old spelling's one-shot
+# deprecation line (asserted separately below) is stripped off the top.
+if [ "$h_new_json_rc" = "1" ] && [ "$h_old_json_rc" = "1" ]; then
+    ok "(H) --json is refused (exit 1) for the lens on both spellings"
+else
+    no "(H) --json refusal exit code differs: --biggest-first=$h_new_json_rc --readability=$h_old_json_rc (want 1/1)"
+fi
+if [ ! -s "$TMP/h_new_json" ] && [ ! -s "$TMP/h_old_json" ]; then
+    ok "(H) --json's refusal prints NO stdout on either spelling"
+else
+    no "(H) --json unexpectedly produced stdout on at least one spelling — the refusal is not clean"
+fi
+tail -n +2 "$TMP/h_old_json_err" >"$TMP/h_old_json_err_stripped"
+if head -n 1 "$TMP/h_old_json_err" | grep -qF "$wantNotice" && cmp -s "$TMP/h_new_json_err" "$TMP/h_old_json_err_stripped"; then
+    ok "(H) the --json refusal sentence on stderr is byte-identical between --biggest-first and --readability, once the old spelling's deprecation line is stripped"
+else
+    no "(H) the --json refusal sentence differs once the deprecation line is stripped: new=$( cat "$TMP/h_new_json_err" ) old(after strip)=$( cat "$TMP/h_old_json_err_stripped" )"
+fi
+if cmp -s "$TMP/h_new_lc" "$TMP/h_old_lc"; then
+    ok "(H) stdout is byte-identical between --biggest-first and --readability (--legend=compact)"
+else
+    no "(H) stdout DIFFERS between --biggest-first and --readability (--legend=compact)"
+fi
+
+if [ -s "$TMP/h_new_err" ]; then
+    no "(H) --biggest-first printed to stderr (expected silence — it is the CURRENT spelling): $( cat "$TMP/h_new_err" )"
+else
+    ok "(H) --biggest-first is silent on stderr"
+fi
+
+oldErrLines="$( wc -l <"$TMP/h_old_err" | tr -d ' ' )"
+if [ "$oldErrLines" = "1" ] && grep -qF "$wantNotice" "$TMP/h_old_err"; then
+    ok "(H) --readability prints exactly one stderr line, the deprecation notice naming --biggest-first"
+else
+    no "(H) --readability's stderr was not exactly one line with '$wantNotice': got $( cat "$TMP/h_old_err" )"
+fi
+
+twiceLines="$( wc -l <"$TMP/h_twice_err" | tr -d ' ' )"
+if [ "$twiceLines" = "1" ] && grep -qF "$wantNotice" "$TMP/h_twice_err"; then
+    ok "(H) --readability --readability still prints the notice exactly ONCE per run (one-shot, not per-occurrence)"
+else
+    no "(H) --readability --readability printed $twiceLines stderr line(s), expected exactly 1: $( cat "$TMP/h_twice_err" )"
 fi
 
 [ "$fail" -eq 0 ] && echo "ALL PASS" || echo "readabilitycheck: FAILURES ABOVE"

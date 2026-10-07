@@ -57,7 +57,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/impactimportfix"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -98,7 +98,7 @@ grep -qE '^\s*return require\("\./Widget"\);\s*$' "$FIX/lib/barrel.js" \
     && ok "fixture guard: barrel.js's require sits on its own line inside the getter's body" \
     || no "fixture guard: barrel.js drifted — the barrel arm below cannot trust its shape"
 
-i(){ perl -e 'alarm 30; exec @ARGV' "$BIN" "$FIX" --impact="$1" --no-cache 2>/dev/null; }
+i(){ perl -e 'alarm 30; exec @ARGV' "$BIN" "$FIX" --impact="$1" --no-cache "${@:2}" 2>/dev/null; }
 # The legend now SPELLS the row shape (`<f via="import" p="…"/>`), so a naive grep for a row matches the
 # documentation of the row. Every row-level assertion runs against the ELEMENT, not the whole document.
 body(){ printf '%s' "$1" | sed 's/^.*<impact /<impact /'; }
@@ -108,7 +108,9 @@ OUT_W="$( i Widget )"
 
 # ── #1 EXTRACTION: `require("./x")` is a file→file dependency edge, top-level OR function-body ─────────
 # The fixture is seven importers of one module; pre-71 the whole dependency graph over it was empty.
-DEPS="$( perl -e 'alarm 30; exec @ARGV' "$BIN" "$FIX" --deps --no-cache 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact, whose root tag leads with schema=; #1 pins `<deps files=`, and #6/#8
+# read the FULL legend's prose — those three documents ask for the full legend.
+DEPS="$( perl -e 'alarm 30; exec @ARGV' "$BIN" "$FIX" --deps --no-cache --legend=full 2>/dev/null )"
 DEPS_FILES="$( printf '%s' "$DEPS" | grep -oE '<deps files="[0-9]+"' | grep -oE '[0-9]+' )"
 [ "${DEPS_FILES:-0}" -ge 7 ] \
     && ok "--deps sees the require() edges: files=$DEPS_FILES (>=7 importers with a dependency edge)" \
@@ -161,7 +163,8 @@ SHOWN="$( attr shown "$OUT_W" )"
 { [ "$S_ROWS" = "$SHOWN" ] && [ "$S_ROWS" = 1 ]; } \
     && ok "--impact=Widget: shown=1 and exactly 1 <s> row — import rows are outside the paged listing" \
     || no "--impact=Widget: <s> rows=$S_ROWS vs shown=$SHOWN (expected 1 and 1)"
-printf '%s' "$OUT_W" | grep -qE '<s t="fn" n="build" p="lib/user\.js:7"/>' \
+# 0.6.5: the listing's first row states its hop depth (d="1": build calls Widget directly) — test/impactdepthcheck.sh.
+printf '%s' "$OUT_W" | grep -qE '<s t="fn" n="build" p="lib/user\.js:7" d="1"/>' \
     && ok "--impact=Widget: user.js appears as the SYMBOL build in the call tier" \
     || no "--impact=Widget: the call-reach row for build (lib/user.js:7) is gone"
 
@@ -173,7 +176,7 @@ IC="$( attr importers_capped "$OUT_W" )"
     || no "--impact=Widget: shown_importers='$SI' importers_capped='$IC', expected 7 and 0"
 
 # ── #5 an EMPTY import tier is a measurement, not a missing attribute ─────────────────────────────────
-OUT_O="$( i lonely )"
+OUT_O="$( i lonely --legend=full )"
 { [ "$( attr importers "$OUT_O" )" = 0 ] && [ "$( attr shown_importers "$OUT_O" )" = 0 ] \
     && [ "$( attr importers_capped "$OUT_O" )" = 0 ]; } \
     && ok "--impact=lonely: importers=0 shown_importers=0 importers_capped=0 (nobody imports orphan.js)" \
@@ -214,7 +217,7 @@ if command -v python3 >/dev/null 2>&1; then
 fi
 
 # ── #8 --format=columnar discloses the COUNT (its row form is the symbol table only) ──────────────────
-COL="$( perl -e 'alarm 30; exec @ARGV' "$BIN" "$FIX" --impact=Widget --format=columnar --no-cache 2>/dev/null )"
+COL="$( perl -e 'alarm 30; exec @ARGV' "$BIN" "$FIX" --impact=Widget --format=columnar --no-cache --legend=full 2>/dev/null )"
 [ "$( attr importers "$COL" )" = 7 ] \
     && ok "--format=columnar: importers=7 on the root (count disclosed even where rows are not emitted)" \
     || no "--format=columnar: importers= missing from the columnar root"
@@ -247,17 +250,78 @@ if [ -n "$CAP_N" ] && [ "$CAP_N" -gt 40 ]; then
         && ok "cap: importers=$CAP_N over 40 → shown_importers=40 importers_capped=1 (default, disclosed)" \
         || no "cap: importers=$CAP_N but shown_importers=$CAP_S importers_capped=$CAP_C (expected 40 / 1)"
     ROWS_CAP="$( body "$OUT_CAP" | grep -oE '<f via="import"' | wc -l | tr -d ' ' )"
-    [ "$ROWS_CAP" = 40 ] && ok "cap: exactly 40 import rows printed" || no "cap: printed $ROWS_CAP import rows, expected 40"
+    if [ "$ROWS_CAP" = 40 ]; then ok "cap: exactly 40 import rows printed"; else no "cap: printed $ROWS_CAP import rows, expected 40"; fi
 else
     no "cap arm inert: --impact=IngestResult on this repo reported importers='$CAP_N', so the >40 case was never exercised"
 fi
 
+# ── #9b RANK BEFORE THE CAP + --limit REACH (cut-fix C, 2026-09-23) ─────────────────────────────────────
+# The tier used to sort by path and cut at 40, and --limit could not reach it, so on a >40 tier the files that
+# survived were the alphabetically-first ones and the rest were one guess away. Now the most-imported importers
+# lead (each file's own importer count), and --limit sizes the tier like the symbol rows. The sandbox makes path
+# order and relevance disagree: 45 leaf importers pkg/a_NN.py (nobody imports them) sort before 3 pkg/z_N.py,
+# each imported by 4 other files. RED on 60b65f02 (the three arms below); GREEN on cut-fix C.
+RS="$( mktemp -d )"
+mkdir -p "$RS/pkg"
+python3 - "$RS" <<'PY'
+import os, sys
+d = os.path.join( sys.argv[1], "pkg" )
+open( os.path.join( d, "__init__.py" ), "w" ).write( "" )
+open( os.path.join( d, "hub.py" ), "w" ).write( "def importHubFn( x ):\n    return x\n" )
+for i in range( 45 ):
+    open( os.path.join( d, "a_%02d.py" % i ), "w" ).write( "from pkg.hub import importHubFn\n\ndef use_a_%02d( ):\n    return importHubFn( %d )\n" % ( i, i ) )
+for i in range( 3 ):
+    open( os.path.join( d, "z_%d.py" % i ), "w" ).write( "from pkg.hub import importHubFn\n\ndef use_z_%d( ):\n    return importHubFn( %d )\n" % ( i, i ) )
+for j in range( 4 ):
+    open( os.path.join( d, "d_%d.py" % j ), "w" ).write( "".join( "from pkg.z_%d import use_z_%d\n" % ( i, i ) for i in range( 3 ) ) )
+PY
+ri(){ perl -e 'alarm 30; exec @ARGV' "$BIN" "$RS" --impact=importHubFn --no-cache "$@" 2>/dev/null; }
+R_DEF="$( ri )"
+R_ALL="$( ri --limit=100 )"
+zRows(){ body "$1" | grep -oE '<f via="import" p="pkg/z_[0-9]\.py"' | wc -l | tr -d ' '; }
+{ [ "$( attr importers "$R_DEF" )" = 48 ] && [ "$( attr shown_importers "$R_DEF" )" = 40 ] && [ "$( attr importers_capped "$R_DEF" )" = 1 ]; } \
+    && ok "rank: presence guard — importers=48 over the 40 cap, shown_importers=40 importers_capped=1" \
+    || no "rank: fixture broken — importers=$( attr importers "$R_DEF" ) shown_importers=$( attr shown_importers "$R_DEF" )"
+[ "$( zRows "$R_DEF" )" = 3 ] \
+    && ok "rank: the default 40-file page keeps all 3 most-imported importers (they sort LAST by path)" \
+    || no "rank: the default page kept $( zRows "$R_DEF" ) of the 3 most-imported importers — the cap cut the head"
+body "$R_DEF" | grep -oE '<f via="import" p="[^"]*"' | head -3 | grep -c 'pkg/z_' | grep -qx 3 \
+    && ok "rank: the most-imported importers lead the tier" \
+    || no "rank: the tier does not lead with the most-imported files: $( body "$R_DEF" | grep -oE '<f via="import" p="[^"]*"' | head -1 )"
+{ [ "$( attr shown_importers "$R_ALL" )" = 48 ] && [ "$( attr importers_capped "$R_ALL" )" = 0 ] \
+  && [ "$( body "$R_ALL" | grep -oE '<f via="import"' | wc -l | tr -d ' ' )" = 48 ]; } \
+    && ok "reach: --limit=100 serves the whole 48-file tier (shown_importers=48 importers_capped=0) — the cut is one known call away" \
+    || no "reach: --limit=100 left the tier at shown_importers=$( attr shown_importers "$R_ALL" ) — --limit cannot reach it"
+# ── #9c THE CUT NAMES ITS CALL (cut-fix E, 2026-09-24) ──────────────────────────────────────────────────
+# A cut tier was a DEAD-END cut (answer-completeness §1.3/§5.8): counted, and no call named that serves the rest.
+# importers_next= on a cut root (the root's next= is --safe-delete's), in the XML and the JSON dialect; pasting it
+# serves the whole tier; absent on an uncut tier. RED on 9936ba4e (no importers_next= anywhere).
+INX="$( attr importers_next "$R_DEF" )"
+[ "$INX" = "--impact=importHubFn --limit=48" ] \
+    && ok "next: the cut tier names its call, importers_next=\"$INX\"" \
+    || no "next: the cut tier carries importers_next='$INX' (want --impact=importHubFn --limit=48)"
+R_NX="$( perl -e 'alarm 30; exec @ARGV' "$BIN" "$RS" $INX --no-cache 2>/dev/null )"
+{ [ "$( attr shown_importers "$R_NX" )" = 48 ] && [ "$( attr importers_capped "$R_NX" )" = 0 ] && [ -z "$( attr importers_next "$R_NX" )" ]; } \
+    && ok "next: pasting importers_next= serves all 48 importers, and that uncut answer carries no importers_next=" \
+    || no "next: pasting importers_next= gave shown_importers=$( attr shown_importers "$R_NX" ) importers_next='$( attr importers_next "$R_NX" )'"
+ri --json | grep -q '"importers_next":"--impact=importHubFn --limit=48"' \
+    && ok "next: the --json dialect carries the same importers_next" \
+    || no "next: --json lacks \"importers_next\" on the cut tier"
+# --format=columnar serves the import tier as its count only, and its lens= names what it withholds that the XML root
+# carries. importers_next= is on the XML root only when the tier is cut, so lens= names it exactly then. RED on
+# 17963410: the cut tier's lens= named only shown_importers,importers_capped.
+LCUT="$( attr lens "$( ri --format=columnar )" )"; LALL="$( attr lens "$( ri --limit=100 --format=columnar )" )"
+{ [ "$LCUT" = "shown_importers,importers_capped,importers_next" ] && [ "$LALL" = "shown_importers,importers_capped" ]; } \
+    && ok "next: --format=columnar's lens= names importers_next on the cut tier, and not on the uncut one" \
+    || no "next: --format=columnar lens='$LCUT' on the cut tier (want shown_importers,importers_capped,importers_next), lens='$LALL' uncut (want shown_importers,importers_capped)"
+rm -rf "$RS"
+
 # ── #10 determinism + well-formedness ─────────────────────────────────────────────────────────────────
 A="$( i Widget )"; B="$( i Widget )"
-[ "$A" = "$B" ] && ok "determinism: --impact=Widget byte-identical run-to-run" || no "non-deterministic --impact output"
+if [ "$A" = "$B" ]; then ok "determinism: --impact=Widget byte-identical run-to-run"; else no "non-deterministic --impact output"; fi
 if command -v xmllint >/dev/null 2>&1; then
-    printf '%s' "$OUT_W" | xmllint --noout - 2>/dev/null && ok "xml well-formed" || no "xml malformed"
-    printf '%s' "$COL"   | xmllint --noout - 2>/dev/null && ok "xml well-formed (columnar)" || no "xml malformed (columnar)"
+    if printf '%s' "$OUT_W" | xmllint --noout - 2>/dev/null; then ok "xml well-formed"; else no "xml malformed"; fi
+    if printf '%s' "$COL"   | xmllint --noout - 2>/dev/null; then ok "xml well-formed (columnar)"; else no "xml malformed (columnar)"; fi
 else
     printf '  SKIP  xml well-formed (no xmllint)\n'
 fi

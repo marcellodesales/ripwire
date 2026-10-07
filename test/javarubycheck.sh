@@ -38,7 +38,7 @@ FIX="$ROOT/test/javarubyfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -50,9 +50,9 @@ echo "javarubycheck: BIN=$BIN  FIX=$FIX"
 MAP_OUT="$TMP/map.xml"
 $BIN "$FIX" --no-cache >"$MAP_OUT" 2>"$TMP/map.err"
 MAP_EXIT=$?
-[ "$MAP_EXIT" -eq 0 ] && ok "default map: exits 0 on Java/Ruby fixture" || no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"
+if [ "$MAP_EXIT" -eq 0 ]; then ok "default map: exits 0 on Java/Ruby fixture"; else no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"; fi
 
-command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$MAP_OUT" && ok "default map: passes xmllint --noout" || no "default map: xmllint failed"; }
+command -v xmllint >/dev/null 2>&1 && { if xmllint --noout "$MAP_OUT"; then ok "default map: passes xmllint --noout"; else no "default map: xmllint failed"; fi; }
 
 # no degrade / ABI-mismatch warning must reach stderr on the clean fixture
 [ -s "$TMP/map.err" ] && no "default map: unexpected stderr (ABI/degrade?): $( cat "$TMP/map.err" )" || ok "default map: clean stderr (no ABI mismatch / degrade)"
@@ -106,14 +106,14 @@ if grep -q "SYMS:0" "$TMP/java_check"; then
 else
     ok "A.java (Java): extracted $( grep -o 'SYMS:[0-9]*' "$TMP/java_check" | cut -d: -f2 ) symbol(s)"
 fi
-grep -q "SYMS:3" "$TMP/java_check" && ok "A.java: exactly 3 symbols (addOne, addTwo, class A — no field/local phantom nodes)" || no "A.java: expected 3 symbols, got: $( grep SYMS "$TMP/java_check" )"
-grep -q "HAS_ADDONE:True" "$TMP/java_check" && ok "A.java: addOne method present" || no "A.java: addOne method missing"
-grep -q "HAS_ADDTWO:True" "$TMP/java_check" && ok "A.java: addTwo method present" || no "A.java: addTwo method missing"
-grep -q "HAS_CLASS_A:True" "$TMP/java_check" && ok "A.java: class A present, tagged t=\"cls\"" || no "A.java: class A missing or not t=\"cls\""
-grep -q "METHODS:True" "$TMP/java_check" && ok "A.java: addOne/addTwo tagged t=\"method\"" || no "A.java: methods not tagged t=\"method\" as expected"
-grep -q "PHANTOM:none" "$TMP/java_check" && ok "A.java: no phantom nodes (params/locals not indexed)" || no "A.java: phantom nodes present: $( grep PHANTOM "$TMP/java_check" )"
-grep -q "EDGE:True" "$TMP/java_check" && ok "A.java: intra-file call edge addTwo -> addOne present" || no "A.java: call edge addTwo -> addOne MISSING"
-grep -q "EDGE_N:1" "$TMP/java_check" && ok "A.java: exactly ONE addTwo -> addOne edge (dedup)" || no "A.java: expected a single addTwo -> addOne edge: $( grep EDGE_N "$TMP/java_check" )"
+if grep -q "SYMS:3" "$TMP/java_check"; then ok "A.java: exactly 3 symbols (addOne, addTwo, class A — no field/local phantom nodes)"; else no "A.java: expected 3 symbols, got: $( grep SYMS "$TMP/java_check" )"; fi
+if grep -q "HAS_ADDONE:True" "$TMP/java_check"; then ok "A.java: addOne method present"; else no "A.java: addOne method missing"; fi
+if grep -q "HAS_ADDTWO:True" "$TMP/java_check"; then ok "A.java: addTwo method present"; else no "A.java: addTwo method missing"; fi
+if grep -q "HAS_CLASS_A:True" "$TMP/java_check"; then ok "A.java: class A present, tagged t=\"cls\""; else no "A.java: class A missing or not t=\"cls\""; fi
+if grep -q "METHODS:True" "$TMP/java_check"; then ok "A.java: addOne/addTwo tagged t=\"method\""; else no "A.java: methods not tagged t=\"method\" as expected"; fi
+if grep -q "PHANTOM:none" "$TMP/java_check"; then ok "A.java: no phantom nodes (params/locals not indexed)"; else no "A.java: phantom nodes present: $( grep PHANTOM "$TMP/java_check" )"; fi
+if grep -q "EDGE:True" "$TMP/java_check"; then ok "A.java: intra-file call edge addTwo -> addOne present"; else no "A.java: call edge addTwo -> addOne MISSING"; fi
+if grep -q "EDGE_N:1" "$TMP/java_check"; then ok "A.java: exactly ONE addTwo -> addOne edge (dedup)"; else no "A.java: expected a single addTwo -> addOne edge: $( grep EDGE_N "$TMP/java_check" )"; fi
 
 # cross-check via --callees / --callers (independent of the raw-XML parse)
 JV_CE="$( $BIN "$FIX" --callees=addTwo 2>/dev/null )"
@@ -139,9 +139,29 @@ has_square = "square" in names
 has_sos = "sum_of_squares" in names
 all_method = all(s["t"] == "method" for s in syms) if syms else False
 edge = any(s["n"] == "sum_of_squares" and "square" in s["calls"] for s in syms)
-# no phantom nodes from `puts` (a resolved-to-nothing call) — the two defs are the only symbols
+# no phantom nodes from `puts` (a resolved-to-nothing call). #60 (train-12) adds a THIRD symbol that is
+# not a phantom: the synthetic module-scope owner of b.rb's last line, `puts sum_of_squares( 3, 4 )` —
+# real Ruby top-level code, which this file has always had and which had no caller node until now. It is
+# excluded from the phantom list BY ITS LABEL (t="modscope", n="<file-scope>"), never by name, so a
+# genuine `puts` node would still be caught. all_method is asked of the two DEFINITIONS only, for the
+# same reason: the owner is not a Ruby `def` and must not be tagged as one.
+# The parser above reads n= straight out of the XML, so the owner's name arrives ESCAPED. Comparing
+# against the escaped spelling is deliberate: it is what the document says, and a gate that silently
+# unescapes would stop noticing if the escaping ever broke.
+OWNER = "&lt;file-scope&gt;"
+defs = [s for s in syms if s["t"] != "modscope"]
+owners = [s for s in syms if s["t"] == "modscope"]
+names = [s["n"] for s in defs]
+has_square = "square" in names
+has_sos = "sum_of_squares" in names
+all_method = all(s["t"] == "method" for s in defs) if defs else False
+edge = any(s["n"] == "sum_of_squares" and "square" in s["calls"] for s in defs)
 phantom = [n for n in names if n not in ("square", "sum_of_squares")]
+owner_ok = len(owners) == 1 and owners[0]["n"] == OWNER
+owner_calls_sos = owner_ok and "sum_of_squares" in owners[0]["calls"]
 print("SYMS:%d" % len(syms))
+print("DEFS:%d" % len(defs))
+print("OWNER:%s OWNER_CALLS_SOS:%s" % (owner_ok, owner_calls_sos))
 print("HAS_SQUARE:%s HAS_SOS:%s ALL_METHOD:%s EDGE:%s PHANTOM:%s" % (has_square, has_sos, all_method, edge, ",".join(phantom) or "none"))
 PYEOF
 cat "$TMP/ruby_check"
@@ -151,12 +171,21 @@ if grep -q "SYMS:0" "$TMP/ruby_check"; then
 else
     ok "b.rb (Ruby): extracted $( grep -o 'SYMS:[0-9]*' "$TMP/ruby_check" | cut -d: -f2 ) symbol(s)"
 fi
-grep -q "SYMS:2" "$TMP/ruby_check" && ok "b.rb: exactly 2 symbols (square, sum_of_squares — puts not indexed)" || no "b.rb: expected 2 symbols, got: $( grep SYMS "$TMP/ruby_check" )"
-grep -q "HAS_SQUARE:True" "$TMP/ruby_check" && ok "b.rb: square method present" || no "b.rb: square method missing"
-grep -q "HAS_SOS:True" "$TMP/ruby_check" && ok "b.rb: sum_of_squares method present" || no "b.rb: sum_of_squares method missing"
-grep -q "ALL_METHOD:True" "$TMP/ruby_check" && ok "b.rb: both symbols tagged t=\"method\"" || no "b.rb: symbols not tagged t=\"method\" as expected"
-grep -q "PHANTOM:none" "$TMP/ruby_check" && ok "b.rb: no phantom symbol nodes (puts / unresolved calls dropped)" || no "b.rb: phantom nodes present: $( grep PHANTOM "$TMP/ruby_check" )"
-grep -q "EDGE:True" "$TMP/ruby_check" && ok "b.rb: intra-file call edge sum_of_squares -> square present" || no "b.rb: call edge sum_of_squares -> square MISSING"
+# RE-AIMED 2026-09-20 (train-12, issue #60): the count is 3, and the third is not a regression. Ruby HAS
+# an executable top level and this fixture uses it — `puts sum_of_squares( 3, 4 )` on the last line. That
+# call had no caller node before #60, so sum_of_squares read as called by nobody; it is now owned by the
+# file's t="modscope" owner. The DEFINITION count is what this arm was really about and it is still 2.
+if grep -q "DEFS:2" "$TMP/ruby_check"; then ok "b.rb: exactly 2 definitions (square, sum_of_squares — puts not indexed)"; else no "b.rb: expected 2 definitions, got: $( grep -E 'SYMS|DEFS' "$TMP/ruby_check" | tr '\n' ' ' )"; fi
+if grep -q "OWNER:True" "$TMP/ruby_check"; then ok "b.rb: exactly one t=\"modscope\" <file-scope> owner for the top-level puts line"; else no "b.rb: the module-scope owner is missing or not unique: $( grep OWNER "$TMP/ruby_check" )"; fi
+# The point of #60 on this fixture, asserted rather than implied: the top-level call is now an EDGE.
+# Ruby's bare-word form (`puts` itself, no parentheses) still produces no reference at all — the lane's
+# stated Ruby gap — which is exactly why PHANTOM stays none below.
+if grep -q "OWNER_CALLS_SOS:True" "$TMP/ruby_check"; then ok "b.rb: the owner calls sum_of_squares — the top-level call is an edge now (#60)"; else no "b.rb: the top-level puts line did not mint an owner -> sum_of_squares edge: $( grep OWNER "$TMP/ruby_check" )"; fi
+if grep -q "HAS_SQUARE:True" "$TMP/ruby_check"; then ok "b.rb: square method present"; else no "b.rb: square method missing"; fi
+if grep -q "HAS_SOS:True" "$TMP/ruby_check"; then ok "b.rb: sum_of_squares method present"; else no "b.rb: sum_of_squares method missing"; fi
+if grep -q "ALL_METHOD:True" "$TMP/ruby_check"; then ok "b.rb: both DEFINITIONS tagged t=\"method\" (the owner is t=\"modscope\", not a Ruby def)"; else no "b.rb: symbols not tagged t=\"method\" as expected"; fi
+if grep -q "PHANTOM:none" "$TMP/ruby_check"; then ok "b.rb: no phantom symbol nodes (puts / unresolved calls dropped)"; else no "b.rb: phantom nodes present: $( grep PHANTOM "$TMP/ruby_check" )"; fi
+if grep -q "EDGE:True" "$TMP/ruby_check"; then ok "b.rb: intra-file call edge sum_of_squares -> square present"; else no "b.rb: call edge sum_of_squares -> square MISSING"; fi
 
 RB_CE="$( $BIN "$FIX" --callees=sum_of_squares 2>/dev/null )"
 echo "$RB_CE" | grep -q 'count="1"' && echo "$RB_CE" | grep -q 'n="square"' \

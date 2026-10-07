@@ -16,7 +16,7 @@
 #   4  situ H6/M9  sections [2] and [3] disclose their caps; the JSON twin carries script_gates_unmodelled
 #                  and agrees with --test-gate's.
 #   5  ID leak     an automated sweep over LIVE emitted text (legends + refusals) for internal audit IDs.
-#   6  gitmine     the --since degrade ALERT agrees with the stderr line and with window= (PLAIN build only).
+#   6  gitmine     an unresolvable --since REFUSES with one line and no degrade alert (the alert half: PLAIN build).
 #   7  ext-surface the showcase caption names the attributes the unpaged root actually emits.
 #   8  --help      the redaction paragraph's coverage list matches what is really redacted.
 #   9  selector    an UNINDEXED file half says so; the five newly-routed arms carry the shared diagnosis.
@@ -26,9 +26,9 @@
 #   RIPWIRE_BIN=build/ripwire      bash test/w3fixlegendcheck.sh
 #   RIPWIRE_BIN=build_base/ripwire bash test/w3fixlegendcheck.sh   # must FAIL (pre-fix binary)
 #
-# NOTE arm 6 observes a DEGRADED_PATH_ALERT, which -DNDEBUG compiles out. It runs only when the binary can
-# emit one (probed, not assumed) and says so loudly when it skips, so a Release build cannot make it pass for
-# the wrong reason.
+# NOTE arm 6's alert half asserts that NO DISCLOSE fires, which -DNDEBUG makes true of every run. It
+# asserts only where --version names a non-NDEBUG build type, beside a positive control proving this binary prints
+# alerts at all, and says so loudly when it skips, so a Release build cannot make it pass for the wrong reason.
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
@@ -36,7 +36,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative binary
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 skip(){ printf '  SKIP  %s\n' "$*"; }
 
@@ -61,7 +61,9 @@ print( s[ i : j + 3 ] if i >= 0 and j > i else "" )
 echo "── 1. partition root counters"
 PTASK="rank symbols by pagerank"
 for N in 2 3 4; do
-    "$BIN" "$ROOT" --pack-task="$PTASK" --partition=$N >"$TMP/p$N" 2>/dev/null
+    # L1 (2026-09-19): the CLI default legend is compact; this gate reads the FULL legends' prose, counts real rows (the compact
+    # legend spells row shapes inside its comment) and pins `<dead-code count=` (compact leads with schema=) — those runs ask for --legend=full.
+    "$BIN" "$ROOT" --pack-task="$PTASK" --partition=$N --legend=full >"$TMP/p$N" 2>/dev/null
 done
 P2ROOT="$( grep -oE '<ctx-partitions[^>]*>' "$TMP/p2" )"
 SH2="$( printf '%s' "$P2ROOT" | attr shared_symbols )"
@@ -202,7 +204,7 @@ DP="$( printf '%s' "$DR" | attr partitions )"; DQ="$( printf '%s' "$DR" | attr r
 
 # ══ 2. --doc-drift: corpus= is its own population; clean= satisfies its identity ═══════════════════════════
 echo "── 2. doc-drift counters"
-"$BIN" "$ROOT" --doc-drift >"$TMP/dd" 2>/dev/null
+"$BIN" "$ROOT" --doc-drift --legend=full >"$TMP/dd" 2>/dev/null
 DDROOT="$( grep -oE '<doc-drift[^>]*>' "$TMP/dd" )"
 DOCS="$( printf '%s' "$DDROOT" | attr docs )"; CLEAN="$( printf '%s' "$DDROOT" | attr clean )"
 # the output is MINIFIED (one line), so `grep -c` would count lines, not rows — count occurrences.
@@ -277,7 +279,7 @@ esac
 
 # ══ 3. --dead-code: the ./-anchor under an ABSOLUTE root spelling ══════════════════════════════════════════
 echo "── 3. dead-code ./-anchor is root-spelling independent"
-dcCount(){ "$BIN" "$1" --dead-code="$2" 2>/dev/null | grep -oE '<dead-code count="[0-9]+"' | grep -oE '[0-9]+'; }
+dcCount(){ "$BIN" "$1" --dead-code="$2" --legend=full 2>/dev/null | grep -oE '<dead-code count="[0-9]+"' | grep -oE '[0-9]+'; }
 for F in ./src ./test ./bench src test; do
     RELC="$( cd "$ROOT" && dcCount . "$F" )"
     ABSC="$( dcCount "$ROOT" "$F" )"
@@ -295,19 +297,25 @@ ANCH="$( dcCount "$ROOT" ./src )"; BARE="$( dcCount "$ROOT" src )"
 
 # ══ 4. --situ H6 disclosures + the M9 JSON twin ════════════════════════════════════════════════════════════
 echo "── 4. situ cap disclosures + JSON twin"
-# a sandbox where the test count EXCEEDS the 25-row cap (this repo's own probes stay under it).
+# a sandbox where the test count EXCEEDS the old 25-row cap. That cap (kSituTestRowsShown) was RETIRED on
+# 2026-09-10 (listing-paging lane): section [2] is the ANSWER of --situ — tests to run — and answer rows
+# never page (docs/METHODOLOGY.md §9; test/listingpagingcheck.sh arm D pins the retirement red-first). So
+# the disclosure this arm used to demand ("showing 25 of 30 tests") must now be ABSENT and every row listed.
 SITSB="$TMP/situsb"; mkdir -p "$SITSB/test"
 printf 'int coreFn(){ return 7; }\n' >"$SITSB/core.cpp"
 i=1; while [ $i -le 30 ]; do printf 'int coreFn();\nint t%02d_main(){ return coreFn(); }\n' "$i" >"$SITSB/test/t$i.cpp"; i=$(( i + 1 )); done
 "$BIN" "$SITSB" --no-cache --situ=core.cpp >"$TMP/situ30" 2>&1
 S2LINE="$( grep -E '^  \[2\]' "$TMP/situ30" || true )"
-S2ROWS="$( sed -n '/\[2\]/,/\[3\]/p' "$TMP/situ30" | grep -c 'test/t[0-9]*\.cpp' || true )"
+# E1 (2026-09-12): runner-less rows sharing their evidence ride ONE `[hops=N] (n): a, b, …` line, so the
+# count is of PATHS (occurrences), not lines — `grep -c` would count the 30 tests as 1.
+S2ROWS="$( sed -n '/\[2\]/,/\[3\]/p' "$TMP/situ30" | grep -o 'test/t[0-9]*\.cpp' | wc -l | tr -d ' ' || true )"
 case "$S2LINE" in
-    *"(30)"*"showing 25 of 30 tests"*) ok "situ [2]: '(30) (showing 25 of 30 tests)' with ${S2ROWS} rows — the cap is disclosed";;
-    *) no "situ [2] does not disclose its 25-row cap: $S2LINE";;
+    *"showing "*" of "*) no "situ [2] still discloses a cut on its ANSWER rows (the 25-row cap was retired): $S2LINE";;
+    *"(30)"*)             ok "situ [2]: '(30)' with no cut disclosed — answer rows never page";;
+    *)                    no "situ [2] header did not count all 30 tests: $S2LINE";;
 esac
-[ "${S2ROWS:-0}" = 25 ] && ok "situ [2]: exactly 25 rows listed, matching the disclosure" \
-                        || no "situ [2] listed ${S2ROWS:-0} rows, disclosure says 25"
+[ "${S2ROWS:-0}" = 30 ] && ok "situ [2]: all 30 rows listed (the retired 25-row cap is gone)" \
+                        || no "situ [2] listed ${S2ROWS:-0} rows, expected all 30 — answer rows never page"
 # section [3] on this repo (git history required for co-change partners).
 "$BIN" "$ROOT" --situ=src/graph.h >"$TMP/situ3" 2>&1
 S3LINE="$( grep -E '^  \[3\]' "$TMP/situ3" || true )"
@@ -421,7 +429,7 @@ fi
 #       and says nothing about whether the call site binds to this definition at all (call edges are matched
 #       by NAME), so a legend promising "provably … never a guess" is making a claim the tool cannot keep —
 #       measured: a clean, compiling tree carries a nonzero incompatible= on several shared names.
-"$BIN" "$ROOT" --edit-check=rankGraphTeleport >"$TMP/ec" 2>/dev/null
+"$BIN" "$ROOT" --edit-check=rankGraphTeleport --legend=full >"$TMP/ec" 2>/dev/null
 if grep -q 'B2\.2' "$TMP/ec"; then
     no "--edit-check's legend still ships the 'B2.2' plan ID"
 elif ! grep -q 'FIXED arity' "$TMP/ec"; then
@@ -434,24 +442,48 @@ else
     ok "--edit-check's legend states the arity RULE + the name-binding limit, with no plan ID and no proof claim"
 fi
 
-# ══ 6. gitmine --since degrade alert (PLAIN build only — NDEBUG deletes the observation) ═══════════════════
-echo "── 6. --since degrade alert (needs the PLAIN build)"
-"$BIN" "$ROOT" --rank-by=churn --since=notadate >"$TMP/since.out" 2>"$TMP/since.err"
-if ! grep -q 'math degraded' "$TMP/since.err"; then
-    skip "no DEGRADED_PATH_ALERT observed — this binary is a Release/NDEBUG build; run this arm against the PLAIN build"
+# ══ 6. gitmine --since: the degrade alert is GONE, and only the refusal speaks ═══════════════════════════════
+# This arm pinned the WORDING of the alert an unresolvable --since raised: it must not promise 'all-history' while
+# the stderr line and window= said the verb's own window applied. e7688981 (M8) deleted that alert and the note
+# beside it — the value is refused now, once, before any verb runs — so the old wording has nothing left to agree
+# with. The arm pins what replaced it, the strongest form of "the alert cannot contradict the answer": no answer,
+# no window=, one stderr line, and no alert at all.
+#
+# RE-POINTED 2026-09-16. The old arm SKIPPED whenever that run printed no alert, reading the silence as "Release
+# build". After M8 the silence was the design, so it skipped on the plain build too and asserted nothing. The
+# absence of an alert is now a CLAIM, and a claim that no alert fired is evidence only on a binary that prints
+# alerts: --version's build type decides whether one could (kotlincheck §12, estchargecheck), and a positive
+# control — a --scip index that opens and fails to decode, the degrade qualitystalecheck probes — proves this
+# binary really does, so the absence below cannot pass on a build whose alerts broke.
+echo "── 6. --since: one refusal, no degrade alert (the alert half needs the PLAIN build)"
+"$BIN" "$ROOT" --rank-by=churn --since=notadate >"$TMP/since.out" 2>"$TMP/since.err"; SINCE_RC=$?
+if [ "$SINCE_RC" -eq 1 ] && [ ! -s "$TMP/since.out" ] \
+   && grep -qF "since='notadate' is neither a git revision nor a real calendar date — refusing" "$TMP/since.err"; then
+    ok "--rank-by=churn --since=notadate refuses (exit 1, no document, so no window= to contradict) naming the value"
 else
-    if grep -q 'all-history' "$TMP/since.err"; then
-        no "the --since alert still promises 'all-history', contradicting the stderr line and window="
-    elif grep -q "calling verb's own default window applies" "$TMP/since.err"; then
-        ok "the --since alert says the calling verb's own default window applies (agrees with the stderr line)"
-    else
-        no "the --since alert wording is neither the old nor the corrected one: $( grep 'math degraded' "$TMP/since.err" | head -1 )"
-    fi
-    WIN="$( grep -oE 'window="[^"]*"' "$TMP/since.out" | head -1 | sed -E 's/^[^"]*"//; s/"$//' )"
-    [ -n "$WIN" ] && [ "$WIN" != "all" ] \
-        && ok "…and the run it describes really used a bounded window (window=\"$WIN\"), so all-history was never true" \
-        || no "expected a bounded window= on the churn root, got '${WIN:-<none>}'"
+    no "--rank-by=churn --since=notadate: exit $SINCE_RC, $( wc -c < "$TMP/since.out" | tr -d ' ' ) B on stdout, stderr: $( head -c 200 "$TMP/since.err" )"
 fi
+SINCE_LINES="$( wc -l < "$TMP/since.err" | tr -d ' ' )"
+if [ "$SINCE_LINES" = 1 ] && ! grep -qE "all-history|ignoring it|default window applies" "$TMP/since.err"; then
+    ok "…with ONE stderr line, and nothing claims the value was ignored or that a default window applies"
+else
+    no "…the refusal is not the only voice ($SINCE_LINES stderr lines): $( head -c 300 "$TMP/since.err" )"
+fi
+SINCE_FLAVOUR="$( "$BIN" --version 2>/dev/null | sed -nE 's/^[^(]*\(([^,)]*).*/\1/p' )"
+case "$SINCE_FLAVOUR" in
+    Release|RelWithDebInfo|MinSizeRel)
+        skip "this $SINCE_FLAVOUR build defines NDEBUG, so DISCLOSE is compiled out and 'the --since refusal raises no alert' is true of every run; the plain-flavour leg proves it" ;;
+    *)
+        printf 'not a scip index at all\n' > "$TMP/probe.scip"
+        "$BIN" "$ROOT/test/fixture" --scip="$TMP/probe.scip" --top-k=1 --no-cache >/dev/null 2>"$TMP/probe.err"
+        if ! grep -qF '[math degraded] --scip: corrupt/truncated index' "$TMP/probe.err"; then
+            no "positive control: '${SINCE_FLAVOUR:-unknown}' is a non-NDEBUG build, yet an undecodable --scip index raised no DISCLOSE — this binary prints no alerts, so an absent one proves nothing: $( head -c 200 "$TMP/probe.err" )"
+        elif grep -qF '[math degraded]' "$TMP/since.err"; then
+            no "the --since refusal still raises a degrade alert on its way to refusing: $( grep -F '[math degraded]' "$TMP/since.err" | head -1 )"
+        else
+            ok "on this '${SINCE_FLAVOUR:-unknown}' (non-NDEBUG) build alerts ARE printed (the --scip decode control raised one) and the --since refusal raises none"
+        fi ;;
+esac
 
 # ══ 7. --external-surface caption names the attributes the unpaged root emits ══════════════════════════════
 echo "── 7. external-surface caption"
@@ -500,7 +532,7 @@ verbatim(){ "$BIN" "$REDSB" --no-cache "$@" 2>/dev/null | grep -c "$KEY" || true
                                         || no "--grep redacted its hit line — the help's stated exception is wrong"
 [ "$( verbatim --regex='AKIA\w+' )" -gt 0 ] && ok "--regex hit lines are NOT redacted, as stated" \
                                             || no "--regex behaviour disagrees with the help"
-HELPTXT="$( "$BIN" --help 2>&1 )"
+HELPTXT="$( "$BIN" --help=all 2>&1 )"
 case "$HELPTXT" in
     *"credentials in emitted bodies are redacted"*) no "--help still carries the stale bodies-only redaction sentence";;
 esac
@@ -556,7 +588,7 @@ esac
 
 # ══ 10. limit="0" — defined in band, and refused as INPUT ══════════════════════════════════════════════════
 echo "── 10. limit=\"0\" sentinel"
-for V in "--grep=DEGRADED_PATH_ALERT" "--impact=rankGraphTeleport" "--tree"; do
+for V in "--grep=DISCLOSE" "--impact=rankGraphTeleport" "--tree"; do
     OUT="$( "$BIN" "$ROOT" $V --offset=5 2>/dev/null )"
     ROOTEL="$( printf '%s' "$OUT" | grep -oE '<(grep|impact|tree) [^>]*>' | head -1 )"
     case "$ROOTEL" in
@@ -570,8 +602,8 @@ case "$( refuse "--grep=x" "--limit=0" )" in
     *) no "--limit=0 was accepted — the output sentinel is then ambiguous";;
 esac
 # in-band definition on the two adopting verbs.
-for V in "--grep=DEGRADED_PATH_ALERT" "--impact=rankGraphTeleport"; do
-    "$BIN" "$ROOT" $V >"$TMP/inband" 2>/dev/null;  L="$( firstComment "$TMP/inband" )"
+for V in "--grep=DISCLOSE" "--impact=rankGraphTeleport"; do
+    "$BIN" "$ROOT" $V --legend=full >"$TMP/inband" 2>/dev/null;  L="$( firstComment "$TMP/inband" )"
     case "$L" in
         *'limit="0" means no explicit limit'*) ok "${V%%=*}: the legend DEFINES limit=\"0\" on the first screen";;
         *) no "${V%%=*}: limit=\"0\" is still undefined in band";;
@@ -585,7 +617,7 @@ TF="$( printf '%s' "$TU" | attr files )"; TUL="$( printf '%s' "$TU" | attr files
 # RE-PINNED 2026-09-05 (capture-audit P4, lane L7): the default --tree is an 80-row window, so the identity reads
 # files_unlisted + total (the listable set the root now discloses) == files; the rows are shown= of that total.
 TTOT="$( printf '%s' "$TU" | attr total )"; TSHOWN="$( printf '%s' "$TU" | attr shown )"
-TROWS="$( "$BIN" "$ROOT" --tree 2>/dev/null | grep -o '<file p=' | wc -l | tr -d ' ' )"   # minified: count occurrences
+TROWS="$( "$BIN" "$ROOT" --tree --legend=full 2>/dev/null | grep -o '<file p=' | wc -l | tr -d ' ' )"   # minified: count occurrences
 [ -n "$TTOT" ] && [ "$(( TUL + TTOT ))" = "$TF" ] && [ "$TROWS" = "$TSHOWN" ] \
     && ok "default window: files_unlisted($TUL) + total($TTOT) == files($TF); rows($TROWS) == shown($TSHOWN)" \
     || no "default tree identity broken: $TUL + ${TTOT:-<none>} != $TF or rows $TROWS != shown ${TSHOWN:-<none>}"
@@ -596,7 +628,7 @@ if [ "$(( TUL + TPT ))" = "$TF" ] && [ "${TPS:-0}" = 2 ]; then
 else
     no "paged tree: $TUL + ${TPT:-0} != $TF (or shown=${TPS:-0} != 2)"
 fi
-"$BIN" "$ROOT" --tree >"$TMP/treeleg" 2>/dev/null;  TREELEG="$( firstComment "$TMP/treeleg" )"
+"$BIN" "$ROOT" --tree --legend=full >"$TMP/treeleg" 2>/dev/null;  TREELEG="$( firstComment "$TMP/treeleg" )"
 case "$TREELEG" in
     *"files equals the listed rows plus files_unlisted on every run"*) no "the tree legend still claims the rows-based identity 'on every run'";;
     *"LISTABLE file set"*) ok "the tree legend states the identity over the LISTABLE set, not the printed rows";;
@@ -607,7 +639,7 @@ esac
 echo "── G4"
 if command -v xmllint >/dev/null 2>&1; then
     g4=0
-    for V in "--doc-drift" "--tree" "--tree --limit=2" "--grep=DEGRADED_PATH_ALERT" "--impact=rankGraphTeleport" \
+    for V in "--doc-drift" "--tree" "--tree --limit=2" "--grep=DISCLOSE" "--impact=rankGraphTeleport" \
              "--dead-code=./src" "--edit-check=rankGraphTeleport" "--external-surface"; do
         "$BIN" "$ROOT" $V 2>/dev/null | xmllint --noout - 2>/dev/null || { no "G4: $V is not well-formed XML"; g4=1; }
     done

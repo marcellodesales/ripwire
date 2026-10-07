@@ -31,7 +31,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -228,7 +228,7 @@ echo
 echo "=== --help names the defaults the root now echoes ==="
 # ══════════════════════════════════════════════════════════════════════════════════════════════════════════
 HELP="$TMP/help.txt"
-"$BIN" --help >"$HELP" 2>/dev/null
+"$BIN" --help=all >"$HELP" 2>/dev/null
 grep -qF -- '--around-depth=N, default 1' "$HELP" \
   && ok "--help names --around-depth's default" || no "--help still gives no default for --around-depth"
 grep -qF -- '--around-fanout=K, default 32' "$HELP" \

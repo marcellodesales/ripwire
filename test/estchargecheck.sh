@@ -28,10 +28,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){   printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){   printf '  FAIL  %s\n' "$*"; fail=1; }
 skip(){ printf '  SKIP  %s\n' "$*"; }
 
@@ -43,26 +44,34 @@ TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 
 # ── BUILD-FLAVOUR / DEGRADE-OBSERVABILITY PROBE (read by #14 below) ───────────────────────────────────
 # CI runs the whole suite TWICE: once against a Release binary (catches optimizer-only bugs, e.g. the
-# VERIFY-then-defend trap) and once against the plain build — Release defines NDEBUG, which compiles
-# DEGRADED_PATH_ALERT out, so "if you add a degrade path, it is the PLAIN run that proves it" (CLAUDE.md).
-# #14 asserts a DEGRADED_PATH_ALERT, so under the Release binary it is unobservable BY DESIGN and must
+# ASSUME-then-defend trap) and once against the plain build — Release defines NDEBUG, which compiles
+# DISCLOSE out, so "if you add a degrade path, it is the PLAIN run that proves it" (CLAUDE.md).
+# #14 asserts a DISCLOSE, so under the Release binary it is unobservable BY DESIGN and must
 # SKIP with the reason named; under the plain binary it must assert. What it must never do is pass
 # silently for lack of an alert it could not have seen — the 2026-07-27 CI trap this gate was written
 # against. (Before 2026-08-01 it took the other branch and FAILED under NDEBUG, which is the same trap
 # from the other side: it made the Release CI leg unconditionally red, so the leg could never be trusted.)
 #
 # Two INDEPENDENT readings, because either alone can lie:
-#   (1) an unrelated, already-gated degrade path (--since=<not a date> → "[math degraded]"). If THAT one
-#       is silent too, this binary compiles alerts out globally rather than #14's own seam having broken.
+#   (1) an unrelated degrade path: a --scip index that OPENS and fails to DECODE ("[math degraded] --scip:
+#       corrupt/truncated index"). If THAT one is silent too, this binary compiles alerts out globally
+#       rather than #14's own seam having broken.
 #   (2) --version's build-type token — versioncheck's source of truth, set by CMakeLists from
 #       CMAKE_BUILD_TYPE ("dev" for the plain configure). Release/RelWithDebInfo/MinSizeRel define
 #       NDEBUG; nothing else does.
 # Only when BOTH agree — no alert observable anywhere AND an NDEBUG-defining flavour — is a skip honest.
 # A binary that CLAIMS to be dev/asan yet observes no alerts is a real FAILURE, and so is one that can
 # observe the unrelated alert but not #14's own.
+#
+# RE-POINTED 2026-09-16. Reading (1) used to be `--rank-by=churn --since=notadate`, which e7688981 (M8,
+# 2026-09-04) made a refusal that exits 1 before any degrade path runs: silent on EVERY flavour, so the two
+# readings had collapsed into one — measured: a Release-labelled binary that still printed every alert except
+# #14's SKIPPED #14 instead of failing it. The replacement is the probe qualitystalecheck.sh uses; its index
+# file lives in $TMP, outside the checkout, and --no-cache keeps the probe from writing next to test/fixture.
 alerts_observable=0
-"$BIN" test/fixture --rank-by=churn --since=notadate >/dev/null 2>"$TMP/flavour.err"
-grep -q 'math degraded' "$TMP/flavour.err" && alerts_observable=1
+printf 'not a scip index at all\n' > "$TMP/flavour.scip"
+"$BIN" test/fixture --scip="$TMP/flavour.scip" --top-k=1 --no-cache >/dev/null 2>"$TMP/flavour.err"
+grep -qF '[math degraded] --scip: corrupt/truncated index' "$TMP/flavour.err" && alerts_observable=1
 BUILD_FLAVOUR="$( "$BIN" --version 2>/dev/null | sed -nE 's/^[^(]*\(([^,)]*).*/\1/p' )"
 case "$BUILD_FLAVOUR" in
     Release|RelWithDebInfo|MinSizeRel) ndebug_flavour=1 ;;
@@ -186,8 +195,10 @@ grep -aq 'withheld_est_tokens=[0-9]* > budget=' "$TMP/wh.err" \
 #        tokens, so reporting est_tokens>N is the truth and over_ceiling= is what makes it readable.
 #    The small end is where fixed overhead dominates, which is exactly why it is swept: EVERY future byte
 #    added to the envelope or the legend shows up here first.
+# L1 (2026-09-19): the CLI default legend is compact; #5's legend arms read the FULL legend's max_tokens=/over_ceiling= prose
+# from this sweep, so it asks for the full legend (byte-identical to the old default, and the larger envelope).
 for N in 100 300 400 450 500 600 800 1200 1500 3000 6000; do
-    "$BIN" src --max-tokens=$N --no-cache >"$TMP/mt$N.out" 2>"$TMP/mt$N.err"
+    "$BIN" src --max-tokens=$N --no-cache --legend=full >"$TMP/mt$N.out" 2>"$TMP/mt$N.err"
     MB="$( bytes_of "$TMP/mt$N.out" )"
     ME="$( est_of "$TMP/mt$N.out" )"
     LIM="$( awk "BEGIN{printf \"%d\", $N*2.36*0.90}" )"
@@ -238,11 +249,49 @@ grep -aq 'over_ceiling=floor-alone-exceeded-fit_bytes' "$TMP/mt400.out" \
 #                        section grows the map's own digit count (+5 B at N=6000 --pack-signatures)
 #    The third is measured on the MAP PORTION (through `</r>`), because fit_bytes has only ever been the
 #    map's ceiling — the appended payload is charged to est_tokens, not to fit_bytes. ────────────────────────
+#    An ambiguous --expand bundle (issue #289) serves its <bodies> BEFORE the map, so "through `</r>`" would
+#    count the bodies and their legend as map bytes. The map portion is then the root's open tag plus
+#    everything after `</bodies>` through `</r>` — the same bytes the appended shape measures (measured on
+#    --expand=estimateTokens at N=6000: the map legend and the <r> element are byte-identical in both orders).
 mapbytes_of(){ python3 - "$1" <<'PY'
 import sys
 d = open( sys.argv[1], 'rb' ).read()
 i = d.find( b'</r>' )
-print( i + 4 if i >= 0 else len( d ) )
+end = i + 4 if i >= 0 else len( d )
+b0, r0, b1 = d.find( b'<bodies' ), d.find( b'<r ' ), d.find( b'</bodies>' )
+if 0 <= b0 < r0 and b0 < b1 < r0:
+    # CodeRabbit PR #292 finding 4052087945, VERIFIED AND REFINED (its own one-line suggestion —
+    # subtracting from b0, the literal "<bodies" position, instead of rootTagEnd — was checked against the
+    # real emission and found to overcorrect: everything between the root tag's '>' and the literal
+    # "<bodies" is NOT uniformly a root disclosure. src/main.cpp's ctxOpenStr (map-charged: the §F5 verdict
+    # bills it via + ctxUnprovenBytes / the note=/mapCtxOpenBytes terms) carries at most ONE thing there,
+    # ctxUnprovenLegend, appended with NOTHING between it and the tag's '>' when ctxUnprovenDefs > 0. But
+    # packBodies (serialize.h) ALSO writes kBodiesLegend — the <bodies> section's OWN "sibs=/inc=/calls"
+    # legend, ~1 KB, gated on withFileContext (always on for --expand) — immediately before the literal
+    # "<bodies" tag, and THAT is payload (bundleDoc.payloadBytes = bodiesSection.xml.size(), never a term in
+    # the §F5 verdict). A flat b0 anchor folds kBodiesLegend into the "map portion" the probe reports,
+    # overcounting by ~1 KB relative to what production actually bills to fit_bytes — measured on
+    # --expand=estimateTokens --max-tokens=6000: a synthetic three-way check (rootTagEnd anchor / b0 anchor /
+    # this fix) against a fixture carrying an unproven-legend AND a bodies-legend distinguishes all three;
+    # only this anchor matches what src/main.cpp's own verdict prices.
+    #
+    # ctxOpenStr's real end: the tag's own '>' (rootTagEnd), pushed past ctxUnprovenLegend's whole comment
+    # when one is present. Matched by its EXACT known literal opener ("<!-- ripwire expand: ",
+    # unprovenDefsVerbComment's one call site in main.cpp — shared by --expand and --outline, the only two
+    # verbs that reach this bodies-first shape), not by "any comment right here": kBodiesLegend is ALSO a
+    # comment starting immediately at rootTagEnd with no gap (measured on the real corpus — see above), so
+    # "starts with <!--" alone cannot tell the two apart; the literal opener can. FULL legend only — under
+    # --legend=compact this opener is itself rewritten (graphlegend.h's own comment on
+    # unprovenDefsVerbComment: "compactlegend.h strips it as the prose it is"), which this gate's #5/#5b/#5c
+    # arms never invoke.
+    rootTagEnd = d.find( b'>' ) + 1
+    ctxAttrEnd = rootTagEnd
+    if d[ rootTagEnd : rootTagEnd + len( b'<!-- ripwire expand: ' ) ] == b'<!-- ripwire expand: ':
+        close = d.find( b'-->', rootTagEnd )
+        if close != -1:
+            ctxAttrEnd = close + 3
+    end -= ( b1 + len( b'</bodies>' ) ) - ctxAttrEnd
+print( end )
 PY
 }
 for entry in "mapdiff:3000:--map-diff" "mapdiff2:12000:--map-diff" "churn:800:--rank-by=churn" "churn2:1200:--rank-by=churn" "payload:6000:--pack-signatures" "payload2:6000:--expand=$SYM"; do
@@ -260,6 +309,76 @@ for entry in "mapdiff:3000:--map-diff" "mapdiff2:12000:--map-diff" "churn:800:--
         no "#5b --max-tokens=$N $args: map portion $PB B EXCEEDS the $LIM B ceiling, unlabelled — the probe priced a shape it did not build"
     fi
 done
+
+# ── #5c: mapbytes_of must keep a root disclosure that sits between the root tag and <bodies> (a REAL
+#    root-priced clause) while still EXCLUDING the bodies section's own legend, which ALSO sits between the
+#    root tag and the literal "<bodies" tag but is payload, not map — CodeRabbit PR #292 finding 4052087945,
+#    verified against the real emission and refined (see mapbytes_of's own comment above for why the
+#    finding's literal one-line suggestion — subtract from b0 — overcorrects: MEASURED on
+#    --expand=estimateTokens --max-tokens=6000, src/, that anchor folds packBodies' ~1 KB kBodiesLegend into
+#    the reported "map portion", which the real §F5 verdict never bills to fit_bytes). Three anchors, one
+#    fixture, one number each:
+#      rootTagEnd (the old bug)   → drops BOTH the root disclosure and the bodies legend
+#      b0 (the finding's own diff) → keeps BOTH — wrongly keeps the bodies legend too
+#      this fix (comment-aware)   → keeps ONLY the root disclosure — the one production actually bills
+python3 - <<'PY' >"$TMP/synth_5c.xml"
+import sys
+prefix      = b'<ctx est_tokens="9">'
+rootlegend  = b'<!-- ripwire expand: unproven_defs=2 (absent when 0) -- two internal-linkage definitions were dropped -->'
+bodieslegend = b'<!-- a body legend not billed to fit_bytes: sibs=/inc=/calls, priced as payload -->'
+bodies      = b'<bodies><b p="x.cpp" n="f">CODE</b></bodies>'
+mapr        = b'<r est_tokens="5"><f p="y.cpp"><s n="g"/></f></r>'
+sys.stdout.buffer.write( prefix + rootlegend + bodieslegend + bodies + mapr )
+PY
+GOT_5C="$( mapbytes_of "$TMP/synth_5c.xml" )"
+WANT_5C="$( python3 -c '
+prefix       = b"<ctx est_tokens=\"9\">"
+rootlegend   = b"<!-- ripwire expand: unproven_defs=2 (absent when 0) -- two internal-linkage definitions were dropped -->"
+mapr         = b"<r est_tokens=\"5\"><f p=\"y.cpp\"><s n=\"g\"/></f></r>"
+print( len( prefix ) + len( rootlegend ) + len( mapr ) )
+' )"
+if [ "$GOT_5C" = "$WANT_5C" ]; then
+    ok "#5c mapbytes_of: keeps the root disclosure, excludes the bodies-section legend ($GOT_5C B)"
+else
+    no "#5c mapbytes_of: got $GOT_5C B, want $WANT_5C B — either the root disclosure was dropped or the bodies legend leaked into the map charge"
+fi
+
+# ── #5d (§F5): CHARGE note= TO THE --max-tokens CEILING — CodeRabbit PR #292 finding 4052087920. The
+#    bundle selector (bundleDoc.rootAttrBytes) already counted noteBytes, but neither the binary-search
+#    that PICKS mapTopK nor the final over_ceiling verdict did — both land inside the same `<ctx ...>` open
+#    tag mapCtxOpenBytes already charges, so a near-limit map could pick a topK whose real emission (with
+#    note= riding along) overran the ceiling, unlabelled. A small isolated fixture (25 same-named,
+#    ambiguous `run` definitions — deterministic ~52 B/topK growth, easy to land exactly on the boundary)
+#    found the real one: MEASURED on the pre-fix binary at N=990, --expand=run picked top-8 and delivered
+#    2224 B against a 2102 B ceiling (over by 122 B, the exact size of the missing note=), with no
+#    over_ceiling label. Fixed, the same command picks top-5 (2082 B, within budget). Both figures pasted
+#    in the lane report; this arm re-derives them live rather than trusting the snapshot.
+F5D="$TMP/f5d_repo"; mkdir -p "$F5D"
+for i in $( seq 1 25 ); do printf 'int run() { return %d; }\n' "$i" >"$F5D/f$i.cpp"; done
+git -C "$F5D" init -q
+git -C "$F5D" config user.email ripwire@example.invalid
+git -C "$F5D" config user.name ripwire-gate
+git -C "$F5D" add -A
+git -C "$F5D" commit -qm base
+"$BIN" "$F5D" --max-tokens=990 --expand=run --no-cache >"$TMP/f5d.out" 2>/dev/null
+PB_5D="$( mapbytes_of "$TMP/f5d.out" )"
+LIM_5D=$(( 990 * 2124 / 1000 ))   # N*2.36*0.90, integer (awk's earlier "%d" truncation, same formula every other arm uses)
+OVER_5D=0; head -c "$PB_5D" "$TMP/f5d.out" | grep -aq 'over_ceiling=1' && OVER_5D=1
+if [ "$PB_5D" -le "$LIM_5D" ] 2>/dev/null; then
+    ok "#5d --max-tokens=990 --expand=run: map portion $PB_5D B within the $LIM_5D B ceiling (note= charged to the search)"
+elif [ "$OVER_5D" = 1 ]; then
+    ok "#5d --max-tokens=990 --expand=run: map portion $PB_5D B over the $LIM_5D B ceiling and SAYS SO (over_ceiling=1)"
+else
+    no "#5d --max-tokens=990 --expand=run: map portion $PB_5D B EXCEEDS the $LIM_5D B ceiling, unlabelled — note= was not charged to the search/verdict"
+fi
+# and the wording is payload-neutral (CodeRabbit finding 4052087924) — no "bodies" literal on an ambiguous
+# --expand's ride-along note, which the fixture above already exercises.
+if grep -aq 'note="[^"]*bodies' "$TMP/f5d.out"; then
+    no "#5d note= still assumes bodies-only wording"
+else
+    ok "#5d note= wording does not assume the payload is bodies"
+fi
+
 # the legend must define both markers AND name the headroom factor + rate, in the map that carries them
 grep -aq 'max_tokens=.*2\.36.*0\.90\|max_tokens=.*conservative' "$TMP/mt1500.out" \
     && ok "#5 legend clause defines max_tokens=/fit_bytes= and names the rate + headroom" \
@@ -276,9 +395,14 @@ grep -aq 'max_tokens=\|fit_bytes=' "$TMP/neutral.out" \
 #    It must say which, in its own legend. ─────────────────────────────────────────────────────────────
 "$BIN" src --pack-task="estimate tokens" --partition=2 --no-cache >"$TMP/part.out" 2>/dev/null
 if grep -aq '<bundle [^>]*est_tokens=' "$TMP/part.out"; then
-    grep -aq '2\.36' "$TMP/part.out" \
-        && ok "#6 --partition's bundle legend names the 2.36 B/tok rate its est_tokens uses" \
-        || no "#6 --partition reports est_tokens with no statement of which estimator/rate produced it"
+    # NON-VACUOUS (L1 fix round, the iter1a measurement): the rate must be stated in the answer's own COMMENTS. A document-wide
+    # grep passed on a ranked body that merely quoted "2.36" in its CDATA, while the compact legend never said it.
+    python3 -c 'import re, sys
+d = open( sys.argv[ 1 ], encoding = "utf-8", errors = "replace" ).read()
+d = re.sub( r"<!\[CDATA\[.*?\]\]>", "", d, flags = re.S )
+sys.exit( 0 if any( "2.36" in c for c in re.findall( r"<!--.*?-->", d, re.S ) ) else 1 )' "$TMP/part.out" \
+        && ok "#6 --partition's bundle legend names the 2.36 B/tok rate its est_tokens uses (in a comment, outside CDATA)" \
+        || no "#6 --partition reports est_tokens with no statement (in its legend comments) of which estimator/rate produced it"
     # and it must remain EXACT-over-measured-bytes: bytes/2.36, rounded to nearest (tokensForEmittedBytes)
     python3 - "$TMP/part.out" <<'PY' && ok "#6 every <bundle est_tokens= equals its own bytes/2.36 (measured, exact)" \
         || no "#6 a <bundle est_tokens= no longer equals bytes/2.36 — the third estimator drifted"
@@ -318,7 +442,7 @@ if command -v xmllint >/dev/null 2>&1; then
         # wrapped in <ctx> by the binary itself; xmllint sees one root either way.
         xmllint --noout "$TMP/$label.out" 2>/dev/null || { echo "    $label: xmllint rejected"; g4=0; }
     done
-    [ "$g4" = 1 ] && ok "#8 all payload shapes well-formed XML" || no "#8 a payload shape is malformed XML"
+    if [ "$g4" = 1 ]; then ok "#8 all payload shapes well-formed XML"; else no "#8 a payload shape is malformed XML"; fi
 else
     printf '  SKIP  #8 xmllint not installed\n'
 fi
@@ -468,6 +592,70 @@ FTB="$( bytes_of "$TMP/f_tb.out" )"
 { [ "$( bytes_of "$TMP/f_for_detail.out" )" -gt "$ALLOW" ]; } 2>/dev/null \
     && ok "#11 A7 no --token-budget: --detail keeps its --pack-budget-bytes budget (unbudgeted bundle unshrunk)" \
     || no "#11 A7 no --token-budget: --detail was trimmed anyway — the budget bound leaked into the default path"
+
+# A7 SWEEP (PR #135 CI, 2026-09-11) — the budget must bound the document at EVERY budget, not at the one operating
+# point above. That arm went red at 5 429 B against its 5 428 B allowance when a merge moved the live src/ corpus,
+# and the main binary emits the same 5 429 bytes on the same tree, so the corpus only exposed it. The defect: the
+# ceiling ladder priced the document WITHOUT the root over_ceiling="1" (17 B) and the legend clause defining it
+# (53 B), which runForLens splices on AFTER the ladder whenever est_tokens exceeds budget_tokens. est_tokens prices
+# markup at 2.50 B/tok and the allowance is sized at 2.36 x 1.15 = 2.714 B/tok, so every bundle in that band
+# carries 70 unpriced bytes, and one the ladder fitted within 70 B of the allowance is pushed past it with no rung
+# fired. One budget on the live tree only sees that when the corpus lands a bundle in the 70 B window, so this arm
+# builds its OWN git-less corpus in $TMP and runs it from a relative path (no at=, no churn, a fixed root=, nothing
+# read from the live repo) and SWEEPS the budget in 10-token steps: the window recurs with every trimmed row
+# (~50 tokens), so a sweep this dense crosses it whatever the legend lengths are. Two shapes — the default bundle
+# and A7's own --detail=20 --with-graph. THE PROPERTY: delivered bytes <= N x 2.36 x 1.15 at exit 0, or the
+# ladder's LAST rung fired and says so (the header floor alone exceeds the budget — the one overshoot it documents).
+A7S="$TMP/a7sweep"
+mkdir -p "$A7S/corpus"
+python3 - "$A7S/corpus" <<'PYG'
+import os, sys
+out = sys.argv[1]
+for i in range( 4 ):
+    lines = []
+    for j in range( 8 ):
+        nxt = f"serializeRow{i}_{j + 1}( map, row )" if j + 1 < 8 else "0"
+        lines += [ f"// serializeRow{i}_{j}: serialize one map row into the output buffer the map writer flushes",
+                   f"int serializeRow{i}_{j}( int map, int row )", "{",
+                   f"    int acc = map + row + {i * 7 + j};",
+                   f"    for( int k = 0; k < {j + 3}; ++k )", "    {",
+                   f"        acc += k * {i + 1} - row;", "    }",
+                   f"    return acc + {nxt};", "}", "" ]
+    with open( os.path.join( out, f"mod{i}.cpp" ), "w" ) as fh:
+        fh.write( "\n".join( lines ) )
+PYG
+a7s_bad=""; a7s_badn=0; a7s_runs=0; a7s_inside_labelled=0
+# RE-ANCHORED 2026-09-13 (PR #215): the default sweep starts at 760, not 1200. --for's rung zero now triggers on the
+# EXACT ceiling (verbs_for.h), so a document 1..15% over its budget drops its three explanatory clauses before the
+# allowance is consulted; on this corpus the late-label band (over_ceiling="1" INSIDE the allowance — the residual
+# after that drop) therefore sits at 780..810 instead of inside 1200..1500, and the control below would otherwise be
+# inert. Swept 700..3300 step 10 on the new binary: default hits at 780 790 800 810, none on the --detail=20 arm.
+for spec in "default:760:1500:" "detail_graph:2880:3080:--detail=20 --with-graph"; do
+    s_label="${spec%%:*}"; s_rest="${spec#*:}"; s_from="${s_rest%%:*}"; s_rest="${s_rest#*:}"; s_to="${s_rest%%:*}"; s_args="${s_rest#*:}"
+    for (( N = s_from; N <= s_to; N += 10 )); do
+        # shellcheck disable=SC2086
+        ( cd "$A7S" && "$BIN" corpus --for="serialize the map" --token-budget=$N $s_args --no-cache ) >"$A7S/o.xml" 2>/dev/null
+        s_rc=$?
+        a7s_runs=$(( a7s_runs + 1 ))
+        s_b="$( bytes_of "$A7S/o.xml" )"
+        s_a="$( awk "BEGIN{printf \"%d\", $N*2.36*1.15}" )"
+        s_root="$( grep -aoE '^<ctx [^>]*>' "$A7S/o.xml" | head -1 )"
+        if [ "$s_rc" -ne 0 ] || { [ "$s_b" -gt "$s_a" ] && ! grep -aqF '[over_ceiling= is 1 on the root: the header floor' "$A7S/o.xml"; }; then
+            a7s_badn=$(( a7s_badn + 1 ))
+            [ "$a7s_badn" -le 6 ] && a7s_bad="$a7s_bad $s_label@$N=${s_b}/${s_a}B(exit $s_rc)"
+        elif [ "$s_b" -le "$s_a" ] && [ "${s_root#* over_ceiling=\"1\"}" != "$s_root" ]; then
+            a7s_inside_labelled=$(( a7s_inside_labelled + 1 ))
+        fi
+    done
+done
+[ "$a7s_badn" -eq 0 ] \
+    && ok "#11 A7 sweep: $a7s_runs budgets over a git-less corpus (default 760..1500, --detail=20 --with-graph 2880..3080, step 10) — every document within N x 2.36 x 1.15 at exit 0, or on the ladder's disclosed last rung" \
+    || no "#11 A7 sweep: $a7s_badn of $a7s_runs budgets deliver past the allowance with no ladder rung fired (first:$a7s_bad) — a byte spliced in after the ladder priced the document"
+# control: the sweep must cross the band the defect lives in — a root that says over_ceiling="1" while the document
+# still fits the allowance (est_tokens > N at 2.50 B/tok, bytes <= 2.714 B/tok). No such budget = inert, re-anchor.
+[ "$a7s_inside_labelled" -gt 0 ] \
+    && ok "#11 A7 sweep control: $a7s_inside_labelled budget(s) carry a root over_ceiling=\"1\" INSIDE the allowance — the sweep crosses the late-label band" \
+    || no "#11 A7 sweep control: no budget carried over_ceiling=\"1\" inside the allowance — the sweep no longer reaches the est_tokens > N band, re-anchor its ranges"
 
 # A9/A10 — the header's own spliced attributes are inside the number. IDENTITY, not a band: for a bundle with
 # no --detail bodies, est_tokens is markup-only, so it must equal round(delivered bytes / 2.50) EXACTLY
@@ -654,17 +842,18 @@ fi
 # ── #14 (the CA4 coverage debt, trap #3): THE open_memstream DEGRADE PATH. The wave-1 verifier declared these
 #    paths never exercised: `open_memstream` fails on ALLOCATION, so no `ulimit -n` harness reaches them. The
 #    fault switch RIPWIRE_FAULT_CHARGE_BUFFER=1 exists ONLY on the non-NDEBUG flavour — the same flavour
-#    DEGRADED_PATH_ALERT exists on — so this arm establishes that flavour with its OWN observability probe
+#    DISCLOSE exists on — so this arm establishes that flavour with its OWN observability probe
 #    rather than assuming it, and it must never pass for lack of an alert it could not have seen.
 #
 #    (a) OBSERVABILITY PROBE. If the switch has no effect, exactly one of two things is true, and the
 #        preamble's two independent readings tell them apart: either this is an NDEBUG build, where the
 #        arm is unobservable BY DESIGN and the plain-flavour CI leg is what proves it (→ SKIP, reason
 #        named), or the seam regressed on a flavour that CAN see alerts (→ FAILURE). ─────────────────────
-RIPWIRE_FAULT_CHARGE_BUFFER=1 "$BIN" src --top-k=10 --pack-signatures --no-cache >"$TMP/dg.out" 2>"$TMP/dg.err"
+# L1 (2026-09-19): the compact legend spells <sigs> inside its comment, so #14c's find(<sigs) would start in the legend; both runs ask for the full legend.
+RIPWIRE_FAULT_CHARGE_BUFFER=1 "$BIN" src --top-k=10 --pack-signatures --no-cache --legend=full >"$TMP/dg.out" 2>"$TMP/dg.err"
 rc_dg=$?
 if grep -aq 'chargeSection: open_memstream failed' "$TMP/dg.err"; then
-    ok "#14a observability probe: this flavour CAN observe DEGRADED_PATH_ALERT (the fault switch is live)"
+    ok "#14a observability probe: this flavour CAN observe DISCLOSE (the fault switch is live)"
 
     #    (b) the alert names the CONSEQUENCE, on both the section and the document
     grep -aq 'streams uncharged' "$TMP/dg.err" \
@@ -676,7 +865,7 @@ if grep -aq 'chargeSection: open_memstream failed' "$TMP/dg.err"; then
 
     #    (c) THE BYTES ARE STILL COMPLETE AND CORRECT. The whole point of the degrade: the caller loses the
     #        charge, never the content. Byte-compare the payload against the undegraded run.
-    "$BIN" src --top-k=10 --pack-signatures --no-cache >"$TMP/dg_ctl.out" 2>/dev/null
+    "$BIN" src --top-k=10 --pack-signatures --no-cache --legend=full >"$TMP/dg_ctl.out" 2>/dev/null
     if python3 - "$TMP/dg_ctl.out" "$TMP/dg.out" <<'PY'
 import sys
 ctl = open( sys.argv[1], 'rb' ).read()
@@ -703,6 +892,40 @@ PY
     { [ -n "$DGE" ] && [ -n "$CTLE" ] && [ "$DGE" -lt "$CTLE" ]; } 2>/dev/null \
         && ok "#14d degraded est_tokens=$DGE is the MODELLED number, below the charged $CTLE (documented fallback, not a fabrication)" \
         || no "#14d degraded est_tokens=$DGE vs charged $CTLE — the fallback is not observable in the document"
+
+    #    (d2) RE-PIN 2026-09-19 (owner decision, lane/disclose-sink-form): the modelled fallback STAYS (the number
+    #         above) and is LABELLED — before, "the fallback is observable" meant only that the number was lower,
+    #         which a reader cannot tell from a smaller map. est_measured="0" rides beside it in every build flavour
+    #         (the MapEstimate / ChargedSection DISCLOSE sinks set it), defined in the same document, and the
+    #         undegraded control carries none. One arm per site class, each isolating the buffer that failed:
+    #         the XML map's own children buffer, the JSON map's rows + header-probe buffers, and a payload section
+    #         on a map-less (--top-k=0) document, where the est rests on the section alone.
+    grep -aq '<r [^>]* est_tokens="[0-9]*" est_measured="0"' "$TMP/dg.out" \
+        && ok "#14d2 [XML map buffer] the modelled est_tokens is labelled est_measured=\"0\" on <r>" \
+        || no "#14d2 [XML map buffer] the modelled est_tokens carries no est_measured=\"0\": $( grep -aoE '<r [^>]*>' "$TMP/dg.out" | head -1 | head -c 200 )"
+    grep -aq 'est_measured=0: ' "$TMP/dg.out" \
+        && ok "#14d2 [XML map buffer] est_measured= is defined in the same document" || no "#14d2 [XML map buffer] est_measured= rides undefined"
+    grep -aq 'est_measured' "$TMP/dg_ctl.out" \
+        && no "#14d2 control: the undegraded map carries est_measured" || ok "#14d2 control: the undegraded map carries no est_measured (measured is the default)"
+    RIPWIRE_FAULT_CHARGE_BUFFER=1 "$BIN" test/fixture --json --no-cache >"$TMP/dgj.out" 2>/dev/null
+    "$BIN" test/fixture --json --no-cache >"$TMP/dgj_ctl.out" 2>/dev/null
+    { grep -aq '"est_tokens":[0-9]*,.*"est_measured":false' "$TMP/dgj.out" && ! grep -aq 'est_measured' "$TMP/dgj_ctl.out"; } \
+        && ok "#14d2 [JSON map + header probe] \"est_measured\":false on the degrade, absent on the control (XML parity)" \
+        || no "#14d2 [JSON map + header probe] the JSON map's modelled est_tokens is unlabelled: $( head -c 200 "$TMP/dgj.out" )"
+    FXSYM="$( "$BIN" test/fixture --no-cache 2>/dev/null | grep -aoE ' n="[A-Za-z_]+"' | head -1 | sed 's/ n="//; s/"//' )"
+    RIPWIRE_FAULT_CHARGE_BUFFER=1 "$BIN" test/fixture --top-k=0 --expand="$FXSYM" --no-cache >"$TMP/dgk0.out" 2>/dev/null
+    "$BIN" test/fixture --top-k=0 --expand="$FXSYM" --no-cache >"$TMP/dgk0_ctl.out" 2>/dev/null
+    { grep -aq '<ctx [^>]*est_tokens="[0-9]*" est_measured="0"' "$TMP/dgk0.out" && grep -aq 'est_measured=0: ' "$TMP/dgk0.out" \
+      && ! grep -aq 'est_measured' "$TMP/dgk0_ctl.out"; } \
+        && ok "#14d2 [payload section, --top-k=0 --expand=$FXSYM] the section-only est_tokens is labelled and defined; the control carries none" \
+        || no "#14d2 [payload section] the uncharged section's est_tokens is unlabelled: $( grep -aoE '<ctx [^>]*>' "$TMP/dgk0.out" | head -1 )"
+
+    RIPWIRE_FAULT_CHARGE_BUFFER=1 "$BIN" test/fixture --pack-task="parse the config" --with-graph --no-cache >"$TMP/dgpt.out" 2>/dev/null
+    "$BIN" test/fixture --pack-task="parse the config" --with-graph --no-cache >"$TMP/dgpt_ctl.out" 2>/dev/null
+    { grep -aq '<ctx [^>]*est_measured="0"' "$TMP/dgpt.out" && grep -aq 'est_measured=0: ' "$TMP/dgpt.out" \
+      && ! grep -aq 'est_measured' "$TMP/dgpt_ctl.out"; } \
+        && ok "#14d2 [trailing section, --pack-task --with-graph] the graph block streamed uncharged and the root says est_measured=\"0\"" \
+        || no "#14d2 [trailing section] the pack-task est_tokens that left the graph block out is unlabelled: $( grep -aoE '<ctx [^>]*>' "$TMP/dgpt.out" | head -1 )"
 
     #    and the --for lens's own contract is the OTHER honest answer: it omits est_tokens rather than
     #    fabricate one it cannot compute. Both are acceptable; silently keeping a stale number is not.
@@ -739,7 +962,7 @@ PY
     #        control (`$TMP/dg_ctl.out`, no switch in the environment) is the reference.
     g4fail=0
     for badval in 10 1x 1000000 11 '1 ' 0 true ''; do
-        RIPWIRE_FAULT_CHARGE_BUFFER="$badval" "$BIN" src --top-k=10 --pack-signatures --no-cache >"$TMP/dg_g4.out" 2>"$TMP/dg_g4.err"
+        RIPWIRE_FAULT_CHARGE_BUFFER="$badval" "$BIN" src --top-k=10 --pack-signatures --no-cache --legend=full >"$TMP/dg_g4.out" 2>"$TMP/dg_g4.err"
         if grep -aq 'chargeSection: open_memstream failed' "$TMP/dg_g4.err"; then
             no "#14e RIPWIRE_FAULT_CHARGE_BUFFER='$badval' INJECTED the fault — only the exact value \"1\" may (prefix test, verifier G4)"
             g4fail=1
@@ -750,10 +973,259 @@ PY
     done
     [ "$g4fail" = 0 ] && ok "#14e the fault switch is exact-match: 8 non-\"1\" values (incl. 10 / 1x / 1000000) are byte-identical to unset"
 elif [ "$alerts_observable" -eq 0 ] && [ "$ndebug_flavour" -eq 1 ]; then
-    skip "#14 open_memstream degrade arms — DEGRADED_PATH_ALERT is compiled out of this binary (--version says build type \"$BUILD_FLAVOUR\", which defines NDEBUG; the unrelated --since=notadate degrade path is silent here too, so alerts are unobservable globally rather than this seam having broken). The RIPWIRE_FAULT_CHARGE_BUFFER switch does not exist on this flavour either. These arms are proven by the PLAIN-flavour run of the same suite, which CI executes as a second leg for exactly this reason."
+    skip "#14 open_memstream degrade arms — DISCLOSE is compiled out of this binary (--version says build type \"$BUILD_FLAVOUR\", which defines NDEBUG; the unrelated --scip decode degrade path is silent here too, so alerts are unobservable globally rather than this seam having broken). The RIPWIRE_FAULT_CHARGE_BUFFER switch does not exist on this flavour either. These arms are proven by the PLAIN-flavour run of the same suite, which CI executes as a second leg for exactly this reason."
 else
-    no "#14a observability probe FAILED: RIPWIRE_FAULT_CHARGE_BUFFER=1 produced no DEGRADED_PATH_ALERT on a build that CAN observe alerts (--version build type \"$BUILD_FLAVOUR\", unrelated-degrade-path observable=$alerts_observable) — the openChargeBuffer seam regressed. This is a FAILURE, not a skip."
+    no "#14a observability probe FAILED: RIPWIRE_FAULT_CHARGE_BUFFER=1 produced no DISCLOSE on a build that CAN observe alerts (--version build type \"$BUILD_FLAVOUR\", unrelated-degrade-path observable=$alerts_observable) — the openChargeBuffer seam regressed. This is a FAILURE, not a skip."
 fi
+
+# ── #14f THE MEMSTREAM FINISH DEGRADE: a buffer that opened and then lost a write takes the SAME path a failed open
+#    takes, and never prints the short bytes. A memstream records a lost write in its error flag, and on macOS fflush and
+#    fclose both return 0 afterwards (measured: 19 of 19 injected realloc failures; src/infra/emit.h MemoryStream).
+#    Every site used to read buf/sz after an unchecked close. INFRA_FAULT_MEMSTREAM_FINISH=1 (non-NDEBUG only, like the
+#    switch above) makes every finish report failure after really closing the stream, so each caller's degrade runs. The
+#    observability rule is #14's: a flavour that CAN see alerts and sees none of these is a FAILURE, NDEBUG is a SKIP.
+#    (a) the alert fires for the section AND the document;
+#    (b) THE DOCUMENT IS STILL WHOLE: byte-identical to the undegraded run once every est_tokens number is masked. The
+#        document was already spent into the buffer when the finish failed, so this proves the re-render, not a replay;
+#    (c) exit 0 and well-formed XML; (d) est_tokens is the MODELLED number, below the charged one;
+#    (e) --json: the same whole-document identity on the other serializer, and the document parses;
+#    (f) --token-budget, where the buffer IS the answer and nothing can render it again: nothing reaches stdout, exit 1,
+#        and stderr says the map was withheld — against an undegraded control that prints the map at exit 0.
+#    (g) --from-trace, whose <trace> map and signature/body section are rendered only into their buffers: the same
+#        refusal as (f). It used to print the bundle without either block at exit 0, which a Release build never told.
+#    (h) the MCP `uses` verb answers -32603 under the fault, never a success with empty text;
+#    (i) the --for lens (XML and --json) reports each redacted secret once when a degraded pre-render renders again.
+#    These arms cover those surfaces, not every MemoryStream holder; #14g is the fence over the rest.
+# RE-PIN 2026-09-19 (lane/disclose-sink-form, owner decision): the degraded document now LABELS its modelled number —
+# est_measured="0" on the root, est_measured=0 in the header comment, "est_measured":false in JSON, and the one legend
+# comment defining it. Those four spellings are the disclosure (asserted present by #14f(b2)), so they are masked with
+# est_tokens: "byte-identical outside the estimate" is still the claim, and the estimate now carries its own label.
+# L1 fix round (iter1a found item): the COMPACT default carries est_measured='s reading inside its one legend comment (a
+# present-only term, compactlegend.h), not as the full dialect's own comment, so the mask drops that sentence too.
+mask_est(){ sed -E 's/<!-- est_measured=0: [^>]*-->//g; s/ est_measured=0: est_tokens is the MODELLED estimate[^.]*\.//g; s/est_tokens(="?|":)[0-9]+/est_tokens\1N/g; s/ est_measured="0"//g; s/ est_measured=0//g; s/"est_measured":false,//g' "$1"; }
+INFRA_FAULT_MEMSTREAM_FINISH=1 "$BIN" src --top-k=10 --pack-signatures --no-cache >"$TMP/mf.out" 2>"$TMP/mf.err"
+rc_mf=$?
+if grep -aq 'chargeSection: the charge buffer did not finish whole' "$TMP/mf.err"; then
+    ok "#14f observability probe: INFRA_FAULT_MEMSTREAM_FINISH=1 reached the chargeSection finish"
+    grep -aq 'serialize: the charge buffer did not finish whole .* MODELLED bytes' "$TMP/mf.err" \
+        && ok "#14f(a) the serialize finish alert fired and says est_tokens reports the MODELLED bytes" \
+        || no "#14f(a) serialize's finish degraded without its alert (or the alert lost the MODELLED clause)"
+    "$BIN" src --top-k=10 --pack-signatures --no-cache >"$TMP/mf_ctl.out" 2>/dev/null
+    if [ -s "$TMP/mf_ctl.out" ] && cmp -s <( mask_est "$TMP/mf_ctl.out" ) <( mask_est "$TMP/mf.out" ); then
+        ok "#14f(b) the degraded document is byte-identical to the undegraded one outside est_tokens ($( bytes_of "$TMP/mf.out" ) B) — rendered again, whole"
+    else
+        no "#14f(b) the degraded document DIFFERS from the undegraded one outside est_tokens — a finish failure lost or corrupted content"
+    fi
+    grep -aq '<r [^>]* est_measured="0"' "$TMP/mf.out" && ! grep -aq 'est_measured' "$TMP/mf_ctl.out" \
+        && ok "#14f(b2) the finish-degraded map labels its modelled est_tokens est_measured=\"0\"; the control carries none" \
+        || no "#14f(b2) the finish-degraded map's modelled est_tokens is unlabelled"
+    if [ "$rc_mf" -eq 0 ]; then
+        ok "#14f(c) the degraded run exits 0"
+    else
+        no "#14f(c) the degraded run exited $rc_mf — a measurement buffer failure must degrade, not fail"
+    fi
+    if command -v xmllint >/dev/null 2>&1; then
+        if xmllint --noout "$TMP/mf.out" 2>/dev/null; then
+            ok "#14f(c) the degraded document is well-formed XML"
+        else
+            no "#14f(c) the degraded document is malformed XML"
+        fi
+    fi
+    MFE="$( est_of "$TMP/mf.out" )";  MFC="$( est_of "$TMP/mf_ctl.out" )"
+    { [ -n "$MFE" ] && [ -n "$MFC" ] && [ "$MFE" -lt "$MFC" ]; } 2>/dev/null \
+        && ok "#14f(d) degraded est_tokens=$MFE is the MODELLED number, below the charged $MFC" \
+        || no "#14f(d) degraded est_tokens=$MFE vs charged $MFC — the modelled fallback is not observable"
+    INFRA_FAULT_MEMSTREAM_FINISH=1 "$BIN" src --top-k=10 --json --no-cache >"$TMP/mfj.out" 2>"$TMP/mfj.err"
+    "$BIN" src --top-k=10 --json --no-cache >"$TMP/mfj_ctl.out" 2>/dev/null
+    if grep -aq 'serializeJson: the charge buffer did not finish whole' "$TMP/mfj.err" && [ -s "$TMP/mfj_ctl.out" ] \
+       && cmp -s <( mask_est "$TMP/mfj_ctl.out" ) <( mask_est "$TMP/mfj.out" ) \
+       && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/mfj.out" 2>/dev/null; then
+        ok "#14f(e) --json: the finish alert fired, and the document parses and is byte-identical outside est_tokens"
+    else
+        no "#14f(e) --json under the finish fault: no alert, a different document outside est_tokens, or JSON that does not parse"
+    fi
+    "$BIN" test/fixture --token-budget=100000 --no-cache >"$TMP/mft_ctl.out" 2>/dev/null; rc_mft_ctl=$?
+    INFRA_FAULT_MEMSTREAM_FINISH=1 "$BIN" test/fixture --token-budget=100000 --no-cache >"$TMP/mft.out" 2>"$TMP/mft.err"; rc_mft=$?
+    if [ "$rc_mft_ctl" -eq 0 ] && [ -s "$TMP/mft_ctl.out" ] && [ "$rc_mft" -eq 1 ] && [ ! -s "$TMP/mft.out" ] \
+       && grep -aq 'the map is withheld, not printed short' "$TMP/mft.err"; then
+        ok "#14f(f) --token-budget: the control prints $( bytes_of "$TMP/mft_ctl.out" ) B at exit 0; under the fault stdout is EMPTY, exit 1, and stderr says the map was withheld"
+    else
+        no "#14f(f) --token-budget under the finish fault: control rc=$rc_mft_ctl ($( bytes_of "$TMP/mft_ctl.out" ) B), faulted rc=$rc_mft with $( bytes_of "$TMP/mft.out" ) B on stdout — want 0/non-empty and 1/empty with the withheld line"
+    fi
+    printf 'Traceback (most recent call last):\n  File "test/fixture/app.py", line 10, in total_area\n    return sum(area_of_triangle(b, h) for b, h in triangles)\n  File "test/fixture/app.py", line 5, in area_of_triangle\n    return 0.5 * base * height\nZeroDivisionError: boom\n' >"$TMP/mftr.txt"
+    "$BIN" test/fixture --from-trace="$TMP/mftr.txt" --no-cache >"$TMP/mftr_ctl.out" 2>/dev/null; rc_mftr_ctl=$?
+    INFRA_FAULT_MEMSTREAM_FINISH=1 "$BIN" test/fixture --from-trace="$TMP/mftr.txt" --no-cache >"$TMP/mftr.out" 2>"$TMP/mftr.err"; rc_mftr=$?
+    if [ "$rc_mftr_ctl" -eq 0 ] && grep -aq '<trace ' "$TMP/mftr_ctl.out" && [ "$rc_mftr" -eq 1 ] && [ ! -s "$TMP/mftr.out" ] \
+       && grep -aq 'a --from-trace buffer lost bytes; the bundle is withheld' "$TMP/mftr.err"; then
+        ok "#14f(g) --from-trace: the control prints its <trace> bundle ($( bytes_of "$TMP/mftr_ctl.out" ) B) at exit 0; under the fault stdout is EMPTY, exit 1, and stderr says the bundle was withheld"
+    else
+        no "#14f(g) --from-trace under the finish fault: control rc=$rc_mftr_ctl ($( bytes_of "$TMP/mftr_ctl.out" ) B), faulted rc=$rc_mftr with $( bytes_of "$TMP/mftr.out" ) B on stdout — want 0 with a <trace> block, then 1/empty with the withheld line (a bundle without its blocks is the defect)"
+    fi
+    # (h) the MCP verbs whose answer buffer IS the answer: under the fault each answers the internal error, -32603 —
+    #     never a SUCCESS with empty text (an empty answer reads as "no use sites") and never the verb's not-found refusal
+    #     (-32602, "no symbols found" / an unknown symbol), which is what impact, exemplar, path_between and for answered
+    #     until CodeRabbit on #277: their builders collapsed a lost buffer into "" and the dispatch read "" as not-found.
+    #     One control per verb proves the fixture answers its element with the fault OFF, so a -32603 below is the fault.
+    python3 - "$BIN" "$ROOT/test/fixture" >"$TMP/mfuses.txt" 2>&1 <<'PY'
+import json, os, subprocess, sys
+b, root = sys.argv[1], sys.argv[2]
+verbs = [ ( "uses",         { "symbol": "distance" },                     "<uses " ),
+          ( "impact",       { "symbol": "distance" },                     "<impact " ),
+          ( "exemplar",     { "kind": "fn" },                             "<exemplar " ),
+          ( "path_between", { "from": "total_area", "to": "distance" },   "<path " ),
+          ( "for",          { "task": "area distance" },                  "<ctx " ) ]
+init = { "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": { "name": "g", "version": "0" } } }
+calls = [ { "jsonrpc": "2.0", "id": 2 + i, "method": "tools/call", "params": { "name": v, "arguments": dict( { "path": root }, **a ) } } for i, ( v, a, _ ) in enumerate( verbs ) ]
+inp = ''.join( json.dumps( m ) + '\n' for m in [ init ] + calls )
+for label, extra in ( ( 'ctl', {} ), ( 'fault', { 'INFRA_FAULT_MEMSTREAM_FINISH': '1' } ) ):
+    out = subprocess.run( [ b, '--mcp' ], input=inp, capture_output=True, text=True, env=dict( os.environ, **extra ), timeout=120 ).stdout
+    replies = { json.loads( l ).get( 'id' ): json.loads( l ) for l in out.splitlines() if l.strip().startswith( '{' ) }
+    for i, ( v, _, element ) in enumerate( verbs ):
+        reply = replies.get( 2 + i, {} )
+        text = ( ( reply.get( 'result' ) or {} ).get( 'content' ) or [ {} ] )[ 0 ].get( 'text', '' )
+        print( f"{label} verb={v} error={( reply.get( 'error' ) or {} ).get( 'code', 'none' )} result_text_bytes={len( text )} element={int( element in text )}" )
+PY
+    for mfVerb in uses impact exemplar path_between for; do
+        if grep -q "^ctl verb=$mfVerb error=none result_text_bytes=[1-9][0-9]* element=1\$" "$TMP/mfuses.txt" && grep -q "^fault verb=$mfVerb error=-32603 " "$TMP/mfuses.txt"; then
+            ok "#14f(h) MCP $mfVerb: the control answers its element; under the fault it answers -32603, not an empty success or a not-found"
+        else
+            no "#14f(h) MCP $mfVerb under the finish fault: $( grep " verb=$mfVerb " "$TMP/mfuses.txt" | tr '\n' ';' ) — want the control's element, then error -32603"
+        fi
+    done
+    # (i) one redaction tally per secret: a degraded pre-render renders its rows again, and the stderr summary must
+    #     count what was emitted once. XML --for and --json, each against its own undegraded control.
+    mkdir -p "$TMP/mfred"
+    printf 'def probeVaultHelper( token = "%s" ):\n    return token\n\ndef probeVaultLoader( key = "%s", label = "rotate-quarterly" ):\n    return probeVaultHelper( key )\n' \
+        "ghp_""ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" "AKIA""IOSFODNN7EXAMPLE" > "$TMP/mfred/app.py"
+    for mfredMode in xml json; do
+        mfredFlag=""; [ "$mfredMode" = json ] && mfredFlag="--json"
+        "$BIN" "$TMP/mfred" --for="probe vault loader helper" $mfredFlag --no-cache >/dev/null 2>"$TMP/mfred_ctl.err"
+        INFRA_FAULT_MEMSTREAM_FINISH=1 "$BIN" "$TMP/mfred" --for="probe vault loader helper" $mfredFlag --no-cache >/dev/null 2>"$TMP/mfred_f.err"
+        mfredCtl="$( grep -a '^ripwire: redacted ' "$TMP/mfred_ctl.err" )"; mfredF="$( grep -a '^ripwire: redacted ' "$TMP/mfred_f.err" )"
+        if [ -n "$mfredCtl" ] && [ "$mfredCtl" = "$mfredF" ]; then
+            ok "#14f(i) --for ($mfredMode): the redaction summary under the fault equals the control's ($mfredCtl)"
+        else
+            no "#14f(i) --for ($mfredMode): control says [${mfredCtl:-no summary}], faulted run says [${mfredF:-no summary}] — a re-rendered block counted its secrets twice"
+        fi
+    done
+elif [ "$alerts_observable" -eq 0 ] && [ "$ndebug_flavour" -eq 1 ]; then
+    skip "#14f memstream finish degrade arms — this NDEBUG binary has neither DISCLOSE nor the INFRA_FAULT_MEMSTREAM_FINISH switch (build type \"$BUILD_FLAVOUR\"); the PLAIN-flavour CI leg proves them"
+else
+    no "#14f observability probe FAILED: INFRA_FAULT_MEMSTREAM_FINISH=1 produced no finish alert on a build that CAN observe alerts (build type \"$BUILD_FLAVOUR\", observable=$alerts_observable) — the MemoryStream seam or its switch regressed"
+fi
+
+# ── #14g THE FENCE, over the source: every memstream is owned by rw::MemoryStream ─────────────────────────────────────
+#    [[nodiscard]] on MemoryStream::finish makes a caller that IGNORES the answer a compiler warning; it cannot stop a
+#    caller from opening a stream by hand, which is how twenty-two sites read buf/sz after an unchecked close. So, over
+#    src/, with comments stripped:
+#      (A) `open_memstream(` appears only inside `class MemoryStream` (src/infra/emit.h) and inside the one opener it is
+#          handed, serialize.h's fault-injectable openChargeBuffer;
+#      (B) openChargeBuffer is called only by openChargeStream, which hands it to MemoryStream::openWith;
+#      (C) no fflush/fclose names a FILE* that came from a memory stream (`= x.open(…)` or `x.openWith(…)`, `= openChargeStream(…)` or
+#          `= open_memstream(…)`, spelled bare, `::`, `os::` or `rw::os::`).
+#    Presence guards first (the class and its [[nodiscard]] finish exist, and the population is real), then the rule,
+#    then a POSITIVE CONTROL: the same scan over a copy of src/ with one real site turned back into the hand-written
+#    open and close it replaced must report exactly that site — a scan that cannot fail is not a fence.
+memstream_scan(){ python3 - "$1" <<'PY'
+import os, re, sys
+src = sys.argv[1]
+texts = {}
+for dirpath, _, files in os.walk( src ):
+    for fn in sorted( files ):
+        if fn.endswith( ( '.h', '.cpp', '.hpp', '.inl' ) ):
+            path = os.path.join( dirpath, fn )
+            texts[ os.path.relpath( path, src ) ] = open( path, encoding='utf-8', errors='replace' ).read().split( '\n' )
+code = lambda line: line.split( '//', 1 )[0]
+def region( rel, head, close ):
+    lines = texts.get( rel, [] )
+    start = next( ( i for i, l in enumerate( lines ) if re.match( head, l ) ), None )
+    end   = next( ( i for i in range( start, len( lines ) ) if lines[i] == close ), None ) if start is not None else None
+    return ( start, end )
+def region_oneline( rel, head ):
+    # a self-contained one-line definition ( `{ ... }` on its own line): the region is that single line.
+    lines = texts.get( rel, [] )
+    start = next( ( i for i, l in enumerate( lines ) if re.match( head, l ) ), None )
+    return ( start, start ) if start is not None else ( None, None )
+emit, ser = os.path.join( 'infra', 'emit.h' ), 'serialize.h'
+cls  = region( emit, r'class MemoryStream\b', '};' )
+opnr = region( ser, r'inline std::FILE\* openChargeBuffer\s*\(', '}' )
+strm = region( ser, r'inline std::FILE\* openChargeStream\s*\(', '}' )
+# src/infra/os.h is THE seam (infra/os.h's own header comment): its open_memstream is the ONE place the raw libc
+# call is still spelled bare — every other opener in this tree now goes through os::open_memstream / rw::os::open_memstream
+# (MemoryStream::open and serialize.h's openChargeBuffer both call it that way, so (A) never sees them). That one
+# wrapper definition is exempt by name, not by a widened pattern — a NEW hand-written open_memstream anywhere else,
+# os.h included, still fires.
+osh    = os.path.join( 'infra', 'os.h' )
+osOpen = region_oneline( osh, r'\[\[gnu::always_inline\]\] inline std::FILE\* open_memstream\(' )
+# The same seam's Windows half: os.h's Windows branch DECLARES open_memstream (one line), and src/infra/os_win32.cpp
+# DEFINES it (a temporary file whose bytes os::fflush / os::fclose publish). Both are the seam itself, exempt by name.
+osWin  = os.path.join( 'infra', 'os_win32.cpp' )
+osDecl = region_oneline( osh, r'std::FILE\* open_memstream\( char\*\* buffer, std::size_t\* size \);' )
+winDef = region( osWin, r'std::FILE\* open_memstream\(', '}' )
+inside = lambda rel, i, r, want: rel == want and r[0] is not None and r[1] is not None and r[0] <= i <= r[1]
+finish = cls[1] is not None and any( re.search( r'\[\[nodiscard\]\]\s*MemoryStreamBytes\s+finish\s*\(', l ) for l in texts[ emit ][ cls[0]:cls[1] ] )
+holders, violations = 0, []
+OPENED = re.compile( r'([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\.open(?:With)?\s*\(|(?:::)?(?:rw::)?(?:os::)?(?:open_memstream|openChargeStream)\s*\()' )
+for rel, lines in sorted( texts.items() ):
+    holders += sum( len( re.findall( r'\bMemoryStream\s+[A-Za-z_]\w*\s*;', code( l ) ) ) for l in lines )
+    names = { m.group( 1 ) for l in lines for m in OPENED.finditer( code( l ) ) }
+    closes = re.compile( r'\b(?:std::)?(fflush|fclose)\s*\(\s*(' + '|'.join( re.escape( n ) for n in sorted( names ) ) + r')\s*\)' ) if names else None
+    for i, l in enumerate( lines ):
+        c = code( l )
+        if re.search( r'\bopen_memstream\s*\(', c ) and not inside( rel, i, cls, emit ) and not inside( rel, i, opnr, ser ) and not inside( rel, i, osOpen, osh ) \
+           and not inside( rel, i, osDecl, osh ) and not inside( rel, i, winDef, osWin ):
+            violations.append( f'{rel}:{i + 1}: (A) open_memstream outside MemoryStream' )
+        if re.search( r'\bopenChargeBuffer\s*\(', c ) and not inside( rel, i, opnr, ser ) and not inside( rel, i, strm, ser ):
+            violations.append( f'{rel}:{i + 1}: (B) openChargeBuffer called outside openChargeStream' )
+        if closes and not inside( rel, i, cls, emit ):
+            for m in closes.finditer( c ):
+                violations.append( f'{rel}:{i + 1}: (C) {m.group( 1 )}( {m.group( 2 )} ) on a memory stream' )
+print( f'holders={holders} class={int( cls[1] is not None )} finish_nodiscard={int( finish )} opener={int( opnr[1] is not None and strm[1] is not None )} violations={len( violations )}' )
+for v in violations:
+    print( 'VIOLATION ' + v )
+PY
+}
+memstream_scan "$ROOT/src" >"$TMP/ms_live.txt" 2>&1
+MS_SUMMARY="$( head -1 "$TMP/ms_live.txt" )"
+MS_HOLDERS="$( sed -nE 's/^holders=([0-9]+).*/\1/p' "$TMP/ms_live.txt" )"
+MS_VIOL="$( sed -nE 's/.* violations=([0-9]+)$/\1/p' "$TMP/ms_live.txt" )"
+{ [ -n "$MS_HOLDERS" ] && [ "$MS_HOLDERS" -ge 10 ]; } 2>/dev/null \
+    && ok "#14g presence: $MS_HOLDERS MemoryStream holders under src/ ($MS_SUMMARY)" \
+    || no "#14g presence: '${MS_HOLDERS:-no}' MemoryStream holders — the population is gone or the pattern stopped matching ($MS_SUMMARY)"
+grep -q 'class=1 finish_nodiscard=1 opener=1' "$TMP/ms_live.txt" \
+    && ok "#14g presence: class MemoryStream with a [[nodiscard]] finish(), and serialize.h's openChargeBuffer and openChargeStream, all found" \
+    || no "#14g presence: MemoryStream, its [[nodiscard]] finish(), openChargeBuffer or openChargeStream is missing — the exemptions would exempt nothing ($MS_SUMMARY)"
+[ "$MS_VIOL" = "0" ] \
+    && ok "#14g the rule: 0 hand-written open_memstream / openChargeBuffer / fflush / fclose of a memory stream outside MemoryStream" \
+    || no "#14g a memory stream handled by hand outside MemoryStream: $( grep '^VIOLATION' "$TMP/ms_live.txt" | tr '\n' ';' )"
+#    positive control: turn tracelocus.h's first MemoryStream back into the hand-written open and close it replaced, once
+#    per spelling of the opener a call site can use — (C) keys the close on the name the open assigned, so a spelling the
+#    OPENED pattern does not know hides the close even while (A) still reports the open. The hand-opened FILE* gets a
+#    name no other site in the file assigns (`hand`): (C)'s names are per file, and tracelocus.h's other holders all
+#    call theirs `m`, so a control that reused `m` would pass on a sibling's open and prove nothing about this one.
+for MS_SPELL in open_memstream ::open_memstream os::open_memstream rw::os::open_memstream; do
+    rm -rf "$TMP/ms_src"; cp -R "$ROOT/src" "$TMP/ms_src"
+    python3 - "$TMP/ms_src/tracelocus.h" "$MS_SPELL" <<'PY'
+import sys
+p, spell = sys.argv[1], sys.argv[2]; t = open( p ).read()
+t = t.replace( 'rw::MemoryStream stream;\n    std::FILE* const m = stream.open();', 'char* buf = nullptr;  std::size_t sz = 0;\n    std::FILE* hand = ' + spell + '( &buf, &sz );\n    std::FILE* const m = hand;', 1 )
+t = t.replace( 'const rw::MemoryStreamBytes block = stream.finish();', 'std::fclose( hand );  const rw::MemoryStreamBytes block{ std::string_view( buf, sz ), buf != nullptr };', 1 )
+open( p, 'w' ).write( t )
+PY
+    if cmp -s "$ROOT/src/tracelocus.h" "$TMP/ms_src/tracelocus.h"; then
+        no "#14g positive control ($MS_SPELL): the mutation did not take (tracelocus.h unchanged) — the control proves nothing"
+        continue
+    fi
+    memstream_scan "$TMP/ms_src" >"$TMP/ms_ctl.txt" 2>&1
+    MS_CA="$( grep -c '^VIOLATION tracelocus.h:[0-9]*: (A)' "$TMP/ms_ctl.txt" )"
+    MS_CC="$( grep -c '^VIOLATION tracelocus.h:[0-9]*: (C) fclose( hand )' "$TMP/ms_ctl.txt" )"
+    MS_CT="$( grep -c '^VIOLATION' "$TMP/ms_ctl.txt" )"
+    if [ "$MS_CA" = "1" ] && [ "$MS_CC" = "1" ] && [ "$MS_CT" = "2" ]; then
+        ok "#14g positive control ($MS_SPELL): the same scan over a copy with one site hand-opened and hand-closed again reports exactly those two lines ($( grep '^VIOLATION' "$TMP/ms_ctl.txt" | sed 's/^VIOLATION //' | tr '\n' ' '))"
+    else
+        no "#14g positive control ($MS_SPELL): expected tracelocus.h (A)=1 (C)=1 and 2 in total, got $MS_CA, $MS_CC and $MS_CT — the scan cannot see the defect it exists for"
+    fi
+done
 
 # ── §C1 + §C2 (capture-audit-4, wave 3): --for --json's ENVELOPE is charged, and so is over_ceiling ─────
 #
@@ -1014,7 +1486,7 @@ printf '<handoff budget="100" withheld="12">' >"$TMP/p15_mut.xml"
 if command -v xmllint >/dev/null 2>&1; then
     for f in p15_pt p15_pt50 p15_ft p15_ft50 p15_ho100 p15_hobig p15_ex; do
         [ -s "$TMP/$f.xml" ] || continue
-        xmllint --noout "$TMP/$f.xml" 2>/dev/null && ok "#15 $f.xml is well-formed" || no "#15 $f.xml FAILED xmllint"
+        if xmllint --noout "$TMP/$f.xml" 2>/dev/null; then ok "#15 $f.xml is well-formed"; else no "#15 $f.xml FAILED xmllint"; fi
     done
 fi
 
@@ -1062,8 +1534,278 @@ else
     "$BIN" "$ROOT" --for="rank graph teleport" --no-cache >"$TMP/f5_cli.xml" 2>/dev/null
     band15 "CLI --for (same task, same repo)" "$TMP/f5_cli.xml" ctx 320 "#16"
     if command -v xmllint >/dev/null 2>&1; then
-        xmllint --noout "$TMP/f5_mcp.xml" 2>/dev/null && ok "#16 the priced MCP for bundle is well-formed XML" || no "#16 the priced MCP for bundle is malformed XML"
+        if xmllint --noout "$TMP/f5_mcp.xml" 2>/dev/null; then ok "#16 the priced MCP for bundle is well-formed XML"; else no "#16 the priced MCP for bundle is malformed XML"; fi
     fi
+fi
+
+# ── #17 (0.6.1, M2): --connect must charge its CONDITIONAL legend comment, and stay CONSERVATIVE ────────
+# packConnect emits THREE things ahead of its payload — kConnectHeader, the #66 graph_unindexed legend
+# comment (emitted exactly when graph_unindexed= rides the root), and the shared root-relative legend — and
+# connectExtraBytes charged only two of them. PR #72 (issue #66, 382e66e6) raised kConnectRootBytes 260 -> 285 for the
+# ATTRIBUTE and missed the 185 B COMMENT beside it, so on the two corpora below — identical but for one file
+# no grammar can read — the delivered document grew 205 B (185 B comment + the 20 B attribute) while
+# est_tokens did not move by a single token:
+#     0 unindexed files  2503 B   est_tokens=1049   modelled 2622 B   -119 B  (conservative)
+#     1 unindexed file   2708 B   est_tokens=1049   modelled 2622 B    +86 B  (OPTIMISTIC — the defect)
+# The printed est_tokens, the --max-tokens fit check and the over_ceiling="1" verdict then all measure a
+# smaller document than the caller receives, which is precisely what connectEstTokens' own header and
+# kConnectRootBytes' ("short is the ONE direction this constant may not be") say must never happen.
+#
+# WHY THIS IS NOT ALREADY COVERED by #1/#15's band arms: 2503/1049 = 2.38 B/tok and 2708/1049 = 2.58 B/tok
+# sit comfortably INSIDE the 2.00-3.20 markup band, so a band arm is green on both sides of the defect. The
+# separating property is the DIRECTION, not the magnitude — the delivered document must fit inside
+# est_tokens x kBytesPerTokenDefault (2.50) — and it must be asserted on a corpus that HAS an unindexed
+# file, because that is the only arm the uncharged comment reaches. Both corpora are asserted so the arm
+# cannot pass by measuring the side that was never broken.
+#
+# THE FIXTURE NAMES ARE THE SAME LENGTH ON PURPOSE, and that is not cosmetic. The first spelling of this
+# arm used "clean" and "unindexed": four extra path bytes land inside root="...", connectExtraBytes DOES
+# charge root=, and the estimate therefore moved 1047 -> 1048 across the mutation (observed, on the binary
+# this arm was written red against). The monotone arm (c)
+# passed on that ONE token while the defect it names was fully present — CONTRIBUTING §2 shape 5, a control
+# whose two arms differ in something other than the thing under test. Equal-length names make the legend
+# comment the only byte source that can move the estimate.
+C17="$TMP/c17"
+mkdir -p "$C17/unindexed_0/src" "$C17/unindexed_1/src"
+for d in unindexed_0 unindexed_1; do
+    printf 'export function greet( name: string ): string\n{\n    return `hello ${name}`;\n}\n'                        >"$C17/$d/src/util.ts"
+    printf 'import { greet } from "./util.ts";\nexport function render(): string\n{\n    return greet( "world" );\n}\n' >"$C17/$d/src/consumer.ts"
+done
+# THE ONE DIFFERENCE between the two corpora: a file no grammar in this build can read (real input, really
+# mutated — the identical extraction runs over both).
+# `.vue`, NOT `.astro`: issue #67 made .astro indexable (it rides the TypeScript grammar over its `---`
+# frontmatter), which is exactly the "if .astro ever became indexable" case the presence guards below were
+# written for — they fired, and this is the update they asked for.
+printf -- '<script setup lang="ts">\nconst x = 1;\n</script>\n<template><p>{{ x }}</p></template>\n' >"$C17/unindexed_1/src/page.vue"
+for d in unindexed_0 unindexed_1; do
+    # L1 (2026-09-19): #17 measures the FULL legend's #66 comment (graph_unindexed= prose), so it asks for the full legend.
+    "$BIN" "$C17/$d" --connect=render,greet --no-cache --legend=full >"$TMP/c17_$d.xml" 2>/dev/null
+done
+C17_LEGEND='graph_unindexed=N is a third gauge'
+# (a) presence guards — assert the mutation TOOK before trusting any number derived from it. Without these
+#     the arm is the "wrong population" shape: if .vue ever became indexable, or the legend moved, the two
+#     corpora would be identical and the comparison below would prove nothing while staying green.
+C17_CLEAN_U="$(  root_attr "$TMP/c17_unindexed_0.xml" connect graph_unindexed )"
+C17_UNIDX_U="$(  root_attr "$TMP/c17_unindexed_1.xml" connect graph_unindexed )"
+{ [ -z "$C17_CLEAN_U" ] && [ "$C17_UNIDX_U" = "1" ]; } \
+    && ok "#17 mutation took: the clean corpus carries no graph_unindexed= and the mutated one carries graph_unindexed=\"1\"" \
+    || no "#17 mutation did NOT take: graph_unindexed= is '${C17_CLEAN_U:-<absent>}' clean vs '${C17_UNIDX_U:-<absent>}' mutated — the arm is measuring two identical corpora"
+{ ! grep -q "$C17_LEGEND" "$TMP/c17_unindexed_0.xml" && grep -q "$C17_LEGEND" "$TMP/c17_unindexed_1.xml"; } \
+    && ok "#17 the #66 legend comment is emitted on the mutated corpus and absent on the clean one (the uncharged bytes are really there)" \
+    || no "#17 the #66 legend comment is not where this arm needs it — present on clean, or missing from the mutated corpus"
+C17_BC="$( bytes_of "$TMP/c17_unindexed_0.xml" )"; C17_EC="$( root_est "$TMP/c17_unindexed_0.xml" connect )"
+C17_BU="$( bytes_of "$TMP/c17_unindexed_1.xml" )"; C17_EU="$( root_est "$TMP/c17_unindexed_1.xml" connect )"
+{ [ -n "$C17_EC" ] && [ -n "$C17_EU" ] && [ "$C17_EC" -gt 0 ] && [ "$C17_EU" -gt 0 ]; } 2>/dev/null \
+    || no "#17 a <connect> root carries no positive est_tokens= (clean '$C17_EC', mutated '$C17_EU')"
+[ "$C17_BU" -gt "$C17_BC" ] 2>/dev/null \
+    && ok "#17 the mutated document is $(( C17_BU - C17_BC )) B larger than the clean one ($C17_BC -> $C17_BU B)" \
+    || no "#17 the mutated document did not grow ($C17_BC -> $C17_BU B) — there is nothing for est_tokens to have missed"
+# (b) THE PROPERTY, on both corpora: the WHOLE delivered document fits inside est_tokens x 2.50 B/tok.
+#     Integer math, no tolerance added: kConnectRootBytes deliberately OVER-covers the start tag, so a
+#     correctly charged document sits ~100 B clear of this line and only an uncharged section crosses it.
+#     The 2.50 is serialize.h's kBytesPerTokenDefault, the rate connectEstTokens divides by — if that
+#     constant ever moves, this arm's 25/10 moves with it, the same hand-pinned coupling #1's bands carry.
+for entry in "0 unindexed files:$C17_BC:$C17_EC" "1 unindexed file:$C17_BU:$C17_EU"; do
+    lab="${entry%%:*}"; rest="${entry#*:}"; b="${rest%%:*}"; e="${rest#*:}"
+    [ -n "$e" ] && [ "$e" -gt 0 ] 2>/dev/null || continue
+    m=$(( e * 25 / 10 ))
+    [ $(( b * 10 )) -le $(( e * 25 )) ] \
+        && ok "#17 --connect ($lab): $b B delivered against est_tokens=$e x 2.50 = $m B modelled — CONSERVATIVE by $(( m - b )) B" \
+        || no "#17 --connect ($lab): $b B delivered against est_tokens=$e x 2.50 = $m B modelled — OPTIMISTIC by $(( b - m )) B; a section of the document is not charged to est_tokens"
+done
+# (c) MONOTONE, the same property #2/#11 assert elsewhere: the two corpora share a payload byte for byte, so
+#     the ONLY thing that moved is the legend comment — and an estimate that does not move when the document
+#     does is the signature of the defect (est_tokens=1049 on both sides of a 205 B growth).
+{ [ -n "$C17_EU" ] && [ -n "$C17_EC" ] && [ "$C17_EU" -gt "$C17_EC" ]; } 2>/dev/null \
+    && ok "#17 --connect: est_tokens rose $C17_EC -> $C17_EU when the document grew (the conditional legend is charged)" \
+    || no "#17 --connect: est_tokens stayed at '$C17_EC' -> '$C17_EU' across a $(( C17_BU - C17_BC )) B growth — the conditional legend comment is uncharged"
+# (d) G4 — the two captures stay well-formed (this arm reads bytes, so it must not be reading a broken doc)
+if command -v xmllint >/dev/null 2>&1; then
+    for f in c17_unindexed_0 c17_unindexed_1; do
+        if xmllint --noout "$TMP/$f.xml" 2>/dev/null; then ok "#17 $f.xml is well-formed"; else no "#17 $f.xml FAILED xmllint"; fi
+    done
+fi
+
+# ── #18 (PR #215 review): RUNG ZERO PRICES THE DOCUMENT IT WOULD EMIT, IN THE ROOT'S OWN MIXED RATE ────
+#
+# THE DEFECT. --for's ceiling ladder has a rung ZERO below its own three rungs: the droppable legend trio
+# (the confidence reading, the r=/<tail> reading, the sc=/route= reading). It fires when the header does not
+# fit "the ceiling the root promises", and it used to spell that ceiling in BYTES — the raw document total
+# against budget x 2.50 — while the promise itself, est_tokens <= budget_tokens, is a MIXED rate: markup at
+# 2.50 B/tok and the --detail / auto bodies at 3.80 B/tok (serialize.h, finishForLensHeader). Every body byte
+# was therefore charged 1.52x what the root charges it. The same test also priced the candidate through a sum
+# built from RESERVES and from the auto section whether or not that section was rendered — not the document
+# stdout receives. Both errors point one way: a document its own root says fits was judged not to, and three
+# definitions the reader has no other source for were spent to buy headroom that was already there.
+#
+# WHAT IS ASSERTED, and why it needs no magic budget. A document that prices at est_tokens=E fits EVERY budget
+# >= E, by the root's own arithmetic — so this arm READS E off a wide run where nothing is dropped and probes
+# just above it. No pinned byte count: if the corpus or the legend moves, E moves with it and the probe follows.
+# Both guards against an empty pass are asserted rather than assumed — the wide run must carry the clauses (else
+# there is no E), and the control below must still DROP them (else the rung is gone, not fixed).
+# GIT-LESS and relative, the #11 A7 sweep's discipline: no at=, no churn, a fixed root=, nothing from the live
+# repo. --detail=1 is what puts bytes at the BODY rate, which is the half of the defect a bodiless bundle cannot
+# see; the fixture's one long body exceeds the tight budget's residual, so the first-entry-whole floor emits a
+# truncated ~190 B of it at every budget in the band and the band's width is that floor x (1/2.50 - 1/3.80).
+# MEASURED on the c4478402 binary: the band is 1069..1099 — 31 budgets at which the kept document prices at
+# est_tokens=1069 with no over_ceiling=, and the pre-fix rung dropped all three clauses and delivered 715.
+RZ="$TMP/rungzero"
+mkdir -p "$RZ/corpus"
+python3 - "$RZ/corpus" <<'PYRZ'
+import os, sys
+out   = sys.argv[ 1 ]
+lines = [ "def widgetPingBoxRouter( alpha, beta ):",
+          '    """Widget ping box router: route every alpha reading onto the beta box."""',
+          "    total = 0" ]
+for j in range( 26 ):
+    lines.append( f"    total = total + alpha * {j} - beta * {j} + widgetPingStep{j % 4}( total, {j} )" )
+lines.append( "    return total" )
+with open( os.path.join( out, "router.py" ), "w" ) as fh:
+    fh.write( "\n".join( lines ) + "\n" )
+with open( os.path.join( out, "steps.py" ), "w" ) as fh:
+    for j in range( 4 ):
+        fh.write( f'def widgetPingStep{j}( total, step ):\n    """Step {j}."""\n    return total + step\n\n' )
+PYRZ
+# L1 (2026-09-19): #18 counts the FULL legend's droppable clauses (confidence=/tail:/route= prose), so rz_run asks for the full legend.
+rz_run(){ ( cd "$RZ" && "$BIN" corpus --for="widget ping box router" --detail=1 --token-budget="$1" --no-cache --legend=full ) >"$RZ/o.xml" 2>/dev/null; }
+rz_est(){ grep -aoE 'est_tokens="[0-9]+"' "$RZ/o.xml" | head -1 | tr -dc '0-9'; }
+rz_note(){ grep -acF '[legend clauses:' "$RZ/o.xml"; }
+RZ_WIDE=1200
+rz_run "$RZ_WIDE"; RZ_E="$( rz_est )"; RZ_WIDE_NOTE="$( rz_note )"
+# THE CLAUSES THIS ARM COUNTS — all THREE of the droppable trio (CodeRabbit, PR #215). It counted two: the
+# confidence reading and the tail reading, but not the route= reading the arm's own paragraph above names.
+# A clause that is asserted in neither direction is not pinned, and the consequence is measured: with the
+# route= reading removed from the binary (forIdRouteLegendParts returning an empty route part), the wide
+# control still read clauses=2/2 and the whole arm reported PASS. Counted in all three runs now — the wide
+# control, the probe, and the tight control that must have dropped every one of them — so a clause can only
+# disappear by failing the wide run or by surviving the control.
+RZ_CLAUSE_ROUTE='route= name-exact(X)|subtoken+body'
+RZ_CLAUSES=0
+grep -aqF 'confidence= derives from the ranked head' "$RZ/o.xml" && RZ_CLAUSES=$(( RZ_CLAUSES + 1 ))
+grep -aqF 'tail: file-grain tail' "$RZ/o.xml"                    && RZ_CLAUSES=$(( RZ_CLAUSES + 1 ))
+grep -aqF "$RZ_CLAUSE_ROUTE" "$RZ/o.xml"                         && RZ_CLAUSES=$(( RZ_CLAUSES + 1 ))
+if [ -z "$RZ_E" ] || [ "$RZ_WIDE_NOTE" != "0" ] || [ "$RZ_CLAUSES" != "3" ]; then
+    no "#18 rung zero: the wide control (--token-budget=$RZ_WIDE) does not carry its legend (est='${RZ_E:-unreadable}' dropped-note=$RZ_WIDE_NOTE clauses=$RZ_CLAUSES/3) — there is no price to probe against; re-anchor the fixture"
+else
+    RZ_PROBE=$(( RZ_E + 5 ))
+    if [ "$RZ_PROBE" -ge "$RZ_WIDE" ]; then
+        no "#18 rung zero: the probe budget $RZ_PROBE is not strictly below the wide control $RZ_WIDE — the two runs are the same run and the arm proves nothing; raise RZ_WIDE"
+    else
+        rz_run "$RZ_PROBE"; RZ_PE="$( rz_est )"; RZ_PN="$( rz_note )"; RZ_PB="$( bytes_of "$RZ/o.xml" )"
+        RZ_PC=0
+        grep -aqF 'confidence= derives from the ranked head' "$RZ/o.xml" && RZ_PC=$(( RZ_PC + 1 ))
+        grep -aqF 'tail: file-grain tail' "$RZ/o.xml"                    && RZ_PC=$(( RZ_PC + 1 ))
+        grep -aqF "$RZ_CLAUSE_ROUTE" "$RZ/o.xml"                         && RZ_PC=$(( RZ_PC + 1 ))
+        # the ROOT's verdict only (read off the <ctx …> open tag): since lane/cutfix-bodies a <b over_ceiling="1"> marks
+        # a --detail body whose first line alone exceeds the BODY allowance, which is not the root's est_tokens claim,
+        # and a CDATA body can spell the literal too.
+        RZ_PO=0; grep -aoE '^<ctx [^>]*>' "$RZ/o.xml" | grep -qF 'over_ceiling="1"' && RZ_PO=1
+        if [ "$RZ_PN" = "0" ] && [ "$RZ_PC" = "3" ] && [ -n "$RZ_PE" ] && [ "$RZ_PE" -le "$RZ_PROBE" ] && [ "$RZ_PO" = "0" ]; then
+            ok "#18 rung zero at --token-budget=$RZ_PROBE (5 tokens above the $RZ_E this document prices at): all three droppable clauses ride, est_tokens=$RZ_PE <= $RZ_PROBE, no over_ceiling=, $RZ_PB B"
+        else
+            no "#18 rung zero at --token-budget=$RZ_PROBE dropped a legend it could afford: dropped-note=$RZ_PN clauses=$RZ_PC/3 est_tokens=${RZ_PE:-unreadable} over_ceiling=$RZ_PO ($RZ_PB B) — the same document prices at $RZ_E at --token-budget=$RZ_WIDE, so it fits every budget >= $RZ_E"
+        fi
+    fi
+    # …and the rung must still FIRE where the kept document genuinely does not fit. Without this, deleting
+    # rung zero outright would turn the arm above green.
+    RZ_CTRL=$(( RZ_E - 200 ))
+    rz_run "$RZ_CTRL"; RZ_CN="$( rz_note )"; RZ_CE="$( rz_est )"
+    # …and the tight control asserts the ABSENCE of the same three, route= included: a present-in-wide /
+    # unchecked-in-tight assertion is the one-sided shape that let the missing clause through.
+    RZ_CC=0
+    grep -aqF 'confidence= derives from the ranked head' "$RZ/o.xml" && RZ_CC=$(( RZ_CC + 1 ))
+    grep -aqF 'tail: file-grain tail' "$RZ/o.xml"                    && RZ_CC=$(( RZ_CC + 1 ))
+    grep -aqF "$RZ_CLAUSE_ROUTE" "$RZ/o.xml"                         && RZ_CC=$(( RZ_CC + 1 ))
+    if [ "$RZ_CN" != "0" ] && [ "$RZ_CC" = "0" ]; then
+        ok "#18 rung zero control at --token-budget=$RZ_CTRL (200 under the $RZ_E the full document prices at): all three clauses dropped and the note says so (est_tokens=$RZ_CE) — the rung still fires when the drop is real"
+    else
+        no "#18 rung zero control at --token-budget=$RZ_CTRL: dropped-note=$RZ_CN clauses still riding=$RZ_CC/3 (est_tokens=${RZ_CE:-unreadable}) — rung zero no longer fires at all, so the arm above is green for the wrong reason"
+    fi
+fi
+
+# ── #19 (CodeRabbit 4054594308, train 8): THE <hdr> ROWS ARE PRICED ─────────────────────────────────────
+#
+# THE DEFECT. --for's <hdr p= of=/> rows (R2-AF: the named file's decl/impl partner, printed first inside the
+# root) were rendered AFTER finishForLensHeader had computed est_tokens= and over_ceiling=, and were in none of
+# the budget sums — not est_tokens, not the ceiling ladder, not the residual the bodies/tail are sized from.
+# One row is ~50 B on a short path, so every existing fixture stayed inside its band; a task naming SIX files
+# under a long directory carried ~1.6 KB of rows its root never priced. MEASURED on the 71d27d07 binary with
+# this arm's fixture: --signatures-only printed est_tokens=2616 over 8183 B (round(bytes/2.50) = 3273), and at
+# --token-budget=1500 the root said est_tokens=1360 with no over_ceiling= over a 5043 B document (2017 tokens).
+# WHAT IS ASSERTED: the #11 identities (markup at 2.50, bodies at 3.80), exact, on three shapes of a document
+# that really carries six <hdr> rows — and under the explicit ceiling, est_tokens > budget iff over_ceiling="1".
+# Git-less and relative (#18's discipline): nothing from the live repo, a fixed root=.
+HX="$TMP/hdrprice"
+mkdir -p "$HX"
+python3 - "$HX" <<'PYHX'
+import os, sys
+d = os.path.join( sys.argv[ 1 ], "corpus", "very_long_subsystem_directory_name_alpha", "deeply_nested_component_module_path" )
+os.makedirs( d, exist_ok=True )
+for i in range( 6 ):
+    s = f"widget_pinger_component_number_{i}_with_a_long_stem"
+    open( os.path.join( d, s + ".h" ), "w" ).write( f"#pragma once\nint widgetPing{i}( int n );\n" )
+    open( os.path.join( d, s + ".cc" ), "w" ).write( f'#include "{s}.h"\nint widgetPing{i}( int n ) {{ return n + {i}; }}\n' )
+PYHX
+HX_DIR="corpus/very_long_subsystem_directory_name_alpha/deeply_nested_component_module_path"
+HX_TASK="fix widget ping in"
+for i in 0 1 2 3 4 5; do HX_TASK="$HX_TASK $HX_DIR/widget_pinger_component_number_${i}_with_a_long_stem.cc"; done
+hx_identity(){ python3 - "$1" <<'PYHXI'
+import sys, re
+d = open( sys.argv[1], 'rb' ).read()
+m = re.search( rb'est_tokens="(\d+)"', d )
+if not m: sys.exit( 2 )
+est = int( m.group( 1 ) )
+a = d.find( b'<bodies ' ); b = d.find( b'</bodies>' )
+span = ( b + 9 - a ) if a >= 0 and b >= 0 else 0
+expected = int( ( len( d ) - span ) / 2.50 + 0.5 ) + ( int( span / 3.80 + 0.5 ) if span else 0 )
+print( f"{len(d)} {span} {est} {expected} hdr={d.count(b'<hdr ')}" )
+sys.exit( 0 if est == expected and d.count( b'<hdr ' ) == 6 else 1 )
+PYHXI
+}
+for hx_mode in "--signatures-only" "" "--token-budget=1500"; do
+    ( cd "$HX" && "$BIN" corpus --for="$HX_TASK" $hx_mode --no-cache ) >"$HX/o.xml" 2>/dev/null
+    hx_label="${hx_mode:-default}"
+    if hx_out="$( hx_identity "$HX/o.xml" )"; then
+        ok "#19 <hdr> rows priced ($hx_label): est_tokens matches markup@2.50 + bodies@3.80 with six rows present — bytes/span/est/expected = $hx_out"
+    else
+        hx_out="$( hx_identity "$HX/o.xml" 2>/dev/null || true )"
+        no "#19 <hdr> rows unpriced ($hx_label): bytes/span/est/expected = ${hx_out:-unreadable} (six <hdr> rows required; a gap of ~bytes-of-rows/2.50 is the defect)"
+    fi
+    if [ "$hx_mode" = "--token-budget=1500" ]; then
+        HX_E="$( grep -aoE 'est_tokens="[0-9]+"' "$HX/o.xml" | head -1 | tr -dc '0-9' )"
+        HX_O=0; grep -aqF 'over_ceiling="1"' "$HX/o.xml" && HX_O=1
+        if [ -n "$HX_E" ] && { { [ "$HX_E" -gt 1500 ] && [ "$HX_O" = 1 ]; } || { [ "$HX_E" -le 1500 ] && [ "$HX_O" = 0 ]; }; }; then
+            ok "#19 --token-budget=1500: over_ceiling=$HX_O agrees with est_tokens=$HX_E (the ceiling verdict sees the <hdr> rows)"
+        else
+            no "#19 --token-budget=1500: over_ceiling=$HX_O disagrees with est_tokens=${HX_E:-unreadable} — the ceiling verdict was made without the <hdr> rows"
+        fi
+    fi
+done
+
+# …and the MCP `for` twin (mcpverbs.h forTaskText) on the same task: it prices the FINISHED document
+# (priceForTaskRoot), so it already counted the rows — pinned here so the two surfaces cannot drift apart.
+python3 - "$HX_TASK" "$HX/corpus" >"$HX/mcp.in" <<'PYHXM'
+import json, sys
+print( json.dumps( { "jsonrpc": "2.0", "id": 1, "method": "initialize" } ) )
+print( json.dumps( { "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": { "name": "for", "arguments": { "path": sys.argv[2], "task": sys.argv[1] } } } ) )
+PYHXM
+"$BIN" --mcp <"$HX/mcp.in" >"$HX/mcp.json" 2>/dev/null
+HX_M="$( python3 - "$HX/mcp.json" <<'PYHXR'
+import json, re, sys
+try:
+    t = json.loads( [ l for l in open( sys.argv[1] ) if l.strip() ][-1] )["result"]["content"][0]["text"].encode()
+    e = int( re.search( rb'est_tokens="(\d+)"', t ).group( 1 ) )
+except Exception:
+    print( "unreadable" ); sys.exit( 0 )
+print( f"{len(t)} {e} {int( len( t ) / 2.50 + 0.5 )} hdr={t.count( b'<hdr ' )}" )
+PYHXR
+)"
+set -- $HX_M
+if [ "$#" = 4 ] && [ "$2" = "$3" ] && [ "$4" = "hdr=6" ]; then
+    ok "#19 MCP for twin: est_tokens = round(bytes/2.50) with six <hdr> rows — bytes/est/expected = $HX_M"
+else
+    no "#19 MCP for twin: bytes/est/expected = ${HX_M:-unreadable} (six <hdr> rows required and priced)"
 fi
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"

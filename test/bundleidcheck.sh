@@ -27,7 +27,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -49,7 +49,9 @@ cat > "$TMP/trace.txt" <<'EOF'
 EOF
 
 "$BIN" "$FIX" --no-cache --for="$TASK"        >"$TMP/for.xml"   2>/dev/null
-"$BIN" "$FIX" --no-cache --pack-task="$TASK"  >"$TMP/task.xml"  2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact and spells `<sigs><d n= sc= l= p=>` inside its comment, which
+# drows() reads as a row; the --pack-task runs ask for the full legend (rows identical across postures).
+"$BIN" "$FIX" --no-cache --pack-task="$TASK" --legend=full >"$TMP/task.xml"  2>/dev/null
 "$BIN" "$FIX" --no-cache --from-trace="$TMP/trace.txt" >"$TMP/trace.xml" 2>/dev/null
 "$BIN" "$FIX" --no-cache                      >"$TMP/map.xml"   2>/dev/null
 
@@ -78,18 +80,20 @@ printf '%s\n' "$MUT" | grep -qE '^<d [^>]* n="' \
 
 # ── 2) id= — emitted exactly when scoped, and identical to the DEFAULT map's canonical id ─────────────
 # The fixture's only scoped symbol is Point (a C++ class); free functions must stay id-less (zero token cost).
-MAP_ID="$( grep -o '<s [^>]*n="Point"[^>]*>' "$TMP/map.xml" | grep -o 'id="[^"]*"' | head -1 )"
-FOR_ID="$( drows "$TMP/for.xml" | grep -E ' n="Point"' | grep -o 'id="[^"]*"' | head -1 )"
+# row 6 (2026-09-12): the identity attribute is the SHORT id sc= (the enclosing scope) on both surfaces; the
+# canonical id composes as p::sc::n, so agreement is "the same sc= for Point" — the path half is the row's own p=.
+MAP_ID="$( grep -o '<s [^>]*n="Point"[^>]*>' "$TMP/map.xml" | grep -o 'sc="[^"]*"' | head -1 )"
+FOR_ID="$( drows "$TMP/for.xml" | grep -E ' n="Point"' | grep -o 'sc="[^"]*"' | head -1 )"
 if [ -n "$MAP_ID" ]; then
     [ "$MAP_ID" = "$FOR_ID" ] \
-        && ok "id= agrees with the default map's canonical id for Point ($MAP_ID)" \
-        || no "id= disagrees with the default map: map=$MAP_ID bundle=${FOR_ID:-<absent>}"
+        && ok "sc= agrees with the default map's scope for Point ($MAP_ID)" \
+        || no "sc= disagrees with the default map: map=$MAP_ID bundle=${FOR_ID:-<absent>}"
 else
-    no "default map emitted no id= for Point — the fixture changed; re-anchor this assertion"
+    no "default map emitted no sc= for Point — the fixture changed; re-anchor this assertion"
 fi
-SCOPELESS_WITH_ID="$( drows "$TMP/for.xml" | grep -E ' n="(distance|perimeter)"' | grep -c 'id="' )"
+SCOPELESS_WITH_ID="$( drows "$TMP/for.xml" | grep -E ' n="(distance|perimeter)"' | grep -c 'sc="\| id="' )"
 [ "$SCOPELESS_WITH_ID" = "0" ] \
-    && ok "id= omitted on scope-less symbols (canonical id == bare name → no token cost)" \
+    && ok "sc= omitted on scope-less symbols (canonical id == bare name → no token cost)" \
     || no "id= emitted on $SCOPELESS_WITH_ID scope-less row(s) — it must add disambiguation or be absent"
 
 # ── 3) --for and --pack-task agree on in= for every symbol BOTH bundles name ──────────────────────────
@@ -158,7 +162,8 @@ fi
 # ── 5) budget accounting survives the added attributes ────────────────────────────────────────────────
 # the header states its own byte budget + ceiling; the delivered document must fit BOTH.
 for B in 600 1200 6000; do
-    "$BIN" "$FIX" --no-cache --pack-task="$TASK" --token-budget=$B >"$TMP/b.$B" 2>/dev/null
+    # L1 (2026-09-19): the budget=/ceiling ledger is prose in the FULL legend's header comment; this arm reads it.
+    "$BIN" "$FIX" --no-cache --pack-task="$TASK" --token-budget=$B --legend=full >"$TMP/b.$B" 2>/dev/null
     BYTES="$( wc -c < "$TMP/b.$B" | tr -d ' ' )"
     BUDGET="$( grep -o 'budget=[0-9]* bytes' "$TMP/b.$B" | head -1 | tr -dc '0-9' )"
     CEIL="$( grep -o 'ceiling [0-9]*' "$TMP/b.$B" | head -1 | tr -dc '0-9' )"
@@ -215,7 +220,7 @@ if [ -z "$LONGTASK" ]; then
     no "5b: python3 unavailable — the long-task ceiling arm could not build its 320-byte task"
 else
     for B in 600 1200; do
-        "$BIN" "$FIX" --no-cache --pack-task="$LONGTASK" --token-budget=$B >"$TMP/lt.$B" 2>/dev/null
+        "$BIN" "$FIX" --no-cache --pack-task="$LONGTASK" --token-budget=$B --legend=full >"$TMP/lt.$B" 2>/dev/null
         LT_BYTES="$( wc -c < "$TMP/lt.$B" | tr -d ' ' )"
         LT_CEIL="$( grep -o 'ceiling [0-9]*' "$TMP/lt.$B" | head -1 | tr -dc '0-9' )"
         # the disclosure lives in the header COMMENT — read only up to the first "-->" so a body cannot supply it
@@ -254,7 +259,7 @@ fi
 
 # ── 6) determinism + well-formed XML on all three verbs ───────────────────────────────────────────────
 "$BIN" "$FIX" --no-cache --for="$TASK" >"$TMP/for2.xml" 2>/dev/null
-"$BIN" "$FIX" --no-cache --pack-task="$TASK" >"$TMP/task2.xml" 2>/dev/null
+"$BIN" "$FIX" --no-cache --pack-task="$TASK" --legend=full >"$TMP/task2.xml" 2>/dev/null
 "$BIN" "$FIX" --no-cache --from-trace="$TMP/trace.txt" >"$TMP/trace2.xml" 2>/dev/null
 for v in for task trace; do
     diff -q "$TMP/$v.xml" "$TMP/${v}2.xml" >/dev/null \

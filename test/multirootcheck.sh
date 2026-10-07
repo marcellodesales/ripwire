@@ -32,6 +32,7 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 # BOTH seams. This gate took RIPWIRE_BIN only, so `bash test/multirootcheck.sh <base>/ripwire` SILENTLY ran
 # against build/ripwire — a red-first run against a pre-fix binary passed for the wrong reason (trap #20).
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
@@ -39,7 +40,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 FIX="$ROOT/test/multirootfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 skip(){ printf '  SKIP  %s\n' "$*"; }
 
@@ -68,7 +69,9 @@ run(){ TMPDIR="$CACHE" "$BIN" "$@"; }
 
 # ── G-solo: the N=1 quarantine — single-root output byte-identical to today's committed golden ──────
 # (relative root spelling, from $ROOT — the golden's paths are crawl-arg-prefixed `test/fixture/...`)
-( cd "$ROOT" && TMPDIR="$CACHE" "$BIN" test/fixture ) >"$TMP/solo.xml" 2>/dev/null
+# L1 (2026-09-19): test/golden.xml was recorded from the FULL-legend default; the CLI default is now compact, so
+# this run asks for --legend=full (the golden stays valid; rows are identical across postures).
+( cd "$ROOT" && TMPDIR="$CACHE" "$BIN" test/fixture --legend=full ) >"$TMP/solo.xml" 2>/dev/null
 if diff -q "$TMP/solo.xml" "$ROOT/test/golden.xml" >/dev/null; then ok "G-solo: N=1 byte-identical to test/golden.xml"
 else no "G-solo: N=1 output diverged from test/golden.xml"; fi
 
@@ -115,7 +118,7 @@ solo_tail="${solo_p#p=\"}"; ws_tail="${ws_p#p=\"}"
   && ok "suffix join: workspace $ws_tail ENDS WITH the single-root $solo_tail (ids relatable across runs)" \
   || no "suffix join: single-root spelling ($solo_tail) is not a suffix of the workspace spelling ($ws_tail)"
 if command -v xmllint >/dev/null 2>&1; then
-  xmllint --noout "$TMP/m1.xml" && ok "G4: merged map is well-formed XML" || no "G4: xmllint rejected the merged map"
+  if xmllint --noout "$TMP/m1.xml"; then ok "G4: merged map is well-formed XML"; else no "G4: xmllint rejected the merged map"; fi
 else skip "xmllint not installed"; fi
 
 # ── M12 universe arm: NO "/./" survives ANYWHERE in the merged map — not just the two probed p= above ──
@@ -131,7 +134,7 @@ for i in 1 2 3; do
   run "$WS/cli" "$WS/svc" >"$TMP/m2.$i.xml" 2>/dev/null
   diff -q "$TMP/m1.xml" "$TMP/m2.$i.xml" >/dev/null || gorder=1
 done
-[ $gorder -eq 0 ] && ok "G-order: reorder byte-identity (x3, warm+cold)" || no "G-order: output differs under root reordering"
+if [ $gorder -eq 0 ]; then ok "G-order: reorder byte-identity (x3, warm+cold)"; else no "G-order: output differs under root reordering"; fi
 
 # ── G-edge: the cross-root evidence edge — cli's caller reaches svc's def through the escaped include ─
 run "$WS/svc" "$WS/cli" --callers=svc_handle >"$TMP/callers.xml" 2>/dev/null
@@ -330,11 +333,11 @@ printf '%s\n' "$svc_sec" | grep -q 'f p="cli/src/cli_main.cpp"' \
   || no "G-pr: cross-root blast radius absent from the svc section"
 # determinism x2 + reorder-stable + G4 xmllint
 run "$PRW/svc" "$PRW/cli" --pr-context >"$TMP/prc2.xml" 2>/dev/null
-diff -q "$TMP/prc.xml" "$TMP/prc2.xml" >/dev/null && ok "G-pr: determinism (x2 byte-identical)" || no "G-pr: nondeterministic across runs"
+if diff -q "$TMP/prc.xml" "$TMP/prc2.xml" >/dev/null; then ok "G-pr: determinism (x2 byte-identical)"; else no "G-pr: nondeterministic across runs"; fi
 run "$PRW/cli" "$PRW/svc" --pr-context >"$TMP/prc3.xml" 2>/dev/null
-diff -q "$TMP/prc.xml" "$TMP/prc3.xml" >/dev/null && ok "G-pr: reorder-stable (argv order irrelevant)" || no "G-pr: differs under root reordering"
+if diff -q "$TMP/prc.xml" "$TMP/prc3.xml" >/dev/null; then ok "G-pr: reorder-stable (argv order irrelevant)"; else no "G-pr: differs under root reordering"; fi
 if command -v xmllint >/dev/null 2>&1; then
-  xmllint --noout "$TMP/prc.xml" && ok "G-pr: G4 well-formed XML" || no "G-pr: xmllint rejected the bundle"
+  if xmllint --noout "$TMP/prc.xml"; then ok "G-pr: G4 well-formed XML"; else no "G-pr: xmllint rejected the bundle"; fi
 else skip "G-pr: xmllint not installed"; fi
 
 # ── G-pr N=1: single-root --pr-context is byte-identical to today (the multi-root path is quarantined) ─
@@ -382,7 +385,7 @@ grep -q '<t n="run_cli" t="fn" p="cli/src/cli_main.cpp' "$TMP/conn1.xml" \
   && ok "G-connect: cross-root join spans both roots through the evidence edge (one group)" \
   || no "G-connect: cross-root join missing/malformed: $( cat "$TMP/conn1.xml" )"
 if command -v xmllint >/dev/null 2>&1; then
-  xmllint --noout "$TMP/conn1.xml" && ok "G-connect: G4 well-formed XML" || no "G-connect: xmllint rejected the connect output"
+  if xmllint --noout "$TMP/conn1.xml"; then ok "G-connect: G4 well-formed XML"; else no "G-connect: xmllint rejected the connect output"; fi
 else skip "G-connect: xmllint not installed"; fi
 
 # reorder-stability + determinism, exactly like G-order above but for --connect specifically.

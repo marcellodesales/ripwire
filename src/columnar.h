@@ -1,4 +1,6 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // columnar.h — an OPT-IN columnar re-serialization for the FLAT list verbs
 // (--callers / --callees / --uses / --impact). §A5c: this header and --help both used to name the
@@ -76,6 +78,7 @@ inline constexpr const char* kColumnarLegend =
 inline void buildPathTable( const std::vector<std::uint32_t>& rowFileIds,
                             std::vector<std::uint32_t>& outUniqueFiles, std::vector<std::uint32_t>& outRowPathIdx )
 {
+    ASSUME_NO_ALIAS3( rowFileIds, outUniqueFiles, outRowPathIdx );
     outUniqueFiles.clear();
     outRowPathIdx.clear();
     outRowPathIdx.reserve( rowFileIds.size() );
@@ -112,7 +115,7 @@ inline void emitPathTable( std::FILE* out, const IngestResult& ing,
         {
             std::fputc( ' ', out );
         }
-        std::fprintf( out, "%zu=", i );
+        rw::emitTo( out, "{}=", i );
         const std::string_view raw = ing.files[ uniqueFiles[i] ];
         const std::string_view rel = rootPrefix.empty() ? raw : rw::sarif::rootRelativeUri( raw, rootPrefix );
         const std::string_view p   = escapeXml( rel, esc );
@@ -138,6 +141,44 @@ inline void emitColumnarTestedColumn( std::FILE* out, const IngestResult& ing, c
     std::fputs( "</tested>", out );
 }
 
+// 0.6.5: the optional dense `<depth>` column — --impact's hop depth per row (graph.h transitiveCallersDepth), one value
+// per row in row order. Built as one string and written once: a depth is a multi-digit number, not the tested column's
+// single character.
+inline void emitColumnarDepthColumn( std::FILE* out, const std::vector<NodeId>& rows, const std::vector<std::uint32_t>& depth )
+{
+    std::string column = "<depth>";
+    for( NodeId n : rows )
+    {
+        column += std::to_string( depth[n] );
+        column += ',';
+    }
+    if( !rows.empty() )
+    {
+        column.pop_back();   // the separator after the last value
+    }
+    column += "</depth>";
+    rw::emitTo( out, "{}", column );
+}
+
+// The optional columns a caller asked for, and the fields= suffix naming them, in ONE place: emitColumnarSymbolRows
+// reads each through these, so its own branch count does not grow per optional column.
+inline std::string_view columnarOptionalFields( bool hasTested, bool hasDepth ) noexcept
+{
+    return hasTested ? ( hasDepth ? ",tested,depth" : ",tested" ) : ( hasDepth ? ",depth" : "" );
+}
+inline void emitColumnarOptionalColumns( std::FILE* out, const IngestResult& ing, const std::vector<NodeId>& rows,
+                                         const std::vector<char>* testReach, const std::vector<std::uint32_t>* depth )
+{
+    if( testReach )
+    {
+        emitColumnarTestedColumn( out, ing, rows, *testReach );
+    }
+    if( depth )
+    {
+        emitColumnarDepthColumn( out, rows, *depth );
+    }
+}
+
 // COLUMNAR form of a symbol-row verb (--callers/--callees/--impact/--pr-context symbols). `wrapperTag` is the
 // element name ("callers"), `wrapperAttrs` the already-formatted attribute string ("of=\"X\" count=\"17\"").
 // `rows` are the symbol node ids in the caller's already-sorted order. Emits:
@@ -146,10 +187,13 @@ inline void emitColumnarTestedColumn( std::FILE* out, const IngestResult& ing, c
 // A6: `testReach` is optional — when given, "tested" joins fields= and a fifth dense `<tested>0,1,..</tested>`
 // column rides alongside (a parallel array cannot omit a false entry the way an XML attribute can; the
 // column itself is present only when a caller passed the lens, so a caller with no test data pays 0 bytes).
+// 0.6.5: `depth` (optional, --impact only) adds a dense `<depth>` column — transitiveCallersDepth's hop per row — and
+// names it in fields=; a caller that passes none pays 0 bytes, like the tested column.
 inline void emitColumnarSymbolRows( std::FILE* out, const IngestResult& ing,
                                     const char* wrapperTag, const std::string& wrapperAttrs,
                                     const std::vector<NodeId>& rows, std::string_view rootPrefix = {},
-                                    const std::vector<char>* testReach = nullptr )
+                                    const std::vector<char>* testReach = nullptr,
+                                    const std::vector<std::uint32_t>* depth = nullptr )
 {
     std::vector<char> esc;
 
@@ -162,9 +206,9 @@ inline void emitColumnarSymbolRows( std::FILE* out, const IngestResult& ing,
     buildPathTable( rowFiles, uniqueFiles, rowPathIdx );
 
     std::fputs( kColumnarLegend, out );   // §B1.5: once per output, before the element it describes
-    std::fprintf( out, "<%s %s format=\"columnar\">", wrapperTag, wrapperAttrs.c_str() );
+    rw::emitTo( out, "<{} {} format=\"columnar\">", wrapperTag, wrapperAttrs.c_str() );
     emitPathTable( out, ing, uniqueFiles, esc, rootPrefix );
-    std::fprintf( out, "<cols n=\"%zu\" fields=\"path,name,line,kind%s\">", rows.size(), testReach ? ",tested" : "" );
+    rw::emitTo( out, "<cols n=\"{}\" fields=\"path,name,line,kind{}\">", rows.size(), columnarOptionalFields( testReach != nullptr, depth != nullptr ) );
 
     // path index array
     std::fputs( "<path>", out );
@@ -174,7 +218,7 @@ inline void emitColumnarSymbolRows( std::FILE* out, const IngestResult& ing,
         {
             std::fputc( ',', out );
         }
-        std::fprintf( out, "%u", rowPathIdx[i] );
+        rw::emitTo( out, "{}", rowPathIdx[i] );
     }
     std::fputs( "</path>", out );
     // name array (XML-escaped; most identifiers never contain a comma, but markdown SECTION symbols and
@@ -198,7 +242,7 @@ inline void emitColumnarSymbolRows( std::FILE* out, const IngestResult& ing,
         {
             std::fputc( ',', out );
         }
-        std::fprintf( out, "%u", ing.symbols[rows[i]].line );
+        rw::emitTo( out, "{}", ing.symbols[rows[i]].line );
     }
     std::fputs( "</line>", out );
     // kind array (terse tags)
@@ -212,13 +256,10 @@ inline void emitColumnarSymbolRows( std::FILE* out, const IngestResult& ing,
         std::fputs( symTag( ing.symbols[rows[i]].kind ), out );
     }
     std::fputs( "</kind>", out );
-    // A6: present only when the caller passed the lens — see the wrapper banner and emitColumnarTestedColumn.
-    if( testReach )
-    {
-        emitColumnarTestedColumn( out, ing, rows, *testReach );
-    }
+    // A6 / 0.6.5: each present only when the caller passed it — see the wrapper banner and emitColumnarOptionalColumns.
+    emitColumnarOptionalColumns( out, ing, rows, testReach, depth );
 
-    std::fprintf( out, "</cols></%s>", wrapperTag );
+    rw::emitTo( out, "</cols></{}>", wrapperTag );
 }
 
 // COLUMNAR form of the --uses verb: use-site rows carry (fileId, line, role, enclosing-symbol name `in`)
@@ -238,9 +279,9 @@ inline void emitColumnarUseSites( std::FILE* out, const IngestResult& ing,
     const std::size_t nRows = fileIds.size();
 
     std::fputs( kColumnarLegend, out );   // §B1.5: the same one legend the symbol-row emitter uses
-    std::fprintf( out, "<uses %s format=\"columnar\">", wrapperAttrs.c_str() );
+    rw::emitTo( out, "<uses {} format=\"columnar\">", wrapperAttrs.c_str() );
     emitPathTable( out, ing, uniqueFiles, esc, rootPrefix );
-    std::fprintf( out, "<cols n=\"%zu\" fields=\"path,line,role,in_id\">", nRows );
+    rw::emitTo( out, "<cols n=\"{}\" fields=\"path,line,role,in_id\">", nRows );
 
     std::fputs( "<path>", out );
     for( std::size_t i = 0; i < rowPathIdx.size(); ++i )
@@ -249,7 +290,7 @@ inline void emitColumnarUseSites( std::FILE* out, const IngestResult& ing,
         {
             std::fputc( ',', out );
         }
-        std::fprintf( out, "%u", rowPathIdx[i] );
+        rw::emitTo( out, "{}", rowPathIdx[i] );
     }
     std::fputs( "</path>", out );
     std::fputs( "<line>", out );
@@ -259,7 +300,7 @@ inline void emitColumnarUseSites( std::FILE* out, const IngestResult& ing,
         {
             std::fputc( ',', out );
         }
-        std::fprintf( out, "%u", lines[i] );
+        rw::emitTo( out, "{}", lines[i] );
     }
     std::fputs( "</line>", out );
     std::fputs( "<role>", out );

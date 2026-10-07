@@ -31,7 +31,7 @@ def extract_flags_from_help(binary_path=None, help_text=None):
     if help_text is None:
         try:
             result = subprocess.run(
-                [binary_path, "--help"],
+                [binary_path, "--help=all"],
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -128,9 +128,9 @@ def extract_flag_tokens_from_legend(legend_text):
         "--canonical",   # prose attribute, not a flag
         # W3-S item 4 (2026-08-19): surfaced by widening run_verb_suite past its original 15 verbs —
         # both are pattern 4 false positives that existed in the code all along and were simply never
-        # exercised before (neither --readability nor --context-ratio was in the old suite).
-        "--closed-form",       # --readability's legend: "the Posnett/Hindle/Devanbu (MSR 2011)
-                                # closed-form lens" -- a closed-form MATH SOLUTION, not a flag
+        # exercised before (neither --biggest-first nor --context-ratio was in the old suite).
+        "--closed-form",       # --biggest-first's (was --readability's) legend: "the Posnett/Hindle/Devanbu
+                                # (MSR 2011) closed-form lens" -- a closed-form MATH SOLUTION, not a flag
         "--local-reasoning",   # --context-ratio's legend: "the LOCAL-REASONING lens" -- the
                                 # code-quality PROPERTY the verb measures, not a flag
     }
@@ -179,7 +179,16 @@ def extract_flag_tokens_from_legend(legend_text):
     # its <calls total=N shown=M ...> child in the same "word=N"/"word=M" placeholder prose this pattern
     # is built to catch — "total" and "shown" are OUTPUT ATTRIBUTES (rides the same shown=/total= pair
     # THE TRUNCATION VOCABULARY, src/pageview.h, already uses on a dozen other elements), never CLI flags.
-    placeholder_exclude = {"bodies", "overloads", "files", "hits", "toks", "noedge", "total", "shown"}
+    # train-14 (2026-09-20): "bodyless" joins for the same documented reason. src/compactlegend.h's
+    # <bodies> row defines the OUTPUT ATTRIBUTE as "bodyless=N of total= are module-scope owners with no
+    # body by construction", and there is no --bodyless flag. The row only reaches a served legend when
+    # something emits bodyless=, which --pack-task's section-dropped placeholder branch started doing in
+    # this train — so the bareword entered the live arm's corpus and manufactured a phantom on correct
+    # legend text. Added by NAME, per this list's own rule, never by narrowing pattern 5.
+    # depth-labelled --impact (0.6.5): "d" joins for the same documented reason. src/graphlegend.h kImpactDepthLegend
+    # defines the <s> row's OUTPUT ATTRIBUTE as "d=N on <s>: hop depth", and there is no --d flag (single-letter flags
+    # do not exist in this CLI). Added by NAME, per this list's own rule.
+    placeholder_exclude = {"bodies", "bodyless", "overloads", "files", "hits", "toks", "noedge", "total", "shown", "d"}
     for match in re.finditer(r'\b([a-z][a-z0-9\-]*)=[NM]\b', legend_text):
         word = match.group(1)
         if word not in placeholder_exclude:
@@ -275,7 +284,7 @@ def run_verb_suite(binary_path, corpus_path):
         ["--dmm"],                           # --dmm (design/metric mismatch)
         ["--comment-coherence"],             # --comment-coherence
         ["--naming-consistency"],            # --naming-consistency
-        ["--readability"],                   # --readability
+        ["--biggest-first"],                 # --biggest-first (was --readability)
         ["--context-ratio"],                 # --context-ratio
         ["--ensemble"],                      # --ensemble
         ["--outline=main.cpp"],              # --outline (whole-file summary)
@@ -285,6 +294,10 @@ def run_verb_suite(binary_path, corpus_path):
 
     all_legends = []
     for verb_args in verbs_to_test:
+        # L1 (2026-09-19): the CLI default legend is compact (it spells attribute shapes like defs=N); this suite reads
+        # the FULL legend's prose, so each XML verb asks for it. --situ is prose and refuses --legend=full.
+        if verb_args != ["--situ"]:
+            verb_args = verb_args + ["--legend=full"]
         xml_output, err = run_ripwire_verb(binary_path, corpus_path, verb_args)
         if err:
             # Non-fatal: some verbs might fail, continue with others

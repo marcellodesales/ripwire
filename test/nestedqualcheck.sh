@@ -57,7 +57,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -115,12 +115,13 @@ fi
     || no "member scope invariance failed (see the constructor assertion above)"
 
 # ── (f) ROUTE SCOPE ────────────────────────────────────────────────────────────────────────────────
-"$BIN" nestedqualfix --for=Inner 2>/dev/null | grep -q 'routed: name-exact' \
+"$BIN" nestedqualfix --for=Inner 2>/dev/null | grep -q 'route="name-exact(' \
     && ok "--for=Inner takes the name-exact route (the route this fix's ranking arms measure)" \
     || no "--for=Inner no longer routes name-exact"
 
 # ── (g) SYMBOL-COUNT DELTA ────────────────────────────────────────────────────────────────────────
-symcount="$( "$BIN" nestedqualfix 2>/dev/null | grep -o 'symbols=[0-9]*' | head -1 | tr -dc 0-9 )"
+# L1 (2026-09-19): the CLI default legend is compact and spells symbols= inside its comment; this arm reads the real header, so it asks for the full legend.
+symcount="$( "$BIN" nestedqualfix --legend=full 2>/dev/null | grep -o 'symbols=[0-9]*' | head -1 | tr -dc 0-9 )"
 [ "$symcount" = "12" ] \
     && ok "fixture symbol count is exactly 12 (10 pre-fix + the two out-of-line definitions)" \
     || no "fixture symbol count is $symcount, expected 12 — an extraction change touched more than the two golds"

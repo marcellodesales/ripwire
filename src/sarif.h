@@ -1,4 +1,6 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // sarif.h — W1-SARIF (board Track A P0-7): serialize --lint's findings as SARIF 2.1.0
 // (github.com/oasis-tcs/sarif-spec) instead of the native XML <lint> block, so they land in
@@ -124,18 +126,45 @@ inline const char* sarifLevel( std::string_view sev )
 // which strips the same way for the same reason). SARIF wants a plain root-relative URI regardless of
 // which spelling the caller used, so this normalizes BOTH shapes against `rootPrefix` (the run's root,
 // trailing '/' already stripped — see rootPrefixOf below) rather than assuming a leading "./".
+// Review of #219: the leading-"./" strip used to RETURN, before the prefix was ever tried. That is correct
+// for the root "." (where the stored spelling is "./x" and "x" is the answer) and wrong for every other
+// relative root: `ripwire ./corp` stores "./corp/test/x.sh", the early return yielded "corp/test/x.sh", and
+// pasting that from the root the document declares is `cd ./corp && bash corp/test/x.sh` — rc 127. Both
+// sides carry the same optional "./", so both sides drop it FIRST and the prefix comparison runs on what is
+// left. Root "." then normalizes to "." , matches no path, and the answer is the "./"-stripped file exactly
+// as before — the one case the old early return got right is the one case this keeps byte-identical.
+// Second review of #219: the filesystem root is the ONE prefix that IS its own separator, so the shape
+// below cannot match it. Under `ripwire /` the stored spelling is "/test/check.sh" and the byte at
+// f[ r.size() ] is 't', not '/', so the comparison failed and the ABSOLUTE path was emitted into a
+// document whose root= declares every path relative to it — testmap.h's runsAreRootRelative is true for
+// any single non-empty root, "/" included, so the document's own claim and its rows disagreed. The extra
+// clause strips the single leading slash: the same one-past-the-prefix rule, with the prefix and the
+// separator being the same byte. It runs AFTER the general shape, so a non-root prefix keeps exactly the
+// behaviour it had, and the "//x" spelling (prefix "/" followed by a real separator) is still answered by
+// the general clause. Guarded on size > 1 so a file spelled "/" alone stays "/" and never becomes an
+// empty URI — a path that is nothing at all would be a wrong answer, not a shorter one.
 inline std::string_view rootRelativeUri( std::string_view file, std::string_view rootPrefix )
 {
-    if( file.rfind( "./", 0 ) == 0 )
+    const auto dropLeadingDot = []( std::string_view p ) noexcept
+    { return p.rfind( "./", 0 ) == 0 ? p.substr( 2 ) : p; };
+    const std::string_view f = dropLeadingDot( file );
+    std::string_view       r = dropLeadingDot( rootPrefix );
+    // #228: a root typed with a trailing '/' ("$PWD/") is the same root. Callers are meant to pass rootPrefixOf's
+    // trimmed spelling, and several --pack-task row renderers passed the raw argument instead, so their p= kept the
+    // whole absolute path under "$PWD/" alone. Trimming here makes every caller agree, whichever spelling it holds.
+    while( r.size() > 1 && r.back() == '/' )
     {
-        return file.substr( 2 );
+        r.remove_suffix( 1 );
     }
-    if( !rootPrefix.empty() && file.size() > rootPrefix.size() + 1
-        && file.compare( 0, rootPrefix.size(), rootPrefix ) == 0 && file[ rootPrefix.size() ] == '/' )
+    if( !r.empty() && f.size() > r.size() + 1 && f.compare( 0, r.size(), r ) == 0 && f[ r.size() ] == '/' )
     {
-        return file.substr( rootPrefix.size() + 1 );
+        return f.substr( r.size() + 1 );
     }
-    return file;
+    if( r == "/" && f.size() > 1 && f.front() == '/' )
+    {
+        return f.substr( 1 );
+    }
+    return f;
 }
 
 // Normalize a scan root for rootRelativeUri above: drop trailing '/' so the prefix strips cleanly
@@ -174,7 +203,7 @@ inline void writeSarifRuleDecl( std::FILE* out, const SarifRuleDecl& r )
     {
         std::fputs( "\"defaultConfiguration\":{\"enabled\":false},", out );
     }
-    std::fprintf( out, "\"properties\":{\"builtin\":%s,\"capped\":%s,\"applicable\":%s}}",
+    rw::emitTo( out, "\"properties\":{{\"builtin\":{},\"capped\":{},\"applicable\":{}}}}}",
                   r.isUserRule ? "false" : "true", r.capped ? "true" : "false",
                   r.applicable ? "true" : "false" );
 }
@@ -185,11 +214,11 @@ inline void writeSarifResult( std::FILE* out, const SarifFinding& f, std::string
 {
     std::fputs( "{\"ruleId\":", out );
     jsonQuoted( out, f.rule );
-    std::fprintf( out, ",\"level\":\"%s\",\"message\":{\"text\":", sarifLevel( f.sev ) );
+    rw::emitTo( out, ",\"level\":\"{}\",\"message\":{{\"text\":", sarifLevel( f.sev ) );
     jsonQuoted( out, f.text );
     std::fputs( "},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":", out );
     jsonQuoted( out, rootRelativeUri( f.file, rootPrefix ) );
-    std::fprintf( out, "},\"region\":{\"startLine\":%u}}}]", f.line );
+    rw::emitTo( out, "}},\"region\":{{\"startLine\":{}}}}}}}]", f.line );
     std::fputs( ",\"properties\":{\"enclosingSymbol\":", out );
     jsonQuoted( out, f.enclosing );
     std::fputs( ",\"sev\":", out );
@@ -201,7 +230,7 @@ inline void writeSarifResult( std::FILE* out, const SarifFinding& f, std::string
 // selection, so a consumer can never read "no selection" as "a selection that kept everything".
 inline void writeSarifRunProperties( std::FILE* out, const SarifRunProperties& props )
 {
-    std::fprintf( out, "\"properties\":{\"findingsCapped\":%s", props.anyRuleCapped ? "true" : "false" );
+    rw::emitTo( out, "\"properties\":{{\"findingsCapped\":{}", props.anyRuleCapped ? "true" : "false" );
     if( props.selectionActive )
     {
         std::fputs( ",\"selected\":", out );

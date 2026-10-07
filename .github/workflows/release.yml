@@ -1,15 +1,23 @@
 name: Release
 
-# Builds ripwire for macOS arm64/x64 + Linux x64/arm64 on every `vX.Y.Z` tag push and attaches the four
-# binaries to a GitHub Release. UNTESTED UNTIL THE FIRST REAL TAG PUSH:
+# 0.6.1 was the last release with a macOS x64 binary: that leg cross-compiled on an arm64 runner and ran its
+# PGO training, determinism diff and smoke test under Rosetta 2, and it left the matrix after 0.6.1.
+# scripts/install.sh tells an Intel Mac so, and test/releaseinstallcheck.sh (H7) refuses a macOS x64 leg here.
+#
+# Builds ripwire for macOS arm64 + Linux x64/arm64 + Windows x64 on every `vX.Y.Z` tag push and attaches the four
+# packages to a GitHub Release. Windows x64 (from 0.6.3, a PREVIEW until Windows testers confirm it) is the
+# build-windows job: it calls .github/workflows/windows-package.yml, the same file ci.yml's windows-package job
+# calls on every full-matrix run, so the .zip published here is built by exactly the steps each train PR already
+# ran and uploaded as an artifact. Its design choices (clang-cl, Release/LTO, static CRT /MT, zip, no PGO) are
+# in that file's header. UNTESTED UNTIL THE FIRST REAL TAG PUSH:
 # this file is statically valid (see test/portablebuildcheck.sh's sibling validation note and the workflow
 # README pointer below) but has never actually run — GitHub Actions itself cannot be executed from this
 # dev environment. Review the FIRST run's logs closely before trusting `scripts/install.sh` against it.
 #
 # Every leg configures WITHOUT -DRIPWIRE_NATIVE=ON on purpose: a release binary must run on any machine of
 # its target arch, not just the exact CPU that happened to build it (see cmake/PortableFlags.cmake — the
-# portable default auto-applies safe generic Apple Silicon tuning on the two macOS-arm64 builders and
-# emits zero host-specific flags everywhere else).
+# portable default keys on the TARGET arch: generic Apple Silicon tuning for macos-arm64, the x86-64-v3
+# floor for linux-x64, and no host-specific flag anywhere).
 
 on:
   push:
@@ -32,20 +40,20 @@ jobs:
       matrix:
         include:
           - name: macos-arm64
-            os: macos-14 # Apple Silicon (arm64) hosted runner
+            os: macos-26 # Apple Silicon (arm64) hosted runner; macos-14, which built this leg through 0.6.1, retires 2026-11-02
             asset_arch: arm64
             asset_os: macos
             pgo: true
-          - name: macos-x64
-            os: macos-14 # cross-compiled: the macos-13 Intel runner pool is retired — the v0.1.0 and
-                         # first v0.2.0 runs both left its leg queued until the 24h auto-cancel. Built
-                         # as x86_64 on the arm64 runner; the smoke-test still executes for real via
-                         # Rosetta 2 (installed on GitHub's macos-14 images).
-            asset_arch: x64
-            asset_os: macos
-            pgo: true # trains under Rosetta 2 — instrumentation counts edges of the same code, so the
-                      # profile is valid x86_64 data; it is just slower to collect
-            cmake_extra: -DCMAKE_OSX_ARCHITECTURES=x86_64
+            # Xcode 26.6 (17F113, Apple clang 21.0.0), the macos-26 image default. Through 0.6.1 this leg pinned Xcode
+            # 16.2, whose AppleClang 16 is LLVM 17: its loop vectorizer ignores ASSUME_NO_ALIAS's separate-storage
+            # promise (llvm/llvm-project#64666, fixed in LLVM 18) and keeps every runtime overlap check. Pinned so an
+            # image bump cannot change the compiler under a release, and ci.yml's macOS legs test this same Xcode.
+            developer_dir: /Applications/Xcode_26.6.app/Contents/Developer
+            # The minimum macOS, PINNED. With no deployment target clang takes the lower of the runner's macOS and the
+            # SDK default: 14.0 on macos-14 (v0.6.1's binary reads `minos 14.0`) but 26.x here, so the runner move alone
+            # would drop every macOS 14 and 15 user. 14.0 is the std::print floor src/infra/emit.h names.
+            # test/portablebuildcheck.sh #2i holds this runner, Xcode and minimum together with ci.yml's.
+            deployment_target: "14.0"
           - name: linux-x64
             os: ubuntu-24.04
             # AlmaLinux-8-based manylinux container (glibc 2.28) with Red Hat gcc-toolset: newer
@@ -62,10 +70,11 @@ jobs:
             asset_os: linux
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container || '' }}
-    # Xcode 16.2 on the macOS legs (image default 15.4): its libc++ carries <print> at a macOS 14 deployment
-    # target — the std::print floor ci.yml holds. Empty on the container legs (gcc-toolset-14 already has it).
+    # The macOS leg names its Xcode (matrix.developer_dir): Xcode 26.6, whose libc++ still defines __cpp_lib_print at
+    # the pinned macOS 14.0 deployment target — the std::print floor ci.yml holds. Empty on the container legs
+    # (gcc-toolset-14 already has it).
     env:
-      DEVELOPER_DIR: ${{ matrix.os == 'macos-14' && '/Applications/Xcode_16.2.app/Contents/Developer' || '' }}
+      DEVELOPER_DIR: ${{ matrix.developer_dir || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -80,16 +89,52 @@ jobs:
             sudo apt-get install -y --no-install-recommends libxml2-utils
           fi
 
+      # The leg's pinned minimum macOS (matrix.deployment_target — see the macos-arm64 entry), exported so both of
+      # pgobuild's configures and every clang invocation see it. A macOS leg without the key FAILS here instead of
+      # building at whatever the runner's macOS implies. The Linux legs skip the step and never see the variable.
+      - name: Pin the macOS deployment target
+        if: runner.os == 'macOS'
+        run: |
+          if [ -z '${{ matrix.deployment_target }}' ]; then
+            echo "release: macOS leg ${{ matrix.name }} sets no deployment_target, so it would ship at the runner's macOS" >&2
+            exit 1
+          fi
+          echo "MACOSX_DEPLOYMENT_TARGET=${{ matrix.deployment_target }}" >> "$GITHUB_ENV"
+
+      # PGO needs one toolchain end to end: the instrumented binary's profile runtime writes a .profraw version that
+      # only the same LLVM's llvm-profdata merges and its clang reads. Both resolve through DEVELOPER_DIR; this step
+      # records them for the log and fails when DEVELOPER_DIR is empty or either tool lives outside the pinned Xcode.
+      # Both sides are compared as physical paths (pwd -P), so a symlinked Xcode neither passes nor fails by spelling.
+      - name: Record the Xcode, compiler and llvm-profdata this leg builds with
+        if: runner.os == 'macOS'
+        run: |
+          if [ -z "$DEVELOPER_DIR" ]; then
+            echo "release: macOS leg ${{ matrix.name }} has no DEVELOPER_DIR, so the image's default Xcode would build it" >&2
+            exit 1
+          fi
+          devDir="$( cd "$DEVELOPER_DIR" && pwd -P )" || { echo "release: DEVELOPER_DIR=$DEVELOPER_DIR is not a directory" >&2; exit 1; }
+          xcodebuild -version
+          c++ --version
+          for tool in clang++ llvm-profdata; do
+            path="$( xcrun --find "$tool" )" || { echo "release: xcrun cannot find $tool under DEVELOPER_DIR=$DEVELOPER_DIR" >&2; exit 1; }
+            toolDir="$( cd "$( dirname "$path" )" && pwd -P )" || { echo "release: cannot resolve the directory of $tool at $path" >&2; exit 1; }
+            path="$toolDir/${path##*/}"
+            echo "$tool: $path"
+            case "$path" in
+              "$devDir"/*) ;;
+              *) echo "release: $tool resolves to $path, outside DEVELOPER_DIR=$DEVELOPER_DIR ($devDir)" >&2; exit 1 ;;
+            esac
+          done
 
       - name: Configure (portable — no RIPWIRE_NATIVE, this binary ships to other machines)
         if: ${{ !matrix.pgo }}
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra || '' }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         if: ${{ !matrix.pgo }}
         run: cmake --build build -j --target ripwire
 
-      # PGO for the shipped binary (macOS legs only): scripts/pgobuild.sh is the same one-command
+      # PGO for the shipped binary (the macOS leg only): scripts/pgobuild.sh is the same one-command
       # instrument -> train -> merge -> optimize flow a dev runs, trained on this checkout (the
       # script's own mixed workload). The Linux legs deliberately STAY LTO-only: their manylinux
       # gcc-toolset is load-bearing for the RHEL static-libstdc++ compat model, and CMake's PGO arm
@@ -100,7 +145,7 @@ jobs:
       - name: Build (profile-guided — instrument, train, merge, optimize)
         if: ${{ matrix.pgo }}
         run: |
-          scripts/pgobuild.sh --cmake-extra -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra && format('--cmake-extra {0}', matrix.cmake_extra) || '' }}
+          scripts/pgobuild.sh --cmake-extra -DCMAKE_BUILD_TYPE=Release
           mkdir -p build
           cp build_pgo/ripwire build/ripwire
 
@@ -114,11 +159,23 @@ jobs:
           diff a.xml b.xml
 
       # The shipped binary must be the std::print arm on every leg (src/infra/emit.h): read off the binary,
-      # after PGO staging on the macOS legs, so a fallback could never ship unnoticed.
+      # after PGO staging on the macOS leg, so a fallback could never ship unnoticed.
       - name: The emitter the shipped binary compiled in is std::print
         run: |
           ./build/ripwire --version
           ./build/ripwire --version | grep -q 'emit=std::print'
+
+      # The deployment-target pin, read off the shipped binary rather than trusted from the environment. The comparison
+      # is an exact string match, so a missing or unreadable LC_BUILD_VERSION, two of them, or any other minimum fails.
+      - name: The shipped binary's minimum macOS is the pinned one
+        if: runner.os == 'macOS'
+        run: |
+          minos="$( otool -l build/ripwire | awk '$1 == "minos" { print $2 }' )"
+          echo "build/ripwire: minos '$minos', pinned '${{ matrix.deployment_target }}'"
+          if [ -z "$minos" ] || [ "$minos" != '${{ matrix.deployment_target }}' ]; then
+            echo "release: the shipped binary's minimum macOS '$minos' is not the pinned '${{ matrix.deployment_target }}'" >&2
+            exit 1
+          fi
 
       - name: Smoke-test the freshly built binary
         run: |
@@ -173,6 +230,14 @@ jobs:
             dist/${{ steps.package.outputs.asset }}.tar.gz.sha256
           if-no-files-found: error
 
+  # The windows-x64 leg: ripwire-<ver>-windows-x64.zip + .zip.sha256, the same naming as the tarballs. It runs the
+  # other legs' std::print, determinism and smoke steps, then verifies the UNZIPPED exe (see windows-package.yml).
+  build-windows:
+    name: build (windows-x64)
+    uses: ./.github/workflows/windows-package.yml
+    with:
+      release_tag: ${{ inputs.tag || github.ref_name }}
+
   smoke-rhel:
     name: smoke RHEL 9 (${{ matrix.name }})
     needs: build
@@ -209,7 +274,7 @@ jobs:
 
   publish:
     name: publish GitHub Release
-    needs: [build, smoke-rhel]
+    needs: [build, build-windows, smoke-rhel]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -249,4 +314,6 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
           generate_release_notes: true

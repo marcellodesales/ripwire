@@ -7,7 +7,7 @@
 # other capped verb in the catalog has a display default (--hotspots 40, --grep 100, --impact 40, …);
 # --lint alone had none, so its own `<lint>` root could grow without bound. The fix (src/main.cpp
 # runLint) gives the DEFAULT (unpaged) run a byte budget (kLintDefaultPayloadBytes=100000, chosen from
-# measurements recorded at its definition site: this repo 367,924 B/3,213 findings, ctxpack (1,033
+# measurements recorded at its definition site: this repo 367,924 B/3,213 findings, its pre-cutover ancestor (1,033
 # tracked files) 254,445 B/2,312 findings, both ~110-115 B/finding, against E6's ~330 B/finding), and
 # reuses src/pageview.h's shared pageDisclosure() so the default run now says shown=/capped= the same
 # way every other capped verb already does — an explicit --limit=N still always beats the default cap
@@ -39,13 +39,14 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 CORPUS="$TMP/corpus"
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "lintpayloadcapcheck: no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -103,7 +104,9 @@ int compute()
 }
 EOF
 
-DEFAULT_OUT="$( "$BIN" "$CORPUS" --lint 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact and spells a <f row shape inside its comment; arm3a counts
+# real rows, so this run (and its determinism twin) ask for the full legend, the pre-change default.
+DEFAULT_OUT="$( "$BIN" "$CORPUS" --lint --legend=full 2>/dev/null )"
 DEFAULT_BYTES="${#DEFAULT_OUT}"
 TAG="$( printf '%s' "$DEFAULT_OUT" | grep -o '<lint [^>]*>' | head -1 )"
 FINDINGS="$( printf '%s' "$TAG" | sed -n 's/.*findings="\([0-9]*\)".*/\1/p' )"
@@ -183,7 +186,7 @@ if command -v xmllint >/dev/null 2>&1; then
 else
     no "arm6: xmllint is required for the G4 arm (install libxml2) — the gate does not skip"
 fi
-REPEAT_OUT="$( "$BIN" "$CORPUS" --lint 2>/dev/null )"
+REPEAT_OUT="$( "$BIN" "$CORPUS" --lint --legend=full 2>/dev/null )"
 if [ "$REPEAT_OUT" = "$DEFAULT_OUT" ]; then ok "arm6: output is byte-identical run-to-run"; else no "arm6: output is not deterministic"; fi
 
 # ── wave-4 item 12: recorded liability 1 from the six-smalls round (docs/EVALS.md) — the root's shown=/

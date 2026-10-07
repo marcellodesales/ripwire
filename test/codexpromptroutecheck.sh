@@ -4,20 +4,23 @@
 # and length, never prompt text, and hook installation stays idempotent.
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 HOOK="$ROOT/hooks/ripwire-codex-route.sh"
 ADAPTER="$ROOT/hooks/ripwire-codex-nudge.sh"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 command -v jq >/dev/null 2>&1 || { echo "jq required"; exit 2; }
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
-"$BIN" --help 2>&1 | grep -q -- '--help-task=' \
+"$BIN" --help=all 2>&1 | grep -q -- '--help-task=' \
     || { echo "codexpromptroutecheck: supplied binary does not expose --help-task"; exit 1; }
 
-mkdir -p "$TMP/bin" "$TMP/repo/.git" "$TMP/home"
+mkdir -p "$TMP/bin" "$TMP/repo" "$TMP/home"
+# A real work tree, not an empty .git directory: the router routes only where `git rev-parse` answers.
+git -C "$TMP/repo" init -q
 cat >"$TMP/bin/ripwire" <<'SH'
 #!/bin/sh
 case "$*" in
@@ -44,7 +47,7 @@ printf '%s' "$OUT" | jq -e '.hookSpecificOutput.additionalContext | contains("ev
 
 QUIET="$( printf '%s\n' "{\"prompt\":\"please abstain\",\"cwd\":\"$TMP/repo\"}" | \
     PATH="$TMP/bin:$PATH" RIPWIRE_HOME="$TMP/meter" "$HOOK" )"
-[ -z "$QUIET" ] && ok "abstention is silent" || no "abstention emitted context: $QUIET"
+if [ -z "$QUIET" ]; then ok "abstention is silent"; else no "abstention emitted context: $QUIET"; fi
 
 LOG="$TMP/meter/routing.jsonl"
 [ -s "$LOG" ] && [ "$( jq -s '[.[] | select(.event == "UserPromptSubmit")] | length' "$LOG" )" = 2 ] \
@@ -67,7 +70,10 @@ grep -R -q 'SECRET_PROMPT_TEXT' "$TMP/meter/routing-pending" 2>/dev/null \
 
 # The next two RIPWIRE calls, rather than arbitrary tool calls, close the recommendation. A different
 # first verb stays pending; the recommended second verb records position=2 and clears the state.
-for command in 'ripwire . --grep=SECRET_COMMAND_TEXT' 'ripwire . --for=alpha'; do
+# 2026-09-12: the first command names a DIRECTORY ending in /ripwire in argument position — not a call. It must
+# consume no window slot, or the --grep below lands at position 2 and the --for reads as missed (the instrument bug
+# the local routing analysis found; test/routehookcheck.sh O5 is the Claude twin).
+for command in 'cd /tmp/x/ripwire && git status' 'ripwire . --grep=SECRET_COMMAND_TEXT' 'ripwire . --for=alpha'; do
     payload="$( jq -cn --arg cwd "$TMP/repo" --arg command "$command" \
         '{session_id:"route-test",cwd:$cwd,tool_name:"Bash",tool_input:{command:$command}}' )"
     printf '%s' "$payload" | PATH="$TMP/bin:$PATH" RIPWIRE_HOME="$TMP/meter" "$ADAPTER" >/dev/null
@@ -134,9 +140,9 @@ OFF="$( printf '%s\n' "{\"prompt\":\"$PROMPT\",\"cwd\":\"$TMP/repo\",\"session_i
     && ok "routing-meter opt-out keeps advice but writes no log or pending state" \
     || no "routing-meter opt-out suppressed advice or wrote state"
 
-HOME="$TMP/home" CODEX_HOME="$TMP/home/.codex" AGENTS_HOME="$TMP/home/.agents" \
+HOME="$TMP/home" CODEX_HOME="$TMP/home/.codex" AGENTS_HOME="$TMP/home/.agents" RIPWIRE_DATA_HOME="$TMP/home/.local/share/ripwire" \
     bash "$ROOT/skills/install.sh" --codex --hook >/dev/null
-HOME="$TMP/home" CODEX_HOME="$TMP/home/.codex" AGENTS_HOME="$TMP/home/.agents" \
+HOME="$TMP/home" CODEX_HOME="$TMP/home/.codex" AGENTS_HOME="$TMP/home/.agents" RIPWIRE_DATA_HOME="$TMP/home/.local/share/ripwire" \
     bash "$ROOT/skills/install.sh" --codex --hook >/dev/null
 SETTINGS="$TMP/home/.codex/hooks.json"
 jq -e --arg cmd "$HOOK" '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command == $cmd)] | length == 1' "$SETTINGS" >/dev/null 2>&1 \

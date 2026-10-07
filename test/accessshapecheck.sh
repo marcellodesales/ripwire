@@ -38,7 +38,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 FIX="$ROOT/test/accessshapefix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -108,7 +108,7 @@ else no 'sepcost/wt arithmetic wrong — Phase B may have silently started affec
 fi
 
 # ── 5) no CLI surface: Phase A ships no new flag (docs/FIELDAFFINITY.md §9.1's "extend, don't ship a new flag") ────────────
-if "$BIN" --help 2>&1 | grep -qi -- '--access-shape'
+if "$BIN" --help=all 2>&1 | grep -qi -- '--access-shape'
 then no '--access-shape appeared in --help — the plan calls for extending --field-affinity, not a new flag'
 else ok 'no --access-shape flag exists — Phase A is --field-affinity-only, per the plan'
 fi

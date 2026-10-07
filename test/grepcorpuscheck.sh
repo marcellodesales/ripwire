@@ -31,7 +31,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -59,12 +59,13 @@ printf '%s' "$TYPO_OUT" | grep -qE '<suggest[^/]*near="gremlinFn"' \
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (2)+(3) corpus_excluded=/corpus_oversize= — present and EXACT ==="
 # ═══════════════════════════════════════════════════════════════════════════
-EXCL_OUT="$( "$BIN" "$SB" --no-cache --exclude=oversized --grep=CORPUSTOKEN 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact; arm (5) reads the FULL legend's prose, so the two runs it reads ask for it.
+EXCL_OUT="$( "$BIN" "$SB" --no-cache --exclude=oversized --grep=CORPUSTOKEN --legend=full 2>/dev/null )"
 printf '%s' "$EXCL_OUT" | grep -qE 'corpus_excluded="1"' \
     && ok "(2) corpus_excluded=\"1\" when --exclude= drops exactly 1 file" \
     || { no "(2) corpus_excluded= missing or wrong"; printf '%s' "$EXCL_OUT" | grep -o '<grep[^>]*>'; }
 
-SIZE_OUT="$( "$BIN" "$SB" --no-cache --max-file-size=64 --grep=CORPUSTOKEN 2>/dev/null )"
+SIZE_OUT="$( "$BIN" "$SB" --no-cache --max-file-size=64 --grep=CORPUSTOKEN --legend=full 2>/dev/null )"
 printf '%s' "$SIZE_OUT" | grep -qE 'corpus_oversize="1"' \
     && ok "(3) corpus_oversize=\"1\" when --max-file-size= drops exactly 1 file" \
     || { no "(3) corpus_oversize= missing or wrong"; printf '%s' "$SIZE_OUT" | grep -o '<grep[^>]*>'; }

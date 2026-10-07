@@ -1,9 +1,12 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // qualitypanel.h — `--quality-panel[=strict|default|lenient]`: THE SINGLE COMMAND.
 //
 // THE ASK. The quality signal in this tool is scattered across --ensemble, --context-ratio, --nonlocal-state,
-// --readability, --lint's two rule packs and --quality-delta. --ensemble is already the JOIN, but it joins only
+// --biggest-first, --lint's two rule packs and --quality-delta. --ensemble is already the JOIN, but it joins only
 // the four families wave 1 shipped; the wave-2 lenses are not in it. So the panel was real and incomplete. This
 // verb is the whole panel, reported ONCE, ranked ONCE.
 //
@@ -63,7 +66,7 @@
 // past commits and found `historical`'s flagged set at mean consecutive Jaccard 0.800-0.862 and endpoint
 // 0.426-0.546 — on gameA, 40% of the symbols it flagged in June were unflagged in July on code that had not
 // changed. §9.9 ran the SAME ladder on the two new families rather than assuming they inherited the others'
-// stability, and that is how the second exclusion was found: on the ctxpack ladder `colocation` comes out at
+// stability, and that is how the second exclusion was found: on the ripwire-ancestor ladder `colocation` comes out at
 // 0.732 mean consecutive and 0.222 endpoint — WORSE than historical, and the worst endpoint anywhere in either
 // study. Measured per family, worst case over the two ladders: lexical 1.000, state 0.999, structural 0.965,
 // confusion 0.920, historical 0.852, colocation 0.732. §9.7's own cut interval, (0.862, 0.920), is unchanged;
@@ -72,7 +75,7 @@
 // THE MECHANISM IS THE SAME IN BOTH CASES, which is why this is a finding and not a coincidence: each is a
 // FIXED-SIZE cut (the worst 40 ranks) over a ranking whose POPULATION moves. Churn is a rolling 12-month
 // window, so a busy week reshuffles the file order; the local-reasoning ranking is by absolute outside-reading
-// volume, so a tree that grew 19x across the ctxpack window reshuffles its top 40 completely. On a repository
+// volume, so a tree that grew 19x across the ripwire-ancestor window reshuffles its top 40 completely. On a repository
 // of stable size the same family is perfectly steady — colocation is 1.000/1.000 on the ripwire ladder. A
 // family that is stable only while the corpus is not growing cannot carry a gate.
 //
@@ -125,6 +128,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <limits>       // std::numeric_limits — the mask-width static_assert: an index shifted into a mask must fit it
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -150,7 +154,9 @@ enum : std::uint8_t
     kPanelFamilyCount = ensemble::kFamilyCount + 2   // 6
 };
 
-inline constexpr std::array<const char*, 2> kNewFamilyNames = { { "colocation", "state" } };
+inline constexpr const char* kNewFamilyNames[] = { "colocation", "state" };
+static_assert( std::size( kNewFamilyNames ) == std::size_t( kPanelFamilyCount ) - std::size_t( ensemble::kFamilyCount ),
+               "kNewFamilyNames is indexed by (family - ensemble::kFamilyCount) — one name per family the panel adds" );
 
 // ONE name table for six families, and the four calibrated names are READ from ensemble's own table rather
 // than copied into a second one — a copied name list is how a report ends up naming a family the join stopped
@@ -161,6 +167,10 @@ inline const char* familyName( std::uint8_t family ) noexcept
                                            : kNewFamilyNames[ family - ensemble::kFamilyCount ];
 }
 
+// The panel's six families are bits of the same std::uint8_t masks ensemble's four are (PanelRow::firedMask below,
+// kAllFamilies here), set by `1u << family`: pinned so a seventh family cannot shift past the mask.
+static_assert( kPanelFamilyCount <= std::numeric_limits<std::uint8_t>::digits,
+               "quality-panel families are bits of a std::uint8_t mask — widen the masks before adding a family" );
 inline constexpr std::uint8_t kAllFamilies = std::uint8_t( ( 1u << kPanelFamilyCount ) - 1u );
 
 // The families measured stable enough to stand behind a gate — everything but `historical` and `colocation`,
@@ -171,6 +181,8 @@ inline constexpr std::uint8_t kUnstableForGating = std::uint8_t( ( 1u << ensembl
 inline constexpr std::uint8_t kStableFamilies    = std::uint8_t( kAllFamilies & ~kUnstableForGating );
 
 enum class Preset : std::uint8_t { Strict = 0, Default = 1, Lenient = 2 };
+inline constexpr std::size_t kPresetCount = static_cast<std::size_t>( Preset::Lenient ) + 1;
+static_assert( enumCountIsExact<Preset, kPresetCount>(), "kPresetCount must name the LAST Preset — move it with the append" );
 
 // A preset is a SELECTION and a CUT. No third field exists, and none may be added: a weight here would be the
 // composite score this verb's rank is defined against.
@@ -181,11 +193,12 @@ struct PresetRow
     std::uint8_t  cut;
 };
 
-inline constexpr std::array<PresetRow, 3> kPresets = { {
+inline constexpr PresetRow kPresets[] = {
     { "strict",  kStableFamilies, 2 },
     { "default", kAllFamilies,    2 },
     { "lenient", kAllFamilies,    1 },
-} };
+};
+static_assert( std::size( kPresets ) == kPresetCount, "kPresets is indexed by Preset — one row per enumerator" );
 
 inline const PresetRow& presetRow( Preset p ) noexcept
 {
@@ -197,7 +210,7 @@ inline const PresetRow& presetRow( Preset p ) noexcept
 // different report.
 inline bool parsePreset( std::string_view value, Preset& out ) noexcept
 {
-    for( std::size_t index = 0; index < kPresets.size(); ++index )
+    for( std::size_t index = 0; index < std::size( kPresets ); ++index )
     {
         if( value == kPresets[index].name )
         {
@@ -567,7 +580,7 @@ inline constexpr const char* kPanelLegend =
     "Absolute bars: bar_ccx=cognitive complexity bar_loc=physical lines bar_nest=max nesting depth "
     "bar_params=param count; a row shows only the ones that crossed. Rankings fire for the worst decile of "
     "their OWN corpus (RELATIVE: 'worst in THIS corpus', never 'bad in absolute terms'): rrank=readability "
-    "rank (0 least readable) rcut=decile width rmeasured=functions measured; hrank=file churn rank (0 most "
+    "rank (0 lowest posnett=, the largest body) rcut=decile width rmeasured=functions measured; hrank=file churn rank (0 most "
     "changed) churn=in-window commit count hcut=decile width hranked=files with any in-window commit "
     "window=the churn window; crank=local-reasoning rank (0 reads most from outside its file) ccut=decile "
     "width cranked=functions resolving any outside definition. state has no threshold (fires on a direct "
@@ -634,7 +647,7 @@ inline int writePanelReport( const IngestResult& ing, const Graph& g, const std:
     std::fputs( kPanelLegend, stdout );
     std::fputs( rw::kAtStampLegend, stdout );
     std::fputs( rw::rootRelPathsLegend( qpSingleRoot ), stdout );
-    std::printf( "<quality_panel preset=\"%s\" families=\"%u\" enabled=\"%s\" enabled_n=\"%u\" cut=\"%u\" cut_reachable=\"%s\"",
+    rw::emitTo( stdout, "<quality_panel preset=\"{}\" families=\"{}\" enabled=\"{}\" enabled_n=\"{}\" cut=\"{}\" cut_reachable=\"{}\"",
                  sel.name, unsigned( kPanelFamilyCount ), familyList( sel.enabled ).c_str(),
                  unsigned( std::popcount( sel.enabled ) ), unsigned( sel.cut ),
                  unsigned( sel.cut ) <= evaluable ? "1" : "0" );
@@ -647,35 +660,35 @@ inline int writePanelReport( const IngestResult& ing, const Graph& g, const std:
     const std::string unavailWhyStr   = detail::unavailWhyList( scan );
     const std::string unavailableAttr    = unavailNamesStr.empty() ? std::string() : ( " unavailable=\"" + unavailNamesStr + "\"" );
     const std::string unavailableWhyAttr = unavailWhyStr.empty()   ? std::string() : ( " unavailable_why=\"" + std::string( escapeXml( unavailWhyStr, escUnavail ) ) + "\"" );
-    std::printf( " eligible=\"%zu\" ranked=\"%zu\" below_cut=\"%zu\" no_family=\"%zu\"%s%s",
+    rw::emitTo( stdout, " eligible=\"{}\" ranked=\"{}\" below_cut=\"{}\" no_family=\"{}\"{}{}",
                  scan.eligibleCount, total, scan.belowCutCount, scan.noFamilyCount,
                  unavailableAttr.c_str(), unavailableWhyAttr.c_str() );
-    std::printf( " bar_ccx=\"%u\" bar_loc=\"%u\" bar_nest=\"%u\" bar_params=\"%u\"",
+    rw::emitTo( stdout, " bar_ccx=\"{}\" bar_loc=\"{}\" bar_nest=\"{}\" bar_params=\"{}\"",
                  quality::kCcxBar, quality::kLocBar, quality::kNestBar, quality::kParamBar );
-    std::printf( " rcut=\"%zu\" rmeasured=\"%zu\" hcut=\"%zu\" hranked=\"%zu\" window=\"%s\" ccut=\"%zu\" cranked=\"%zu\"",
+    rw::emitTo( stdout, " rcut=\"{}\" rmeasured=\"{}\" hcut=\"{}\" hranked=\"{}\" window=\"{}\" ccut=\"{}\" cranked=\"{}\"",
                  scan.readabilityCut, scan.readabilityMeasured, scan.churnCut, scan.churnRanked,
                  ensemble::kEnsembleWindowLabel, scan.colocCut, scan.colocRanked );
     // The LANGUAGE-COVERAGE denominators — what each availability verdict was computed FROM, so a reader can
-    std::printf( " cfiles=\"%zu\" cscope=\"%zu\" lscope=\"%zu\" sfiles=\"%zu\" sscope=\"%zu\" cells=\"%zu\"",
+    rw::emitTo( stdout, " cfiles=\"{}\" cscope=\"{}\" lscope=\"{}\" sfiles=\"{}\" sscope=\"{}\" cells=\"{}\"",
                  scan.confusionFiles, scan.confusionScope, scan.lexicalScope,   // check each verdict instead of
-                 scan.stateFiles, scan.stateScope, scan.stateCells );           // taking it on trust.
+                 scan.stateFiles, scan.stateScope, scan.stateCells  );           // taking it on trust.
     // The join's own two numbers, on the root for the same reason every other denominator is: tested_scope=0
     // is what a reader needs to know before reading a missing annotation as a clean bill of coverage.
-    std::printf( " tested_scope=\"%zu\" deep_untested=\"%zu\"", scan.testedScope, scan.deepUntestedCount );
+    rw::emitTo( stdout, " tested_scope=\"{}\" deep_untested=\"{}\"", scan.testedScope, scan.deepUntestedCount );
     if( scan.unreadableFileCount != 0 )
     {
-        std::printf( " unreadable_files=\"%u\"", scan.unreadableFileCount );
+        rw::emitTo( stdout, " unreadable_files=\"{}\"", scan.unreadableFileCount );
     }
     if( scan.stateFloor )
     {
-        std::printf( " state_floor=\"1\"" );
+        rw::emitRaw( stdout, " state_floor=\"1\"" );
     }
     if( !floorRules.empty() )
     {
-        std::printf( " findings_capped=\"1\" floor_rules=\"%s\"%s", std::string( escapeXml( std::string_view( floorRules ), escFloor ) ).c_str(),
-                     kGraphCountFloorAttrXml );   // H8: a floored family floors the root's counts
+        rw::emitTo( stdout, " findings_capped=\"1\" floor_rules=\"{}\"{}", std::string( escapeXml( std::string_view( floorRules ), escFloor ) ).c_str(),
+                     kGraphCountFloorAttrXml  );   // H8: a floored family floors the root's counts
     }
-    std::printf( " shown=\"%zu\" capped=\"%s\"%s%s%s>", shown, shown < total ? "1" : "0", paging,
+    rw::emitTo( stdout, " shown=\"{}\" capped=\"{}\"{}{}{}>", shown, shown < total ? "1" : "0", rw::cstr( paging ),
                  qpRootAttr.c_str(), gitstamp::atAttr( root ).c_str() );
 
     // TWO scratch buffers, not one reused twice in the same call: escapeXml returns a VIEW into its `out`, so a
@@ -698,7 +711,7 @@ inline int writePanelReport( const IngestResult& ing, const Graph& g, const std:
         const std::string uncountedStr  = familyList( std::uint8_t( row.firedMask & ~row.countedMask ) );
         const std::string uncountedAttr = uncountedStr.empty() ? std::string() : ( " uncounted=\"" + uncountedStr + "\"" );
         const std::string unavailAttr   = unavailNames.empty() ? std::string() : ( " unavail=\"" + unavailNames + "\"" );
-        std::printf( "<s p=\"%s:%u\" n=\"%s\" fam=\"%u\" of=\"%u\" fired=\"%s\"%s%s%s>",
+        rw::emitTo( stdout, "<s p=\"{}:{}\" n=\"{}\" fam=\"{}\" of=\"{}\" fired=\"{}\"{}{}{}>",
                      path.c_str(), s.line, name.c_str(), unsigned( row.firedCount ), evaluable,
                      familyList( row.countedMask ).c_str(),
                      uncountedAttr.c_str(), unavailAttr.c_str(),
@@ -710,13 +723,13 @@ inline int writePanelReport( const IngestResult& ing, const Graph& g, const std:
                 continue;
             }
             std::vector<char> escWhy;
-            std::printf( "<e f=\"%s\" counted=\"%s\" why=\"%s\"/>", familyName( family ),
+            rw::emitTo( stdout, "<e f=\"{}\" counted=\"{}\" why=\"{}\"/>", familyName( family ),
                          ( ( row.countedMask >> family ) & 1u ) != 0 ? "1" : "0",
                          std::string( escapeXml( row.why[family], escWhy ) ).c_str() );
         }
-        std::printf( "</s>" );
+        rw::emitRaw( stdout, "</s>" );
     }
-    std::printf( "</quality_panel>" );
+    rw::emitRaw( stdout, "</quality_panel>" );
     return 0;
 }
 

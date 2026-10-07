@@ -3,6 +3,9 @@
 #error "verbs_quality.h is a SECTION of src/main.cpp's translation unit - include it only from main.cpp (see the verb-family split note there)"
 #endif
 
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 // verbs_quality.h — the quality family, moved VERBATIM from main.cpp in the 2026-08-29 split:
 // the delta-basis plumbing (noBaselineFatalMessage, loadRefPairDelta, resolveDeltaBasis),
 // runQualityDelta, runDmm, the dead-code path filters, runQualityPanel, runQualityViews and
@@ -26,6 +29,26 @@ std::string noBaselineFatalMessage( const std::string& baselineFile, const rw::q
     // auto-compare against" errMsg) has always carried both halves for the identical state, so a CLI reader
     // could not tell the fallback had even been tried and would look for a bug in the sidecar. Same two
     // clauses, same order, same verb-name spelling convention as the stale arms below.
+    if( sel.sidecarSymlinkRefused )
+    {
+        // Round 3 (pathguard.h): "no <file>" is false while a link sits at the name, so say what happened to it.
+        return "ripwire: " + baselineFile + " is a symlink, which is refused on read exactly as on write (it was not opened), and there is no git HEAD to auto-compare against — "
+               "replace the link with a regular copy of its target, or remove it and run `ripwire <dir> --quality-baseline` BEFORE the change you want to measure\n";
+    }
+    if( sel.sidecarUnreadable )
+    {
+        // Same "no <file>" falsehood about a file that is there — reached by every pre-v6 sidecar in a non-git root.
+        return "ripwire: " + baselineFile + " exists but is not a readable baseline (unrecognizable, an older sidecar format, or a pre-Q1 sidecar without per-symbol loc "
+               "records) and there is no git HEAD to auto-compare against — re-pin it with `ripwire <dir> --quality-baseline` BEFORE the change you want to measure\n";
+    }
+    if( sel.isSidecarForeign() )
+    {
+        // The producer rule (quality.h BaselineSource): the file is there and is a real floor, just not this
+        // build's — "no <file>" would be false, and so would "delete it", since the build that pinned it may run.
+        return "ripwire: " + baselineFile + " was pinned by another ripwire build (its producer stamp does not name this binary's sources, and a dead set depends on how "
+               "calls were resolved) and there is no git HEAD to auto-compare against — it was left on disk: run --quality-delta with the build that pinned it, "
+               "or re-pin on a clean tree (commit or stash first) with `ripwire <dir> --quality-baseline` BEFORE the change you want to measure\n";
+    }
     if( !sel.isSidecarStale() )
     {
         return "ripwire: no " + baselineFile + " and no git HEAD to auto-compare against — run `ripwire <dir> --quality-baseline` BEFORE the change you want to measure\n";
@@ -78,13 +101,15 @@ std::optional<int> loadRefPairDelta( const std::string& root, std::string_view s
             // The did-you-mean here cannot be a spelling neighbourhood — git already owns the ref namespace and
             // has no cheap enumeration of it — so the adjacent help names the PROBE and the three causes that
             // actually produce this on an agent's machine, which is more use than a guessed nearest ref.
-            std::fprintf( stderr, "ripwire: --quality-delta: '%s' does not resolve to a commit in %s\n"
-                                  "  check it with `git -C %s rev-parse --verify %s^{commit}`; the usual causes are a typo, a ref that\n"
+            // 0.6.7: the cause list below GUESSES; on a depth-limited clone the probe KNOWS, so the first line names it
+            // (gitstamp::shallowRefHint — the same sentence pr-context and merge-scout print; "" on a full clone).
+            rw::emitTo( stderr, "ripwire: --quality-delta: '{}' does not resolve to a commit in {}{}\n"
+                                  "  check it with `git -C {} rev-parse --verify {}^{{commit}}`; the usual causes are a typo, a ref that\n"
                                   "  lives only on a remote you have not fetched, or a shallow clone whose history stops before it\n",
-                          ref.badToken.c_str(), root.c_str(), root.c_str(), ref.badToken.c_str() );
+                          ref.badToken.c_str(), root.c_str(), rw::gitstamp::shallowRefHint( root ), root.c_str(), ref.badToken.c_str() );
             return 1;
         case quality::RefSpecStatus::BadRange:
-            std::fprintf( stderr, "ripwire: --quality-delta: '%s' uses the three-dot form; this compares two TREES, so spell it A..B "
+            rw::emitTo( stderr, "ripwire: --quality-delta: '{}' uses the three-dot form; this compares two TREES, so spell it A..B "
                                   "(or --quality-delta=$(git merge-base A B)..B if the merge base is what you meant)\n", ref.badToken.c_str() );
             return 1;
         case quality::RefSpecStatus::NoGit:
@@ -92,7 +117,7 @@ std::optional<int> loadRefPairDelta( const std::string& root, std::string_view s
             // Environment, not a typo — and unlike --dmm (a measurement that reports UNAVAILABLE and exits 0)
             // this verb has nothing to report at all, so it takes the same exit 1 the bare form's
             // "nothing to compare against" path takes.
-            std::fprintf( stderr, "ripwire: --quality-delta=%.*s: %s\n", int( spec.size() ), spec.data(), ref.reason.c_str() );
+            rw::emitTo( stderr, "ripwire: --quality-delta={}: {}\n", std::string_view( spec.data(), spec.size() ), ref.reason.c_str() );
             return 1;
         case quality::RefSpecStatus::Ok:
             break;
@@ -102,7 +127,7 @@ std::optional<int> loadRefPairDelta( const std::string& root, std::string_view s
     // a materialized tree against a working tree whose keys are spelled against a different root.
     if( ref.targetIsWorkingTree || ref.baseSha.empty() || ref.targetSha.empty() )
     {
-        std::fprintf( stderr, "ripwire: --quality-delta needs TWO commits (A..B); use the bare --quality-delta for the working tree\n" );
+        rw::emitRaw( stderr, "ripwire: --quality-delta needs TWO commits (A..B); use the bare --quality-delta for the working tree\n" );
         return 1;
     }
 
@@ -111,12 +136,12 @@ std::optional<int> loadRefPairDelta( const std::string& root, std::string_view s
     out.sameRef = ( ref.baseSha == ref.targetSha );
     if( !quality::loadRefTree( root, ref.baseSha, cfg.excludes, cfg.maxFileBytes, "qdpair-base", out.baseGuard, out.baseTree ) )
     {
-        std::fprintf( stderr, "ripwire: --quality-delta: could not materialize or parse the tree at %s\n", ref.baseSha.c_str() );
+        rw::emitTo( stderr, "ripwire: --quality-delta: could not materialize or parse the tree at {}\n", ref.baseSha.c_str() );
         return 1;
     }
     if( !out.sameRef && !quality::loadRefTree( root, ref.targetSha, cfg.excludes, cfg.maxFileBytes, "qdpair-target", out.targetGuard, out.targetTree ) )
     {
-        std::fprintf( stderr, "ripwire: --quality-delta: could not materialize or parse the tree at %s\n", ref.targetSha.c_str() );
+        rw::emitTo( stderr, "ripwire: --quality-delta: could not materialize or parse the tree at {}\n", ref.targetSha.c_str() );
         return 1;
     }
 
@@ -156,7 +181,19 @@ struct DeltaBasis
     gtl::btree_map<std::string, rw::quality::AckRecord> acks;
     rw::quality::IdentityHealing                        healing;
     std::size_t                                         registerMacroExcluded = 0;   // P2.2: disclosed dead-code exemption count
+    std::size_t                                         declinedCallExcluded  = 0;   // dead-code exemption by a declined call (quality.h isDeadCandidate)
+    std::size_t                                         valueRefExcluded      = 0;   // dead-code exemption: held as a VALUE (valuerefindex.h)
+    std::size_t                                         apiNewSurface         = 0;   // Q-DIAL-4: new PUBLIC symbols this change added — the count that replaced one never-gating row each
     std::size_t acksBadLines = 0;   // 2026-09-06: .ripwire_quality_acks lines skipped as unparseable (disclosed on the root)
+    // #228: WHICH basis produced baseSel.snapshot when the marker is one of the git-HEAD family, and WHY when
+    // the fast one was refused for a reason the caller can act on. nullptr = the attribute is absent, which is
+    // the ordinary archived comparison every git-HEAD marker has always meant. See quality::HeadBasis.
+    const char* headBasis = nullptr;
+    // Every CURRENT-tree clone group's (member-set hash, idiom verdict) — computeDelta already had both in
+    // hand, so this is a copy rather than a second clone pass. Consumed ONLY by the legacy-ack backfill
+    // (quality::backfillCloneAckProvenance) on the --quality-ack path; a read-only --quality-delta fills it
+    // and never looks at it, which keeps the two runs' reported findings identical.
+    std::vector<rw::quality::CloneIdiomFact> cloneIdioms;
 };
 
 // Returns an EXIT CODE when there is nothing to compare against (already reported), nullopt when `out` holds
@@ -192,7 +229,8 @@ std::optional<int> resolveDeltaBasis( const MainDispatch& d, const std::string& 
         out.healing = quality::healIdentity( out.baseSel.snapshot, out.acks, refs.target().ing, refs.target().g,
                                              out.deltaRoot, root, cfg.qualityAck, refs.rangeSpan );
         out.regs    = quality::computeDelta( refs.target().ing, refs.target().g, out.baseSel.snapshot,
-                                             out.deltaRoot, cfg.excludes, cfg.maxFileBytes, &out.registerMacroExcluded );
+                                             out.deltaRoot, cfg.excludes, cfg.maxFileBytes, &out.registerMacroExcluded, &out.apiNewSurface,
+                                             &out.cloneIdioms, &out.declinedCallExcluded, &out.valueRefExcluded );
         return std::nullopt;
     }
 
@@ -217,14 +255,17 @@ std::optional<int> resolveDeltaBasis( const MainDispatch& d, const std::string& 
     // and the ONLY record is the `baseline=` XML attribute ("git-HEAD (stale sidecar removed)") — no stderr
     // spam, which is the B10.1b noise fix that survives the ruling intact. The read-only MCP arm passes false
     // and reports "…ignored" instead. When the unlink FAILS (read-only parent dir) this arm degrades to the
-    // read-only story — marker "…ignored", one DEGRADED_PATH_ALERT from the seam — because the pin is still
+    // read-only story — marker "…ignored", one DISCLOSE from the seam — because the pin is still
     // on disk; `isStaleFileOnDisk()` is the fact, and the fatal message words itself from it, not the intent.
     out.deltaRoot = std::string( cfg.rootPath );
     out.baseSel   = quality::selectBaseline( root, baselineFile, /*removeStaleFile=*/true );
     if( !out.baseSel.isSidecarHonored() )
     {
-        auto [ headSnap, ok ] = computeHeadSnapshot( root, nullptr, cfg.maxFileBytes, cfg.excludes );
-        if( !ok )
+        // #228 part 1 — the IDENTITY BASIS (quality.h): when the tracked tree already IS HEAD, the baseline is
+        // this tree's own snapshot, so a no-op diff is empty by construction instead of by luck. Falls back to
+        // the archived HEAD snapshot on any modified tree, unchanged.
+        quality::HeadBasis basis = quality::computeHeadBasis( root, d.ing, d.g, cfg.rootPath, cfg.maxFileBytes, cfg.excludes );
+        if( !basis.ok )
         {
             // w1 MED: this used to say "no <file>" in BOTH cases — factually false when the file is a STALE
             // sidecar that was just dropped, and doubly so when the self-heal unlink FAILED and the thing is
@@ -233,16 +274,34 @@ std::optional<int> resolveDeltaBasis( const MainDispatch& d, const std::string& 
             std::fputs( noBaselineFatalMessage( baselineFile, out.baseSel ).c_str(), stderr );
             return 1;
         }
-        out.baseSel.snapshot = std::move( headSnap );
+        out.baseSel.snapshot   = std::move( basis.snapshot );
+        out.headBasis          = basis.basis;
+        if( basis.notAtHead != 0 )
+        {
+            // The basis is stated where it is not the obvious one: these files are in the tree and in the graph,
+            // so they shape every verdict, but HEAD does not hold them and the baseline therefore does not
+            // either — their own symbols read as new, exactly as they do against an archived HEAD.
+            rw::emitTo( stderr, "ripwire: {} indexed file(s) are not tracked at HEAD — their symbols are judged as NEW; tracked symbols are compared "
+                                  "with HEAD's own content in this same tree\n", basis.notAtHead );
+        }
         if( out.baseSel.sidecarUnreadable )
         {
             // 2026-09-06 stranger audit: this used to print "no <file>" about a file sitting on disk.
-            std::fprintf( stderr, "ripwire: %s exists but is not a readable baseline (unrecognizable, or a pre-Q1 sidecar without per-symbol loc records) — IGNORED; "
+            rw::emitTo( stderr, "ripwire: {} exists but is not a readable baseline (unrecognizable, an older sidecar format, or a pre-Q1 sidecar without per-symbol loc records) — IGNORED; "
                                   "auto-comparing the working tree vs git HEAD; re-pin it with --quality-baseline\n", baselineFile.c_str() );
         }
-        else if( !out.baseSel.isSidecarStale() )
-        { // the stale/healed case is silent by design — only the true "never baselined" case is informative
-            std::fprintf( stderr, "ripwire: no %s — auto-comparing the working tree vs git HEAD (commit the baseline with --quality-baseline to pin it)\n",
+        else if( out.baseSel.isSidecarForeign() )
+        {
+            // Said on stderr like the unreadable case above and unlike the stale one: a stale pin is removed, so its
+            // silence costs one run, while a foreign pin stays on disk and is ignored on every run until re-pinned.
+            rw::emitTo( stderr, "ripwire: {} was pinned by another ripwire build (its producer stamp does not name this binary's sources, and a dead set depends on how "
+                                  "calls were resolved) — IGNORED and left on disk; auto-comparing the working tree vs git HEAD; run --quality-delta with the build that "
+                                  "pinned it, or re-pin on a clean tree (commit or stash first) with --quality-baseline\n", baselineFile.c_str() );
+        }
+        else if( !out.baseSel.isSidecarStale() && !out.baseSel.sidecarSymlinkRefused )
+        { // the stale/healed case is silent by design — only the true "never baselined" case is informative. A refused
+          // link (pathguard.h round 3) is not "never baselined" either, and pathguard has already said why on stderr.
+            rw::emitTo( stderr, "ripwire: no {} — auto-comparing the working tree vs git HEAD (commit the baseline with --quality-baseline to pin it)\n",
                           baselineFile.c_str() );
         }
     }
@@ -251,7 +310,8 @@ std::optional<int> resolveDeltaBasis( const MainDispatch& d, const std::string& 
     out.acks    = quality::readAckRecords( quality::acksPath( root ), out.acksBadLines );
     out.healing = quality::healIdentity( out.baseSel.snapshot, out.acks, d.ing, d.g,
                                          std::string( cfg.rootPath ), root, cfg.qualityAck );
-    out.regs = quality::computeDelta( d.ing, d.g, out.baseSel.snapshot, cfg.rootPath, cfg.excludes, cfg.maxFileBytes, &out.registerMacroExcluded );
+    out.regs = quality::computeDelta( d.ing, d.g, out.baseSel.snapshot, cfg.rootPath, cfg.excludes, cfg.maxFileBytes, &out.registerMacroExcluded, &out.apiNewSurface,
+                                      &out.cloneIdioms, &out.declinedCallExcluded, &out.valueRefExcluded );
     return std::nullopt;
 }
 
@@ -273,14 +333,14 @@ std::optional<int> expandScopeDiff( rw::quality::Scope& scope, bool refPair, con
         // The token names the WORKING TREE's changes, and this form compares two committed trees — the
         // working tree is not part of the comparison at all, so the answer would describe a different tree
         // than the one being judged.
-        std::fprintf( stderr, "ripwire: --scope=diff scopes to the WORKING TREE's changes, but --quality-delta=A..B compares two COMMITTED trees —\n"
+        rw::emitRaw( stderr, "ripwire: --scope=diff scopes to the WORKING TREE's changes, but --quality-delta=A..B compares two COMMITTED trees —\n"
                               "  spell the scope as paths there (e.g. --scope=src/quality.h), or drop the range to measure the working tree\n" );
         return 1;
     }
     std::vector<char> changed( judged.files.size(), 0 );
     if( !rw::gitChangedFiles( root, judged, changed ) )
     {
-        std::fprintf( stderr, "ripwire: --scope=diff needs git to say what changed, and %s is not a readable git repository —\n"
+        rw::emitTo( stderr, "ripwire: --scope=diff needs git to say what changed, and {} is not a readable git repository —\n"
                               "  name the paths instead (e.g. --scope=src/quality.h,src/verbs_quality.h)\n", root.c_str() );
         return 1;
     }
@@ -302,7 +362,7 @@ std::optional<int> expandScopeDiff( rw::quality::Scope& scope, bool refPair, con
     }
     if( diffFileCount == 0 )
     {
-        std::fprintf( stderr, "ripwire: --scope=diff expanded to NO changed indexed file — the working tree matches the baseline (or the edits are in files\n"
+        rw::emitRaw( stderr, "ripwire: --scope=diff expanded to NO changed indexed file — the working tree matches the baseline (or the edits are in files\n"
                               "  this index does not carry), so the scope owns nothing and an exit 0 under it would say nothing about your change\n" );
         return 1;
     }
@@ -330,9 +390,8 @@ std::optional<int> refuseUnusableScope( const rw::Config& cfg, const rw::quality
         // an XML attribute. A pattern that cannot round-trip through both is refused here rather than mangled
         // at the emitter: matching against something the caller never typed is the one outcome worse than
         // not matching at all.
-        std::fprintf( stderr, "ripwire: --scope=%.*s contains whitespace or an XML metacharacter — a scope is recorded verbatim in the ack ledger and in the report,\n"
-                              "  so each pattern must be spellable as one token (e.g. --scope=src/quality.h,src/verbs_quality.h)\n",
-                      int( cfg.qualityScope.size() ), cfg.qualityScope.data() );
+        rw::emitTo( stderr, "ripwire: --scope={} contains whitespace or an XML metacharacter — a scope is recorded verbatim in the ack ledger and in the report,\n"
+                              "  so each pattern must be spellable as one token (e.g. --scope=src/quality.h,src/verbs_quality.h)\n", std::string_view( cfg.qualityScope.data(), cfg.qualityScope.size() ) );
         return 1;
     }
     // A scope that names nothing INDEXED is a typo, not a measurement — and a typo here reads as "you're
@@ -345,9 +404,8 @@ std::optional<int> refuseUnusableScope( const rw::Config& cfg, const rw::quality
             return std::nullopt;
         }
     }
-    std::fprintf( stderr, "ripwire: --scope=%.*s matches no indexed path — an exit 0 under a scope that owns nothing is a failure, not a clean tree\n"
-                          "  (patterns are matched ROOT-RELATIVE, the same spelling p= prints: --scope=src or --scope=src/quality.h, not an absolute path)\n",
-                  int( cfg.qualityScope.size() ), cfg.qualityScope.data() );
+    rw::emitTo( stderr, "ripwire: --scope={} matches no indexed path — an exit 0 under a scope that owns nothing is a failure, not a clean tree\n"
+                          "  (patterns are matched ROOT-RELATIVE, the same spelling p= prints: --scope=src or --scope=src/quality.h, not an absolute path)\n", std::string_view( cfg.qualityScope.data(), cfg.qualityScope.size() ) );
     return 1;
 }
 
@@ -370,6 +428,7 @@ std::size_t partitionByScope( const rw::quality::Scope& scope, std::vector<rw::q
                               std::vector<rw::quality::Regression>& outOfScope,
                               const gtl::btree_map<std::string, rw::quality::AckRecord>& acks )
 {
+    ASSUME_NO_ALIAS( regs, outOfScope );   // push_back into outOfScope while iterating regs: the same vector twice is UB
     if( !scope.active() )
     {
         return 0;
@@ -435,10 +494,9 @@ std::optional<int> refuseForeignAckSelection( const rw::Config& cfg, const rw::q
     {
         return std::nullopt;
     }
-    std::fprintf( stderr, "ripwire: --ack-only=%.*s selects %zu finding(s) OUT OF SCOPE for --scope=%s — refusing, and writing nothing at all:%s%s\n"
+    rw::emitTo( stderr, "ripwire: --ack-only={} selects {} finding(s) OUT OF SCOPE for --scope={} — refusing, and writing nothing at all:{}{}\n"
                           "  those rows belong to whoever is editing those paths. Acking them here writes their debt into a committed ledger under YOUR\n"
-                          "  reason string, which is how a per-finding ratchet becomes a rubber stamp. Narrow the pattern, or widen the scope if they really are yours.\n",
-                  int( cfg.qualityAckOnly.size() ), cfg.qualityAckOnly.data(), namedCount, scope.spec.c_str(),
+                          "  reason string, which is how a per-finding ratchet becomes a rubber stamp. Narrow the pattern, or widen the scope if they really are yours.\n", std::string_view( cfg.qualityAckOnly.data(), cfg.qualityAckOnly.size() ), namedCount, scope.spec.c_str(),
                   named.c_str(), namedCount > 8 ? "\n    …" : "" );
     return 1;
 }
@@ -462,7 +520,7 @@ std::optional<int> refuseForeignAckSelection( const rw::Config& cfg, const rw::q
 // this prose either: several gates grep the header counters (regressions=, gating=, stale=) and a
 // quoted example here would be matched ahead of the real one.
 
-// Always. The verb, the ten kinds, the three axes, the exit predicate, and the two counters that are
+// Always. The verb, the eleven kinds, the three axes, the exit predicate, and the two counters that are
 // printed even at zero. Every row in the document — finding rows and stale-ack rows alike — carries
 // kind=, so it is defined here rather than in either conditional row dictionary.
 // P8 (L7): the bar= literals in emitRow mirror quality.h's constants — pinned here so a moved bar cannot drift the row
@@ -472,9 +530,10 @@ static_assert( rw::quality::kCcxBar == 15 && rw::quality::kLocBar == 60 && rw::q
 inline constexpr const char* kQdLegendCore =
     "<!-- ripwire quality-delta: only what a change made WORSE against the floor baseline= names below. "
     "Descriptive: weigh and fix the real ones, do not game the number (a wrong abstraction beats a low "
-    "score). TEN KINDS, and kind= on every row names which one: complexity over the ccx bar, verbosity "
+    "score). ELEVEN KINDS, and kind= on every row names which one: complexity over the ccx bar, verbosity "
     "(LOC), nesting, params, duplication, dead-code, api-surface (new public contract drift), "
-    "error-masking, short-horizon-churn, new-clone-of-reused-helper. THREE independent axes, in this "
+    "error-masking, short-horizon-churn, new-clone-of-reused-helper, placeholder (added stub/TODO). "
+    "THREE independent axes, in this "
     "order: (1) acked findings are suppressed entirely (acked= counts them); (2) ORIGIN — a finding on a "
     "symbol that EXISTED at the baseline is preexisting-worse (no origin attribute), one that exists only "
     "because the code is NEW carries origin=\"new-symbol\"; (3) MATERIALITY — a small numeric delta is "
@@ -485,6 +544,7 @@ inline constexpr const char* kQdLegendCore =
     "preexisting by construction. preexisting-worse= and new-symbol= partition regressions=. stale= is a "
     "FOURTH axis, never gating and never counted in regressions=: rows in the .ripwire_quality_acks ledger "
     "whose target no longer applies. "
+    "api-new-surface= COUNTS the new PUBLIC symbols (never gates, not in regressions=, printed even at zero). "
     "register-macro-excluded= is a FLOOR, not a finding: symbols this run excluded from the dead-code kind "
     "because their own definition is a registered self-registering test/benchmark macro call. Never gates, "
     "never counted in regressions=, printed even at zero (zero means none excluded, not that the check did "
@@ -528,14 +588,28 @@ inline constexpr const char* kQdBaseHeadRemoved =
     "quality-baseline) — so anything already committed cannot appear. ";
 inline constexpr const char* kQdBaseHeadUnreadable =
     "baseline=\"git-HEAD (sidecar unreadable)\" means a .ripwire_quality_baseline EXISTS but could not be read as one "
-    "(no recognizable structure, or a pre-Q1 sidecar without per-symbol loc records), so it was IGNORED and the "
-    "working tree was compared against the HEAD tree — re-pin it with quality-baseline. baseline_bad_lines= and "
+    "(no recognizable structure, an older sidecar format, or a pre-Q1 sidecar without per-symbol loc records), so it was IGNORED and the "
+    "working tree was compared against the HEAD tree, and an allow-dirty pin's absorbed findings are not in force — re-pin it on a "
+    "clean tree (commit or stash first) with quality-baseline. baseline_bad_lines= and "
     "acks_bad_lines=, when present, count sidecar lines of a known kind whose payload did not parse and were "
     "skipped (absent means none). ";
+inline constexpr const char* kQdBaseHeadSymlinkRefused =
+    "baseline=\"git-HEAD (symlinked sidecar refused)\" means .ripwire_quality_baseline is a SYMLINK, which is refused on "
+    "read exactly as on write: it was not opened, so the working tree was compared against the HEAD tree — replace "
+    "the link with a regular copy of its target, or remove it and re-pin with quality-baseline. ";
 inline constexpr const char* kQdBaseHeadIgnored =
     "baseline=\"git-HEAD (stale sidecar ignored)\" is the same staleness verdict, but the file was left on "
     "disk (the read-only MCP arm, or an unlink that failed), and the comparison fell back to the HEAD "
     "tree — so anything already committed cannot appear. ";
+// The producer rule (quality.h BaselineSource). Spelled for a reader who pinned on purpose and is looking at a
+// floor they did not choose: why their file was not used, that it is still there, and the two ways back.
+inline constexpr const char* kQdBaseHeadForeign =
+    "baseline=\"git-HEAD (foreign sidecar ignored)\" means a .ripwire_quality_baseline pinned at the CURRENT HEAD was "
+    "written by ANOTHER ripwire build: its producer stamp does not name this binary's sources, or it has none. A dead "
+    "set depends on how calls were resolved, so that floor could invent a dead-code regression or hide a real one; it "
+    "was IGNORED, left on disk, and the working tree was compared against the HEAD tree this build computed — so "
+    "anything already committed cannot appear, and an allow-dirty pin's absorbed findings are not in force. Run the "
+    "delta with the build that pinned it, or re-pin on a clean tree (commit or stash first) with quality-baseline. ";
 // H11 — emitted ONLY when baseline_absorbed= is on the root, i.e. when the honored sidecar was pinned with
 // --allow-dirty on a tree that already gated. NB: the sentence itself spells the flag WITHOUT its leading
 // dashes, because this text lands inside an XML comment and G4 forbids a literal double-hyphen there (the
@@ -551,9 +625,27 @@ inline constexpr const char* kQdBaseRefPair =
     "compared two COMMITTED trees and no sidecar was read, written or deleted. base_ref= and target_ref= "
     "are the two RESOLVED shas, at full length because a wave number gets quoted into handoffs, and they "
     "are the anchor, so at= is omitted. churn= is reported unavailable there, which is the honest statement "
-    "that one of the ten kinds, short-horizon-churn, cannot be measured at all in that form: it needs git "
+    "that one kind, short-horizon-churn, cannot be measured at all in that form: it needs git "
     "history at the tree being judged, and both trees are materialized OUT of the repo into temp dirs. Its "
     "silence in such a report is not evidence that nothing churned. ";
+// #228 — emitted only when head_basis= is on the root, i.e. only when the identity basis produced the floor.
+// The attribute exists because a zero from a self-comparison and a zero from an archived comparison are
+// DIFFERENT CLAIMS, and the honesty rule is that a zero means "none found", never "none exists". Its absence
+// on a git-HEAD run is not a silent no: it is the archived HEAD tree, which is what every git-HEAD marker
+// meant before this attribute existed.
+inline constexpr const char* kQdHeadBasisIdentityLegend =
+    "head_basis=\"identity\" means the tracked files already WERE HEAD, so the floor is this tree's own "
+    "snapshot: a comparison with itself. Files HEAD does not TRACK are crawled but are not in that floor, so "
+    "their symbols read as new. Absent: the archived HEAD tree. ";
+// The REFUSAL, named on the answer rather than left to silence — its own constant so the clean form, which is
+// the posture this verb is most often called in, never pays for a sentence about a state it is not in.
+inline constexpr const char* kQdHeadBasisArchivedLegend =
+    "head_basis=\"archived-index-hidden\" means the tracked files match HEAD by git's own diff, but a tracked "
+    "path carries skip-worktree or assume-unchanged, which git is SPECIFIED not to read: the tree could differ "
+    "from HEAD in a way nothing can see, so the faster self-comparison was refused and the archived HEAD tree "
+    "was used. That tree is not sparse-aware, so on a sparse checkout an excluded caller can read as vanished "
+    "and gate; clear the bit, or read such a row as a population difference rather than a change. ";
+
 // at= is absent in the ref-pair form, so its sentence is too.
 inline constexpr const char* kQdAtLegend =
     "at= is the git commit (plus a dirty marker when the working tree differs) this list was computed at. ";
@@ -618,8 +710,23 @@ inline constexpr const char* kQdRowLegend =
     "the numeric kinds; p=\"path:line\" is the locator (root-relative; the first-sorting member for the "
     "clone kinds; omitted, never faked, when none resolves). churn= and surface= are per-kind "
     "classification facets (short-horizon-churn's self/ambient split; api-surface's new-symbol/"
-    "contract-change tier). Every row the header's gating= counter counts also carries a gating attribute "
+    "contract-change tier). churn= facets never gate alone: the kind gates only on 2+ COMMITTED in-window "
+    "rewrites of the edited lines. "
+    "Every row the header's gating= counter counts also carries a gating attribute "
     "set to 1 — marked positively, never by the ABSENCE of sev or origin. ";
+
+// Emitted only when a placeholder row is in the document: why every one of them carries origin="new-symbol",
+// including one that landed in a symbol that existed at the baseline.
+inline constexpr const char* kQdPlaceholderLegend =
+    "placeholder is new-symbol by construction: the finding is the stub or TODO the change added, never "
+    "something that existed getting worse, so it never gates. ";
+
+// Emitted only when an error-masking row is sev="minor" — the one way that kind is ever minor, so the
+// sentence explains a state the reader is looking at and costs nothing on any other report.
+inline constexpr const char* kQdMaskReportOnlyLegend =
+    "An error-masking row is sev=\"minor\" when every construct it added is a widened shape that does not "
+    "gate in that language yet: log-only (a broad handler whose body only logs and never names the error) "
+    "or rethrow-only (the sole handler re-throws the error unchanged). ";
 
 // Emitted only when a clone-family row (duplication / new-clone-of-reused-helper) is in the document,
 // which is what puts members=, tokens= and idiom= on a first screen. A clean tree has none.
@@ -691,6 +798,9 @@ struct QualityDeltaLegendParts
     bool                                          scoped;        // a scope partition or a foreign-ack row is in the document
     bool                                          anyForeignAck; // foreign-acks= is on the root, with foreign-scope sa rows under it
     std::size_t                                   baselineAbsorbed; // H11: baseline_absorbed= on the root (0 = attribute absent)
+    const char*                                   headBasis;     // #228: head_basis= value on the root (nullptr = attribute absent)
+    bool                                          anyDeclinedCallExcluded = false;   // declined-call-excluded= is on the root
+    bool                                          anyValueRefExcluded     = false;   // value-ref-excluded= is on the root
 };
 
 // A DEFINITION IS EMITTED WHEN THE THING IT DEFINES IS IN THE DOCUMENT. Nothing is dropped and no limit is
@@ -706,6 +816,14 @@ inline void emitQualityDeltaLegend( const QualityDeltaLegendParts& p )
         }
         return false;
     };
+    const auto anyMinorMaskRow = [] ( const std::vector<rw::quality::Regression>& v )
+    {
+        return std::any_of( v.begin(), v.end(), []( const rw::quality::Regression& r ) { return r.kind == "error-masking" && r.isMinor; } );
+    };
+    const auto anyPlaceholderRow = [] ( const std::vector<rw::quality::Regression>& v )
+    {
+        return std::any_of( v.begin(), v.end(), []( const rw::quality::Regression& r ) { return r.kind == "placeholder"; } );
+    };
 
     std::fputs( kQdLegendCore, stdout );
 
@@ -717,10 +835,17 @@ inline void emitQualityDeltaLegend( const QualityDeltaLegendParts& p )
     else if( p.marker == "git-HEAD (stale sidecar removed)" ) { std::fputs( kQdBaseHeadRemoved, stdout ); }
     else if( p.marker == "git-HEAD (stale sidecar ignored)" ) { std::fputs( kQdBaseHeadIgnored, stdout ); }
     else if( p.marker == "git-HEAD (sidecar unreadable)"     ) { std::fputs( kQdBaseHeadUnreadable, stdout ); }
+    else if( p.marker == "git-HEAD (symlinked sidecar refused)" ) { std::fputs( kQdBaseHeadSymlinkRefused, stdout ); }
+    else if( p.marker == "git-HEAD (foreign sidecar ignored)"   ) { std::fputs( kQdBaseHeadForeign, stdout ); }
     else                                                      { std::fputs( kQdBaseHead,        stdout ); }
     if( p.baselineAbsorbed > 0 )
     {
         std::fputs( kQdBaselineAbsorbedLegend, stdout );   // H11 — the attribute that re-reads the exit code
+    }
+    // #228 — the attribute that says WHICH git-HEAD floor this is, one sentence per value it can carry.
+    if( p.headBasis != nullptr )
+    {
+        std::fputs( std::string_view( p.headBasis ) == "identity" ? kQdHeadBasisIdentityLegend : kQdHeadBasisArchivedLegend, stdout );
     }
 
     // (2) at= is omitted in the ref-pair form, so its sentence follows the attribute, not the verb.
@@ -735,6 +860,18 @@ inline void emitQualityDeltaLegend( const QualityDeltaLegendParts& p )
     if( p.anyRegisterMacroWarning )
     {
         std::fputs( kQdRegisterMacroWarnLegend, stdout );
+    }
+    if( p.anyDeclinedCallExcluded )
+    {
+        std::fputs( "declined-call-excluded= is a FLOOR, not a finding: symbols this run kept out of the dead-code kind only because a call "
+                    "the resolver declined to bind (the map's declined=) could have meant them. Never gates; absent at zero. ", stdout );
+    }
+    if( p.anyValueRefExcluded )
+    {
+        rw::emitRaw( stdout, "value-ref-excluded= is a FLOOR, not a finding: symbols this run kept out of the dead-code kind only because a table, "
+                             "field, argument or registering decorator holds them as a VALUE (matched by name; it is not a proven call; the callers "
+                             "verb lists the sites; @classmethod-style wrappers do not count), "
+                             "the --dead-code verb's own rule. Never gates; absent at zero. " );
     }
 
     // (3) the two identity re-filings, each keyed to the attribute family it defines. The second is
@@ -768,6 +905,14 @@ inline void emitQualityDeltaLegend( const QualityDeltaLegendParts& p )
         if( anyCloneRow( p.rows ) || anyCloneRow( p.disclosedRows ) )
         {
             std::fputs( kQdCloneLegend, stdout );
+        }
+        if( anyMinorMaskRow( p.rows ) || anyMinorMaskRow( p.disclosedRows ) )
+        {
+            rw::emitRaw( stdout, kQdMaskReportOnlyLegend );
+        }
+        if( anyPlaceholderRow( p.rows ) || anyPlaceholderRow( p.disclosedRows ) )
+        {
+            rw::emitRaw( stdout, kQdPlaceholderLegend );
         }
     }
 
@@ -805,12 +950,12 @@ inline std::string registerMacroConfigWarningAttr( const rw::quality::RegisterMa
     };
     if( !diag.unrecognizedKeys.empty() )
     {
-        std::fprintf( stderr, "ripwire: .ripwire_config has an unrecognized key (the only key this file reads is register_macros): %s\n",
+        rw::emitTo( stderr, "ripwire: .ripwire_config has an unrecognized key (the only key this file reads is register_macros): {}\n",
                       joined( diag.unrecognizedKeys ).c_str() );
     }
     if( !diag.inertNames.empty() )
     {
-        std::fprintf( stderr, "ripwire: .ripwire_config's register_macros= names a macro matching no indexed symbol (typo, or unused): %s\n",
+        rw::emitTo( stderr, "ripwire: .ripwire_config's register_macros= names a macro matching no indexed symbol (typo, or unused): {}\n",
                       joined( diag.inertNames ).c_str() );
     }
     return " config-warnings=\"" + std::to_string( diag.total() ) + "\"";
@@ -826,27 +971,26 @@ inline std::string registerMacroConfigWarningAttr( const rw::quality::RegisterMa
 int ackNothingToAccept( const std::string& acksFile, const gtl::btree_map<std::string, rw::quality::AckRecord>& acks,
                         const rw::quality::Scope& scope, std::size_t outOfScopeCount )
 {
-    std::string onDisk;
-    rw::docparse::detail::readWholeFile( acksFile, onDisk );   // absent file ⇒ "" ⇒ never equal to a rendered ledger
-    if( acks.empty() || rw::quality::renderAckRecords( acks ) == onDisk )
+    // `acks.empty()` first, so a ledger that is not a regular file (already refused on read) is not read and disclosed twice.
+    if( acks.empty() || rw::quality::renderAckRecords( acks ) == rw::docparse::detail::readRegularFile( "the quality-acks ledger", acksFile ).value_or( std::string() ) )
     {
         if( scope.active() && outOfScopeCount > 0 )
         {
-            std::fprintf( stderr, "ripwire: nothing to acknowledge — 0 finding(s) in --scope=%s (%zu out of scope, not yours); %s left untouched\n",
+            rw::emitTo( stderr, "ripwire: nothing to acknowledge — 0 finding(s) in --scope={} ({} out of scope, not yours); {} left untouched\n",
                           scope.spec.c_str(), outOfScopeCount, acksFile.c_str() );
         }
         else
         {
-            std::fprintf( stderr, "ripwire: nothing to acknowledge — the report has 0 finding(s); %s left untouched\n", acksFile.c_str() );
+            rw::emitTo( stderr, "ripwire: nothing to acknowledge — the report has 0 finding(s); {} left untouched\n", acksFile.c_str() );
         }
         return 0;
     }
     if( !rw::quality::writeAckRecords( acksFile, acks ) )
     {
-        std::fprintf( stderr, "ripwire: could not write %s\n", acksFile.c_str() );
+        rw::emitTo( stderr, "ripwire: could not write {}\n", acksFile.c_str() );
         return 1;
     }
-    std::fprintf( stderr, "ripwire: nothing to acknowledge — the report has 0 finding(s), but %s was not in canonical form "
+    rw::emitTo( stderr, "ripwire: nothing to acknowledge — the report has 0 finding(s), but {} was not in canonical form "
                           "(duplicate, legacy or misfiled rows) and has been re-serialised\n", acksFile.c_str() );
     return 0;
 }
@@ -882,15 +1026,19 @@ DirtyPinVerdict inspectDirtyBaselinePin( const MainDispatch& d, const std::strin
     const std::string& root = d.root;
 
     DirtyPinVerdict verdict;
-    auto [ headSnap, ok ] = computeHeadSnapshot( root, nullptr, cfg.maxFileBytes, cfg.excludes );
-    if( !ok )
+    // The SAME basis the delta arm takes (quality::computeHeadBasis) — the refusal this verdict feeds is a
+    // statement about the delta, so computing it another way is how the two would come to disagree. #228: on a
+    // tree whose tracked files are HEAD this now absorbs nothing, which is what unblocks --quality-baseline on
+    // exactly the repositories that needed the escape hatch.
+    quality::HeadBasis basis = quality::computeHeadBasis( root, d.ing, d.g, cfg.rootPath, cfg.maxFileBytes, cfg.excludes );
+    if( !basis.ok )
     {
         return verdict;   // no HEAD tree to compare against — nothing can be absorbed, so nothing is claimed
     }
     gtl::btree_map<std::string, quality::AckRecord> acks = quality::readAckRecords( acksFile );
-    quality::healIdentity( headSnap, acks, d.ing, d.g, std::string( cfg.rootPath ), root, /*wantContentIds=*/false );
+    quality::healIdentity( basis.snapshot, acks, d.ing, d.g, std::string( cfg.rootPath ), root, /*wantContentIds=*/false );
     std::vector<quality::Regression> regs =
-        quality::computeDelta( d.ing, d.g, headSnap, cfg.rootPath, cfg.excludes, cfg.maxFileBytes );
+        quality::computeDelta( d.ing, d.g, basis.snapshot, cfg.rootPath, cfg.excludes, cfg.maxFileBytes );
     quality::applyAckRatchet( regs, acks );
 
     for( const quality::Regression& r : regs )
@@ -920,10 +1068,10 @@ int runQualityBaselinePin( const MainDispatch& d, const std::string& baselineFil
     const DirtyPinVerdict pin = inspectDirtyBaselinePin( d, acksFile );
     if( pin.absorbed > 0 && !d.cfg.allowDirty )
     {
-        std::fprintf( stderr, "ripwire: --quality-baseline: this tree already holds %zu gating finding(s) against HEAD — pinning here would absorb\n"
-                              "  them into the floor, and every later --quality-delta would read clean. First: %s\n"
-                              "  Commit the tree first, or pass --allow-dirty to pin anyway (the sidecar then records the %zu absorbed, and every\n"
-                              "  report against it carries baseline_absorbed=\"%zu\").\n",
+        rw::emitTo( stderr, "ripwire: --quality-baseline: this tree already holds {} gating finding(s) against HEAD — pinning here would absorb\n"
+                              "  them into the floor, and every later --quality-delta would read clean. First: {}\n"
+                              "  Commit the tree first, or pass --allow-dirty to pin anyway (the sidecar then records the {} absorbed, and every\n"
+                              "  report against it carries baseline_absorbed=\"{}\").\n",
                       pin.absorbed, pin.firstRow.c_str(), pin.absorbed, pin.absorbed );
         return 1;
     }
@@ -931,8 +1079,8 @@ int runQualityBaselinePin( const MainDispatch& d, const std::string& baselineFil
     const bool              wrote = quality::writeBaseline( snap, baselineFile, gitHeadSha( d.root ), pin.absorbed );
     if( wrote && pin.absorbed > 0 )
     {
-        std::fprintf( stderr, "ripwire: --quality-baseline --allow-dirty: pinned with %zu gating finding(s) ABSORBED into the floor "
-                              "(stamped in the sidecar; every --quality-delta against it carries baseline_absorbed=\"%zu\")\n",
+        rw::emitTo( stderr, "ripwire: --quality-baseline --allow-dirty: pinned with {} gating finding(s) ABSORBED into the floor "
+                              "(stamped in the sidecar; every --quality-delta against it carries baseline_absorbed=\"{}\")\n",
                       pin.absorbed, pin.absorbed );
     }
     // §L10b LOW tail: this used to report ing.symbols.size() — every raw indexed symbol — while the sidecar
@@ -940,9 +1088,18 @@ int runQualityBaselinePin( const MainDispatch& d, const std::string& baselineFil
     // symbol with no canonId at all — g.canonId[i].empty() — is skipped entirely), a smaller number by
     // construction (12,854 vs 13,358 on this tree at the time this was found). ccxBySym is computed for every
     // one of those rows without exception, so its size is the true count of what the file holds.
-    std::fprintf( stderr, wrote ? "ripwire: wrote %s (snapshot of %zu per-symbol rows, %zu indexed symbols total)\n"
-                                : "ripwire: could not write %s\n",
-                  baselineFile.c_str(), snap.ccxBySym.size(), d.ing.symbols.size() );
+    // Split from one ternary over two format strings into the two calls it always was. printf let a
+    // 1-conversion format be handed 3 arguments and quietly ignore the extra two; std::format_string is
+    // consteval and checks arity per format, so the shape has to be honest. Same bytes on both branches.
+    if( wrote )
+    {
+        rw::emitTo( stderr, "ripwire: wrote {} (snapshot of {} per-symbol rows, {} indexed symbols total)\n",
+                    baselineFile.c_str(), snap.ccxBySym.size(), d.ing.symbols.size() );
+    }
+    else
+    {
+        rw::emitTo( stderr, "ripwire: could not write {}\n", baselineFile.c_str() );
+    }
     return wrote ? 0 : 1;
 }
 
@@ -997,7 +1154,7 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
         // same dead pin, and the ONLY record is the `baseline=` XML attribute ("git-HEAD (stale sidecar
         // removed)") — no stderr spam, which is the B10.1b noise fix that survives the ruling intact. The
         // read-only MCP arm passes false and reports "…ignored" instead. When the unlink FAILS (read-only
-        // parent dir) this arm degrades to the read-only story — marker "…ignored", one DEGRADED_PATH_ALERT
+        // parent dir) this arm degrades to the read-only story — marker "…ignored", one DISCLOSE
         // from the seam — because the pin is still on disk; `baseSel.isStaleFileOnDisk()` is the fact, and the
         // fatal message below words itself from it rather than from the intent.
         // `refs` is declared HERE because it owns both materialized trees' teardown and they must outlive
@@ -1029,7 +1186,7 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
         DeltaBasis   basis;
         if( const std::optional<int> refused = resolveDeltaBasis( d, baselineFile, refs, basis ) )
         {
-            return *refused;
+            return refused;
         }
         const quality::BaselineSelection& baseSel   = basis.baseSel;
         const std::string&                deltaRoot = basis.deltaRoot;
@@ -1042,11 +1199,11 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
         const IngestResult&              judged        = refPair ? refs.target().ing : ing;
         if( const std::optional<int> refused = expandScopeDiff( scope, refPair, judged, root, deltaRoot, diffFileCount ) )
         {
-            return *refused;
+            return refused;
         }
         if( const std::optional<int> refused = refuseUnusableScope( cfg, scope, judged, deltaRoot ) )
         {
-            return *refused;
+            return refused;
         }
 
         // Signal-to-noise round — the per-finding ACK RATCHET. Suppress findings already accepted (with a
@@ -1109,7 +1266,27 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
             // P1 — THE RUBBER-STAMP GUARD (refuseForeignAckSelection owns the rule and the message).
             if( const std::optional<int> refused = refuseForeignAckSelection( cfg, scope, outOfScope, deltaRoot, ackSelected ) )
             {
-                return *refused;
+                return refused;
+            }
+
+            // THE LEGACY-ACK BACKFILL, run on the map this process already holds the write lock over and
+            // BEFORE this run's own acks are folded in, so a row healed here can still be overwritten by a
+            // live measurement of the same finding in the loop below — measured always beats reconstructed,
+            // and ordering is what guarantees it rather than a check. It runs even when this run accepts
+            // NOTHING: healing the ledger's provenance is the same class of forward repair the identity
+            // remap already performs on every ack, and H10's ackNothingToAccept re-renders and notices.
+            // quality::backfillCloneAckProvenance owns the rule, what it refuses to touch, and why.
+            const quality::AckBackfill backfilled = quality::backfillCloneAckProvenance( acks, basis.cloneIdioms );
+            // DISCLOSED, never silent: a reconstructed row is a weaker claim than a measured one, so a reader
+            // is told how many rows just changed confidence class and how many could not be healed at all.
+            // The unresolved count is a FLOOR on what is missing, not a total of what is wrong: a member set
+            // that no longer clones in THIS tree is unanswerable here, not proven gone.
+            if( backfilled.resolved > 0 || backfilled.refreshed > 0 || backfilled.unverified > 0 || backfilled.unresolved > 0 )
+            {
+                rw::emitTo( stderr, "ripwire: ack provenance backfill — {} clone row(s) reconstructed from the current tree, {} re-derived, {} left UNVERIFIED (their group was not found here — a floor, not proof it is gone), "
+                                      "{} left legacy (member set not found cloning here — a floor, not proof it is gone), {} ineligible (no current-tree fact answers their kind), {} already measured (left alone). "
+                                      "prov=recon is what the idiom is NOW, as of the last run that could check it — not what was measured when the row was accepted.\n",
+                              backfilled.resolved, backfilled.refreshed, backfilled.unverified, backfilled.unresolved, backfilled.ineligible, backfilled.measured );
             }
 
             std::size_t ackWritten = 0, ackSkipped = 0;
@@ -1138,15 +1315,65 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
                 // "<new> | prior: <old>" (capped at one hop; a no-op when the reason is unchanged), so a
                 // shared row re-acked by unrelated sessions keeps both justifications instead of the last
                 // writer silently erasing the one before it. See quality.h's composeAckReason for the rule.
+                // RE-SCORE PROVENANCE: was/now/facet/path/line are a REFRESH, not a preserve, same posture as
+                // cid= above — a re-ack re-reads the finding, so the stored triple always describes the row AS
+                // JUST ACCEPTED, never as it was some earlier run. See AckRecord's doc comment for what each
+                // one is and why a later run can re-score from them alone.
                 rec = quality::AckRecord{ ackKind, r.key, std::max( rec.ackNow, r.now ), cid,
                                           scope.active() ? scope.spec : rec.by,
+                                          r.was, r.now, r.facet, r.path, r.line, quality::AckProvenance::Measured,
                                           cfg.qualityAckReason.empty() ? rec.reason
                                                                        : quality::composeAckReason( rec.reason, std::string( cfg.qualityAckReason ) ) };
+                // SELF-CHECK, not a one-off test: every magnitude-bearing ack proves that the TABLE-DRIVEN
+                // re-score formula agrees with the LIVE one on the row it just built. NOT a full round trip —
+                // rescoreAckRecord runs here on the in-memory `rec` directly; it never goes through
+                // renderAckRecords/readAckRecords, so this does not exercise the ledger's text grammar (order-
+                // tolerant token parsing, splitAckLocator, the takeAckNamedToken family) at all — that half of
+                // the contract is what qackconcurrencycheck.sh's grammar arm (2) and byte-identity arm (7) pin
+                // instead, over the actual file. What THIS catches: rescoreNumericMajor's kMaterialityBars
+                // lookup (by kind name) silently drifting from the bar/minorDelta/growthTiered literals
+                // perSymbolKind was called with (computeDelta, above) — two spellings of the same three
+                // constants that a future edit could change in only one place. A drift there means the live
+                // formula (numericRegressionIsMajor, via perSymbolKind) and the re-score formula
+                // (rescoreNumericMajor) have silently diverged — see quality.h's MaterialityBar table, the one
+                // place both are meant to agree. ENSURES, not ASSUME: this is this function's OWN postcondition
+                // on the row it just built, not a fact something else already guarantees.
+                const std::optional<bool> rescored      = quality::rescoreAckRecord( rec );
+                const bool                rescoreAgrees = !rescored.has_value() || *rescored == !r.isMinor;   // plain bool, so the promise below is a bare accessor-free read
+                ENSURES( rescoreAgrees,
+                         "ack provenance re-score (in-memory, not a ledger round trip) must reproduce the just-computed severity" );
             }
             if( ackWritten == 0 && !cfg.qualityAckOnly.empty() )
             {
-                std::fprintf( stderr, "ripwire: --ack-only=%.*s matched none of the %zu finding(s) — nothing written\n",
-                              int( cfg.qualityAckOnly.size() ), cfg.qualityAckOnly.data(), regs.size() );
+                // M1 FOLLOW-UP (round train-18, rv-ack-provenance-backfill.md): this refusal used to discard
+                // the backfill above unconditionally — `backfillCloneAckProvenance` already mutated `acks` in
+                // memory, but returning here without ever calling writeAckRecords threw that healing away,
+                // so a rubber-stamp-guarded --ack-only that (correctly) refused to accept anything ALSO
+                // silently un-did an otherwise-independent repair to the ledger's provenance. Same
+                // canonical-bytes rule H10's ackNothingToAccept applies when there is nothing to accept at
+                // all: a ledger already equal to its own canonical bytes is left untouched (no spurious
+                // diff); a non-canonical one — including one this run's backfill just healed — is rewritten
+                // and the run says so. This never accepts a finding and the refusal's exit code is unchanged.
+                const bool nonCanonical = !acks.empty()
+                    && quality::renderAckRecords( acks ) != docparse::detail::readRegularFile( "the quality-acks ledger", acksFile ).value_or( std::string() );
+                if( nonCanonical )
+                {
+                    // A failed heal is said, not folded into "nothing written" (CodeRabbit on #331): the same
+                    // "could not write" ackNothingToAccept prints for the same failure. writeAckRecords has already
+                    // DISCLOSEd on its answerRefused sink; the exit code is 1 either way.
+                    if( !quality::writeAckRecords( acksFile, acks ) )
+                    {
+                        rw::emitTo( stderr, "ripwire: --ack-only={} matched none of the {} finding(s) — nothing accepted; could not write {} "
+                                              "(it was not in canonical form, and re-serialising it failed)\n",
+                                      std::string_view( cfg.qualityAckOnly.data(), cfg.qualityAckOnly.size() ), regs.size(), acksFile.c_str() );
+                        return 1;
+                    }
+                    rw::emitTo( stderr, "ripwire: --ack-only={} matched none of the {} finding(s) — nothing accepted, but {} was not in canonical form "
+                                          "(ack provenance backfill / legacy rows) and has been re-serialised\n",
+                                  std::string_view( cfg.qualityAckOnly.data(), cfg.qualityAckOnly.size() ), regs.size(), acksFile.c_str() );
+                    return 1;
+                }
+                rw::emitTo( stderr, "ripwire: --ack-only={} matched none of the {} finding(s) — nothing written\n", std::string_view( cfg.qualityAckOnly.data(), cfg.qualityAckOnly.size() ), regs.size() );
                 return 1;
             }
             // H10: nothing to accept — leave a canonical ledger alone, heal a non-canonical one (ackNothingToAccept)
@@ -1157,24 +1384,24 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
             const bool wroteAcks = quality::writeAckRecords( acksFile, acks );
             if( wroteAcks && !cfg.qualityAckOnly.empty() )
             {
-                std::fprintf( stderr, "ripwire: acknowledged %zu of %zu finding(s) (%zu left UNACKED by --ack-only, %zu already acked) → %s\n",
+                rw::emitTo( stderr, "ripwire: acknowledged {} of {} finding(s) ({} left UNACKED by --ack-only, {} already acked) → {}\n",
                               ackWritten, regs.size(), ackSkipped, ackedCount, acksFile.c_str() );
             }
             else if( wroteAcks )
             {
-                std::fprintf( stderr, "ripwire: acknowledged %zu finding(s) (%zu already acked) → %s\n",
+                rw::emitTo( stderr, "ripwire: acknowledged {} finding(s) ({} already acked) → {}\n",
                               regs.size(), ackedCount, acksFile.c_str() );
             }
             else
             {
-                std::fprintf( stderr, "ripwire: could not write %s\n", acksFile.c_str() );
+                rw::emitTo( stderr, "ripwire: could not write {}\n", acksFile.c_str() );
             }
             // P1 — the skip is DISCLOSED, never silent: the count of rows this ack deliberately did not
             // touch is the whole reason the caller passed a scope, and a quiet success would leave them
             // believing the ledger now covers the report they were looking at.
             if( wroteAcks && scope.active() && !outOfScope.empty() )
             {
-                std::fprintf( stderr, "ripwire: %zu finding(s) OUT OF SCOPE for --scope=%s were left unacked — not yours to accept "
+                rw::emitTo( stderr, "ripwire: {} finding(s) OUT OF SCOPE for --scope={} were left unacked — not yours to accept "
                                       "(they are still in the report, under the out-of-scope element)\n",
                               outOfScope.size(), scope.spec.c_str() );
             }
@@ -1272,7 +1499,7 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
                 // M12: displaySym, not first->sym raw — the XML/JSON rows both normalize sym's path segment
                 // for display (quality::displaySym); this stderr line was the one caller that skipped it,
                 // so it named "./src/…::rw::…" beside a row that named the same finding "src/…::rw::…".
-                std::fprintf( stderr, "ripwire: --quality-delta gating: %zu preexisting-worse major finding(s); first: %s %s%s (was=%u now=%u)\n",
+                rw::emitTo( stderr, "ripwire: --quality-delta gating: {} preexisting-worse major finding(s); first: {} {}{} (was={} now={})\n",
                               gatingCount, first->kind.c_str(), quality::displaySym( first->sym, deltaRoot ).c_str(), at.c_str(), first->was, first->now );
             }
         }
@@ -1298,88 +1525,94 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
             // H11: the JSON twin of baseline_absorbed=, under the same absent-means-none rule as the XML half.
             const std::string absorbedJson = baselineAbsorbed == 0 ? std::string()
                                             : ",\"baseline_absorbed\":" + std::to_string( baselineAbsorbed );
-            std::printf( "{\"baseline\":\"%s\",\"regressions\":%zu,\"minor\":%zu,\"acked\":%zu,\"stale\":%zu,"
-                         "\"preexisting-worse\":%zu,\"new-symbol\":%zu,\"gating\":%zu,\"register-macro-excluded\":%zu,\"at\":%s%s%s%s%s%s,\"r\":[",
+            // #228: the JSON twin of head_basis=, under the same absent-means-the-ordinary-archived-tree rule.
+            const std::string headBasisJson = ( basis.headBasis == nullptr ? std::string()
+                                              : std::string( ",\"head_basis\":\"" ) + basis.headBasis + "\"" )
+                                            + ( basis.declinedCallExcluded == 0 ? std::string()   // the XML twin's declined-call-excluded=, absent at zero
+                                              : ",\"declined-call-excluded\":" + std::to_string( basis.declinedCallExcluded ) )
+                                            + rw::countFieldOrEmpty( "value-ref-excluded", basis.valueRefExcluded, /*json=*/true );
+            rw::emitTo( stdout, "{{\"baseline\":\"{}\",\"regressions\":{},\"minor\":{},\"acked\":{},\"stale\":{},"
+                         "\"preexisting-worse\":{},\"new-symbol\":{},\"gating\":{},\"register-macro-excluded\":{},\"api-new-surface\":{},\"at\":{}{}{}{}{}{}{},\"r\":[",
                          jsonStr( baseMarkerJ ).c_str(), regs.size(), minorCount, ackedCount, staleAcks.size(),
-                         preexistingCount, newSymbolCount, gatingCount, basis.registerMacroExcluded, atJsonJ.c_str(), refs.jsonAttrs.c_str(),
-                         identityJson.c_str(), scopeJson.c_str(), configWarnJson.c_str(), absorbedJson.c_str() );
+                         preexistingCount, newSymbolCount, gatingCount, basis.registerMacroExcluded, basis.apiNewSurface, atJsonJ.c_str(), refs.jsonAttrs.c_str(),
+                         identityJson.c_str(), scopeJson.c_str(), configWarnJson.c_str(), absorbedJson.c_str(), headBasisJson.c_str() );
             // P1: one row emitter, called for both halves of the scope partition — the disclosed rows carry
             // the identical key set, so nothing about a row changes by being someone else's. `gatingAllowed`
             // is the ONE difference: an out-of-scope row is not what the exit code fires on, so claiming
             // gating on it would contradict the exit code in the same document.
             const auto emitJsonRow = [ & ]( const quality::Regression& r, bool gatingAllowed )
             {
-                std::printf( "{\"kind\":\"%s\"", jsonStr( r.kind ).c_str() );
+                rw::emitTo( stdout, "{{\"kind\":\"{}\"", jsonStr( r.kind ).c_str() );
                 if( r.kind == "duplication" )
                 {
-                    std::printf( ",\"members\":\"%s\",\"tokens\":%u", jsonStr( quality::displaySym( r.sym, deltaRoot ) ).c_str(), r.now );
+                    rw::emitTo( stdout, ",\"members\":\"{}\",\"tokens\":{}", jsonStr( quality::displaySym( r.sym, deltaRoot ) ).c_str(), r.now );
                 }
                 else
                 {
-                    std::printf( ",\"sym\":\"%s\"", jsonStr( quality::displaySym( r.sym, deltaRoot ) ).c_str() );
+                    rw::emitTo( stdout, ",\"sym\":\"{}\"", jsonStr( quality::displaySym( r.sym, deltaRoot ) ).c_str() );
                     if( !( r.kind == "dead-code" ) && !( r.kind == "api-surface" && r.was == r.now ) )
                     {
-                        std::printf( ",\"was\":%u,\"now\":%u", r.was, r.now );
+                        rw::emitTo( stdout, ",\"was\":{},\"now\":{}", r.was, r.now );
                     }
                 }
                 if( !r.path.empty() )
                 {
-                    std::printf( ",\"p\":\"%s:%u\"", jsonStr( r.path ).c_str(), r.line ); // P2.5 locator
+                    rw::emitTo( stdout, ",\"p\":\"{}:{}\"", jsonStr( r.path ).c_str(), r.line ); // P2.5 locator
                 }
                 if( gatingAllowed && !r.isNewSymbol && !r.isMinor )
                 {
-                    std::printf( ",\"gating\":true" ); // P2.5 — the exit predicate, stated per row
+                    rw::emitRaw( stdout, ",\"gating\":true" ); // P2.5 — the exit predicate, stated per row
                 }
                 if( r.isMinor )
                 {
-                    std::printf( ",\"sev\":\"minor\"" );
+                    rw::emitRaw( stdout, ",\"sev\":\"minor\"" );
                 }
                 if( !r.facet.empty() )
                 {
                     const char* facetName = quality::facetAttrName( r.kind );   // ONE kind→name table (quality.h)
                     if( facetName )
                     {
-                        std::printf( ",\"%s\":\"%s\"", facetName, jsonStr( r.facet ).c_str() );
+                        rw::emitTo( stdout, ",\"{}\":\"{}\"", facetName, jsonStr( r.facet ).c_str() );
                     }
                 }
                 if( r.isNewSymbol )
                 {
-                    std::printf( ",\"origin\":\"new-symbol\"" ); // absent = preexisting-worse (mirrors the XML)
+                    rw::emitRaw( stdout, ",\"origin\":\"new-symbol\"" ); // absent = preexisting-worse (mirrors the XML)
                 }
-                std::printf( "}" );
+                rw::emitRaw( stdout, "}" );
             };
             bool firstR = true;
             for( const quality::Regression& r : regs )
             {
                 if( !firstR )
                 {
-                    std::printf( "," );
+                    rw::emitRaw( stdout, "," );
                 }
                 firstR = false;
                 emitJsonRow( r, /*gatingAllowed=*/true );
             }
-            std::printf( "]," );
+            rw::emitRaw( stdout, "]," );
             if( scope.active() )
             {
                 // The JSON sibling of the XML out-of-scope element: a SEPARATE array, never a flag on a row
                 // in "r", so a consumer that reads "r" and checks "gating" cannot accidentally count someone
                 // else's debt as this run's. Emitted (possibly empty) whenever a scope was given, so its
                 // absence means "no scope", never "no disclosed rows".
-                std::printf( "\"oos\":[" );
+                rw::emitRaw( stdout, "\"oos\":[" );
                 bool firstO = true;
                 for( const quality::Regression& r : outOfScope )
                 {
                     if( !firstO )
                     {
-                        std::printf( "," );
+                        rw::emitRaw( stdout, "," );
                     }
                     firstO = false;
                     emitJsonRow( r, /*gatingAllowed=*/false );
                 }
-                std::printf( "]," );
+                rw::emitRaw( stdout, "]," );
             }
             std::fputs( quality::staleAcksJsonArray( saRows ).c_str(), stdout );   // L2 — "sa":[...], same taxonomy as the XML sa= rows below
-            std::printf( "}" );
+            rw::emitRaw( stdout, "}" );
             return gatingCount > 0 ? 2 : 0;
         }
 
@@ -1398,15 +1631,21 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
         // one set of values rather than restated as a second condition that could drift from it.
         emitQualityDeltaLegend( { baseSel.marker, refPair, identityAttrs, !saRows.empty(), ackedCount > 0,
                                   basis.registerMacroExcluded > 0, configDiag.total() > 0, regs, outOfScope,
-                                  scope.active() || !foreignAcks.empty(), !foreignAcks.empty(), baselineAbsorbed } );
+                                  scope.active() || !foreignAcks.empty(), !foreignAcks.empty(), baselineAbsorbed,
+                                  basis.headBasis, basis.declinedCallExcluded > 0, basis.valueRefExcluded > 0 } );
         const char* baseMarker = baseSel.marker;    // R3: ditto — one seam decides staleness AND names it
         // 2026-09-06: what the sidecar readers skipped, on the root (absent means none) — see kQdBaseHeadUnreadable
         std::string sidecarHealthAttrs;
         if( baseSel.sidecarBadLines > 0 ) { sidecarHealthAttrs += " baseline_bad_lines=\"" + std::to_string( baseSel.sidecarBadLines ) + "\""; }
         if( basis.acksBadLines > 0 )      { sidecarHealthAttrs += " acks_bad_lines=\"" + std::to_string( basis.acksBadLines ) + "\""; }
+        // #228: present-only, and its absence is the ordinary archived HEAD tree — the floor every git-HEAD
+        // marker named on its own before this attribute existed.
+        if( basis.headBasis != nullptr )  { sidecarHealthAttrs += std::string( " head_basis=\"" ) + basis.headBasis + "\""; }
+        if( basis.declinedCallExcluded > 0 ) { sidecarHealthAttrs += " declined-call-excluded=\"" + std::to_string( basis.declinedCallExcluded ) + "\""; }
+        sidecarHealthAttrs += rw::countAttrXmlOrEmpty( "value-ref-excluded", basis.valueRefExcluded );   // absent at zero, beside its sibling
         // at= anchors this regression list to the commit (+dirty state) it was computed against.
-        std::printf( "<quality-delta baseline=\"%s\" regressions=\"%zu\" minor=\"%zu\" acked=\"%zu\" stale=\"%zu\" preexisting-worse=\"%zu\" new-symbol=\"%zu\" gating=\"%zu\" register-macro-excluded=\"%zu\"%s%s%s%s%s%s%s>",
-                     baseMarker, regs.size(), minorCount, ackedCount, staleAcks.size(), preexistingCount, newSymbolCount, gatingCount, basis.registerMacroExcluded,
+        rw::emitTo( stdout, "<quality-delta baseline=\"{}\" regressions=\"{}\" minor=\"{}\" acked=\"{}\" stale=\"{}\" preexisting-worse=\"{}\" new-symbol=\"{}\" gating=\"{}\" register-macro-excluded=\"{}\" api-new-surface=\"{}\"{}{}{}{}{}{}{}>",
+                     baseMarker, regs.size(), minorCount, ackedCount, staleAcks.size(), preexistingCount, newSymbolCount, gatingCount, basis.registerMacroExcluded, basis.apiNewSurface,
                      // R-I: at= is OMITTED for the ref-pair form rather than stamped with the working tree's
                      // sha, which would anchor the list to a commit it was not computed from. base_ref= and
                      // target_ref= are the anchor there, and they carry FULL shas because a wave measurement
@@ -1471,11 +1710,11 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
             }
             if( r.kind == "duplication" )
             {
-                std::printf( "<r kind=\"duplication\" members=\"%s\" tokens=\"%u\"%s%s%s%s%s/>", ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), r.now, sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr );
+                rw::emitTo( stdout, "<r kind=\"duplication\" members=\"{}\" tokens=\"{}\"{}{}{}{}{}/>", ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), r.now, sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr );
             }
             else if( r.kind == "dead-code" )
             {
-                std::printf( "<r kind=\"%s\" sym=\"%s\"%s%s%s%s%s%s/>", r.kind.c_str(), ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr, nextAttr.c_str() );
+                rw::emitTo( stdout, "<r kind=\"{}\" sym=\"{}\"{}{}{}{}{}{}/>", r.kind.c_str(), ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr, nextAttr.c_str() );
             // B10.2e: api-surface now carries two shapes — a brand-new/newly-public symbol (was=now=0, no
             // param comparison to show) and a param-count contract-change (was/now = the real counts). Print
             // was/now whenever they differ from each other so the contract-change case's was=/now= is visible
@@ -1483,11 +1722,11 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
             }
             else if( r.kind == "api-surface" && r.was == r.now )
             {
-                std::printf( "<r kind=\"%s\" sym=\"%s\"%s%s%s%s%s%s/>", r.kind.c_str(), ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr, nextAttr.c_str() );
+                rw::emitTo( stdout, "<r kind=\"{}\" sym=\"{}\"{}{}{}{}{}{}/>", r.kind.c_str(), ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr, nextAttr.c_str() );
             }
             else
             {
-                std::printf( "<r kind=\"%s\" sym=\"%s\" was=\"%u\" now=\"%u\"%s%s%s%s%s%s%s/>", r.kind.c_str(), ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), r.was, r.now, barAttr, sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr, nextAttr.c_str() );
+                rw::emitTo( stdout, "<r kind=\"{}\" sym=\"{}\" was=\"{}\" now=\"{}\"{}{}{}{}{}{}{}/>", r.kind.c_str(), ex( quality::displaySym( r.sym, deltaRoot ) ).c_str(), r.was, r.now, barAttr, sev, facetAttr.c_str(), origin, locAttr.c_str(), gatingAttr, nextAttr.c_str() );
             }
         };
         for( const quality::Regression& r : regs )
@@ -1501,21 +1740,21 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
             // someone's report. So they are printed, in their own element, marked non-gating, with the one
             // sentence a reader needs written where they meet it. Emitted even when EMPTY — an absent
             // element then means "no scope was given", never "nobody else has anything open".
-            std::printf( "<out-of-scope n=\"%zu\" would-gate=\"%zu\" note=\"not yours - do not ack: these rows lie outside the scope this run named. "
+            rw::emitTo( stdout, "<out-of-scope n=\"{}\" would-gate=\"{}\" note=\"not yours - do not ack: these rows lie outside the scope this run named. "
                          "They are disclosed rather than hidden, they never gate this exit code, and the ack refuses to write them.\">",
                          outOfScope.size(), scopedOutGating );
             for( const quality::Regression& r : outOfScope )
             {
                 emitRow( r, /*gatingAllowed=*/false );
             }
-            std::printf( "</out-of-scope>" );
+            rw::emitRaw( stdout, "</out-of-scope>" );
         }
         {   // L2 — one <sa> row per stale ack (quality::staleAcksXml). M21(a): the escaper is passed in
             // because sym= carries a canonical id (corpus text), unlike the closed-vocabulary kind=/why=.
             std::vector<char> saEsc;
             std::fputs( quality::staleAcksXml( saRows, [ & ]( std::string_view t ) { return std::string( escapeXml( t, saEsc ) ); } ).c_str(), stdout );
         }
-        std::printf( "</quality-delta>" );
+        rw::emitRaw( stdout, "</quality-delta>" );
         return gatingCount > 0 ? 2 : 0;   // r26: only a PREEXISTING-worse AND major regression gates (== gating=)
     }
     return std::nullopt;
@@ -1542,12 +1781,13 @@ std::optional<int> runDmm( const MainDispatch& d )
     const dmm::Result r = dmm::computeDmm( d.root, cfg.dmmRange, d.ing, cfg.excludes, cfg.maxFileBytes );
     if( r.status == dmm::Status::BadRev )
     {
-        std::fprintf( stderr, "ripwire: --dmm: '%s' does not resolve to a commit in %s\n", r.badToken.c_str(), d.root.c_str() );
+        rw::emitTo( stderr, "ripwire: --dmm: '{}' does not resolve to a commit in {}{}\n", r.badToken.c_str(), d.root.c_str(),
+                      rw::gitstamp::shallowRefHint( d.root ) );   // 0.6.7: the likeliest cause on a depth-limited clone, "" otherwise
         return 1;
     }
     if( r.status == dmm::Status::BadRange )
     {
-        std::fprintf( stderr, "ripwire: --dmm: '%s' uses the three-dot form; --dmm compares two TREES, so spell it A..B "
+        rw::emitTo( stderr, "ripwire: --dmm: '{}' uses the three-dot form; --dmm compares two TREES, so spell it A..B "
                               "(or --dmm=$(git merge-base A B)..B if the merge base is what you meant)\n", r.badToken.c_str() );
         return 1;
     }
@@ -1633,9 +1873,8 @@ int runQualityPanel( const MainDispatch& d )
     qpanel::Preset preset = qpanel::Preset::Default;
     if( !cfg.qualityPanelPreset.empty() && !qpanel::parsePreset( cfg.qualityPanelPreset, preset ) )
     {
-        std::fprintf( stderr, "ripwire: --quality-panel: unknown preset '%.*s' (supported: strict|default|lenient; "
-                              "bare --quality-panel is default)\n",
-                      int( cfg.qualityPanelPreset.size() ), cfg.qualityPanelPreset.data() );
+        rw::emitTo( stderr, "ripwire: --quality-panel: unknown preset '{}' (supported: strict|default|lenient; "
+                              "bare --quality-panel is default)\n", std::string_view( cfg.qualityPanelPreset.data(), cfg.qualityPanelPreset.size() ) );
         return 1;
     }
 
@@ -1661,10 +1900,11 @@ std::optional<int> runQualityViews( const MainDispatch& d )
     std::vector<char>  qvRootEsc;
     const std::string  qvRootAttr   = qvSingleRoot ? ( " root=\"" + std::string( escapeXml( cfg.roots[0], qvRootEsc ) ) + "\"" ) : std::string();
 
-    // --readability: the Posnett/Hindle/Devanbu (MSR 2011) closed-form lens, per function, LEAST readable
-    // first (readability.h owns the measurement AND its emission, the way --handoff owns its packet). It
-    // reads only the symbol table and the files on disk, so it needs neither the graph nor git — and it is
-    // a LENS: exit 0 always, no verdict, no threshold.
+    // --biggest-first (was --readability): the Posnett/Hindle/Devanbu (MSR 2011) closed-form lens, per
+    // function, LARGEST Halstead volume/token-count/length first — a size proxy, not a readability order
+    // (the ordering claim is WITHDRAWN, docs/EVALS.md §8; readability.h owns the measurement AND its
+    // emission, the way --handoff owns its packet). It reads only the symbol table and the files on
+    // disk, so it needs neither the graph nor git — and it is a LENS: exit 0 always, no verdict, no threshold.
     if( cfg.readability )
     {
         return writeReadabilityReport( ing, cfg.pageLimit, cfg.pageOffset, qvRootPrefix, qvRootAttr );
@@ -1672,7 +1912,7 @@ std::optional<int> runQualityViews( const MainDispatch& d )
 
     // --comment-coherence: two published content measures per documented function/method (Steidl c_coeff
     // + Scalabrino CIC) — commentcoherence.h owns the measurement AND its emission, the same shape as
-    // --readability. Symbol table + files on disk only; no graph, no git; a LENS: exit 0 always.
+    // --biggest-first. Symbol table + files on disk only; no graph, no git; a LENS: exit 0 always.
     if( cfg.commentCoherence )
     {
         return writeCommentCoherenceReport( ing, cfg.pageLimit, cfg.pageOffset, qvRootPrefix, qvRootAttr );
@@ -1680,8 +1920,8 @@ std::optional<int> runQualityViews( const MainDispatch& d )
 
     // --nonlocal-state: per function, the non-local MUTABLE state it or its transitive callees reach, reads
     // and writes kept apart (nonlocalstate.h owns the discovery, the closure AND its emission, the way
-    // --readability does). It needs the symbol table, the value-use references and the call graph — but no
-    // git — and it is a LENS: exit 0 always, no verdict, no threshold, every count a disclosed floor.
+    // --biggest-first does). It needs the symbol table, the value-use references and the call graph — but
+    // no git — and it is a LENS: exit 0 always, no verdict, no threshold, every count a disclosed floor.
     if( cfg.nonlocalState )
     {
         return nonlocal::writeNonLocalStateReport( ing, g, cfg.pageLimit, cfg.pageOffset, qvRootPrefix, qvRootAttr );
@@ -1693,7 +1933,7 @@ std::optional<int> runQualityViews( const MainDispatch& d )
     }
 
     // --naming-calibration: §9.5 — the naming-* lint rules judged against the repo's OWN rename history
-    // (renamemine.h owns the mining, the join, the scoring AND the emission, the way --readability does).
+    // (renamemine.h owns the mining, the join, the scoring AND the emission, the way --biggest-first does).
     // It walks git and reads the symbol table; it needs no graph. Exit 0 always — a measurement, not a
     // verdict: test/namingcalibrationcheck.sh is where the per-rule floor lives.
     if( cfg.namingCalibration )
@@ -1777,6 +2017,10 @@ std::optional<int> runQualityViews( const MainDispatch& d )
             return quality::startsWithRegisteredMacro( std::string_view( src ).substr( symbol.sigStartByte ), registerMacroNames );
         };
         std::size_t registerMacroExcluded = 0;   // P2.2: disclosed count — see the header comment below
+        std::size_t runnerRootExcluded    = 0;   // 0.6.6 D4: disclosed count (runner-root-excluded=, absent at 0)
+        std::size_t decoratedExcluded     = 0;   // 0.6.6 D4 review: decorated Python defs, counted apart (decorated-excluded=)
+        std::size_t valueRefExcluded      = 0;   // reference-as-value round: held as a VALUE by a table/field/argument (value-ref-excluded=)
+        const rw::ValueRefIndex dcVri( ing );    // valuerefs.h — the same rows --callers shows, under its visibility rules
 
         // Optional path filter (--dead-code=DIR). §P0.3: this was a bare SUFFIX test, so it could only ever
         // match a FILENAME — every directory argument produced count="0" with confidence="high", and a typo'd
@@ -1813,9 +2057,8 @@ std::optional<int> runQualityViews( const MainDispatch& d )
             }
             if( !filterHitsIndex )
             {
-                std::fprintf( stderr, "ripwire: --dead-code=%.*s matches no indexed path — a zero here would be a failure, not a measurement "
-                                      "(pass a directory or file that exists in the tree, e.g. ripwire <dir> --dead-code=src)\n",
-                              int( dirFilterRaw.size() ), dirFilterRaw.data() );
+                rw::emitTo( stderr, "ripwire: --dead-code={} matches no indexed path — a zero here would be a failure, not a measurement "
+                                      "(pass a directory or file that exists in the tree, e.g. ripwire <dir> --dead-code=src)\n", std::string_view( dirFilterRaw.data(), dirFilterRaw.size() ) );
                 return 1;
             }
         }
@@ -1859,6 +2102,22 @@ std::optional<int> runQualityViews( const MainDispatch& d )
                 ++registerMacroExcluded;   // P2.2: self-registers via a static initializer — never dead-code
                 continue;
             }
+            if( quality::pythonDecoratedDef( s, sourceFor( s.fileId ) ) )
+            {
+                ++decoratedExcluded;   // 0.6.6 D4: decorated — a decorator may register it; its only "linkage" was a token
+                continue;
+            }
+            if( quality::pythonRunnerRoot( ing.files[ s.fileId ], s, sourceFor( s.fileId ) ) )
+            {
+                ++runnerRootExcluded;   // 0.6.6 D4: a test runner reaches it — never dead-code
+                continue;
+            }
+            // One entity, one reason: checked LAST, so a def a reason above already excluded is counted there only.
+            if( dcVri.isValueReferenced( s.id ) )
+            {
+                ++valueRefExcluded;     // a dispatch table / field / argument holds it — not dead, not a proven call either
+                continue;
+            }
             candidates.push_back( s.id );
         }
 
@@ -1878,7 +2137,8 @@ std::optional<int> runQualityViews( const MainDispatch& d )
             return sa.name < sb.name;
         } );
 
-        std::printf( "<!-- ripwire dead-code: high-confidence source functions with internal linkage and no caller in the indexed tree. "
+        rw::emitTo( stdout, "<!-- ripwire dead-code: source functions with internal linkage and no caller found in the indexed tree — a name-based "
+                     "graph reading, not a confidence judgement (dynamic dispatch, reflection and macro-generated callers are invisible to it). "
                      "A bare-name filter matches by path COMPONENT: filter=\"src\" keeps any path with a src segment at any depth "
                      "(test/x/src/y.cpp included); anchor with ./ (filter=\"./src\") to pin the root-level directory only. "
                      "register-macro-excluded= counts symbols excluded because their OWN definition is a registered "
@@ -1889,7 +2149,19 @@ std::optional<int> runQualityViews( const MainDispatch& d )
                      "config-warnings= counts two DISCLOSED .ripwire_config problems, each also written to stderr — an "
                      "unrecognized key, and a register_macros= name matching no indexed symbol — never gating, present "
                      "only when non-zero. "
-                     "Graph evidence is local to the indexed tree; verify before deleting. %s-->", rw::graphCountFloorBrief( g.unindexedFiles > 0 ).c_str() );
+                     "runner-root-excluded= counts Python defs excluded because a test runner reaches them (pytest "
+                     "test*/xunit hooks in test_*.py or *_test.py; test*/setUp-family methods of a class whose own bases name a "
+                     "TestCase); decorated-excluded= counts decorated Python defs, excluded because a decorator MAY register "
+                     "them (wrappers such as @staticmethod/@property/@lru_cache are included, and register nothing): Python has "
+                     "no internal linkage, so such a row rested on a `static` token alone. Both are FLOORS, never findings, "
+                     "absent at 0. A `static` inside a comment is not linkage evidence. "
+                     "Graph evidence is local to the indexed tree; verify before deleting. {}{}-->",
+                     // Reference-as-value round: beside its hyphenated siblings above, exactly when the root carries it.
+                     valueRefExcluded > 0 ? "value-ref-excluded=N (absent when 0): internal functions kept off this list because a table, "
+                                            "field or argument holds them as a VALUE (matched by name; it is not a proven call; the callers verb "
+                                            "lists the sites). One entity, one reason: a def a reason above already excluded is counted there only. "
+                                          : "",
+                     rw::graphCountFloorBrief( rw::graphGaugeClauses( g ) ).c_str() );
         // §P15/§P16: candidates is already deterministically sorted (path asc, line asc, name asc) and used to
         // print every candidate unconditionally — completeness was the whole contract, matching --uses' shape,
         // so it pages the same way: no historic display cap, discloseCap=false (un-paginated tag byte-identical).
@@ -1904,13 +2176,17 @@ std::optional<int> runQualityViews( const MainDispatch& d )
             std::vector<char> dcFiltEsc;
             dcFilterAttr = " filter=\"" + std::string( escapeXml( cfg.deadCodeDir, dcFiltEsc ) ) + "\"";
         }
-        std::printf( "<dead-code count=\"%zu\" confidence=\"high\" evidence=\"internal-linkage+zero-callers\" register-macro-excluded=\"%zu\"%s%s%s%s%s>",
-                     candidates.size(), registerMacroExcluded,
+        // 0.6.6 D4: runner-root-excluded= is absent at 0, so a tree with no Python test/decorated root is byte-identical
+        const std::string runnerRootAttr = ( runnerRootExcluded == 0 ? std::string() : std::format( " runner-root-excluded=\"{}\"", runnerRootExcluded ) )
+                                         + ( decoratedExcluded == 0 ? std::string() : std::format( " decorated-excluded=\"{}\"", decoratedExcluded ) )
+                                         + ( valueRefExcluded == 0 ? std::string() : std::format( " value-ref-excluded=\"{}\"", valueRefExcluded ) );
+        rw::emitTo( stdout, "<dead-code count=\"{}\" evidence=\"internal-linkage+zero-callers\" register-macro-excluded=\"{}\"{}{}{}{}{}{}>",
+                     candidates.size(), registerMacroExcluded, runnerRootAttr,
                      dcFilterAttr.c_str(),
                      pageDisclosure( dcAb, sizeof( dcAb ), dcPw.end - dcPw.begin, candidates.size(), dcPw.end,
                                      cfg.pageLimit, cfg.pageOffset, false ),
                      qvRootAttr.c_str(), dcConfigWarn.c_str(),
-                     rw::graphCountFloorAttrXml( g ).c_str() );   // H5/M15: gauge + marker; "zero callers" is a claim about the name-based CSR — a floor
+                     rw::graphCountFloorAttrXml( g ).c_str()  );   // H5/M15: gauge + marker; "zero callers" is a claim about the name-based CSR — a floor
         std::vector<char> dcEsc;
         for( std::size_t candidateIndex = dcPw.begin; candidateIndex < dcPw.end; ++candidateIndex )
         {
@@ -1918,12 +2194,12 @@ std::optional<int> runQualityViews( const MainDispatch& d )
             const Symbol& s = ing.symbols[ candidateId ];
             // name and path may contain & < > " — escape both so output is valid XML.
             const auto en = rw::escapeXml( s.name, dcEsc );
-            std::printf( "<d n=\"%.*s\" t=\"%s\"", int( en.size() ), en.data(), symTag( s.kind ) );
+            rw::emitTo( stdout, "<d n=\"{}\" t=\"{}\"", std::string_view( en.data(), en.size() ), symTag( s.kind ) );
             const std::string_view rp = qvSingleRoot ? rw::sarif::rootRelativeUri( ing.files[ s.fileId ], qvRootPrefix ) : std::string_view( ing.files[ s.fileId ] );
             const auto ep = rw::escapeXml( rp, dcEsc );
-            std::printf( " p=\"%.*s\" l=\"%u\"/>", int( ep.size() ), ep.data(), s.line );
+            rw::emitTo( stdout, " p=\"{}\" l=\"{}\"/>", std::string_view( ep.data(), ep.size() ), s.line );
         }
-        std::printf( "</dead-code>" );
+        rw::emitRaw( stdout, "</dead-code>" );
         return 0;
     }
     return std::nullopt;
@@ -1956,7 +2232,7 @@ std::optional<int> runQualityViews( const MainDispatch& d )
 //   unchanged         — SYM existed at baseline and none of the three moved (a body-only edit is unchanged by
 //                       design: this checks the CONTRACT, not the body — that is --quality-delta's
 //                       short-horizon-churn kind's job).
-// A non-git root / no HEAD degrades to new-symbol (nothing to compare against) with a DEGRADED_PATH_ALERT —
+// A non-git root / no HEAD degrades to new-symbol (nothing to compare against) with a DISCLOSE —
 // never a crash; only an unresolvable SYM refuses loudly (below).
 //
 // 1-hop callers (reuse the --callers 1-hop in-edge walk, unioned over the whole overload set) are listed with
@@ -2001,20 +2277,27 @@ std::optional<int> runEditCheck( const MainDispatch& d )
         return std::nullopt;
     }
 
-    const std::vector<NodeId> matches = resolveAllByNameQualified( ing, cfg.editCheckSym );
+    // H1: the out-param is the decl→def widening's RESIDUE — same-named definitions this selector found and could not tie
+    // to the file it named. callers=/incompatible= are read from the one definition picked below, so unreported, a drop
+    // reached the reader as incompatible="0": a no-broken-callers reading about a definition nobody read. The --dry-run
+    // preview re-resolves on the tree it measures and reports its own (editpreview.h).
+    std::size_t               ecUnprovenDefs = 0;
+    const std::vector<NodeId> matches        = resolveAllByNameQualified( ing, cfg.editCheckSym, &ecUnprovenDefs );
     if( matches.empty() )
     {
         // §B4.2: the shared refusal — see selectorrefuse.h. A `file:name` whose FILE half is the fault used
         // to read as "that symbol does not exist", which sends an agent hunting for a rename that never was.
-        std::fprintf( stderr, "%s\n", selectorNotFoundMessage( ing, "ripwire: --edit-check symbol not found: ",
+        rw::emitTo( stderr, "{}\n", selectorNotFoundMessage( ing, "ripwire: --edit-check symbol not found: ",
                                                                cfg.editCheckSym, "--edit-check=" ).c_str() );
         return 1;
     }
 
-    const std::vector<EditCheckGroup> groups = editCheckGroups( ing, d.g, matches );
+    // the C/C++ declaration/definition fold is the post-hoc verb's (editcheck.h editCheckFoldDeclGroups); the preview
+    // below splices over ONE definition span, so it keeps one group per (file, scope) and refuses as before
+    const std::vector<EditCheckGroup> groups = editCheckGroups( ing, d.g, matches, /*foldDecls=*/!editPreviewRequested( cfg ) );
     if( groups.size() > 1 )
     {
-        std::fprintf( stderr, "ripwire: --edit-check: %s\n",
+        rw::emitTo( stderr, "ripwire: --edit-check: {}\n",
                       editCheckAmbiguousMessage( cfg.editCheckSym, groups, "--edit-check=", matches.size() ).c_str() );
         return 1;
     }
@@ -2030,21 +2313,27 @@ std::optional<int> runEditCheck( const MainDispatch& d )
         std::string payload, payloadErr;
         if( !rw::editpreview::readPayload( cfg.editPayload, cfg.maxFileBytes, payload, payloadErr ) )
         {
-            std::fprintf( stderr, "ripwire: --edit-check --dry-run: %s\n", payloadErr.c_str() );
+            rw::emitTo( stderr, "ripwire: --edit-check --dry-run: {}\n", payloadErr.c_str() );
             return 1;
         }
         const rw::editpreview::Outcome preview = rw::editpreview::run( ing, d.g, d.root, cfg.maxFileBytes, cfg.excludes,
-                                                                        d.valueUses, cfg.editCheckSym, focus, payload, d.notesPtr );
+                                                                        d.valueUses, cfg.editCheckSym, focus, payload, d.notesPtr,
+                                                                        cfg.pageLimit, cfg.pageOffset );
         if( !preview.ok )
         {
-            std::fprintf( stderr, "ripwire: --edit-check --dry-run: %s\n", preview.message.c_str() );
+            rw::emitTo( stderr, "ripwire: --edit-check --dry-run: {}\n", preview.message.c_str() );
             return 1;
         }
         std::fwrite( preview.xml.data(), 1, preview.xml.size(), stdout );
         return 0;
     }
 
-    const std::string xml = editCheckBundleText( ing, d.g, d.root, cfg.maxFileBytes, cfg.excludes, focus, d.notesPtr );
+    // 2026-09-10: --limit/--offset window the UNFLAGGED context rows and nothing else (editcheck.h,
+    // editCheckRowWindow). cli.h's honorsPaging() lists this verb, so the pair reaches here rather than
+    // being refused, and 0/0 — the un-spelled window — is the default cap, not "unbounded".
+    const std::string xml = editCheckBundleText( ing, d.g, d.root, cfg.maxFileBytes, cfg.excludes, focus, d.notesPtr,
+                                                  /*preview=*/false, cfg.pageLimit, cfg.pageOffset, ecUnprovenDefs,
+                                                  d.notesDegraded );   // L3 follow-up (CodeRabbit 4053600616)
     std::fwrite( xml.data(), 1, xml.size(), stdout );
     return 0;
 }

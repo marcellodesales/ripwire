@@ -11,6 +11,11 @@
 #   (a) SAFE FALLBACK — a CONCEPTUAL --for query defaults to subtoken+body; its RANKING is byte-identical to
 #       the pre-routing golden captured via --no-route (the confidence gate does not over-fire on prose).
 #   (b) identifier query — --for="buildGraph" (DEFAULT, no flag) routes to name-exact; the header says so.
+# NOT RE-PINNED 2026-09-13 (lane/sc-legend, PR #215): the sc= reading joined this legend (+29 B) and then left it
+# again when the review round made both identity readings present-only -- routefix serves free functions, which
+# have no enclosing scope, so there is nothing for the reading to define. Byte-identical to its pre-lane self at
+# 3,776 B. The golden is also the --no-route capture, so the route= reading is absent: both halves of the
+# present-only rule are controlled here.
 #   (c) --no-route forces subtoken+body and matches the pre-flip capture byte-for-byte (golden neutrality
 #       preserved for the opt-out path); its header carries NO 'routed:' note.
 #   (d) determinism — two DEFAULT --route runs are byte-identical.
@@ -45,7 +50,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -106,34 +111,36 @@ CONCEPT="how does resolution work"
 # ladder trimmed used to appear in neither section), and the clause defining the tail says so. Verified before
 # re-pinning: with every comment and est_tokens= normalized out, old and new documents are byte-identical —
 # this fixture's head covers every file, so its tail is unchanged and every ranking byte is unmoved.
-"$BIN" routefix --no-cache --for="$CONCEPT" --no-route >"$TMP/concept_noroute.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; golden_for.xml was recorded from the full default and the --query arm
+# reads the full legend's "routed:" comment, so those two runs ask for the full legend.
+"$BIN" routefix --no-cache --for="$CONCEPT" --no-route --legend=full >"$TMP/concept_noroute.xml" 2>/dev/null
 diff -q "$TMP/concept_noroute.xml" "$ROOT/test/routefix/golden_for.xml" >/dev/null \
     && ok "safe fallback: conceptual --for --no-route byte-identical to the pre-routing golden" \
     || no "conceptual --for --no-route drifted from test/routefix/golden_for.xml"
 # the DEFAULT (routed) conceptual run must fall back to subtoken+body — same ranker, only a header note added.
 "$BIN" routefix --no-cache --for="$CONCEPT" >"$TMP/concept_default.xml" 2>/dev/null
-grep -q 'routed: subtoken+body' "$TMP/concept_default.xml" \
+grep -q 'route="subtoken+body' "$TMP/concept_default.xml" \
     && ok "safe fallback: conceptual --for DEFAULTS to subtoken+body (no over-fire to name-exact)" \
     || no "conceptual --for did not fall back to subtoken+body (router over-fired on prose)"
 
 # ── (b) identifier query DEFAULTS to name-exact (routing is on with no flag) ───────────────────────────
 "$BIN" routefix --no-cache --for="buildGraph" >"$TMP/ident.xml" 2>/dev/null
-grep -q 'routed: name-exact' "$TMP/ident.xml" \
+grep -q 'route="name-exact(' "$TMP/ident.xml" \
     && ok "identifier query 'buildGraph' DEFAULTS to name-exact BM25 (routing is on by default)" \
-    || no "identifier query did not route to name-exact (header missing 'routed: name-exact')"
+    || no "identifier query did not route to name-exact (root missing route=\"name-exact(\")"
 
 # A7: an identifier embedded in LONG issue/review prose is evidence, not the whole intent. The old
 # any-camel/snake rule discarded every prose/body term and cratered corrected LocBench train retrieval.
 "$BIN" routefix --no-cache --for="repair buildGraph when the serialized ranked map is empty after cache reload" >"$TMP/long_ident.xml" 2>/dev/null
-grep -q 'routed: subtoken+body' "$TMP/long_ident.xml" \
+grep -q 'route="subtoken+body' "$TMP/long_ident.xml" \
     && ok "long issue prose with one identifier stays subtoken+body" \
     || no "one identifier over-fired name-exact on a long conceptual query"
 
 # ── (c) --no-route forces subtoken+body and matches the pre-flip capture; header carries NO routed note ─
 "$BIN" routefix --no-cache --for="buildGraph" --no-route >"$TMP/ident_noroute.xml" 2>/dev/null
-{ ! grep -q 'routed:' "$TMP/ident_noroute.xml"; } \
-    && ok "--no-route on an identifier query forces subtoken+body (no 'routed:' header note)" \
-    || no "--no-route still emitted a 'routed:' note — the opt-out did not disable routing"
+{ ! grep -q ' route="' "$TMP/ident_noroute.xml"; } \
+    && ok "--no-route on an identifier query forces subtoken+body (no route= attribute)" \
+    || no "--no-route still emitted a route= attribute — the opt-out did not disable routing"
 
 # ── (d) determinism — two DEFAULT --for runs byte-identical ────────────────────────────────────────────
 "$BIN" routefix --no-cache --for="buildGraph" >"$TMP/r1" 2>/dev/null
@@ -143,19 +150,19 @@ diff -q "$TMP/r1" "$TMP/r2" >/dev/null && ok "determinism (DEFAULT --for byte-id
 
 # ── well-formed XML on the routed bundle (rides the same seam) ────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/ident.xml" 2>/dev/null && ok "xml well-formed (DEFAULT --for)" || no "xml malformed (DEFAULT --for)"
-    xmllint --noout "$TMP/concept_default.xml" 2>/dev/null && ok "xml well-formed (conceptual DEFAULT --for)" || no "xml malformed (conceptual DEFAULT --for)"
+    if xmllint --noout "$TMP/ident.xml" 2>/dev/null; then ok "xml well-formed (DEFAULT --for)"; else no "xml malformed (DEFAULT --for)"; fi
+    if xmllint --noout "$TMP/concept_default.xml" 2>/dev/null; then ok "xml well-formed (conceptual DEFAULT --for)"; else no "xml malformed (conceptual DEFAULT --for)"; fi
 else
     ok "xml well-formed (xmllint absent — skipped)"
 fi
 
 # ── --query also routes by default (name-exact pick surfaces as a leading comment before the map) ───────
-"$BIN" routefix --no-cache --query="buildGraph" >"$TMP/q.xml" 2>/dev/null
+"$BIN" routefix --no-cache --query="buildGraph" --legend=full >"$TMP/q.xml" 2>/dev/null
 grep -q 'routed: name-exact' "$TMP/q.xml" \
     && ok "--query='buildGraph' DEFAULTS to name-exact (leading routed comment before the map)" \
     || no "--query identifier did not route to name-exact"
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/q.xml" 2>/dev/null && ok "xml well-formed (DEFAULT --query, routed comment)" || no "xml malformed (DEFAULT --query)"
+    if xmllint --noout "$TMP/q.xml" 2>/dev/null; then ok "xml well-formed (DEFAULT --query, routed comment)"; else no "xml malformed (DEFAULT --query)"; fi
 fi
 
 # ── (e) --no-route without --for/--query refuses loudly ────────────────────────────────────────────────
@@ -168,15 +175,18 @@ fi
 # reconstructed from what the assertion expects.
 # verify-wave2 F6 re-pin: stop on the attribute quote. The trailing "]" this used to anchor on was the
 # unbalanced half of a bracket pair L10b half-trimmed; route= is delimited by its own quotes.
-reasonOf(){ "$BIN" "$@" --no-cache 2>/dev/null | grep -oE 'routed: [^"]*' | head -1; }
+reasonOf(){ "$BIN" "$@" --no-cache 2>/dev/null | grep -oE ' route="[^"]*' | head -1 | sed 's/^ route="//'; }
 routeOf(){  reasonOf "$@" | grep -oE 'name-exact|subtoken\+body' | head -1; }
 
 # (f1) the fixture's identifier query: buildGraph is defined once, in routefix/graph.cpp.
+# RE-PIN 2026-09-16 (#228, test/rootspellingcheck.sh): the anchor names that file ROOT-RELATIVE, `graph.cpp`. It read
+# `routefix/graph.cpp` only because the root is typed `routefix` here; crawled as `.` it always said `graph.cpp` and
+# crawled absolute `/.../graph.cpp`. (f4) below moves the same way: `dupfix/alpha.cpp+1` -> `alpha.cpp+1`.
 identReason="$( reasonOf routefix --for="buildGraph" )"
 case "$identReason" in
-    *'anchors: buildGraph(routefix/graph.cpp)'*)
+    *'anchors: buildGraph(graph.cpp)'*)
         ok "(f1) the name-exact reason names the anchoring symbol's defining file: [$identReason]" ;;
-    *)  no "(f1) the name-exact reason must carry 'anchors: buildGraph(routefix/graph.cpp)' — without the defining file a reader cannot tell a core symbol from a one-use test helper, which is the whole failure this arm records. Got: [$identReason]" ;;
+    *)  no "(f1) the name-exact reason must carry 'anchors: buildGraph(graph.cpp)' — without the defining file a reader cannot tell a core symbol from a one-use test helper, which is the whole failure this arm records. Got: [$identReason]" ;;
 esac
 
 # (f2) a subtoken+body route has no anchoring symbol, so it must claim none. An 'anchors:' list on a route
@@ -233,15 +243,15 @@ case "$synReason" in
 esac
 dupReason="$( reasonOf dupfix --for="sharedName" )"
 case "$dupReason" in
-    *'anchors: sharedName(dupfix/alpha.cpp+1)'*)
+    *'anchors: sharedName(alpha.cpp+1)'*)
         ok "(f4) a name with two definitions discloses one file and the count of the rest (+1)" ;;
-    *)  no "(f4) a name defined in two files must disclose 'sharedName(dupfix/alpha.cpp+1)' — an anchor that names one file and hides that others exist over-states the evidence. Got: [$dupReason]" ;;
+    *)  no "(f4) a name defined in two files must disclose 'sharedName(alpha.cpp+1)' — an anchor that names one file and hides that others exist over-states the evidence. Got: [$dupReason]" ;;
 esac
 
 # (f5) the disclosure rides inside the EXISTING reason: the phrase downstream gates read must survive.
 case "$identReason" in
-    *'names a symbol (buildGraph)'*) ok "(f5) the pre-existing 'names a symbol (X)' phrasing is intact — the anchors were appended, not substituted" ;;
-    *)                               no "(f5) the anchors replaced the existing reason phrasing; test/taskechocheck.sh reads 'names a symbol (…)' out of this same string: [$identReason]" ;;
+    *'name-exact(buildGraph)'*) ok "(f5) the ranker code name-exact(X) is intact — the anchors were appended, not substituted (row 6: the code replaced the 'names a symbol (X)' prose; test/taskechocheck.sh reads the code out of this same string)" ;;
+    *)                          no "(f5) the anchors replaced the ranker code; test/taskechocheck.sh reads 'name-exact(…)' out of this same string: [$identReason]" ;;
 esac
 
 # ── (g) ANCHOR PLAUSIBILITY (LB-2): the all-words trigger at nWords>=2 additionally requires every
@@ -298,14 +308,14 @@ else
 fi
 # NOTE the quotes around the anchor word arrive attribute-escaped (&apos;) — match on the words, not the quotes.
 case "$declinedReason" in
-    *"name-exact declined: anchor"*"split"*"name-carriers"*"defs"*)
+    *"subtoken+body:declined("*"split"*"-carriers,"*"-defs)"*)
         ok "(g1) the declined reason names the failing anchor and its carrier count: [$declinedReason]" ;;
     *)  no "(g1) the declined reason must say WHY (failing anchor + carrier count) — got: [$declinedReason]" ;;
 esac
 case "$declinedReason" in
-    *"anchors:"*|*"names a symbol ("*)
-        no "(g1) a declined (subtoken+body) reason carried a name-exact-only literal ('anchors:' / 'names a symbol (') — downstream gates parse those as name-exact markers: [$declinedReason]" ;;
-    *)  ok "(g1) the declined reason carries neither 'anchors:' nor 'names a symbol ('" ;;
+    *"anchors:"*|*"name-exact("*)
+        no "(g1) a declined (subtoken+body) reason carried a name-exact-only literal ('anchors:' / 'name-exact(') — downstream gates parse those as name-exact markers: [$declinedReason]" ;;
+    *)  ok "(g1) the declined reason carries neither 'anchors:' nor 'name-exact('" ;;
 esac
 
 # (g2) the decline is a RECOVERY, not a shrug: the conceptual ranking surfaces the compound target.
@@ -334,18 +344,20 @@ diff -q "$TMP/declined.xml" "$TMP/declined2.xml" >/dev/null \
     && ok "(g5) declined route deterministic (two runs byte-identical)" \
     || no "(g5) declined route non-deterministic"
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/declined.xml" 2>/dev/null && ok "(g5) xml well-formed (declined route)" || no "(g5) xml malformed (declined route)"
+    if xmllint --noout "$TMP/declined.xml" 2>/dev/null; then ok "(g5) xml well-formed (declined route)"; else no "(g5) xml malformed (declined route)"; fi
 fi
 
 # (g6) MUTATION arm — the declined-disclosure assertion must FAIL against a --no-route run of the same
 # query (no routed: note at all there), proving the assertion is live and reads real output.
 "$BIN" commonfix --no-cache --for="split chunks" --no-route >"$TMP/declined_noroute.xml" 2>/dev/null
-GMUT="$( grep -q 'name-exact declined' "$TMP/declined_noroute.xml" && echo BAD || echo TRIPPED )"
+# row 6: read the route ATTRIBUTE only — the legend's route= reading spells ':declined(' on every --for document,
+# routed or not, so a whole-document grep would never trip and the self-test would be shape 5 (no contrast).
+GMUT="$( grep -oE ' route="[^"]*"' "$TMP/declined_noroute.xml" | grep -q ':declined(' && echo BAD || echo TRIPPED )"
 [ "$GMUT" = "TRIPPED" ] && ok "(g6) mutation self-test (the declined assertion fails on the --no-route run, so it is live)" \
                         || no "(g6) mutation self-test broke — the declined assertion cannot fail"
 
 # ── MUTATION self-test — the name-exact routing assertion must FAIL against the --no-route run ─────────
-MUT="$( grep -q 'routed: name-exact' "$TMP/ident_noroute.xml" && echo BAD || echo TRIPPED )"
+MUT="$( grep -q 'route="name-exact(' "$TMP/ident_noroute.xml" && echo BAD || echo TRIPPED )"
 [ "$MUT" = "TRIPPED" ] && ok "mutation self-test (the routing assertion fails on the --no-route run, so it is live)" \
                        || no "mutation self-test broke — the routing assertion cannot fail"
 

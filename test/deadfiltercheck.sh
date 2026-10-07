@@ -21,26 +21,28 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
 echo "deadfiltercheck: BIN=$BIN  ROOT=$ROOT"
 
-deadCount(){ "$BIN" "$ROOT" "$@" 2>/dev/null | grep -oE '<dead-code count="[0-9]+"' | grep -oE '[0-9]+'; }
+# L1 (2026-09-19): the CLI default is the compact posture, whose root leads with schema=; the count reads below
+# anchor on `<dead-code count=`, the full-posture root shape, so these runs ask for --legend=full (rows identical).
+deadCount(){ "$BIN" "$ROOT" "$@" --legend=full 2>/dev/null | grep -oE '<dead-code count="[0-9]+"' | grep -oE '[0-9]+'; }
 
 BARE="$( deadCount --dead-code )"
-[ "${BARE:-0}" -ge 3 ] && ok "bare --dead-code: count=$BARE" || no "bare --dead-code: count=${BARE:-<none>} (expected >= 3)"
+if [ "${BARE:-0}" -ge 3 ]; then ok "bare --dead-code: count=$BARE"; else no "bare --dead-code: count=${BARE:-<none>} (expected >= 3)"; fi
 
 # ── 1. a DIRECTORY filter selects the symbols under it (2 in test/, 1 in bench/ on this repo)
 T="$( deadCount --dead-code=test )"
-[ "${T:-0}" -ge 2 ] && ok "--dead-code=test: count=$T (>= 2)" || no "--dead-code=test: count=${T:-<none>} (expected >= 2)"
+if [ "${T:-0}" -ge 2 ]; then ok "--dead-code=test: count=$T (>= 2)"; else no "--dead-code=test: count=${T:-<none>} (expected >= 2)"; fi
 B="$( deadCount --dead-code=bench )"
-[ "${B:-0}" -ge 1 ] && ok "--dead-code=bench: count=$B (>= 1)" || no "--dead-code=bench: count=${B:-<none>} (expected >= 1)"
+if [ "${B:-0}" -ge 1 ]; then ok "--dead-code=bench: count=$B (>= 1)"; else no "--dead-code=bench: count=${B:-<none>} (expected >= 1)"; fi
 
 # a trailing slash is the same directory
 TS="$( deadCount --dead-code=test/ )"
-[ "${TS:-x}" = "${T:-y}" ] && ok "--dead-code=test/ == --dead-code=test ($TS)" || no "--dead-code=test/ = ${TS:-<none>} != ${T:-<none>}"
+if [ "${TS:-x}" = "${T:-y}" ]; then ok "--dead-code=test/ == --dead-code=test ($TS)"; else no "--dead-code=test/ = ${TS:-<none>} != ${T:-<none>}"; fi
 
 # ── 2. the parts never exceed the whole (a filter SELECTS, it does not invent findings)
 [ $(( ${T:-0} + ${B:-0} )) -le "${BARE:-0}" ] \
@@ -54,17 +56,17 @@ F="$( deadCount --dead-code=deadfix.cpp )"
 
 # ── 4. a filter matching NO indexed path refuses loudly — never a confident zero
 "$BIN" "$ROOT" --dead-code=nosuchdir >"$TMP/out" 2>"$TMP/err"; rc=$?
-[ "$rc" -eq 1 ] && ok "--dead-code=nosuchdir exits 1" || no "--dead-code=nosuchdir exits $rc (expected 1)"
-grep -q 'nosuchdir' "$TMP/err" && ok "refusal names the filter" || no "refusal does not name the filter: $( head -c 200 "$TMP/err" )"
+if [ "$rc" -eq 1 ]; then ok "--dead-code=nosuchdir exits 1"; else no "--dead-code=nosuchdir exits $rc (expected 1)"; fi
+if grep -q 'nosuchdir' "$TMP/err"; then ok "refusal names the filter"; else no "refusal does not name the filter: $( head -c 200 "$TMP/err" )"; fi
 grep -q 'count=' "$TMP/out" && no "refusal still printed a <dead-code count=> element" || ok "no count= element on the refusal path"
 
 # a directory-boundary near-miss must also refuse rather than prefix-match loosely
 "$BIN" "$ROOT" --dead-code=sr >/dev/null 2>"$TMP/err2"; rc2=$?
-[ "$rc2" -eq 1 ] && ok "--dead-code=sr (partial component) refuses" || no "--dead-code=sr exits $rc2 (expected 1 — 'sr' is not a path component)"
+if [ "$rc2" -eq 1 ]; then ok "--dead-code=sr (partial component) refuses"; else no "--dead-code=sr exits $rc2 (expected 1 — 'sr' is not a path component)"; fi
 
 # ── 5. a REAL indexed directory that simply holds no dead code stays a MEASUREMENT (exit 0, count="0").
 #      The refusal must fire on "names nothing in the tree", never on "found nothing there".
-"$BIN" "$ROOT" --dead-code=scripts >"$TMP/tp" 2>/dev/null; rc3=$?
+"$BIN" "$ROOT" --dead-code=scripts --legend=full >"$TMP/tp" 2>/dev/null; rc3=$?
 [ "$rc3" -eq 0 ] && grep -q '<dead-code count="0"' "$TMP/tp" \
     && ok "--dead-code=scripts (real dir, no dead code) exits 0 with count=\"0\" — a measurement" \
     || no "--dead-code=scripts exits $rc3 without a count=\"0\" measurement"
@@ -86,7 +88,7 @@ echo "$BARE_PATHS" | grep -q 'archmetricsfix' \
 # ── 6. determinism
 "$BIN" "$ROOT" --dead-code=test >"$TMP/d1" 2>/dev/null
 "$BIN" "$ROOT" --dead-code=test >"$TMP/d2" 2>/dev/null
-diff -q "$TMP/d1" "$TMP/d2" >/dev/null && ok "deterministic (byte-identical run-to-run)" || no "non-deterministic --dead-code output"
+if diff -q "$TMP/d1" "$TMP/d2" >/dev/null; then ok "deterministic (byte-identical run-to-run)"; else no "non-deterministic --dead-code output"; fi
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

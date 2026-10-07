@@ -7,15 +7,17 @@
 // it, don't reimplement" (and "if you fix this, fix its twins"). Type-3 (gapped) clones are a later upgrade.
 
 #include "model.h"
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — graceful-degrade on the Type-3 pair-cap guard (never throw)
+#include "infra/Diagnostics.h"  // DISCLOSE — graceful-degrade on the Type-3 pair-cap guard (never throw)
 #include "infra/hashutil.h"     // sanitizer-clean modulo-2^64 FNV multiplication
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <limits>       // std::numeric_limits — the mask-width static_assert: an index shifted into a mask must fit it
 #include <cstdio>
 #include <string>
+#include <utility>      // std::forward — the C-family scanCodeTokens spelling hands its sink to the CodeScanOptions one
 #include <vector>
 
 namespace rw
@@ -112,6 +114,13 @@ inline std::size_t multiByteOperatorLen( const std::string& src, std::size_t i, 
 // re-derived shape in the tree, and --quality-delta names each new copy of it. The mask is one shift and one
 // AND with no branch, so it is also the cheapest form for something called once per indexed symbol.
 inline constexpr std::uint32_t langBit( Lang lang ) noexcept { return std::uint32_t( 1 ) << std::uint32_t( lang ); }
+// SHIFT WIDTH vs ENUM COUNT. A shift by a value at or past the mask's width is undefined behaviour, and the language
+// masks are shifted by a Lang at RUNTIME (usesHashLineComments below, lintcatalog.h's corpusLangMask), where no
+// constant evaluation refuses it. So the count every such mask is built over is pinned to the mask type's width: a
+// 33rd language is a build error here, beside the shift, not UB in a lens. (A Lang byte past the enum from a corrupt
+// cache is the cache reader's to refuse; this is the bound for every value the enum can name.)
+static_assert( kLangCount <= std::numeric_limits<decltype( langBit( Lang::Cpp ) )>::digits,
+               "Lang outgrew the 32-bit language masks (langBit, kHashLineCommentLangMask, LintCatalogRow::langMask) — widen them" );
 // Toml and Yaml belong here and Json/Markdown deliberately do not: `#` opens a real line comment in TOML
 // and YAML alike, whereas
 // JSON has no comment syntax at all and markdown's `#` is a heading. The distinction is load-bearing rather
@@ -125,14 +134,29 @@ inline constexpr std::uint32_t langBit( Lang lang ) noexcept { return std::uint3
 // normalized span and manufacture clone matches. (Lua's `--` opener is not modelled here at all; that is
 // a disclosed floor of the clone lens for Lua, in the safe direction — comments count as content, so two
 // bodies must agree on their COMMENTS too before they clone-match, which can only ever miss a clone.)
+// Kotlin is not in this mask: its line comment is `//`, handled unconditionally by the scanner below.
 inline constexpr std::uint32_t kHashLineCommentLangMask = langBit( Lang::Python ) | langBit( Lang::Bash ) | langBit( Lang::Ruby ) | langBit( Lang::Toml ) | langBit( Lang::Yaml )
-                                                       | langBit( Lang::Php ) | langBit( Lang::Elixir );
-static_assert( std::uint32_t( Lang::Dart ) < 32, "Lang outgrew a 32-bit mask — widen kHashLineCommentLangMask" );
+                                                       | langBit( Lang::Php ) | langBit( Lang::Elixir ) | langBit( Lang::GDScript );
+static_assert( kLangCount <= std::numeric_limits<decltype( kHashLineCommentLangMask )>::digits,
+               "Lang outgrew a 32-bit mask — widen kHashLineCommentLangMask" );
 
-inline bool usesHashLineComments( Lang lang ) noexcept
-{
-    return ( ( kHashLineCommentLangMask >> std::uint32_t( lang ) ) & std::uint32_t( 1 ) ) != 0;
-}
+// Is `lang`'s bit set in a langBit mask? One shift and one AND, the form every mask predicate below shares (so the
+// second predicate did not land as a 29-token clone of the first, which --quality-delta named when it did).
+inline constexpr bool langInMask( std::uint32_t mask, Lang lang ) noexcept { return ( ( mask >> std::uint32_t( lang ) ) & std::uint32_t( 1 ) ) != 0; }
+
+inline bool usesHashLineComments( Lang lang ) noexcept { return langInMask( kHashLineCommentLangMask, lang ); }
+
+// Languages whose `'` opens a STRING literal (CodeScanOptions::singleQuoteStrings), not a char literal: the three the
+// builtin-method name gate has a table for (graph.h BuiltinMethodGate::tableFor), which is the one consumer that asks.
+// Only Python is exercised today (the gate's same-file rule is Python-only; test/commenttokencheck.sh A-I); the JS-family
+// and Ruby rows are the lexical fact, kept so a later extension of that rule cannot scan `'…'` as code by omission. Not
+// in this mask, deliberately: C/C++/Java/Rust (char literals), and every language the clone/readability lenses scan,
+// whose normalized streams must keep their bytes.
+inline constexpr std::uint32_t kSingleQuoteStringLangMask = langBit( Lang::Python ) | langBit( Lang::Ruby ) | langBit( Lang::JavaScript ) | langBit( Lang::TypeScript );
+static_assert( kLangCount <= std::numeric_limits<decltype( kSingleQuoteStringLangMask )>::digits,
+               "Lang outgrew a 32-bit mask — widen kSingleQuoteStringLangMask" );
+
+inline bool usesSingleQuoteStrings( Lang lang ) noexcept { return langInMask( kSingleQuoteStringLangMask, lang ); }
 
 // What the scanner decided a token IS. The consumer decides what to DO with that — normalize it away
 // (--clones) or keep it verbatim (--readability) — which is the whole reason the two are separable.
@@ -157,14 +181,64 @@ enum class CodeTokenKind : std::uint8_t { Identifier, Keyword, Number, String, P
 // PARAMETER and not a unification precisely because flipping it for --clones would change that verb's
 // normalized streams — i.e. its output bytes — and the new lens must be purely additive (G5).
 //
+// singleQuoteStrings (CodeScanOptions): OFF (every C-family consumer) keeps the `'` branch below — a char literal with a
+// plausible close, else punctuation. ON, a `'` opens a STRING that runs to the next unescaped `'`, exactly as `"` does,
+// because in Python, Ruby and the JS family `'…'` IS a string: with it off, `'Pool warm'` scans as `'` `Pool` `warm` `'`
+// and the words inside a log message count as code. An f-string's `{…}` is string content here (the graph.h consumer reads
+// the fields itself, StringTokenPosition::isFormatString).
+//
+// tripleQuoteStrings (CodeScanOptions): OFF (the default) reads `"""` as `""` then `"` — a quote INSIDE the triple would then
+// close the string early and flip code and string for the rest of the span. ON, a `"""` or `'''` opens one STRING that runs
+// to the matching closing triple, as Python reads it, so an apostrophe or a lone `"` inside a docstring stays string
+// content (commenttokencheck arm Q). The one consumer is graph.h identifierTokenCountExceeds, for Python.
+//
+// slashComments (CodeScanOptions): ON (every C-family consumer, and the default) drops `//`-to-EOL and `/* … */` as
+// comments. OFF keeps them as punctuation, because in Python `//` is floor division: `n = total // 2; kind = Pool` must
+// not lose the rest of its line (commenttokencheck arm P). The one consumer that turns it off is the same graph.h count,
+// for Python (PHP has `#` AND `//` comments, so the `#`-comment mask is not the right switch).
+//
 // `sink( std::string_view token, CodeTokenKind kind )` is called once per token, in source order.
-template<typename Sink>
-inline void scanCodeTokens( const std::string& src, std::size_t a, std::size_t b, bool stripHashComments,
-                            bool munchMultiByteOperators, Sink&& sink )
+struct CodeScanOptions
 {
+    bool stripHashComments       = false;   // `#` to EOL is a comment (usesHashLineComments)
+    bool munchMultiByteOperators = false;   // longest match from kMultiByteOperators (the --readability shape)
+    bool singleQuoteStrings      = false;   // `'` opens a string literal, not a char literal (Python, Ruby, the JS family)
+    bool slashComments           = true;    // `//` to EOL and `/* … */` are comments (off: Python's `//` is floor division)
+    bool tripleQuoteStrings      = false;   // `"""…"""` / `'''…'''` is one string to its closing triple (Python)
+};
+
+template<typename Sink>
+inline void scanCodeTokens( const std::string& src, std::size_t a, std::size_t b, CodeScanOptions options, Sink&& sink )
+{
+    const bool        stripHashComments       = options.stripHashComments;
+    const bool        munchMultiByteOperators = options.munchMultiByteOperators;
     const std::size_t n = std::min<std::size_t>( b, src.size() );
     std::size_t       i = std::min<std::size_t>( a, n );
     const auto        idc = []( unsigned char c ) noexcept { return std::isalnum( c ) != 0 || c == '_'; };
+    // a `"`-style string: from the opening quote to the next unescaped close (or the end of the span), one String token;
+    // with tripleQuoteStrings, an opening `"""` runs to the next unescaped `"""`
+    const auto        quoted = [ & ]( char quote )
+    {
+        const std::size_t begin  = i;
+        const bool        triple = options.tripleQuoteStrings && i + 2 < n && src[i + 1] == quote && src[i + 2] == quote;
+        const std::size_t width  = triple ? 3 : 1;
+        i += width;
+        while( i < n )
+        {
+            if( src[i] == '\\' )
+            {
+                i += 2;
+                continue;
+            }
+            if( src[i] == quote && ( !triple || ( i + 2 < n && src[i + 1] == quote && src[i + 2] == quote ) ) )
+            {
+                break;
+            }
+            ++i;
+        }
+        i = std::min( n, i + width );
+        sink( std::string_view( src.data() + begin, i - begin ), CodeTokenKind::String );
+    };
 
     while( i < n )
     {
@@ -174,7 +248,7 @@ inline void scanCodeTokens( const std::string& src, std::size_t a, std::size_t b
             ++i;
             continue;
         }
-        if( c == '/' && i + 1 < n && src[i + 1] == '/' )
+        if( options.slashComments && c == '/' && i + 1 < n && src[i + 1] == '/' )
         {
             i += 2;
             while( i < n && src[i] != '\n' )
@@ -183,7 +257,7 @@ inline void scanCodeTokens( const std::string& src, std::size_t a, std::size_t b
             }
             continue;
         }
-        if( c == '/' && i + 1 < n && src[i + 1] == '*' )
+        if( options.slashComments && c == '/' && i + 1 < n && src[i + 1] == '*' )
         {
             i += 2;
             while( i + 1 < n && !( src[i] == '*' && src[i + 1] == '/' ) )
@@ -204,18 +278,12 @@ inline void scanCodeTokens( const std::string& src, std::size_t a, std::size_t b
         }
         if( c == '"' )
         {
-            const std::size_t begin = i;
-            ++i;
-            while( i < n && src[i] != '"' )
-            {
-                if( src[i] == '\\' )
-                {
-                    ++i;
-                }
-                ++i;
-            }
-            i = std::min( n, i + 1 );
-            sink( std::string_view( src.data() + begin, i - begin ), CodeTokenKind::String );
+            quoted( '"' );
+            continue;
+        }
+        if( c == '\'' && options.singleQuoteStrings )
+        {
+            quoted( '\'' );
             continue;
         }
         // ' opens a char literal only with a plausible close (bounded lookahead) AND not directly after an
@@ -262,6 +330,15 @@ inline void scanCodeTokens( const std::string& src, std::size_t a, std::size_t b
         sink( std::string_view( src.data() + i, len ), CodeTokenKind::Punctuation );
         i += len;
     }
+}
+
+// The C-family spelling every --clones / --readability / --comment-coherence / --clone-idiom call site uses: `'` stays a
+// char literal. The two flags map onto CodeScanOptions in declaration order; nothing else differs.
+template<typename Sink>
+inline void scanCodeTokens( const std::string& src, std::size_t a, std::size_t b, bool stripHashComments,
+                            bool munchMultiByteOperators, Sink&& sink )
+{
+    scanCodeTokens( src, a, b, CodeScanOptions{ stripHashComments, munchMultiByteOperators, false }, std::forward<Sink>( sink ) );
 }
 
 // The --clones PROJECTION of a scanned token: identity erased, control flow kept. One statement of the
@@ -566,6 +643,22 @@ struct Type3Stats
     std::uint64_t jaccardMerges  = 0;   // exact fingerprint merges run
     std::uint64_t lcsRuns        = 0;   // pairs that cleared every gate and reached the LCS DP
     std::uint64_t emittedPairs   = 0;   // final Type-3 pairs returned
+    bool          pairCapHit     = false;   // kType3MaxPairs fired: the pair list (and every count built on it) is a FLOOR
+
+    // The DISCLOSE sink for the pass's one degrade. Until 2026-09-24 the cap used the one-argument DISCLOSE, whose
+    // trace compiles out under NDEBUG, so a shipped binary that hit the cap said nothing, while --clones printed
+    // counts_floor="1" on every run whether or not the cap fired. The sink records it; the emitters read pairCapHit.
+    enum class DisclosureWhy : std::uint8_t
+    {
+        PairCapHit,
+    };
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        switch( why )
+        {
+            case DisclosureWhy::PairCapHit: pairCapHit = true; break;
+        }
+    }
 };
 
 // FNV-1a over a token — used to reduce a k-gram to a single 64-bit fingerprint (order-sensitive within the gram).
@@ -813,7 +906,7 @@ inline std::vector<CloneGroup> findClonesType3( const IngestResult& ing, int min
                     continue;
                 }
                 pairSeen.emplace( pk, 1 );
-                if( comparedPairs >= kType3MaxPairs ) { DEGRADED_PATH_ALERT( "clones: Type-3 pair cap hit — first N compared (both-gate-surviving) near-misses kept, rest skipped" ); goto done; }
+                if( comparedPairs >= kType3MaxPairs ) { DISCLOSE( st, Type3Stats::DisclosureWhy::PairCapHit, "clones: Type-3 pair cap hit — first N compared (both-gate-surviving) near-misses kept, rest skipped" ); goto done; }
                 ++st.distinctPairs;
 
 #ifndef CTX_TYPE3_SKETCH_OFF
@@ -917,7 +1010,8 @@ done:
 //
 // FLOOR, not total. The Type-3 pair list is capped upstream (kType3MaxPairs) and the per-file candidate
 // walk is prefiltered, so a dropped pair is a component that did not get merged and a percentage that is
-// too LOW. Every derived count here is a floor; the emitter labels it counts_floor="1".
+// too LOW. When the cap fired (Type3Stats::pairCapHit) every derived count here is a floor, and the emitter
+// labels it counts_floor="1" type3_capped="1" — on that run only (2026-09-24; it used to print on every run).
 //
 // Deterministic: components are numbered by their smallest member id ascending, and members are collected
 // by an ascending id sweep — no hash-map iteration reaches the result.

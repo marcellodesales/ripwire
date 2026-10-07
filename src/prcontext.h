@@ -1,4 +1,9 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os::popen / pclose — the diff name-status walk
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // prcontext.h — Wave-4 feature: --pr-context[=BASEREF]. The no-LLM review-evidence bundle: for the
 // current working-tree diff (default) or a diff vs BASEREF, emit ONE deterministic XML section per
@@ -54,11 +59,13 @@
 #include "graph.h"
 #include "filter.h"             // isTestPath
 #include "gitmine.h"            // shSingleQuote, cochangePartners, gitFileAuthors, FileOwnership
-#include "quality.h"            // gitOneLine — the SAME one-line git primitive crossref/abicheck/mergescout resolve their merge-base with
+#include "quality.h"            // gitOneLine — the SAME one-line git primitive crossref/abicheck/mergescout resolve their merge-base with;
+                                // gitResolveCommitSha — the shared resolver BASEREF goes through (P0.1)
 #include "serialize.h"          // escapeXml
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — the unrelated-history (no merge-base) degrade
+#include "infra/Diagnostics.h"  // DISCLOSE — the unrelated-history (no merge-base) degrade
 #include "gitstamp.h"           // gitstamp::atAttr — the at="<sha>[+dirty]" root anchor
 #include "graphlegend.h"        // §H4 §3.4 / V4 MED-3: the shared counts_floor= marker + graph-count legend clauses
+#include "compactlegend.h"      // L1 fix round: compactDeliveredEstTokens — trim at the price a compact-posture run delivers
 #include "testmap.h"            // §A9.5 / §P11.4: TestRunnerIndex / runAttr — the run= hint on a named test row
 
 #include <algorithm>
@@ -213,10 +220,10 @@ inline NumstatDiff numstatChangedPaths( const std::string& root, const std::stri
     // revision this file builds is a rev-parse-resolved sha, see resolveDiffAnchor), so nothing downstream
     // can be re-read as an option or as an ambiguous pathspec. Belt to the resolver's braces; an empty
     // pathspec list after `--` means "all paths", so the diff itself is unchanged.
-    const std::string cmd = "git -c core.quotepath=false -C " + shSingleQuote( root ) + " diff --numstat "
+    const std::string cmd = gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root ) + " diff --numstat "
                           + revArgs + " -- 2>/dev/null";
 
-    std::FILE* pipe = popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( !pipe )
     {
         return out;
@@ -236,7 +243,7 @@ inline NumstatDiff numstatChangedPaths( const std::string& root, const std::stri
             out.paths.push_back( std::move( path ) );
         }
     }
-    const int rc = pclose( pipe );
+    const int rc = os::pclose( pipe );
     if( rc != 0 && out.paths.empty() && out.skippedModeOnly == 0 )
     {
         return out; // git failed outright
@@ -258,50 +265,38 @@ inline NumstatDiff numstatChangedPaths( const std::string& root, const std::stri
 // stops SHELL injection, but the token still arrives at git as its own argv entry — and `git diff` honors
 // `--output=FILE`, which TRUNCATES and rewrites FILE. A ref beginning with `-` fails merge-base first,
 // which is *exactly* what routed it into that fallback: `--pr-context=--output=/etc/x` clobbered a file
-// outside the repo and exited 0. So: resolve through `rev-parse --verify ...^{commit}` FIRST (the same
-// probe mergescout.h:resolveCommittish uses) and diff the resulting 40-hex sha, which can never begin
-// with `-`. An unresolvable ref is a REFUSAL (`badRef`), never a fallback — the caller exits 1 (P2.8).
+// outside the repo and exited 0. So: resolve through quality::gitResolveCommitSha FIRST and diff the sha it
+// returns. That is the one resolver a user-supplied revision goes through, and it holds both halves of the
+// house rule: a ref beginning with `-` is refused before git is asked at all (a private copy of the probe
+// used to live here and handed `rev-parse` `--output=…^{commit}` as its own argv entry, stopped only by git's
+// own rejection), and `rev-parse --verify ...^{commit}`'s answer counts only as a bare 40/64-hex object name
+// (`^REF` answers `^<sha>` at rc 0) — so "the revision token can never begin with `-`" is proven in ripwire,
+// not inherited from git's output format. An unresolvable ref is a REFUSAL (`badRef`), never a fallback — the
+// caller exits 1 (P2.8). test/prrefsafecheck.sh proves both halves from the git child's argv, through a PATH shim.
 struct DiffAnchor
 {
     std::string revArgs;               // the already-shell-quoted revision tail for `git diff --numstat`
     std::string baseSha;               // the resolved merge-base, or "" (default form / unrelated history)
-    std::string refSha;                // BASEREF resolved to a commit sha — the ONLY spelling of the ref that
-                                       // reaches a git argv (see the base-moved probe below)
+    std::string refSha;                // BASEREF resolved to a commit sha — the ONLY spelling of the ref any git
+                                       // call after its own resolve probe is handed (see the base-moved probe below)
     bool        baseRefGiven = false;
     bool        baseAnchored = false;
     bool        refHasNoWork = false;  // §A9.2: merge-base == the ref's own tip ⇒ the ref is an ancestor of HEAD
                                        // and has NO divergent work (what --merge-scout reports as changed="0")
     bool        badRef       = false;  // ref given, root has git history, ref does not resolve ⇒ refuse (exit 1)
     bool        gitUnusable  = false;  // no HEAD at all (non-git root / git unavailable) ⇒ the exit-0 degrade
+
+    // The DISCLOSE sink for the unrelated-history degrade: the diff falls back to two-dot against the resolved tip, and
+    // baseAnchored=false is what the root prints as the anchor actually used (anchor="ref-tip-two-dot").
+    enum class DisclosureWhy : std::uint8_t
+    {
+        NoMergeBase,
+    };
+    void disclose( DisclosureWhy ) noexcept
+    {
+        baseAnchored = false;
+    }
 };
-
-// A git object name is 40 (sha-1) or 64 (sha-256) lowercase hex characters. Checked explicitly rather than
-// assumed so "the revision token can never look like an option" is a property this file PROVES rather than
-// inherits from git's output format — a non-hex answer degrades to a refusal, never to a raw-token diff.
-inline bool isCommitSha( std::string_view s )
-{
-    if( s.size() != 40 && s.size() != 64 )
-    {
-        return false;
-    }
-    for( const char c : s )
-    {
-        if( !( ( c >= '0' && c <= '9' ) || ( c >= 'a' && c <= 'f' ) ) )
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Resolve REF to a commit sha. `^{commit}` peels — so a blob/tree hash or a malformed ref answers "" — and
-// mirrors mergescout.h:resolveCommittish verbatim rather than growing a second dialect of the same probe.
-inline std::string resolveBaseRefSha( const std::string& root, std::string_view ref )
-{
-    const std::string sha = quality::gitOneLine( root, "rev-parse --verify --quiet "
-                                                       + shSingleQuote( std::string( ref ) + "^{commit}" ) + " 2>/dev/null" );
-    return isCommitSha( sha ) ? sha : std::string{};
-}
 
 inline DiffAnchor resolveDiffAnchor( const std::string& root, std::string_view baseRef )
 {
@@ -315,11 +310,12 @@ inline DiffAnchor resolveDiffAnchor( const std::string& root, std::string_view b
     const std::string headSha = quality::gitOneLine( root, "rev-parse --verify --quiet HEAD 2>/dev/null" );
     if( headSha.empty() ) { out.gitUnusable = true; return out; }
 
-    // P0.1 + P2.8: an unresolvable ref REFUSES. It is never handed to `git diff` as a token.
-    out.refSha = resolveBaseRefSha( root, baseRef );
+    // P0.1 + P2.8: an unresolvable ref REFUSES. It is never handed to `git diff` as a token — and one beginning
+    // with `-` is refused inside the resolver, before git is asked to resolve it at all.
+    out.refSha = quality::gitResolveCommitSha( root, std::string( baseRef ) );
     if( out.refSha.empty() )
     {
-        // No DEGRADED_PATH_ALERT (F20): the caller REFUSES on badRef, so this stamped a "[math degraded] …"
+        // No DISCLOSE (F20): the caller REFUSES on badRef, so this stamped a "[math degraded] …"
         // line — the marker of a run that CONTINUED in a reduced mode — immediately ahead of a refusal that
         // continued nothing. The sentence it carried is already the caller's user-facing refusal.
         out.badRef = true;
@@ -330,7 +326,7 @@ inline DiffAnchor resolveDiffAnchor( const std::string& root, std::string_view b
                                                         + " " + shSingleQuote( headSha ) + " 2>/dev/null" );
     if( base.empty() )
     {
-        DEGRADED_PATH_ALERT( "pr-context: no merge-base with the base ref (unrelated history?) — falling back to a two-dot diff against its tip" );
+        DISCLOSE( out, DiffAnchor::DisclosureWhy::NoMergeBase, "pr-context: no merge-base with the base ref (unrelated history?) — falling back to a two-dot diff against its tip" );
         out.revArgs = shSingleQuote( out.refSha );   // the RESOLVED sha, never the raw ref
         return out;
     }
@@ -454,6 +450,8 @@ struct PrBudget
     bool        isDefault  = false;   // kPrDefaultBudgetTokens applied because the caller named none
     int         pageLimit  = 0;       // --limit=N over the changed files (0 = none)
     int         pageOffset = 0;       // --offset=M over the changed files
+    bool        compactLegend = false; // L1 fix round: the run's legend posture is compact — the trim ladder decides on the
+                                       // price the compact layer will DELIVER, not the full dialect's (rv-r1-L1 MED-4)
 };
 
 inline constexpr PrTrim kPrTrims[] = {
@@ -540,6 +538,8 @@ struct PrTrimRender
     std::size_t estTokens   = 0;
     std::size_t level       = 0;
     std::string truncated   = "none";
+    std::size_t testFiles   = 0;      // E1: test FILES this level's body actually rendered — 0 ⇒ no <test>/<g> row
+    bool        rendered    = true;   // false ⇒ the measurement buffer failed; `body` is empty and means nothing
 };
 
 // ONE estimator for every --pr-context root, never two counters (serialize.h's standing rule, the one
@@ -551,40 +551,77 @@ struct PrTrimRender
 // The floor-exceeded suffix feeds back into the price (it lengthens truncated=, hence the root tag), so it
 // is applied and RE-PRICED: monotone, since adding bytes to a document already over budget cannot bring it
 // under, so one re-price is the fixpoint and the printed number is the document's real price either way.
-template< typename EmitFn, typename PriceFn >
-inline PrTrimRender pickPrTrimLevel( const EmitFn& emitFiles, std::size_t budgetTokens, const PriceFn& price,
+// One level's body, plus the two facts a caller cannot recover from the bytes: how many test FILES it
+// rendered (E1 — the run-hint clause is gated on that count, never on a string match over the body) and
+// whether the measurement buffer opened at all. Through infra/emit.h's ONE renderToString seam, so a failure
+// is ALERTED rather than returned as an indistinguishable empty body.
+template< typename EmitFn >
+inline PrTrimRender prRenderLevel( const EmitFn& emitFiles, const PrTrim& trim )
+{
+    PrTrimRender out;
+    const rw::Rendered r = rw::renderToString( [ & ]( std::FILE* ms ) { emitFiles( ms, trim, &out.testFiles ); } );
+    out.body     = r.text;
+    out.rendered = r.ok;
+    if( !r.ok )
+    {
+        out.testFiles = 0;
+    }
+    return out;
+}
+
+// The two prices of one candidate level (L1 fix round, rv-r1-L1 MED-4): `price` is what the root PRINTS — the emitter's price
+// of what it writes, which the compact layer then reprices by its own rule — and `delivered( candidate, windowAttrs )` is
+// what the ladder DECIDES on: the same number in the full posture, the compact layer's price of the same document in the
+// compact one (writePrContext). Kept apart so the printed number is never moved twice.
+template< typename PriceFn, typename DeliveredFn >
+struct PrLevelPricing
+{
+    const PriceFn&     price;
+    const DeliveredFn& delivered;
+};
+
+template< typename EmitFn, typename Pricing >
+inline PrTrimRender pickPrTrimLevel( const EmitFn& emitFiles, std::size_t budgetTokens, const Pricing& pricing,
                                      const std::string& windowAttrs )
 {
+    const auto& price     = pricing.price;
+    const auto& delivered = pricing.delivered;
     constexpr std::size_t nLevels = sizeof( kPrTrims ) / sizeof( kPrTrims[0] );
     PrTrimRender out;
     for( std::size_t li = 0; li < nLevels; ++li )
     {
-        char*       buf = nullptr;
-        std::size_t sz  = 0;
-        std::string rendered;
-        if( std::FILE* ms = open_memstream( &buf, &sz ) )
-        {
-            emitFiles( ms, kPrTrims[li] );
-            std::fflush( ms );
-            std::fclose( ms );
-            if( buf )
-            {
-                rendered.assign( buf, sz );
-            }
-        }
-        std::free( buf );
+        const PrTrimRender probe = prRenderLevel( emitFiles, kPrTrims[li] );
+        out.body      = probe.body;
+        out.testFiles = probe.testFiles;
+        out.rendered  = probe.rendered;
         out.level     = li;
         out.truncated = li > 0 ? std::string( kPrTrims[li].dropped ) : std::string( "none" );
-        out.body      = std::move( rendered );
-        out.estTokens = price( out.body.size(), li, out.truncated, windowAttrs );
-        if( out.estTokens <= budgetTokens )
+        out.estTokens = price( out.body, out.testFiles, li, out.truncated, windowAttrs );
+        if( !probe.rendered )
+        {
+            // THIS LEVEL WAS NOT MEASURED, AND THE DOCUMENT MUST SAY SO. A failed render leaves probe.body
+            // EMPTY, the price of an empty body fits any budget, and the ladder therefore breaks here with a
+            // root that prints est_tokens = the price of nothing while writePrContext streams the COMPLETE
+            // floor level. The bytes are the right answer — cutting rows because a measurement buffer failed
+            // would make a cap decide the content, which is the one thing a cap may never do — but the
+            // NUMBER is modelled, and until now its only signal was DISCLOSE, which Diagnostics.h
+            // compiles to `do {} while (0)` under NDEBUG. So the shipped binary printed a wrong est_tokens
+            // with no disclosure at all (review of #214). truncated= is the attribute that already carries
+            // exactly this class of fact, so the fact goes there and survives the flavour.
+            //
+            // Re-priced after the label is appended, for the same reason the budget-floor rung below
+            // re-prices: the label lengthens the root tag, so a number printed beside it must include it.
+            out.truncated += ";est-unmeasured";
+            out.estTokens = price( out.body, out.testFiles, li, out.truncated, windowAttrs );
+        }
+        if( delivered( out, windowAttrs ) <= budgetTokens )
         {
             break;
         }
         if( li + 1 == nLevels )
         {
             out.truncated += ";budget-floor-exceeded";   // even the floor render is over budget
-            out.estTokens = price( out.body.size(), li, out.truncated, windowAttrs );
+            out.estTokens = price( out.body, out.testFiles, li, out.truncated, windowAttrs );
         }
     }
     return out;
@@ -595,8 +632,15 @@ inline PrTrimRender pickPrTrimLevel( const EmitFn& emitFiles, std::size_t budget
 inline std::string prBudgetTail( std::size_t changedFiles, std::uint32_t skippedModeOnly, std::size_t budgetTokens,
                                  const PrTrimRender& chosen, const std::string& truncatedEscaped )
 {
-    char tail[ 256 ];
-    std::snprintf( tail, sizeof( tail ), " files=\"%zu\" skipped_mode_only=\"%u\" budget_tokens=\"%zu\" est_tokens=\"%zu\" trim_level=\"%zu\" truncated=\"%s\"",
+    // 320, not 256: test/fixedbufsweep.sh measured this buffer's worst case at 248 B of 256 — SEVEN bytes of
+    // margin — and warned that "one more attribute crosses it". ';est-unmeasured' is 15 more and CAN ride
+    // beside ';budget-floor-exceeded' (a small --max-tokens puts even the empty-body envelope over budget),
+    // so the worst case is 88 lit + 90 digits + 85 label = 263 B. formatTo is not what was saving it: it
+    // truncates SILENTLY and its return is not read here, so an overrun would have dropped the closing quote
+    // of truncated=" and shipped a malformed root — a G4 breach with no diagnostic. The sweep's row moves in
+    // the same commit with the recomputed number.
+    char tail[ 320 ];
+    rw::formatTo( tail, sizeof( tail ), " files=\"{}\" skipped_mode_only=\"{}\" budget_tokens=\"{}\" est_tokens=\"{}\" trim_level=\"{}\" truncated=\"{}\"",
                    changedFiles, skippedModeOnly, budgetTokens, chosen.estTokens, chosen.level, truncatedEscaped.c_str() );
     return tail;
 }
@@ -615,7 +659,52 @@ inline std::string prBudgetTail( std::size_t changedFiles, std::uint32_t skipped
 // this comment IS ~91% of that document. Same bytes in the same order; they are simply measured before
 // they are written, the way every other priced root measures itself (serialize.h §H7). File scope, beside
 // kPrEmptyDiffBody, so the emitter reads as the decisions it makes rather than as the prose it ships.
-inline std::string prLegendText( const std::string& baseEscaped, bool hasUnindexed )
+// E1 (2026-09-12): `withRunClause` splices testmap.h's run=/run_unknown=/<g> clause. The clause is a rule about
+// rows, so it rides only a document whose chosen body renders a <test>/<g> row — decided by the COUNT that
+// body's own emitter reported (PrTrimRender::testFiles), never by a search of the rendered bytes. The writer
+// builds both forms, the pricer charges runClauseBytes per candidate level from that level's own body, and the
+// form matching the chosen body is written — after the choice, since the legend precedes the root in the
+// stream but not in the decision. A corpus-level predicate ("the corpus holds a test file") over-approximated
+// (CodeRabbit on #214): a test elsewhere in the corpus, or a testCap=0 level, bought the clause for a document
+// with no row. Measured on test/defaultceilingcheck.sh's 120-file, no-test fixture: unconditional, 7,989 ->
+// 8,025 tokens, over the 8,000 default budget; gated, 7,989.
+// Review of #214: the est-unmeasured label's definition, and the ONE wording that defines it — the legend
+// clause for the disclosure that replaces an alert the release build compiles out.
+//
+// CHARGED LIKE kRunHintLegendClause, AND FOR THE SAME REASON. This is a rule about a label, so it rides only
+// a document whose chosen level actually carries that label — decided by the FACT the ladder recorded
+// (PrTrimRender::rendered), never by a search of the rendered bytes. Unconditional, it cost the
+// test/defaultceilingcheck.sh fixture its whole remaining headroom: that 120-file tree prices at 7,989 of
+// the 8,000 default (11 tokens spare, as E1 measured when it gated the run clause for the same reason) and
+// went to 8,037 — over budget, on a document with nothing unmeasured about it. Gated, it is 0 B there and
+// the pricer charges it exactly on the level that states it, so the priced and the delivered legend cannot
+// disagree. Defined-wherever-emitted is the rule prbudgetcheck (#10) already holds budget-floor-exceeded to;
+// test/prcontextcheck.sh (F6) holds this one to it.
+inline constexpr std::string_view kPrEstUnmeasuredLegendClause =
+    "truncated= carrying est-unmeasured means the chosen level could not be MEASURED (its measurement buffer, or the copy out of it, failed), so est_tokens= is a MODELLED "
+    "number and not this document's own price — recounting the delivered bytes will NOT reproduce it. The BYTES are unaffected: the complete untrimmed level is served, "
+    "because a failed measurement may not decide what the answer contains. ";
+
+// The two CONDITIONAL clauses of this legend, named instead of passed as a pair of bare bools: the call site
+// `prLegendText( escBase, unindexed, true, false )` says nothing about which clause is which, and the two are
+// decided by different facts — the chosen body's test-row COUNT, and whether that body could be measured at
+// all. Both are gated for the same measured reason (see kPrEstUnmeasuredLegendClause): a clause that states a
+// rule about something this document does not contain is bytes every reader pays for and no reader needs.
+// MERGE of #214 and #219, and the third field is why this is a union and not a choice. #214 replaced two
+// bare bools with this struct; #219 (A3) had made the run clause's ROOT-RELATIVE sentence conditional, so the
+// clause is no longer the constant kRunHintLegendClause but whatever testmap.h's runHintClauseIfRows returns
+// for this run. Taking either side whole drops the other's fact: main's spelling loses the root sentence,
+// ours loses the est-unmeasured clause. `rootRelativeRuns` is not a third GATE — it selects which run clause
+// is spliced once runHint has already decided that one is — and it answers to the SAME predicate that spells
+// run= itself (testmap.h runsAreRootRelative), so the sentence and the spelling still cannot disagree.
+struct PrLegendClauses
+{
+    bool runHint          = false;   // M21(b)/E1: testmap.h's run=/run_unknown=/<g> rule — rides a rows-bearing body
+    bool estUnmeasured    = false;   // review of #214: the est-unmeasured label's definition — rides a document carrying the label
+    bool rootRelativeRuns = false;   // A3 / review of #219: the run clause's root-relative SENTENCE — one declared root, or the command stays absolute
+};
+
+inline std::string prLegendText( const std::string& baseEscaped, rw::GaugeClauses hasUnindexed, const PrLegendClauses& clauses )
 {
     return std::string(
                  "<!-- ripwire pr-context: no-LLM review-evidence bundle per changed file — defined symbols, their callers, blast radius (transitive dependents), affected tests, co-change partners not in the diff, and owners. "
@@ -642,7 +731,12 @@ inline std::string prLegendText( const std::string& baseEscaped, bool hasUnindex
                  // from the in-edge CSR --callers reads, and <impact dependents=> is the same transitive reach
                  // --impact reports, so the same floor applies to hundreds of attributes in this one document.
                  // The shared constants, never a pr-context wording — that is the §B4 echo-site rule.
-                 + rw::graphCountDisclosure( hasUnindexed ) + "-->";
+                 + rw::graphCountDisclosure( hasUnindexed )
+                 // Rows-gated through testmap.h's OWN seam rather than its bare constant: runHintClauseIfRows is
+                 // what appends the root-relative sentence, so #219's A3 fix survives #214's struct.
+                 + rw::runHintClauseIfRows( clauses.runHint ? 1 : 0, clauses.rootRelativeRuns )
+                 + std::string( clauses.estUnmeasured ? kPrEstUnmeasuredLegendClause : std::string_view() )   // review of #214: the est-unmeasured label's definition — label-gated, same reason
+                 + "-->";
 }
 
 inline constexpr std::string_view kPrEmptyDiffBody =
@@ -676,13 +770,13 @@ inline std::string prEmptyRootTail( std::uint32_t skippedModeOnly, std::size_t b
 template< typename PriceFn >
 inline std::pair<std::size_t, std::string> prEmptyRootPrice( const PriceFn& price, std::size_t budgetTokens )
 {
-    const std::size_t plain = price( kPrEmptyDiffBody.size(), 0, std::string( "none" ), std::string() );
+    const std::size_t plain = price( kPrEmptyDiffBody, 0, 0, std::string( "none" ), std::string() );
     if( budgetTokens == 0 || plain <= budgetTokens )
     {
         return { plain, std::string( "none" ) };
     }
     const std::string labelled( "budget-floor-exceeded" );
-    return { price( kPrEmptyDiffBody.size(), 0, labelled, std::string() ), labelled };
+    return { price( kPrEmptyDiffBody, 0, 0, labelled, std::string() ), labelled };
 }
 
 // Open the <pr-context> root: the attributes EVERY form shares, this site's own tail, and the one remark row
@@ -720,7 +814,9 @@ struct PrPriceCtx
     const PrContextMask* anchor          = nullptr;
     const std::string*   baseEscaped     = nullptr;
     const std::string*   atAttrs         = nullptr;   // gitstamp::atAttr, appended past every tail attribute
-    std::size_t          envelopeBytes   = 0;         // legend + anchoring note + closing tag (never the root tag)
+    std::size_t          envelopeBytes   = 0;         // legend (WITHOUT the run clause) + anchoring note + closing tag (never the root tag)
+    std::size_t          runClauseBytes  = 0;         // E1: testmap.h's run=/run_unknown=/<g> clause, charged only for a body that renders a test row
+    std::size_t          estUnmeasuredClauseBytes = 0;   // review of #214: the est-unmeasured clause, charged only for a level that could not be measured
     std::size_t          changedFiles    = 0;
     std::uint32_t        skippedModeOnly = 0;
     std::size_t          budgetTokens    = 0;
@@ -740,10 +836,25 @@ struct PrPriceCtx
 //
 // The attribute is part of the document it prices, so its own digits are converged in ≤4 passes exactly as
 // pricedRootAttr converges them.
-inline std::size_t prPriceDocument( const PrPriceCtx& c, std::size_t bodyBytes, std::size_t level,
+// E1 (review of #214): the run clause is charged for a level exactly when that level's body RENDERED a test
+// row, and the count comes from the emitter that wrote it (PrTrimRender::testFiles), never from a string
+// match over the rendered bytes — a body can carry the literal text of a tag inside CDATA or an attribute,
+// and a predicate that greps for one is answering a different question than the emitter did. The pricer and
+// the writer read the SAME count, so the priced legend and the delivered legend cannot disagree.
+inline std::size_t prPriceDocument( const PrPriceCtx& c, std::string_view body, std::size_t testFiles, std::size_t level,
                                     const std::string& truncatedEscaped, const std::string& windowAttrs )
 {
-    std::size_t est = 0;
+    // Review of #214: the est-unmeasured clause is charged off the LABEL this document will print, read from
+    // the truncated= value the caller already hands in — not off a parallel boolean beside it. The label is
+    // the fact (pickPrTrimLevel appends it from PrTrimRender::rendered before it prices, wherever it prices),
+    // so charging on its presence makes the priced legend and the delivered legend impossible to disagree:
+    // one condition decides both. This is NOT the E1 objection to grepping rendered bytes — truncated= is the
+    // ladder's own decision string, never emitter output, and the vocabulary that may appear in it is a
+    // closed const table plus these two labels.
+    const bool        unmeasured = truncatedEscaped.find( "est-unmeasured" ) != std::string::npos;
+    const std::size_t bodyBytes  = body.size() + ( testFiles > 0 ? c.runClauseBytes : 0 )                     // E1: the clause rides only a rows-bearing document
+                                   + ( unmeasured ? c.estUnmeasuredClauseBytes : 0 );                          // review of #214: and this one only a level that was not measured
+    std::size_t       est       = 0;
     for( int pass = 0; pass < 4; ++pass )
     {
         PrTrimRender probe;
@@ -895,7 +1006,12 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
     };
     // r26-stamp Task A: anchor these callers/blast-radius/tests numbers to the commit (+dirty state) they were
     // computed against — "" (omitted) on a non-git root, never a placeholder.
-    const std::string atAttrStr = gitstamp::atAttr( root );
+    // 0.6.7 shallow-history tail: the embedded <cochange window= commits=> and <owners bf= share=> rows are mined from THIS
+    // root's history, so on a depth-limited clone the root carries the same shallow="1" the owners/cochange verbs carry (one
+    // probe; the attribute rides the same splice as at=, which stays the last attribute, and prices the same way). "" on a
+    // full clone, so every full-history bundle keeps its bytes. A multi-root run calls this once per root with ITS root.
+    const bool        prShallow = gitstamp::isShallow( root );
+    const std::string atAttrStr = std::string( gitstamp::shallowAttr( prShallow ) ) + gitstamp::atAttr( root );
 
     // r26 anchoring attributes — emitted ONLY for the BASEREF form (the working-tree default has no anchoring
     // question, and stays byte-identical). anchor="merge-base" is the normal path; anchor="ref-tip-two-dot" is
@@ -917,11 +1033,32 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
     }
     std::sort( changed.begin(), changed.end(), [ & ]( std::uint32_t a, std::uint32_t b ) { return ing.files[a] < ing.files[b]; } );
 
-    const std::string legendText = prLegendText( escBase, g.unindexedFiles > 0 );
-    std::fwrite( legendText.data(), 1, legendText.size(), out );
-
-    const std::string anchorNoteText = prAnchorNoteText( anchorAttr );
-    std::fwrite( anchorNoteText.data(), 1, anchorNoteText.size(), out );
+    // E1: both legend forms are built now and ONE is written later, once the body is known — writeHead takes
+    // that body's own PrTrimRender::testFiles count. The envelope is priced without the clause and the pricer
+    // adds runClauseBytes for a rows-bearing body. A3 / review of #219: the run clause's ROOT-RELATIVE
+    // sentence is conditional too, so every form is built with the one predicate that also decides the run=
+    // spelling — carried in the clause struct rather than as a second bare bool.
+    const bool        prRootRelRuns  = rw::runsAreRootRelative( ing, root );
+    const std::string legendText     = prLegendText( escBase, rw::graphGaugeClauses( g ), PrLegendClauses{ .rootRelativeRuns = prRootRelRuns } );
+    // 0.6.7: the shallow clause rides the anchoring-note slot — written and priced by every form (empty diff / plain / budgeted)
+    // exactly as the note is, and defined exactly when the root carries the attribute ("" otherwise).
+    const std::string anchorNoteText = prAnchorNoteText( anchorAttr ) + gitstamp::shallowLegend( prShallow );
+    // The clause-bearing form is built ONCE, and only if it is the form that gets written — the difference
+    // between the two is exactly what testmap.h's runHintClauseIfRows returns for this run (prLegendText
+    // splices that and the est-unmeasured clause, nothing else), so the pricer below asks that same seam for
+    // its size rather than measuring a second rendering.
+    // Review of #214: `unmeasured` is the SECOND rows-style gate — the est-unmeasured clause rides only the
+    // document whose chosen level could not be measured, and the pricer charged it on exactly that fact
+    // (PrTrimRender::rendered), so the written legend and the priced legend are the same bytes.
+    const auto        writeHead      = [ & ]( std::size_t testFiles, bool unmeasured )
+    {
+        const std::string legend = ( testFiles > 0 || unmeasured )
+                                       ? prLegendText( escBase, rw::graphGaugeClauses( g ),
+                                                       PrLegendClauses{ .runHint = testFiles > 0, .estUnmeasured = unmeasured, .rootRelativeRuns = prRootRelRuns } )
+                                       : legendText;
+        std::fwrite( legend.data(), 1, legend.size(), out );
+        std::fwrite( anchorNoteText.data(), 1, anchorNoteText.size(), out );
+    };
 
     // R2/N4: the fixed, non-body envelope of every root this emitter writes — the legend, the anchoring
     // note, and the closing tag. The root's OWN start tag varies with the tail it carries, so it is
@@ -931,10 +1068,14 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
     // R2/N4: the price context (see prPriceDocument) — the envelope and every root attribute that does not
     // vary per candidate trim level, gathered once.
     const PrPriceCtx priceCtx{ .g = &g, .sharedAttrs = &sharedAttrs, .anchor = &anchor, .baseEscaped = &escBase, .atAttrs = &atAttrStr,
-                               .envelopeBytes = envelopeBytes, .changedFiles = changed.size(), .skippedModeOnly = skippedModeOnly,
+                               // #219: the run clause is priced through the SAME seam that writes it, so the root
+                               // sentence is charged exactly when it is emitted — never the bare constant's size.
+                               .envelopeBytes = envelopeBytes, .runClauseBytes = rw::runHintClauseIfRows( 1, prRootRelRuns ).size(),
+                               .estUnmeasuredClauseBytes = kPrEstUnmeasuredLegendClause.size(),
+                               .changedFiles = changed.size(), .skippedModeOnly = skippedModeOnly,
                                .budgetTokens = budgetTokens, .isDefaultBudget = budget.isDefault };
-    const auto priceOf = [ & ]( std::size_t bodyBytes, std::size_t level, const std::string& truncatedRaw, const std::string& windowAttrs )
-    { return prPriceDocument( priceCtx, bodyBytes, level, ex( truncatedRaw ), windowAttrs ); };
+    const auto priceOf = [ & ]( std::string_view body, std::size_t testFiles, std::size_t level, const std::string& truncatedRaw, const std::string& windowAttrs )
+    { return prPriceDocument( priceCtx, body, testFiles, level, ex( truncatedRaw ), windowAttrs ); };
 
     if( changed.empty() )
     {
@@ -942,6 +1083,7 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
         const std::string rootOpen = prRootOpenText( g, sharedAttrs,
                                                      prEmptyRootTail( skippedModeOnly, budgetTokens, budget.isDefault, emptyEst, ex( emptyTruncated ) ) + atAttrStr,
                                                      anchor, escBase );
+        writeHead( 0, false );   // the empty-diff body is a fixed comment: no changed file, so no test row and nothing to measure
         std::fwrite( rootOpen.data(), 1, rootOpen.size(), out );
         std::fwrite( kPrEmptyDiffBody.data(), 1, kPrEmptyDiffBody.size(), out );
         std::fwrite( kPrCloseTag.data(), 1, kPrCloseTag.size(), out );
@@ -965,7 +1107,7 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
     const auto allOwners = gitFileAuthors( root, ing, UINT32_MAX, 182.5, onlyRoot );
 
     // §A9.5 / §P11.4: run= on the named test rows, from the SAME index --affected/--situ/--test-gate read.
-    const TestRunnerIndex prRunners( ing );   // built once, like coSets/allOwners — the bundle re-renders
+    const TestRunnerIndex prRunners( ing, root );   // built once, like coSets/allOwners — the bundle re-renders
 
     // One-time file→defined-symbols index (in id order == file/line order), so each changed file reads its
     // symbols in O(1) instead of re-scanning all N symbols (A4-P10). Buckets fill in ascending id order.
@@ -977,7 +1119,10 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
     // The per-file body emitter, parameterized by a trim level so the budget path can render it at several
     // depths into a memstream to measure, then re-render the chosen one to `out`. At the deepest trim it is
     // still one <file> element PER changed file (counts intact) — files are never dropped, only detail is.
-    const auto emitFilesRange = [ & ]( std::FILE* o, const PrTrim& trim, std::size_t begin, std::size_t end )
+    // `testFilesOut` (optional): the number of test FILES the rows below actually rendered, accumulated over
+    // the range — E1's ONE gate for the run-hint clause, reported BY the emitter instead of grepped back out
+    // of its bytes. nullptr on the streaming degrade path, which has no legend left to decide.
+    const auto emitFilesRange = [ & ]( std::FILE* o, const PrTrim& trim, std::size_t begin, std::size_t end, std::size_t* testFilesOut )
     {
         for( std::size_t ci = begin; ci < end; ++ci )
         {
@@ -985,7 +1130,7 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
             // this file's defined symbols, in id order (== file/line order by the ingest sort).
             const FileSymbols& fileSyms = symsByFile[f];
 
-            std::fprintf( o, "<file p=\"%s\" symbols=\"%zu\">", ex( prPathRel( f ) ).c_str(), std::size_t( fileSyms.size() ) );
+            rw::emitTo( o, "<file p=\"{}\" symbols=\"{}\">", ex( prPathRel( f ) ).c_str(), std::size_t( fileSyms.size() ) );
 
             // (1) blast radius: transitive dependents of ALL this file's symbols. Reuse transitiveCallers.
             const std::vector<NodeId>  reach = transitiveCallers( g, fileSyms );
@@ -993,7 +1138,7 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
             // (2) affected test files among the blast radius (the --affected logic), path-sorted.
             std::vector<char>          fseen( F, 0 );
             std::vector<std::uint32_t> testFiles;
-            for( NodeId n : reach ) { const std::uint32_t tf = ing.symbols[n].fileId; if( !fseen[tf] && isTestPath( ing.files[tf] ) ) { fseen[tf] = 1; testFiles.push_back( tf ); } }
+            for( NodeId n : reach ) { const std::uint32_t tf = ing.symbols[n].fileId; if( !fseen[tf] && isTestPath( rootRelPath( ing, tf ) ) ) { fseen[tf] = 1; testFiles.push_back( tf ); } }
             std::sort( testFiles.begin(), testFiles.end(), [ & ]( std::uint32_t a, std::uint32_t b ) { return ing.files[a] < ing.files[b]; } );
 
             // (3) blast-radius files (non-changed), ranked by # dependent symbols then path — the "what this
@@ -1043,17 +1188,17 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
             const PrShownCap fSc = prShownCap( radiusFiles.size(), trim.impactCap );
             if( trim.impactCap > 0 )
             {
-                std::fprintf( o, "<impact dependents=\"%zu\" files=\"%zu\" files_other=\"%zu\" shown=\"%zu\" capped=\"%u\">",
+                rw::emitTo( o, "<impact dependents=\"{}\" files=\"{}\" files_other=\"{}\" shown=\"{}\" capped=\"{}\">",
                              reach.size(), totalReachFiles, radiusFiles.size(), fSc.shown, fSc.capped );
                 for( std::size_t i = 0; i < fSc.shown; ++i )
                 {
-                    std::fprintf( o, "<f p=\"%s\" deps=\"%u\"/>", ex( prPathRel( radiusFiles[i] ) ).c_str(), fileReachers[ radiusFiles[i] ] );
+                    rw::emitTo( o, "<f p=\"{}\" deps=\"{}\"/>", ex( prPathRel( radiusFiles[i] ) ).c_str(), fileReachers[ radiusFiles[i] ] );
                 }
-                std::fprintf( o, "</impact>" );
+                rw::emitRaw( o, "</impact>" );
             }
             else
             {
-                std::fprintf( o, "<impact dependents=\"%zu\" files=\"%zu\" files_other=\"%zu\" shown=\"%zu\" capped=\"%u\"/>",
+                rw::emitTo( o, "<impact dependents=\"{}\" files=\"{}\" files_other=\"{}\" shown=\"{}\" capped=\"{}\"/>",
                              reach.size(), totalReachFiles, radiusFiles.size(), fSc.shown, fSc.capped );
             }
 
@@ -1061,16 +1206,17 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
             const PrShownCap tSc = prShownCap( testFiles.size(), trim.testCap );
             if( trim.testCap > 0 )
             {
-                std::fprintf( o, "<tests count=\"%zu\" shown=\"%zu\" capped=\"%u\">", testFiles.size(), tSc.shown, tSc.capped );
-                for( std::size_t i = 0; i < tSc.shown; ++i )
-                {
-                    std::fprintf( o, "<test p=\"%s\"%s/>", ex( prPathRel( testFiles[i] ) ).c_str(), runAttrDisclosed( prRunners, testFiles[i], ex ).c_str() );   // §A9.5
-                }
-                std::fprintf( o, "</tests>" );
+                rw::emitTo( o, "<tests count=\"{}\" shown=\"{}\" capped=\"{}\">", testFiles.size(), tSc.shown, tSc.capped );
+                // §A9.5 / E1: the shown window, grouped where no runner is derivable (testmap.h's seam), which
+                // returns the FILE count with the rows — the number the legend's clause is gated on.
+                const JoinedTestRows tRows = testRowsList( prRunners, testRowsOutOf( std::span( testFiles ).first( tSc.shown ), prPathRel ), TestRowShape{ RowDialect::Xml, "test" }, ex );
+                rw::emitRaw( o, tRows.text.c_str() );
+                rw::emitRaw( o, "</tests>" );
+                if( testFilesOut ) { *testFilesOut += tRows.files; }
             }
             else
             {
-                std::fprintf( o, "<tests count=\"%zu\" shown=\"%zu\" capped=\"%u\"/>", testFiles.size(), tSc.shown, tSc.capped );
+                rw::emitTo( o, "<tests count=\"{}\" shown=\"{}\" capped=\"{}\"/>", testFiles.size(), tSc.shown, tSc.capped );
             }
 
             // (5) per-symbol callers (1-hop in-edges) — the review anchor "who breaks if this symbol changes".
@@ -1081,7 +1227,7 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
 
             if( trim.emitSymbolRows )
             {
-                std::fprintf( o, "<changed-symbols count=\"%zu\"%s>", std::size_t( fileSyms.size() ), sectionsAttr.c_str() );
+                rw::emitTo( o, "<changed-symbols count=\"{}\"{}>", std::size_t( fileSyms.size() ), sectionsAttr.c_str() );
                 for( NodeId s : rowSyms )
                 {
                     const Symbol& sy = ing.symbols[s];
@@ -1107,26 +1253,26 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
                     const PrShownCap cSc = prShownCap( callers.size(), trim.callerCap );
                     if( trim.callerCap > 0 )
                     {
-                        std::fprintf( o, "<s t=\"%s\" n=\"%s\" p=\"%s:%u\" callers=\"%zu\" shown=\"%zu\" capped=\"%u\">",
+                        rw::emitTo( o, "<s t=\"{}\" n=\"{}\" p=\"{}:{}\" callers=\"{}\" shown=\"{}\" capped=\"{}\">",
                                      symTag( sy.kind ), ex( sy.name ).c_str(), ex( prPathRel( sy.fileId ) ).c_str(), sy.line, callers.size(), cSc.shown, cSc.capped );
                         for( std::size_t i = 0; i < cSc.shown; ++i )
                         {
                             const Symbol& cs = ing.symbols[ callers[i] ];
-                            std::fprintf( o, "<caller t=\"%s\" n=\"%s\" p=\"%s:%u\"/>", symTag( cs.kind ), ex( cs.name ).c_str(), ex( prPathRel( cs.fileId ) ).c_str(), cs.line );
+                            rw::emitTo( o, "<caller t=\"{}\" n=\"{}\" p=\"{}:{}\"/>", symTag( cs.kind ), ex( cs.name ).c_str(), ex( prPathRel( cs.fileId ) ).c_str(), cs.line );
                         }
-                        std::fprintf( o, "</s>" );
+                        rw::emitRaw( o, "</s>" );
                     }
                     else
                     { // keep the row + its callers COUNT (the cheap structural fact), drop the caller list
-                        std::fprintf( o, "<s t=\"%s\" n=\"%s\" p=\"%s:%u\" callers=\"%zu\" shown=\"%zu\" capped=\"%u\"/>",
+                        rw::emitTo( o, "<s t=\"{}\" n=\"{}\" p=\"{}:{}\" callers=\"{}\" shown=\"{}\" capped=\"{}\"/>",
                                      symTag( sy.kind ), ex( sy.name ).c_str(), ex( prPathRel( sy.fileId ) ).c_str(), sy.line, callers.size(), cSc.shown, cSc.capped );
                     }
                 }
-                std::fprintf( o, "</changed-symbols>" );
+                rw::emitRaw( o, "</changed-symbols>" );
             }
             else
             {
-                std::fprintf( o, "<changed-symbols count=\"%zu\"%s/>", std::size_t( fileSyms.size() ), sectionsAttr.c_str() );
+                rw::emitTo( o, "<changed-symbols count=\"{}\"{}/>", std::size_t( fileSyms.size() ), sectionsAttr.c_str() );
             }
 
             // (6) co-change partners NOT in the diff (gitmine). Degrades to an empty list without git. A4-P10:
@@ -1146,17 +1292,17 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
             const PrShownCap pSc = prShownCap( outside.size(), trim.cochangeCap );
             if( trim.cochangeCap > 0 )
             {
-                std::fprintf( o, "<cochange window=\"%s\" commits=\"%u\" partners=\"%zu\" shown=\"%zu\" capped=\"%u\">", coWindow.c_str(), commits, outside.size(), pSc.shown, pSc.capped );
+                rw::emitTo( o, "<cochange window=\"{}\" commits=\"{}\" partners=\"{}\" shown=\"{}\" capped=\"{}\">", coWindow.c_str(), commits, outside.size(), pSc.shown, pSc.capped );
                 for( std::size_t i = 0; i < pSc.shown; ++i )
                 {
-                    std::fprintf( o, "<partner p=\"%s\" deg=\"%.2f\"%s/>", ex( prPathRel( outside[i]->fileId ) ).c_str(),
-                                 outside[i]->deg, coPairAttr( *outside[i] ) );   // §A9.3: surprising= or dep_capable="0"
+                    rw::emitTo( o, "<partner p=\"{}\" deg=\"{:.2f}\"{}/>", ex( prPathRel( outside[i]->fileId ) ).c_str(),
+                                 outside[i]->deg, coPairAttr( *outside[i] )  );   // §A9.3: surprising= or dep_capable="0"
                 }
-                std::fprintf( o, "</cochange>" );
+                rw::emitRaw( o, "</cochange>" );
             }
             else
             {
-                std::fprintf( o, "<cochange window=\"%s\" commits=\"%u\" partners=\"%zu\" shown=\"%zu\" capped=\"%u\"/>", coWindow.c_str(), commits, outside.size(), pSc.shown, pSc.capped );
+                rw::emitTo( o, "<cochange window=\"{}\" commits=\"{}\" partners=\"{}\" shown=\"{}\" capped=\"{}\"/>", coWindow.c_str(), commits, outside.size(), pSc.shown, pSc.capped );
             }
 
             // (7) owners of this file (gitmine, recency-weighted). A4-P?: answered from the once-mined
@@ -1167,37 +1313,51 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
             if( ow && trim.ownerCap > 0 )
             {
                 const PrShownCap aSc = prShownCap( ow->authors.size(), trim.ownerCap );
-                std::fprintf( o, "<owners authors=\"%u\" bf=\"%d\" shown=\"%zu\" capped=\"%u\">", ow->uniqueAuthors, ow->busFactor ? 1 : 0, aSc.shown, aSc.capped );
+                rw::emitTo( o, "<owners authors=\"{}\" bf=\"{}\" shown=\"{}\" capped=\"{}\">", ow->uniqueAuthors, ow->busFactor ? 1 : 0, aSc.shown, aSc.capped );
                 for( std::size_t i = 0; i < aSc.shown; ++i )
                 {
-                    std::fprintf( o, "<author email=\"%s\" share=\"%.2f\"/>", ex( ow->authors[i].email ).c_str(), ow->authors[i].share );
+                    rw::emitTo( o, "<author email=\"{}\" share=\"{:.2f}\"/>", ex( ow->authors[i].email ).c_str(), ow->authors[i].share );
                 }
-                std::fprintf( o, "</owners>" );
+                rw::emitRaw( o, "</owners>" );
             }
             else if( ow )
             { // trimmed: keep the author COUNT + bus-factor flag (cheap structural facts), drop the list
-                std::fprintf( o, "<owners authors=\"%u\" bf=\"%d\" shown=\"0\" capped=\"%u\"/>", ow->uniqueAuthors, ow->busFactor ? 1 : 0, ow->authors.empty() ? 0u : 1u );
+                rw::emitTo( o, "<owners authors=\"{}\" bf=\"{}\" shown=\"0\" capped=\"{}\"/>", ow->uniqueAuthors, ow->busFactor ? 1 : 0, ow->authors.empty() ? 0u : 1u );
             }
             else
             {
-                std::fprintf( o, "<owners authors=\"0\" bf=\"0\"/>" );   // no git ownership data at all — not a capped listing, nothing to disclose
+                rw::emitRaw( o, "<owners authors=\"0\" bf=\"0\"/>" );   // no git ownership data at all — not a capped listing, nothing to disclose
             }
 
-            std::fprintf( o, "</file>" );
+            rw::emitRaw( o, "</file>" );
         }
     };
 
     // P4 (L7): the changed-file WINDOW — --limit/--offset when given, else every file (the budget may still cut it below)
     const PageWindow  filePw    = pageWindow( changed.size(), budget.pageLimit, budget.pageOffset );
     std::size_t       fileEnd   = filePw.end;
-    const auto        emitFiles = [ & ]( std::FILE* o, const PrTrim& trim ) { emitFilesRange( o, trim, filePw.begin, fileEnd ); };
+    const auto        emitFiles = [ & ]( std::FILE* o, const PrTrim& trim, std::size_t* testFilesOut ) { emitFilesRange( o, trim, filePw.begin, fileEnd, testFilesOut ); };
 
     // NO budget at all (only a multi-root sub-bundle handed 0): level 0, no budget attributes.
     if( budgetTokens == 0 )
     {
         const std::string rootOpen = prRootOpenText( g, sharedAttrs, " files=\"" + std::to_string( changed.size() ) + "\" skipped_mode_only=\"" + std::to_string( skippedModeOnly ) + "\"" + atAttrStr, anchor, escBase );
+        // E1: the head carries a rule about rows, so it follows the body's DECISION even though it precedes
+        // the body in the stream — the level is rendered into a measurement buffer first and its row count
+        // decides the legend form. DEGRADE (infra/emit.h renderToString, which alerts): if that buffer cannot
+        // be opened there is no count, so the clause-less legend is written and the body is STREAMED straight
+        // to `out` exactly as it was before E1. Complete, correct bytes either way — never an empty body.
+        const PrTrimRender flat = prRenderLevel( emitFiles, kPrTrims[0] );
+        writeHead( flat.testFiles, false );   // this root carries no est_tokens/truncated= at all, so it has no unmeasured price to disclose
         std::fwrite( rootOpen.data(), 1, rootOpen.size(), out );
-        emitFiles( out, kPrTrims[0] );
+        if( flat.rendered )
+        {
+            std::fwrite( flat.body.data(), 1, flat.body.size(), out );
+        }
+        else
+        {
+            emitFiles( out, kPrTrims[0], nullptr );
+        }
         std::fwrite( kPrCloseTag.data(), 1, kPrCloseTag.size(), out );
         return 0;
     }
@@ -1206,8 +1366,48 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
     // keep the least-trimmed fit. P4: when even the FLOOR of the whole window is over, shrink the window to the
     // largest file prefix whose floor fits (binary search on the floor render; at least one file), then pick the
     // level for that prefix — the cut is disclosed below and next= pastes the page that starts where this one stopped.
+    // L1 fix round (rv-r1-L1 MED-4): the candidate as the run will print it — the same head, root and body the writes below
+    // produce — so the compact posture can price what it delivers. The full posture never builds it.
+    const auto candidateDoc = [ & ]( const PrTrimRender& cand, const std::string& windowAttrs ) -> std::string
+    {
+        const std::string legend = ( cand.testFiles > 0 || !cand.rendered )
+                                       ? prLegendText( escBase, rw::graphGaugeClauses( g ),
+                                                       PrLegendClauses{ .runHint = cand.testFiles > 0, .estUnmeasured = !cand.rendered, .rootRelativeRuns = prRootRelRuns } )
+                                       : legendText;
+        return legend + anchorNoteText
+             + prRootOpenText( g, sharedAttrs,
+                               prBudgetTail( changed.size(), skippedModeOnly, budgetTokens, cand, ex( cand.truncated ) )
+                                   + ( budget.isDefault ? " budget_default=\"1\"" : "" ) + windowAttrs + atAttrStr,
+                               anchor, escBase )
+             + cand.body + std::string( kPrCloseTag );
+    };
+    const auto deliveredOf = [ & ]( const PrTrimRender& cand, const std::string& windowAttrs ) -> std::size_t
+    {
+        if( !budget.compactLegend )
+        {
+            return cand.estTokens;
+        }
+        const std::size_t compactEst = rw::compactDeliveredEstTokens( candidateDoc( cand, windowAttrs ), "pr-context" );
+        return compactEst > 0 ? compactEst : cand.estTokens;
+    };
+    // the changed files are this root's PRIMARY listing, so a cut speaks the plain quintet (shown=/capped=/total=/
+    // has_more=/next_offset=/offset=/limit=, pageview.h) — never a noun-prefixed twin beside it (one fact, one name)
+    const auto windowAttrsFor = [ & ]( std::size_t end ) -> std::string
+    {
+        std::string attrs;
+        const std::size_t shown = end - filePw.begin;
+        if( shown < changed.size() )
+        {
+            char pab[ kPageDisclosureCap ];
+            attrs += pageDisclosure( pab, sizeof( pab ), shown, changed.size(), end, budget.pageLimit, budget.pageOffset, true );
+            attrs += nextAttrXml( std::string( "--pr-context" ) + ( baseLabel == "working-tree" ? std::string() : "=" + std::string( baseLabel ) )
+                                  + " --offset=" + std::to_string( end ) );
+        }
+        return attrs;
+    };
+    const PrLevelPricing pricing{ priceOf, deliveredOf };
     const std::string noWindow;
-    PrTrimRender      chosen = pickPrTrimLevel( emitFiles, budgetTokens, priceOf, noWindow );
+    PrTrimRender      chosen = pickPrTrimLevel( emitFiles, budgetTokens, pricing, noWindow );
     if( chosen.truncated.find( "budget-floor-exceeded" ) != std::string::npos && fileEnd - filePw.begin > 1 )
     {
         std::size_t lo = 1, hi = fileEnd - filePw.begin;   // prefix lengths: lo fits (assumed for 1), hi does not
@@ -1215,32 +1415,38 @@ inline int writePrContext( std::FILE* out, const std::string& root, const Ingest
         {
             const std::size_t mid = lo + ( hi - lo ) / 2;
             fileEnd = filePw.begin + mid;
-            const PrTrimRender probe = pickPrTrimLevel( emitFiles, budgetTokens, priceOf, noWindow );
+            // L1 fix round: the compact posture prices each probe prefix WITH the window disclosure it will carry (~100 B
+            // of shown=/has_more=/next=), so the prefix it keeps is one the final pick below can still fit. The full posture
+            // keeps its pre-existing probe unchanged (compactlegendcheck A-PIN).
+            const std::string probeWindow = budget.compactLegend ? windowAttrsFor( fileEnd ) : noWindow;
+            const PrTrimRender probe = pickPrTrimLevel( emitFiles, budgetTokens, pricing, probeWindow );
             if( probe.truncated.find( "budget-floor-exceeded" ) == std::string::npos ) { lo = mid; } else { hi = mid; }
         }
         fileEnd = filePw.begin + lo;
     }
-    // the changed files are this root's PRIMARY listing, so a cut speaks the plain quintet (shown=/capped=/total=/
-    // has_more=/next_offset=/offset=/limit=, pageview.h) — never a noun-prefixed twin beside it (one fact, one name)
-    const std::size_t filesShown = fileEnd - filePw.begin;
-    std::string       windowAttrs;
-    if( filesShown < changed.size() )
-    {
-        char pab[ kPageDisclosureCap ];
-        windowAttrs += pageDisclosure( pab, sizeof( pab ), filesShown, changed.size(), fileEnd, budget.pageLimit, budget.pageOffset, true );
-        windowAttrs += nextAttrXml( std::string( "--pr-context" ) + ( baseLabel == "working-tree" ? std::string() : "=" + std::string( baseLabel ) )
-                                    + " --offset=" + std::to_string( fileEnd ) );
-    }
+    const std::string windowAttrs = windowAttrsFor( fileEnd );
     // R2/N4: the window disclosure is itself ~100 bytes of the document est_tokens prices, so once it is
     // known the level is chosen AGAIN with it in the price — otherwise the printed number would under-read
     // its own root tag by exactly the disclosure that says the files were cut.
-    chosen = pickPrTrimLevel( emitFiles, budgetTokens, priceOf, windowAttrs );
+    chosen = pickPrTrimLevel( emitFiles, budgetTokens, pricing, windowAttrs );
     const std::string rootOpen = prRootOpenText( g, sharedAttrs,
                                                  prBudgetTail( changed.size(), skippedModeOnly, budgetTokens, chosen, ex( chosen.truncated ) )
                                                      + ( budget.isDefault ? " budget_default=\"1\"" : "" ) + windowAttrs + atAttrStr,
                                                  anchor, escBase );
+    writeHead( chosen.testFiles, !chosen.rendered );   // E1 / review of #214: the legend form the chosen body was priced with, from the same count and the same rendered fact
     std::fwrite( rootOpen.data(), 1, rootOpen.size(), out );
-    std::fwrite( chosen.body.data(), 1, chosen.body.size(), out );
+    if( chosen.rendered )
+    {
+        std::fwrite( chosen.body.data(), 1, chosen.body.size(), out );
+    }
+    else
+    {
+        // DEGRADE (renderToString alerted): no level could be measured, so est_tokens= is the modelled number
+        // for an empty body — but the document still owes its bytes. Stream the floor level straight out, the
+        // same contract serialize.h's ChargedSection degrade keeps: complete, correct bytes, a wrong estimate,
+        // and an alert saying which. Never an empty <pr-context>.
+        emitFiles( out, kPrTrims[0], nullptr );
+    }
     std::fwrite( kPrCloseTag.data(), 1, kPrCloseTag.size(), out );
     return 0;
 }

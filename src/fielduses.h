@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // fielduses.h — the ONE `--uses=Owner.field` emitter (the member-variable round, card A3), printed verbatim by
 // the CLI --uses arm (verbs_navigate.h runUses) and the MCP `uses` verb (mcpverbs.h usesText). One renderer,
@@ -46,11 +49,11 @@ struct FieldUsesArgs
 
 inline std::string renderFieldUses( const IngestResult& ing, FieldId fieldId, const FieldUsesArgs& args )
 {
-    VERIFY( fieldId < ing.fields.size() );
+    ASSUME( fieldId < ing.fields.size() );
     const Symbol&        field  = ing.fields[ fieldId ];
     const FieldUseAnswer answer = collectFieldUseSites( ing, fieldId );
 
-    struct Row { std::uint32_t fileId; std::uint32_t line; RefRole role; std::uint32_t candidateCount; std::string in; };
+    struct Row { std::uint32_t fileId; std::uint32_t line; RefRole role; std::uint32_t candidateCount; std::string in; NodeId from; };   // from: rankUseSites' weight
     std::vector<Row> rows;
     rows.reserve( answer.sites.size() );
     const std::string_view rootForId = args.singleRoot ? args.root : std::string_view{};
@@ -62,7 +65,7 @@ inline std::string renderFieldUses( const IngestResult& ing, FieldId fieldId, co
         {
             in = canonicalIdForEmit( ing, ing.symbols[ r.fromSymbol ], rootForId );
         }
-        rows.push_back( { r.fileId, r.line, r.role, site.candidateCount, std::move( in ) } );
+        rows.push_back( { r.fileId, r.line, r.role, site.candidateCount, std::move( in ), r.fromSymbol } );
     }
     const std::vector<std::uint8_t> tierOfFile = pathTierIndexOver( ing, rows, [ ]( const Row& u ) { return u.fileId; } );
     std::sort( rows.begin(), rows.end(), [ & ]( const Row& a, const Row& b )
@@ -72,6 +75,7 @@ inline std::string renderFieldUses( const IngestResult& ing, FieldId fieldId, co
                    if( a.role != b.role ) { return std::uint8_t( a.role ) < std::uint8_t( b.role ); }
                    return a.in < b.in;
                } );
+    rankUseSites( ing, args.graph, rows );   // cut-fix C: the --uses order, shared — the cap drops the lightest sites
 
     const PageWindow  window      = pageWindow( rows.size(), effectiveRowCap( args.pageLimit, kUseSiteRowCap ), args.pageOffset );
     const std::size_t pageRows    = window.end - window.begin;
@@ -87,7 +91,7 @@ inline std::string renderFieldUses( const IngestResult& ing, FieldId fieldId, co
     out += kUsesLegendOpen;
     out += kUsesFieldLegend;
     out += capLegendClause( computePageDisclosure( pageRows, rows.size(), window.end, args.pageLimit, args.pageOffset, discloseCap ).active );
-    out += graphCountDisclosure( args.graph.unindexedFiles > 0 );
+    out += graphCountDisclosure( rw::graphGaugeClauses( args.graph ) );
     out += "-->";
     out += rootRelPathsLegend( args.singleRoot );
 
@@ -144,14 +148,14 @@ inline std::optional<int> memberUsesArm( const IngestResult& ing, const Graph& g
     }
     if( const std::string refusal = memberOwnerRefusal( ing, fields, sym, "--uses=" ); !refusal.empty() )
     {
-        std::fprintf( stderr, "ripwire: --uses=%s refused: %s\n", std::string( sym ).c_str(), refusal.c_str() );
+        rw::emitTo( stderr, "ripwire: --uses={} refused: {}\n", std::string( sym ).c_str(), refusal.c_str() );
         return 1;
     }
     // `Owner.field` on a type whose language extracts no fields refuses BY LANGUAGE NAME — the generic
     // not-found would read as a typo, and an empty answer as "no uses".
     if( const std::string unserved = memberSelectorUnservedRefusal( ing, sym ); !unserved.empty() )
     {
-        std::fprintf( stderr, "ripwire: --uses %s\n", unserved.c_str() );
+        rw::emitTo( stderr, "ripwire: --uses {}\n", unserved.c_str() );
         return 1;
     }
     return std::nullopt;

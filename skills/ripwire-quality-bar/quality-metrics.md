@@ -53,13 +53,13 @@ defect- and vulnerability-prone files in the empirical literature. Push hardest 
 | **Change-amplification `amp`** | `|direct callers| + |co-change partners|` — "editing this historically touches N places" in one number. Granularity note: callers are symbol-level, co-change is file-level — read it as a blast-radius proxy, not a pure per-symbol count. | high `amp` ⇒ change carefully | `--metrics amp=`, `--for` | add tests before touching a high-`amp` symbol; don't refactor it and three callers in the same diff |
 | **Dependency cycles / god-files** | tangled, hard to test in isolation. VALIDATED — defects concentrate in cyclic-dependent components. | 0 cycles; no 100-fan-in header | `--deps`, `--report` | break the cycle (introduce an interface); split the god-file |
 | **External dependency surface** | supply-chain + build weight + reader-learning tax | add only when it earns it | `--external-surface`, `--uses` import role | reuse an in-tree dep first; justify each new import |
-| **Dead code** | latent risk + reader tax | 0 newly-orphaned | `--dead-code` | review high-confidence internal zero-caller candidates; verify before deletion |
+| **Dead code** | latent risk + reader tax | 0 newly-orphaned | `--dead-code` | review internal zero-caller candidates (`evidence=`); verify before deletion |
 | **Bus factor** | knowledge concentration (`bf=1` = one owner) | flag `bf=1` on code you touch | `--owners` | add a second reviewer; leave a doc/comment trail |
 | **Untested integration seams** | cross-module calls no test reaches | 0 new uncovered seams | `--seams`, `--affected` | add a test across the seam you introduced |
 | **Resolution ambiguity `amb=`** | the map's OWN honesty signal — K calls the resolver guessed | verify high-`amb` in source | header `ambiguous=`, per-symbol `amb=` | read the source before trusting a high-`amb` edge |
 | **Cache-friendly data layout (DOD)** | hot-path perf + this codebase's house value: SoA over AoS, smallest type that fits, 32-bit ids | contextual | `--field-affinity[=STRUCT]` for co-accessed-but-far-apart fields (`split-line`/`straddle`); `--for` finds the hot struct. A static HYPOTHESIS, not a measurement — see `ripwire-perf-target` for what it cannot see | mirror the surrounding hot-path layout; don't AoS a hot loop — confirm on hardware counters before changing a layout |
 
-## Why `--quality-delta`'s 10 kinds — the measured agent failure modes
+## Why `--quality-delta`'s 11 kinds — the measured agent failure modes
 Not a generic lint list; each targets what the 2025-26 literature found agent-written code actually
 degrades on (large-N studies):
 - **Verbosity**: agent code runs **2.3× more verbose** than human code on matched tasks.
@@ -68,6 +68,8 @@ degrades on (large-N studies):
 - **Contract drift**: unplanned API-surface growth is a documented failure mode distinct from complexity —
   classic complexity metrics lost predictive power for real agent-maintainability failures once controlled
   for size; contract drift and code growth are what remained predictive (arXiv:2606.21804).
+- **Placeholders** (the eleventh kind, not a literature-measured mode): a stub or TODO the change added.
+  It never gates; it exists so a change is not called done over a `todo!()` or a `NotImplementedException`.
 - **Pass-rate ≠ design quality**: fewer than half of test-passing agent patches satisfy design constraints
   (DesignBench) — tests passing is not evidence the delta is clean.
 - One-time "write good code" prompting cuts initial verbosity/erosion by about a third but does **not**

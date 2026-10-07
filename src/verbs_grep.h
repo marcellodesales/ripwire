@@ -3,6 +3,9 @@
 #error "verbs_grep.h is a SECTION of src/main.cpp's translation unit - include it only from main.cpp (see the verb-family split note there)"
 #endif
 
+#include "infra/emit.h" // rw::emitTo — THE emitter (std::print, or std::format+fputs where <print> is absent)
+#include <string_view>       // std::string_view — the %.*s (precision, pointer) pair collapses to one view
+
 // verbs_grep.h — the --grep verb family, moved VERBATIM from main.cpp in the 2026-08-29 split:
 // GrepEncOptions/GrepHandleAttrs, the five grep emitters (handle legend, enc rows, suggest,
 // unindexed, tier), the term/corpus attribute builders, emitGrepReport and runGrep. The --match/
@@ -52,16 +55,13 @@ public:
         {
             return {};
         }
-        if( row.defCount != 1 || row.ids.size() != 1 )
+        const char*      omitted = nullptr;
+        const rw::NodeId id      = rw::grepEncHandleCandidate( ing_, row, omitted );   // 0.6.7: the rule the MCP twin shares
+        if( id == rw::kNoNode )
         {
-            return " handle_omitted=\"ambiguous\"";
+            return std::string( " handle_omitted=\"" ) + omitted + "\"";
         }
-        const rw::NodeId id = row.ids.front();
         const rw::Symbol& s = ing_.symbols[id];
-        if( s.kind == rw::SymKind::Section )
-        {
-            return " handle_omitted=\"non-code\"";
-        }
         const std::uint64_t contentHash = hashFor( s.fileId );
         const std::string handle = rw::sourceHandleFor( ing_, g_, root_, id, contentHash );
         return handle.empty() ? " handle_omitted=\"unreadable\"" : " h=\"" + handle + "\"";
@@ -95,7 +95,7 @@ void emitGrepHandleLegend( bool enabled )
     {
         return;
     }
-    std::printf( "<!-- ripwire grep handles: h= is sym#<stable-identity-hash>@<whole-file-content-hash>; "
+    rw::emitTo( stdout, "<!-- ripwire grep handles: h= is sym#<stable-identity-hash>@<whole-file-content-hash>; "
                  "the content half pins the exact file bytes scanned, so an edit after any file change refuses as stale. "
                  "Only one editable enclosing definition receives h=. handle_omitted=ambiguous means the name grouped "
                  "several definitions; non-code means a document/data section has no safe definition span; unreadable "
@@ -110,14 +110,14 @@ void emitGrepEncRows( const rw::IngestResult& ing, const rw::Graph& g, std::span
     for( const GrepEncRow& row : grepEnclosingRows( ing, g, hits ) )
     {
         const auto en = rw::escapeXml( row.chain, opt.esc );
-        std::printf( "<enc n=\"%.*s\" callers=\"%u\"", int( en.size() ), en.data(), row.callerCount );
+        rw::emitTo( stdout, "<enc n=\"{}\" callers=\"{}\"", std::string_view( en.data(), en.size() ), row.callerCount );
         if( row.defCount > 1 )
         {
-            std::printf( " defs=\"%u\"", row.defCount );
+            rw::emitTo( stdout, " defs=\"{}\"", row.defCount );
         }
         if( row.cx > 0 )
         {
-            std::printf( " cx=\"%u\"", row.cx );
+            rw::emitTo( stdout, " cx=\"{}\"", row.cx );
         }
         std::uint32_t ampMax = 0;  bool anyTested = false;
         for( const NodeId id : row.ids )
@@ -133,14 +133,14 @@ void emitGrepEncRows( const rw::IngestResult& ing, const rw::Graph& g, std::span
         }
         if( ampMax > 0 )
         {
-            std::printf( " amp=\"%u\"", ampMax );
+            rw::emitTo( stdout, " amp=\"{}\"", ampMax );
         }
         if( anyTested )
         {
-            std::printf( " tested=\"1\"" );
+            rw::emitTo( stdout, " tested=\"1\"" );
         }
         std::fputs( handleAttrs.forRow( row ).c_str(), stdout );
-        std::printf( "/>" );
+        rw::emitTo( stdout, "/>" );
     }
 }
 
@@ -154,18 +154,18 @@ void emitGrepSuggest( const rw::IngestResult& ing, const std::string& pat, bool 
     {
         return;
     }
-    std::printf( "<suggest" );
+    rw::emitTo( stdout, "<suggest" );
     if( !sug.near.empty() )
     {
         const auto nn = rw::escapeXml( sug.near, esc );
-        std::printf( " near=\"%.*s\"", int( nn.size() ), nn.data() );
+        rw::emitTo( stdout, " near=\"{}\"", std::string_view( nn.data(), nn.size() ) );
     }
     if( sug.offerFor )
     {
         const auto fp = rw::escapeXml( pat, esc );
-        std::printf( " next=\"--for=&quot;%.*s&quot;\"", int( fp.size() ), fp.data() );
+        rw::emitTo( stdout, " next=\"--for=&quot;{}&quot;\"", std::string_view( fp.data(), fp.size() ) );
     }
-    std::printf( "/>" );
+    rw::emitTo( stdout, "/>" );
 }
 
 // §R-J: the root attributes unindexed_hits=/unindexed_files_scanned=/unindexed_files_skipped=/
@@ -225,25 +225,34 @@ void emitGrepUnindexed( const std::vector<rw::GrepAuxHit>& hits, const rw::PageW
     const std::size_t shown = window.end - window.begin;
     // capped= is exactly "this element printed fewer rows than it holds" — the one reading that stays true
     // whether the cut came from --limit, from --offset, or from the default row cap.
-    std::printf( "<unindexed count=\"%zu\" shown=\"%zu\" capped=\"%d\">", hits.size(), shown, shown < hits.size() ? 1 : 0 );
+    rw::emitTo( stdout, "<unindexed count=\"{}\" shown=\"{}\" capped=\"{}\">", hits.size(), shown, shown < hits.size() ? 1 : 0 );
     for( std::size_t i = window.begin; i < window.end; )
     {
         std::size_t j = i;
-        std::printf( "<f p=\"%s\">", ex( singleRoot ? rw::sarif::rootRelativeUri( hits[i].path, rootPrefix )
+        rw::emitTo( stdout, "<f p=\"{}\">", ex( singleRoot ? rw::sarif::rootRelativeUri( hits[i].path, rootPrefix )
                                                      : std::string_view( hits[i].path ) ).c_str() );
         for( ; j < window.end && hits[j].path == hits[i].path; ++j )
         {
             const GrepAuxHit& h = hits[j];
             std::string        safe;
             appendCdataSafe( h.text, safe );
-            std::printf( "<hit l=\"%u\"><![CDATA[", h.line );   // P12 (L7): no <m> wrapper here either
+            // P12 (L7): no <m> wrapper here either. line_bytes= is the indexed row's own matched-line
+            // disclosure, restated on this list because it is served by the SAME 512 B cut.
+            if( h.lineBytes != 0 )
+            {
+                rw::emitTo( stdout, "<hit l=\"{}\" line_bytes=\"{}\"><![CDATA[", h.line, h.lineBytes );
+            }
+            else
+            {
+                rw::emitTo( stdout, "<hit l=\"{}\"><![CDATA[", h.line );
+            }
             std::fwrite( safe.data(), 1, safe.size(), stdout );
-            std::printf( "]]></hit>" );
+            rw::emitTo( stdout, "]]></hit>" );
         }
-        std::printf( "</f>" );
+        rw::emitTo( stdout, "</f>" );
         i = j;
     }
-    std::printf( "</unindexed>" );
+    rw::emitTo( stdout, "</unindexed>" );
 }
 
 // R-H span tiers: the legend clause and the root attributes, lifted out of emitGrepReport for exactly the
@@ -262,7 +271,9 @@ const char* grepTierLegend( const rw::GrepTierReport& tier )
     }
     return "SPAN TIERS: each hit is classified by the tree-sitter span it sits in (code/comment/string) and this answer serves "
            "the CODE tier, or — when no hit is code — comment and string TOGETHER; tier= names what was served when it is not "
-           "code, so a pattern living only in prose is answered, never emptied. "
+           "code, so a pattern living only in prose is answered, never emptied. When every code hit is a USE of the literal (a "
+           "test/doc file, or a shell, YAML, TOML or JSON file) and source code (not one of those) holds it as a string, the string tier is "
+           "served WITH code, labelled code+string; comments stay held back. "
            // M17 (capture-audit 2026-09-04, lens1 F4): the label is a CLAIM, and this sentence is the
            // difference between a proven one and an unproven one. Deliberately no attribute=value literal
            // (this verb's own rule — gates parse the header counters by grep).
@@ -273,8 +284,9 @@ const char* grepTierLegend( const rw::GrepTierReport& tier )
            "suppressed_comment=/suppressed_string= are the classified hits held back: not in hits=, and the "
            "reason complete= cannot appear. Pass grep-in=any (dashes omitted) for every tier. Hit files are parsed on demand "
            "under a fixed budget: tier_parsed= how many were classified, tier_budget= which ceiling stopped it (files or bytes, "
-           "present only then — and the root then also carries counts_floor=\"1\": the tier counts are floors while hits= stays "
-           "exact and every row is served), tier_unclassified= hits in files nothing classified — always EMITTED, never suppressed. ";
+           "present only then, beside tier_files= the hit files it had to cover — and the root then also carries counts_floor=\"1\": "
+           "the tier counts are floors while hits= stays exact and every row is served), tier_unclassified= hits in files nothing "
+           "classified — always EMITTED, never suppressed. ";
 }
 
 // Present only when this answer actually held something back or stopped short — absent-means-nothing-was-
@@ -328,7 +340,46 @@ std::string grepTierAttrs( const rw::GrepTierReport& tier, bool floorAlreadyEmit
     attrs += " tier_unclassified=\"" + std::to_string( tier.unclassifiedHits ) + "\"";
     if( tier.budgetHit != nullptr )
     {
-        attrs += std::string( " tier_budget=\"" ) + tier.budgetHit + "\"" + ( floorAlreadyEmitted ? "" : rw::kGraphCountFloorAttrXml );   // N2: the floor rides with its cause
+        // tier_files= (cut-fix lane D): the TOTAL beside tier_parsed='s shown. tier_budget= named WHICH ceiling cut the
+        // classification but never how much it left, and files= cannot stand in for it (it counts files AFTER suppression,
+        // so a file whose every hit was held back is in tier_parsed= and not in files=). ~16 B, only on a budgeted answer.
+        attrs += std::string( " tier_budget=\"" ) + tier.budgetHit + "\" tier_files=\"" + std::to_string( tier.hitFileCount ) + "\""
+               + ( floorAlreadyEmitted ? "" : rw::kGraphCountFloorAttrXml );   // N2: the floor rides with its cause
+    }
+    return attrs;
+}
+
+// A --regex answer's long-line disclosure: regex_lines_skipped= ALWAYS (0 is the proof that no line was kept from the
+// engine), and, when it is not 0, regex_line_max= (the longest line the engine was handed) and the floor marker, which
+// rides with its cause unless the page disclosure or tier_budget= already spelled it. Literal --grep answers never
+// reach the engine and carry none of it — byte-identical to before.
+std::string grepRegexSkipAttrs( const rw::Config& cfg, const rw::GrepCollection& found, const rw::GrepAuxCollection& aux, bool floorAlreadyEmitted )
+{
+    if( !cfg.grepRegex )
+    {
+        return {};
+    }
+    // Each scan settled ONE stack for all its threads (search.h); the unindexed scan never asks for more than the indexed
+    // one got, so the smaller of the two, and the bound it gives, are the ones a reader can rely on for every line.
+    const std::uint64_t skipped      = found.regexLinesSkipped + aux.regexLinesSkipped;
+    const std::size_t   stackBytes   = ( found.regexStackBytes == 0 || aux.regexStackBytes == 0 ) ? std::max( found.regexStackBytes, aux.regexStackBytes )
+                                                                                                 : std::min( found.regexStackBytes, aux.regexStackBytes );
+    const std::size_t   lineMax      = found.regexStackBytes == 0 ? aux.regexLineBytesMax
+                                     : aux.regexStackBytes == 0   ? found.regexLineBytesMax
+                                                                  : std::min( found.regexLineBytesMax, aux.regexLineBytesMax );
+    const bool          isStackShort = stackBytes != 0 && stackBytes < rw::kGrepScanStackBytes;
+    std::string         attrs        = " regex_lines_skipped=\"" + std::to_string( skipped ) + "\"";
+    if( ( skipped != 0 || isStackShort ) && lineMax != SIZE_MAX )
+    {
+        attrs += " regex_line_max=\"" + std::to_string( lineMax ) + "\"";
+    }
+    if( isStackShort )
+    {
+        attrs += " regex_stack_bytes=\"" + std::to_string( stackBytes ) + "\"";
+    }
+    if( skipped != 0 && !floorAlreadyEmitted )
+    {
+        attrs += rw::kGraphCountFloorAttrXml;
     }
     return attrs;
 }
@@ -344,7 +395,7 @@ std::vector<rw::GrepTerm> makeGrepTerms( const rw::Config& cfg )
 
 void emitCompactGrepLegend()
 {
-    std::printf( "<!-- ripwire grep ripwire.grep/v1: files group source-ordered hits; l=line, m=matched text, "
+    rw::emitTo( stdout, "<!-- ripwire grep ripwire.grep/v1: files group source-ordered hits; l=line, m=matched text, "
                  "in=enclosing name when known. shown/capped disclose the printed window; hits_capped=1 makes hits a floor; "
                  "complete=1 only for an exhaustive literal scan whose whole unfiltered window printed. root anchors relative p; "
                  "enc callers remain a call-graph floor; tier/suppressed and corpus attrs disclose excluded populations, tier_partial=1 "
@@ -376,6 +427,22 @@ std::string grepCorpusAttrs( const rw::IngestResult& ing )
     if( !ing.skippedOversize.empty() )
     {
         attrs += " corpus_oversize=\"" + std::to_string( ing.skippedOversize.size() ) + "\"";
+    }
+    // THE THIRD WAY A FILE LEAVES THE CORPUS, and until 2026-09-09 the only one --grep did not name.
+    // corpus_excluded= counts an --exclude= hit; corpus_oversize= counts the size ceiling. Neither fires
+    // for the BUILT-IN crawl denylist (rw::kCrawlSkipDirs — vendor, third_party, build, dist, out,
+    // target, node_modules, captures, …), which prunes those subtrees whole and increments a DIRECTORY
+    // counter (CrawlSkips::prunedDirs) that only the skipped verb reported. So a grep answer could carry
+    // complete="1" over a corpus that had silently lost entire trees. Measured on this repository at
+    // 4c10be9d: `--grep='malloc('` served 33 hits with complete="1" where `rg -F 'malloc(' .` found 78 —
+    // the missing 45 are every line under third_party/, 58% of the truth, behind a completeness claim.
+    // A DIRECTORY count is the honest cheap unit: files under a pruned subtree are never stat'd, so a
+    // file count would cost a second walk to report a number nothing else needs. Same convention as its
+    // two siblings — present only when non-zero, absent means zero — and the same spelling the skipped
+    // verb already uses (pruned_dirs=), prefixed corpus_ like the rest of this family.
+    if( ing.crawlSkips.prunedDirs > 0 )
+    {
+        attrs += " corpus_pruned_dirs=\"" + std::to_string( ing.crawlSkips.prunedDirs ) + "\"";
     }
     return attrs;
 }
@@ -448,7 +515,8 @@ GrepScanPhases collectGrepScanPhases( const rw::Config& cfg, const rw::IngestRes
     {
         PROFILE_SCOPE_DESCRIBE( "grep/3: aux unindexed scan" );
         const std::size_t maxAuxFileBytes = cfg.maxFileBytes == 0 ? kDefaultMaxFileBytes : cfg.maxFileBytes;
-        phases.aux = grepCollectAux( ing.crawlSkips, pat, cfg.grepRegex, maxAuxFileBytes );
+        phases.aux = grepCollectAux( ing.crawlSkips, pat, cfg.grepRegex, maxAuxFileBytes,
+                                     phases.found.regexStackBytes != 0 ? phases.found.regexStackBytes : kGrepScanStackBytes );
     }
     phases.valid = true;
     return phases;
@@ -487,7 +555,8 @@ std::thread startGrepScanPrefetch( const rw::Config& cfg, const rw::IngestResult
                             catch( ... )   // a throw crossing this thread boundary would be std::terminate
                             {
                                 out.valid = false;
-                                DEGRADED_PATH_ALERT( "grep: scan prefetch degraded (exception swallowed) — the verb recomputes inline" );
+                                DISCLOSE( Diagnostics::answerUnchanged, "the verb recomputes the prefetched phases inline: same bytes, no overlap",
+                                          "grep: scan prefetch degraded (exception swallowed) — the verb recomputes inline" );
                             }
                         } );
 }
@@ -500,6 +569,31 @@ void joinGrepScanPrefetch( std::thread& worker )
     {
         worker.join();
     }
+}
+
+// A --regex scan whose engine ABANDONED a match (RegexVerdict::Exhausted, src/regexguard.h) — in an indexed file or
+// an unindexed one — has no count to report: the hits it kept are the ones found before the engine gave up, and
+// how many lie past that point is unknown. Before the seam the file was skipped with an alert NDEBUG deletes,
+// and the run printed hits= as a measurement at exit 0. Refused here, by name, before a byte reaches stdout —
+// the same shape and exit code as the pattern refusal above, so a caller handles both the one way it already
+// does. The file named is the lowest-fileId indexed one (else the first unindexed one): deterministic.
+static bool refuseAbandonedRegexScan( const rw::Config& cfg, const rw::IngestResult& ing, const rw::GrepCollection& found, const rw::GrepAuxCollection& aux )
+{
+    const std::uint32_t abandonedCount = found.regexAbandonedFiles + aux.regexAbandonedFiles;
+    if( !cfg.grepRegex || abandonedCount == 0 )
+    {
+        return false;
+    }
+    const bool             singleRoot = ing.realPaths.empty() && cfg.roots.size() == 1;
+    const std::string      rootPrefix = singleRoot ? rw::sarif::rootPrefixOf( std::string( cfg.roots[0] ) ) : std::string();
+    const std::string_view firstPath  = found.regexAbandonedFiles == 0 ? std::string_view( aux.firstRegexAbandonedPath )
+                                      : singleRoot ? rw::sarif::rootRelativeUri( ing.files[ found.firstRegexAbandonedFile ], rootPrefix )
+                                                   : std::string_view( ing.files[ found.firstRegexAbandonedFile ] );
+    rw::emitTo( stderr, "ripwire: --regex='{}' refused, no hit is reported: {} in {} file(s), first {} — the hits collected before that "
+                        "point would be a floor this verb cannot state (rewrite the pattern so no two of its alternatives can match the "
+                        "same text, e.g. (a|b)+ rather than (a|a)+)\n",
+                cfg.grep, rw::kRegexAbandonedReason, abandonedCount, firstPath );
+    return true;
 }
 
 int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw::Graph& g,
@@ -522,7 +616,7 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
             // refuses patterns that are perfectly valid ECMAScript — L5's non-portable escapes and M2's
             // catastrophic-backtracking family — so "is not a valid regular expression" would be false
             // for two of its three verdicts. The reason string itself names which case it was.
-            std::fprintf( stderr, "ripwire: --regex='%s' refused, nothing was scanned: %s "
+            rw::emitTo( stderr, "ripwire: --regex='{}' refused, nothing was scanned: {} "
                                   "(a hits=\"0\" here would be a failure, not a measurement — fix the pattern, e.g. ripwire <dir> --regex='fnv1a\\w+')\n",
                           pat.c_str(), reErr->c_str() );
             return 1;
@@ -551,6 +645,10 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     const std::vector<GrepTerm>&    grepTerms       = phases->terms;
     const GrepScope                 grepScopeVal    = phases->scope;
     const std::uint32_t             termsSuppressed = phases->termsSuppressed;
+    if( refuseAbandonedRegexScan( cfg, ing, found, aux ) )
+    {
+        return 1;
+    }
     PROFILE_SCOPE_DESCRIBE( "grep/4: window + enrich + emit" );
 
     const std::size_t          hitCount = found.raw.size();
@@ -595,6 +693,12 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     // `hits=` is itself a FLOOR, not a total. §A1: that ceiling no longer moves with --limit/--offset, so
     // hits=/files=/total= now read the SAME on every page of a walk.
     const int         hitsCapped = found.isBudgetReached ? 1 : 0;
+    // The scan's OWN shortfall, which no ceiling explains: an indexed file the scan could not read, or a scan that threw
+    // part-way (the DISCLOSE sinks in search.h set `degraded`; an abandoned regex also sets it, but that answer was
+    // refused above and never reaches here). Either one makes hits= a floor, so each is named on the root with
+    // counts_floor="1" — withholding complete= alone left a count that read as a total.
+    const bool        isScanDegraded = ( found.degraded && found.regexAbandonedFiles == 0 ) || ( aux.degraded && aux.regexAbandonedFiles == 0 );
+    const bool        isScanShort    = isScanDegraded || found.unreadableFiles != 0;
     // T1 (completeness claims — the mirror of the floor vocabulary). complete="1" appears on the root
     // exactly when this listing is EXHAUSTIVE over the index, so a consumer need not re-derive (re-grep)
     // the answer. Four conditions, each with a mutation arm in test/completecheck.sh:
@@ -651,19 +755,7 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     }
     else
     {
-    std::printf( "<!-- ripwire grep: parallel literal/regex scan; hits GROUP by file under <f p=\"…\">, each <hit> carrying its LINE "
-                 "(l=), its matched text as the hit's own CDATA and enclosing symbol (in=, a NAME here; the same spelling is a fan-in COUNT in for/pack-task/exemplar; "
-                 "ABSENT (never an empty in= value) when no symbol encloses the hit, which is NOT the same claim as file scope — and "
-                 "on a file row carrying parse_degraded=\"1\" it is NO CLAIM AT ALL: that file's parse holds ERROR/MISSING nodes "
-                 "(the skipped verb itemizes err=/err_ratio=), symbols there may be unextracted, so read in= absence inside it as "
-                 "UNKNOWN, not as file scope; absence of parse_degraded= on a row means the parse was clean, except that a file the "
-                 "ingest never parsed at all — doc-format, binary-sniffed, unreadable — is also unmarked, the skipped verb's "
-                 "unmeasured class). "
-                 "root= on the root element is the crawl root every <f p=…> is now RELATIVE to (single-root runs only; absent ⇒ p= is the "
-                 "path ingest itself used, unchanged). ORDER: SOURCE files before test/bench files before docs, then path and line. "
-                 "shown=/capped= = rows printed vs found (a count of underlying HITS, the same unit hits= uses, not of printed <hit> "
-                 "elements); hits_capped=\"1\" ⇒ hits= is a FLOOR (collection budget reached) and the root then also carries "
-                 "counts_floor=\"1\" and capped=\"1\" — rows exist that no page holds. " );
+    rw::emitRaw( stdout, "<!-- ripwire grep: parallel literal/regex scan; hits GROUP by file under <f p=\"…\">, each <hit> carrying its LINE (l=), its matched text as the hit's own CDATA (line_bytes= rides a row whose line was too long to print whole and gives that WHOLE line's byte length — absent means the CDATA IS the whole line) and enclosing symbol (in=, a NAME here; the same spelling is a fan-in COUNT in for/pack-task/exemplar; ABSENT (never an empty in= value) when no symbol encloses the hit, which is NOT the same claim as file scope — and on a file row carrying parse_degraded=\"1\" it is NO CLAIM AT ALL: that file's parse holds ERROR/MISSING nodes (the skipped verb itemizes err=/err_ratio=), symbols there may be unextracted, so read in= absence inside it as UNKNOWN, not as file scope; absence of parse_degraded= on a row means the parse was clean, except that a file the ingest never parsed at all — doc-format, binary-sniffed, unreadable — is also unmarked, the skipped verb's unmeasured class). root= on the root element is the crawl root every <f p=…> is now RELATIVE to (single-root runs only; absent ⇒ p= is the path ingest itself used, unchanged). ORDER: SOURCE files before test/bench files before docs, then path and line. shown=/capped= = rows printed vs found (a count of underlying HITS, the same unit hits= uses, not of printed <hit> elements); hits_capped=\"1\" ⇒ hits= is a FLOOR (collection budget reached) and the root then also carries counts_floor=\"1\" and capped=\"1\" — rows exist that no page holds. " );
     // G3 (2026-08-15 harvest): terms=/scope=/terms_suppressed= appear ONLY when the run passed and/not —
     // deliberately no literal "--and"/"--not" substring (illegal "--" digraph inside an XML comment; spelled
     // without the leading dashes, matching this legend's own convention) — and so does the PROSE defining
@@ -676,7 +768,7 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     // uncapped small-hit arm; grepandcheck (4d)/(4e) still assert the prose IS there on an and/not run.
     if( !grepTerms.empty() )
     {
-        std::printf( "terms= (present only with and/not) restates the whole boolean query as it was EVALUATED: the base pattern, then "
+        rw::emitTo( stdout, "terms= (present only with and/not) restates the whole boolean query as it was EVALUATED: the base pattern, then "
                      "each and term prefixed +, each not term prefixed -. scope=line (default) requires every term on the SAME matched "
                      "line as the base pattern; scope=file requires every term ANYWHERE in the file, independent of which line matched. "
                      "terms_suppressed= counts the raw hits the boolean filter REJECTED — a different axis from hits_capped= (a collection-"
@@ -687,8 +779,26 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     // above set the precedent, and legendcoveragecheck's rule is "define what you EMIT"). An answer that
     // held nothing back emits no tier attribute and pays no tier prose — byte-identical to the pre-tier
     // verb, which is the "purely additive" contract. Helper above; empty string when there is nothing to say.
-    std::printf( "%s", grepTierLegend( tierReport ) );
-    std::printf(
+    rw::emitTo( stdout, "{}", grepTierLegend( tierReport ) );
+    // The long-line clause rides only on a regex answer — the only one that can carry the attributes it defines.
+    if( cfg.grepRegex )
+    {
+        rw::emitRaw( stdout, "LONG LINES: regex_lines_skipped= (regex only, always present) counts lines the regex engine was never handed "
+                             "because they were longer than its thread's stack can take (libstdc++ recurses once per character matched): a match "
+                             "on one of them is neither found nor ruled out, and a value of 0 means no line was skipped. When it is not 0, "
+                             "regex_line_max= is the longest line the engine could take on that stack and the root also carries counts_floor: hits= is a "
+                             "floor. regex_stack_bytes= appears only when the system refused the scan threads their full stack: it is the ONE smaller "
+                             "stack every thread was held to, and regex_line_max= then rides even beside a 0 wherever the engine's bound is finite. A pattern that is a literal (or literals joined by |) never reaches the engine, so no line is too long "
+                             "for it; neither is a line holding none of the pattern's required literal text. " );
+    }
+    // Gated on its own attributes' condition, like the clauses above: a clean scan pays nothing for it.
+    if( isScanShort )
+    {
+        rw::emitRaw( stdout, "SHORT SCAN: unread_files= counts indexed files the scan could not read when it ran (removed or unreadable since the "
+                             "index); scan_degraded=\"1\" means a scan stopped part-way on an internal failure, keeping the hits it had. Either one "
+                             "makes hits= a floor, so the root also carries counts_floor: a match may sit in what was not read. " );
+    }
+    rw::emitTo( stdout,
                  // G1 (2026-08-15 harvest): byte-identical match text within one file's hits on the UNPAGINATED default view folds into
                  // ONE <hit> row plus <at l=… in=…/> children for the extra sites — n= on the <hit> (present only when >1) is 1+the <at>
                  // count, so summing n= across a page's <hit> rows recovers shown=. Paging or --grep-context/-before/-after disables the
@@ -714,7 +824,9 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
                  "this answer a zero really is zero and a hit absent above is absent from every indexed file. The claim is "
                  "complete-within-the-index ONLY: most files the ingest skipped were never scanned (the skipped verb lists exactly "
                  "which, with reasons; the ONE exception is the unindexed_files_scanned= class right below, itself never covered by "
-                 "complete=), and files outside the indexed roots are outside the claim. It never appears on a regex answer (the "
+                 "complete=), and files outside the indexed roots are outside the claim. The largest single subtraction is named on "
+                 "the root itself: corpus_pruned_dirs= below counts the subtrees the built-in crawl denylist removed WHOLE, so read "
+                 "this claim as exhaustive over what was indexed, never over what is on disk. It never appears on a regex answer (the "
                  "prefilter is a performance switch that may not change the answer, so neither mode claims), a capped or paged listing, "
                  "or a scan that could not read a file; its ABSENCE claims nothing. The enc rows' caller counts stay FLOORS regardless "
                  "— complete= speaks for the hit rows alone. "
@@ -745,14 +857,17 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
                  // same absent-means-none convention as skippedOversize itself (model.h). Deliberately no
                  // literal 'hits="0"' example below (a quoted numeric example — the quality-delta legend's
                  // own rule, restated here after it bit a naive ` hits="N"` extraction downstream twice).
-                 "corpus_excluded= counts files an exclude filter (or built-in crawl policy) kept OUT of the index entirely; "
-                 "corpus_oversize= counts files the crawl SAW but dropped for exceeding the size ceiling. Both answer what an "
+                 "corpus_excluded= counts files a caller's own exclude filter kept OUT of the index entirely; "
+                 "corpus_oversize= counts files the crawl SAW but dropped for exceeding the size ceiling; "
+                 "corpus_pruned_dirs= counts the DIRECTORIES the BUILT-IN crawl denylist pruned whole — vendor, third_party, "
+                 "build, dist, out, target, node_modules and the rest — a directory count and not a file count, because files "
+                 "beneath a pruned subtree are never stat'd and so were never counted. All three answer what an "
                  "otherwise-empty answer alone cannot: not in this repo, or in a file that was never scanned — the skipped "
-                 "verb itemizes the rows behind either count. "
+                 "verb itemizes the rows behind the first two and reports the third as its own pruned_dirs=. "
                  // P3 (L7): next= on the root, defined where the reader meets it
                  "next= is the one pasteable follow-up: the at verb on the top hit; the next page (compact legend) when cut; "
                  "the conceptual lens on a zero-hit answer. "
-                 "%s -->", rw::kPageRaiseCapClause );
+                 "{} -->", rw::kPageRaiseCapClause );
     }
     emitGrepHandleLegend( cfg.grepHandles );
     // G3: terms=/scope=/suppressed= — only when AND/NOT was actually given, so a plain --grep answer
@@ -767,6 +882,22 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     const std::string tierAttr = grepTierAttrs( tierReport, /*floorAlreadyEmitted=*/hitsCapped != 0 );   // N2: tier_budget= floors the root too
     // §R-J: unindexed_files_scanned=/unindexed_files_skipped=/unindexed_candidates_capped= (helper above).
     const std::string auxAttr = grepUnindexedAttrs( aux );
+    const std::string regexSkipAttr = grepRegexSkipAttrs( cfg, found, aux, /*floorAlreadyEmitted=*/hitsCapped != 0 || tierReport.budgetHit != nullptr );
+    std::string       scanShortAttr;
+    if( found.unreadableFiles != 0 )
+    {
+        scanShortAttr += " unread_files=\"" + std::to_string( found.unreadableFiles ) + "\"";
+    }
+    if( isScanDegraded )
+    {
+        scanShortAttr += " scan_degraded=\"1\"";
+    }
+    const bool isFloorAlreadyEmitted = hitsCapped != 0 || tierReport.budgetHit != nullptr
+                                    || regexSkipAttr.find( rw::kGraphCountFloorAttrXml ) != std::string::npos;
+    if( isScanShort && !isFloorAlreadyEmitted )
+    {
+        scanShortAttr += rw::kGraphCountFloorAttrXml;
+    }
     const char* schemaAttr = cfg.legend == "compact" ? " schema=\"ripwire.grep/v1\"" : "";
     // P3 (L7, nextverb.h): the one follow-up. A CUT answer → the next page, under the compact legend (the page
     // is what the agent wants, not the prose it has already read); a hit → the enclosing-definition chain at the
@@ -784,13 +915,13 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     {
         grepNext = rw::nextFlag( "--for=", pat );
     }
-    std::printf( "<grep pattern=\"%s\"%s%s%s files=\"%d\" hits=\"%zu\"%s hits_capped=\"%d\"%s%s%s%s%s>",
+    rw::emitTo( stdout, "<grep pattern=\"{}\"{}{}{} files=\"{}\" hits=\"{}\"{} hits_capped=\"{}\"{}{}{}{}{}{}{}>",
                  ex( pat ).c_str(), schemaAttr, rootAttr.c_str(), termsAttr.c_str(), filesMatched, hitCount,
                  pageDisclosure( grab, sizeof( grab ), grepPage.end - grepPage.begin, hitCount, grepPage.end,
                                  cfg.pageLimit, cfg.pageOffset, true, kXmlPageSyntax,
                                  /*collectionCapped=*/ hitsCapped != 0 ),   // H8: the cap hits_capped= names floors the root
-                 hitsCapped, completeAttr, tierAttr.c_str(), corpusAttr.c_str(), auxAttr.c_str(),
-                 rw::nextAttrXml( grepNext ).c_str() );
+                 hitsCapped, completeAttr, tierAttr.c_str(), corpusAttr.c_str(), auxAttr.c_str(), regexSkipAttr.c_str(),
+                 scanShortAttr.c_str(), rw::nextAttrXml( grepNext ).c_str() );
     // G1 (2026-08-15 harvest): hits GROUP by file under <f p="…">, root-relative when this is a single-root
     // run (report-memgraph §F6: the absolute root prefix alone was 42.5% of a real --grep payload; the
     // repeated-per-hit path was report-octocode §F1's 31.4%). Byte-identical text within one file's group
@@ -808,50 +939,54 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
         // parse_degraded routing (2026-08-30, degradedhintcheck): join the health fact the skipped verb
         // already computed — over a shredded parse the in=-absent claim below is unknowable, and the
         // reader must not be sent hunting for a rename (the looksObjC misroute cost exactly that hunt).
-        std::printf( "<f p=\"%s\"%s>", ex( pathFor( group.fileId ) ).c_str(),
+        rw::emitTo( stdout, "<f p=\"{}\"{}>", ex( pathFor( group.fileId ) ).c_str(),
                      fileParseDegraded( ing, group.fileId ) ? " parse_degraded=\"1\"" : "" );
         for( const GrepCollapsedHit& c : group.hits )
         {
             const GrepHit& h = c.hit;
-            std::printf( "<hit l=\"%u\"", h.line );
+            rw::emitTo( stdout, "<hit l=\"{}\"", h.line );
             if( !h.enclosing.empty() )                // in= honesty: ABSENT means no enclosing symbol, never in=""
             {
-                std::printf( " in=\"%s\"", ex( h.enclosing ).c_str() );
+                rw::emitTo( stdout, " in=\"{}\"", ex( h.enclosing ).c_str() );
+            }
+            if( h.lineBytes != 0 )                    // the matched-line cut, disclosed: absent = the whole line is here
+            {
+                rw::emitTo( stdout, " line_bytes=\"{}\"", h.lineBytes );
             }
             if( !c.more.empty() )
             {
-                std::printf( " n=\"%zu\"", c.more.size() + 1 );   // 1 (this row) + the folded sites — sums to shown=
+                rw::emitTo( stdout, " n=\"{}\"", c.more.size() + 1 );   // 1 (this row) + the folded sites — sums to shown=
             }
-            std::printf( ">" );
+            rw::emitTo( stdout, ">" );
             if( !h.before.empty() )
             {
                 const std::string safe = cdataSafe( h.before );
-                std::printf( "<b><![CDATA[" );  std::fwrite( safe.data(), 1, safe.size(), stdout );  std::printf( "]]></b>" );
+                rw::emitTo( stdout, "<b><![CDATA[" );  std::fwrite( safe.data(), 1, safe.size(), stdout );  rw::emitTo( stdout, "]]></b>" );
             }
             {
                 // P12 (L7): the matched line is the hit's OWN text — no <m> wrapper (9 B/hit, ~900 B on a 100-row page);
                 // with context on, the reading order is <b>…</b> then this CDATA then <a>…</a>
                 std::string safe;
                 appendCdataSafe( h.text, safe );
-                std::printf( "<![CDATA[" );  std::fwrite( safe.data(), 1, safe.size(), stdout );  std::printf( "]]>" );
+                rw::emitTo( stdout, "<![CDATA[" );  std::fwrite( safe.data(), 1, safe.size(), stdout );  rw::emitTo( stdout, "]]>" );
             }
             if( !h.after.empty() )
             {
                 const std::string safe = cdataSafe( h.after );
-                std::printf( "<a><![CDATA[" );  std::fwrite( safe.data(), 1, safe.size(), stdout );  std::printf( "]]></a>" );
+                rw::emitTo( stdout, "<a><![CDATA[" );  std::fwrite( safe.data(), 1, safe.size(), stdout );  rw::emitTo( stdout, "]]></a>" );
             }
             for( const GrepHitSite& site : c.more )
             {
-                std::printf( "<at l=\"%u\"", site.line );
+                rw::emitTo( stdout, "<at l=\"{}\"", site.line );
                 if( !site.enclosing.empty() )
                 {
-                    std::printf( " in=\"%s\"", ex( site.enclosing ).c_str() );
+                    rw::emitTo( stdout, " in=\"{}\"", ex( site.enclosing ).c_str() );
                 }
-                std::printf( "/>" );
+                rw::emitTo( stdout, "/>" );
             }
-            std::printf( "</hit>" );
+            rw::emitTo( stdout, "</hit>" );
         }
-        std::printf( "</f>" );
+        rw::emitTo( stdout, "</f>" );
     }
 
     // ── §R-J: the aux block — files OUTSIDE the index (see unindexed_files_scanned= above), wrapped in its
@@ -883,7 +1018,7 @@ int emitGrepReport( const rw::Config& cfg, const rw::IngestResult& ing, const rw
     {
         emitGrepSuggest( ing, pat, cfg.grepRegex, esc );
     }
-    std::printf( "</grep>" );
+    rw::emitTo( stdout, "</grep>" );
     return 0;
 }
 

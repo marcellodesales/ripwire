@@ -31,7 +31,7 @@ cmake -S . -B asan -DRIPWIRE_ASAN=ON && cmake --build asan -j
 ```
 
 **Do not configure a local dev tree with `-DCMAKE_BUILD_TYPE=Release`.** Release defines `NDEBUG`,
-which compiles `DEGRADED_PATH_ALERT` out; any gate that asserts a degrade path then passes blind.
+which compiles the `DISCLOSE( msg )` trace out; any gate that asserts a degrade path then passes blind.
 CI builds *both* flavours on purpose — Release catches optimizer-only bugs, the plain build catches
 degrade paths. If you add a degrade path, the plain run is what proves it.
 
@@ -77,17 +77,26 @@ cmake --build build --clean-first -j          # and the same for asan/ if that t
 `test/g1freshcheck.sh` catches the ordinary stale binary (binary older than source) and is worth
 believing when it fires — it is not noise. It cannot catch this variant, because here the binary is
 *newer* than the source and only its contents are stale. Nothing in CMake can repair a source that
-changed mid-compile; the discipline is the fix.
+changed mid-compile; the discipline is the fix. When this variant is suspected, `--doctor`'s `layout`
+row reports the cross-translation-unit `sizeof`/`alignof` evidence; treat `state="disagree"` as a
+clean-rebuild requirement. `state="agree"` compares only the `types=` registered in `src/model.h`; a
+same-size layout change or a stale constant is invisible, so `agree` does not rule out a mixed binary.
 
 ## Verify
 
 ```bash
+./build/ripwire . --quality-delta --legend=compact      # the "am I done" checkpoint — see the note below
 python3 test/pargates.py . ./build/ripwire -j 6         # the full gate suite, in parallel
 test/regression.sh                                      # the same set, sequentially (authoritative list)
 LSAN_OPTIONS=suppressions=lsan_suppressions.txt ./asan/ripwire <dir> >/dev/null
-./build/ripwire <dir> >a; ./build/ripwire <dir> >b; diff -q a b     # determinism gate
+t=$(mktemp -d); ./build/ripwire <dir> >"$t/a"; ./build/ripwire <dir> >"$t/b"; diff -q "$t/a" "$t/b"   # determinism gate (outputs outside <dir>)
 ./build/ripwire <dir> | xmllint --noout -                          # well-formedness gate
 ```
+
+`--legend=compact` on the checkpoint run is not cosmetic: on a clean report the legend is nearly the
+whole document, and dropping it takes the run from 2,776 B to 454 B (measured 2026-09-10 on a
+two-function fixture; 15,601 B to 8,775 B on this repo mid-change). The findings are byte-identical
+either way — only the dictionary in front of them is shorter, and you already know it.
 
 Run gates in the **foreground**. A new `test/*check.sh` must be listed in `test/regression.sh` in
 the same commit — `test/manifestcheck.sh` fails otherwise.
@@ -105,8 +114,15 @@ the same commit — `test/manifestcheck.sh` fails otherwise.
 - **G3 — one deterministic build step.** CMake only, dependencies pinned and vendored, tree-sitter
   linked statically, no host-installed dependencies, no OpenMP. "Self-contained", not "static" — a
   fully static binary is impossible on macOS, so never pass `-static`.
-- **G4 — maximum token density.** Minified XML, no inter-tag whitespace, terse attributes, one
-  legend at the top. Gate: pipes clean through `xmllint --noout`, no newline outside CDATA.
+  Platforms: Unix/Linux/macOS first, native Windows second (clang-cl primary; MSVC `cl.exe` must also build).
+  A `cl.exe` portability finding is worth fixing but does not block a POSIX-only code path.
+- **G4 — maximum token density.** Minified XML, no inter-tag whitespace, terse attributes. The legend is emitted
+  once per answer on the CLI (`--legend=full|compact`) or once per session on agent surfaces (`--legend=ref`,
+  served only after the session dictionary was delivered in that process; the answer then ends with
+  `<about … legend="ref" dict= dictv=/>`). Every attribute a default answer emits is defined in that answer's own
+  legend — gates `legendcoveragecheck` (G) and `compactlegendcheck` (UG); a ref answer carries the same attributes
+  as its inline twin, and every definition it leans on is bytes that session was already sent or that the answer
+  carries itself — gate `legendrefcheck`. Output pipes clean through `xmllint --noout`; no newline outside CDATA.
 - **G5 — modular zero-dependency CLI.** Hand-rolled argument parser; a flagless run is the core map;
   every flag is purely additive.
 
@@ -121,8 +137,10 @@ the same commit — `test/manifestcheck.sh` fails otherwise.
 3. **Honesty in output is a feature.** Counts that cannot be totals are labelled floors
    (`counts_floor="1"`); a zero means "none found", never "none exists"; every truncation is
    disclosed in the header. Do not add a surface that quietly rounds, guesses, or omits.
-4. **Never `VERIFY( false )` on a degrade path** — release deletes the fallback behind it. Use
-   `DEGRADED_PATH_ALERT`.
+4. **Never `ASSUME( false )` (or an `EXPECTS`/`ENSURES` of false) on a degrade path.** Release deletes the fallback
+   behind it. Guard the path and disclose it: `DISCLOSE( sink, why )`, whose sink sets the output field the reader
+   sees, or `DISCLOSE( Diagnostics::answerUnchanged, "reason" )` when the answer truly cannot change. A one-argument
+   `DISCLOSE( msg )` ships nothing and may not be added. External input is `VALIDATE`d, never `ASSUME`d.
 5. **Never `std::map` / `std::unordered_map`** — see the container rule in `CONTRIBUTING.md`.
 
 ## Style

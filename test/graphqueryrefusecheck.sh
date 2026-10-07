@@ -20,7 +20,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -32,7 +32,7 @@ echo "graphqueryrefusecheck: BIN=$BIN  ROOT=$ROOT"
 # a genuine 1-edit typo of this repo's own "main" — a real near-miss — so the did-you-mean assertion still
 # tests the actual (fixed) behavior instead of pinning the old bug.
 "$BIN" "$ROOT" --graph-query='name("mainn")' >"$TMP/out" 2>"$TMP/err"; rc=$?
-[ "$rc" -eq 1 ] && ok "unknown name(): exit 1" || no "unknown name(): exit $rc (expected 1)"
+if [ "$rc" -eq 1 ]; then ok "unknown name(): exit 1"; else no "unknown name(): exit $rc (expected 1)"; fi
 grep -q 'mainn' "$TMP/err" && ok "refusal names the unresolved literal" \
     || no "refusal does not name the literal: $( head -c 200 "$TMP/err" )"
 grep -q 'count=' "$TMP/out" && no "refusal still printed a <query count=> element" || ok "no count= element on the refusal path"
@@ -43,7 +43,7 @@ grep -qi 'did you mean' "$TMP/err" && ok "refusal carries a did-you-mean suggest
 "$BIN" "$ROOT" --graph-query='and(callers(name("parseArgsTypo"),2),kind(all,fn))' >"$TMP/out2" 2>"$TMP/err2"; rc2=$?
 [ "$rc2" -eq 1 ] && ok "unknown name() nested in an expression: exit 1" \
     || no "unknown name() nested in an expression: exit $rc2 (expected 1)"
-grep -q 'parseArgsTypo' "$TMP/err2" && ok "nested refusal names the literal" || no "nested refusal does not name the literal"
+if grep -q 'parseArgsTypo' "$TMP/err2"; then ok "nested refusal names the literal"; else no "nested refusal does not name the literal"; fi
 
 # ── 2b. C3: the SAME typo, with the pushdown-eligible predicate(all,…) arm FIRST and the typo'd name() arm
 #    SECOND — the order check #2 doesn't exercise. and()'s predicate pushdown must not short-circuit the
@@ -71,6 +71,27 @@ N="$( grep -oE ' count="[0-9]+"' "$TMP/ok" | head -1 | grep -oE '[0-9]+' )"
 "$BIN" "$ROOT" --callers=mainn >/dev/null 2>&1; sib=$?
 [ "$sib" -eq 1 ] && ok "--callers=mainn also exits 1 (siblings agree)" \
     || no "--callers=mainn exits $sib — the sibling contract this gate mirrors has moved"
+
+# ── 6. nesting depth is bounded before evaluation. The evaluator recurses once per `(` level, and a cx(cx(…all…,1),1)
+#    chain 20,000 levels deep overflowed the stack: SIGSEGV, exit 139, no output. On the default 8 MB main-thread stack
+#    that crashed a macOS dev build and a Linux release build. It is refused now at 256 levels, with the reason, before
+#    evaluation; a chain inside the bound still evaluates.
+#    Two platform limits shape this arm. Linux caps ONE argv string at MAX_ARG_STRLEN (128 KiB), so the expression is
+#    120 KB (the cx( form nests the most frames per byte; a 400 KB chain was refused by execve with "Argument list too
+#    long" before ripwire ran). And frame sizes differ between compilers and build flavours, so the run gets a 2 MB
+#    stack: without the bound that depth overflows on every build, and with it the refusal never evaluates at all.
+FIX="$ROOT/test/fixture"
+DEEP="$( python3 -c 'n=20000; print("cx("*n + "all" + ",1)"*n)' )"
+( ulimit -s 2048 2>/dev/null; exec "$BIN" "$FIX" --graph-query="$DEEP" ) >"$TMP/deep.out" 2>"$TMP/deep.err"; rc6=$?
+[ "$rc6" -eq 1 ] && ok "a 20,000-level expression refuses: exit 1" \
+    || no "a 20,000-level expression: exit $rc6 (expected 1; 139 is the stack overflow this arm exists for, 126 an argv the OS refused)"
+grep -q 'nests deeper than 256 levels' "$TMP/deep.err" && ok "the refusal names the nesting bound" \
+    || no "the deep refusal does not name the bound: $( head -c 200 "$TMP/deep.err" )"
+SHALLOW="$( python3 -c 'n=200; print("kind("*n + "all" + ",fn)"*n)' )"
+"$BIN" "$FIX" --graph-query="$SHALLOW" >"$TMP/shallow.out" 2>/dev/null; rc6b=$?
+[ "$rc6b" -eq 0 ] && grep -q '<query [^>]*count="[1-9]' "$TMP/shallow.out" \
+    && ok "a 200-level expression inside the bound still evaluates (exit 0, count >= 1)" \
+    || no "a 200-level expression: exit $rc6b without a non-zero count"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

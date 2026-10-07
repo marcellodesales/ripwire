@@ -1,10 +1,10 @@
 ---
 name: ripwire-quality-bar
 description: >
-  Code QUALITY of what YOU just wrote, before you commit or say 'done': --quality-delta reports only
-  what got WORSE across 10 kinds and exits non-zero on new debt; then which restructuring a measured
-  shape (humps/deep, a tangle) calls for. Merge safety → change-check. Even a single-line leaf fix
-  runs the one-shot delta.
+  Code QUALITY of what YOU just wrote, before you commit or say 'done', or verifying a cleanup:
+  --quality-delta lists what got WORSE in 11 kinds and exits 2 only when pre-existing code got
+  materially worse; which restructuring a measured shape (humps/deep, a tangle) calls for. Merge
+  safety → change-check. Even a single-line leaf fix runs it.
 allowed-tools: Bash, Read
 ---
 
@@ -17,8 +17,8 @@ allowed-tools: Bash, Read
 > • Wide-angle "where does this still look rotten" read across a whole file/subsystem (not a before/after
 >   delta) → the panel below, or **ripwire-fresh-eyes** for the full six-family breakdown.
 > • **You have the measurement and need the FIX** — for your own diff or for a subsystem **ripwire-fresh-eyes**
->   just measured → the shape → refactor playbook and the closed fix loop are both on this page, below.
-> • **The regression is a MEMORY-layout hypothesis, not one of the 10 quality kinds** — `--lint`'s built-in
+>   just measured → the shape → refactor playbook, the closed fix loop and the debt fix loop are all on this page, below.
+> • **The regression is a MEMORY-layout hypothesis, not one of the 11 quality kinds** — `--lint`'s built-in
 >   cache-\* pack (8 static data-layout checks) is a normal part of a lint pass; `--field-affinity[=STRUCT]`
 >   is the deeper struct-level lens once a profile implicates a specific aggregate → **ripwire-perf-target**.
 > • Not sure which skill? → **ripwire-router**.
@@ -36,7 +36,7 @@ something — a clean `gating="0"` run on a leaf fix is confirmation, not ceremo
 
 ## Before you converge: the wide-angle read — `--quality-panel`
 
-`ripwire <dir> --quality-panel[=strict|default|lenient]` is THE SINGLE COMMAND for "does what I just
+`ripwire <dir> --quality-panel[=strict|default|lenient] --legend=compact` is THE SINGLE COMMAND for "does what I just
 touched still look rotten" — one ranked report over **six** evidence families (the four `--ensemble`
 joins — `structural`, `lexical`, `confusion`, `historical` — plus `colocation` and `state`; the full
 per-family breakdown lives in **ripwire-fresh-eyes**). Point it at the file or symbol you just edited for
@@ -119,8 +119,10 @@ of its own. Discount it accordingly: on a row whose other evidence is thin, `his
 something always fires.)
 
 ## The loop
-1. **Zero-setup path:** just make your change, then run `ripwire <dir> --quality-delta` before you call it
-   done — in a git repo it auto-compares the working tree vs `git HEAD` (`<quality-delta
+1. **Zero-setup path:** just make your change, then run `ripwire <dir> --quality-delta --legend=compact`
+   before you call it done — add `--legend=compact` every time you run this in a loop: on a CLEAN report the
+   legend is nearly the whole payload (2,776 B to 454 B measured on a small fixture, 15,601 B to 8,775 B on
+   a mid-change repo), the rows are byte-identical either way, and you have already read the dictionary — in a git repo it auto-compares the working tree vs `git HEAD` (`<quality-delta
    baseline="git-HEAD">` confirms it), no start-of-task action needed. **Tighter loop on a long change:** run
    `ripwire <dir> --quality-baseline` FIRST — **on a clean tree** — to pin an explicit floor (takes
    precedence over HEAD) so each edit deltas against the original start, not the last commit. On a tree that
@@ -128,8 +130,9 @@ something always fires.)
    floor: commit first, or pass `--allow-dirty` to pin anyway, which stamps the absorbed count so every later
    report carries `baseline_absorbed="N"` and a green exit beside it reads "clean *since the pin*".
 2. **Make your change.**
-3. **Measure the delta** — `ripwire <dir> --quality-delta` → only the regressions you introduced, across the
-   10 kinds in the table below. Each emits `<r kind="…" sym=… was=… now=…>` (`members=` for duplication).
+3. **Measure the delta** — `ripwire <dir> --quality-delta --legend=compact` → only the regressions you
+   introduced, across the
+   11 kinds in the table below. Each emits `<r kind="…" sym=… was=… now=…>` (`members=` for duplication).
    Test-fixture dirs are exempt from `dead-code`; `short-horizon-churn` ignores your own current edit and
    exempts brand-new symbols/markdown/fixtures. Two exemptions are DISCLOSED on the report rather than
    silent, and both change how you read a zero: a symbol defined by a self-registering test/benchmark
@@ -199,7 +202,7 @@ something always fires.)
    prevents it. `--scope=GLOB[,GLOB...]` files each finding by its `p=` path:
 
    ```bash
-   ripwire <dir> --quality-delta --scope=src/render,src/render_gl.h             # gate on MY subtree only
+   ripwire <dir> --quality-delta --legend=compact --scope=src/render,src/render_gl.h             # gate on MY subtree only
    ripwire <dir> --quality-delta --scope=src/render --quality-ack="deliberate"  # …and ack only my rows
    ```
 
@@ -214,7 +217,7 @@ something always fires.)
    one path per changed indexed file. It is sugar for the **single-writer** case — in the shared tree
    this flag exists for, a sibling's edits are "changed" too, so name your own paths there.
 
-5. **Want ONE number instead of a list — `ripwire <dir> --dmm`.** `--quality-delta` says *which* kinds got
+5. **Want ONE number instead of a list — `ripwire <dir> --dmm --legend=compact`.** `--quality-delta` says *which* kinds got
    worse; it has no scale, so "is this change better than my last one?" has no answer. `--dmm` is that scale:
    the Delta Maintainability Model (di Biase, Rastogi, Bruntink & van Deursen, TechDebt 2019; thresholds and
    arithmetic from PyDriller's reference implementation) scores the share of the volume your change moved
@@ -251,15 +254,17 @@ Thresholds/definitions are the catalog in [`quality-metrics.md`](quality-metrics
 | `duplication` | `--clones` | reuse the existing body — Rule of Three; wrong abstraction beats two honest copies |
 | `dead-code` | — | delete what you orphaned, or wire the caller you forgot |
 | `api-surface` (new public symbol) | `--callers=SYM` | intentional? keep it. Accidental? narrow it (should've been file-local) |
-| `error-masking` (empty catch / bare `except: pass` / swallowed `.catch`) | `--expand=SYM` | handle, log, or rethrow — AI code adds these +47% vs human (GitClear 2026) |
+| `error-masking` (empty catch / bare `except: pass` / swallowed `.catch`; a broad handler that only logs and never names the error; a sole handler that re-throws it unchanged) | `--expand=SYM` | handle it, log the error itself, or drop the try — AI code adds these +47% vs human (GitClear 2026). The two widened shapes gate only in Python (measured precision); elsewhere `sev="minor"` |
 | `short-horizon-churn` | `--hotspots` · `git log -p <file>` | rewritten again inside 2 weeks (+15% AI) — is the design unsettled? consolidate |
 | `new-clone-of-reused-helper` | `--clones` · `--callers=HELPER` | call the existing well-reused helper — reuse is declining in AI code (GitClear) |
+| `placeholder` (an added stub or TODO: `todo!()`, `NotImplementedException`, a "not implemented" throw/panic, a TODO/FIXME naming no issue) | `--expand=SYM` | finish it, or name the issue that tracks it — never gates, but do not call the work done over it |
 
-These 10 kinds aren't a generic lint list — each targets a large-N-validated agent-code degradation mode
+These 11 kinds aren't a generic lint list — ten target a large-N-validated agent-code degradation mode (the
+eleventh, `placeholder`, is an honesty check on your own "done")
 (verbosity, structural erosion, smell rate, contract drift; passing tests ≠ clean design). Numbers + why the
 loop must be continuous, not a one-time prompt → [`quality-metrics.md`](quality-metrics.md).
 
-**Read the Fix column as DIRECTION, not a computed answer.** None of these 10 kinds has a corpus-derivable
+**Read the Fix column as DIRECTION, not a computed answer.** None of these 11 kinds has a corpus-derivable
 correct replacement — "split the fn" names a move, not a target function shape, and you still judge it. That
 is deliberate: complexity, coupling, and colocation don't have a computable right answer the way a naming
 CONVENTION does. The one exception in this whole tool is `--naming-consistency` (→ **ripwire-fresh-eyes**),
@@ -282,7 +287,7 @@ still your call, and "leave it alone" is always on the menu.
 | **Deciding whether an extract-method is mechanical or a rewrite** — check `ev=` before picking a fix off this table | `ev=` absent (or `ev="1"`) on a `cx=` row means every region is single-entry/single-exit: **extract-method applies mechanically**, anywhere. `ev>=2` means a jump gave some region a second exit — the same extraction is now the "one deep tangle" row above, not a cheap lift. | `ev_why=tag:count` (guard-return, loop-escape, goto, ...) names which jumps raised it — a guard-return-heavy row is visibly not a knot. A FLOOR (`ev_floor="1"`): noreturn calls and macro-hidden exits can only push the true value higher. |
 | **Small AND dense** — small `loc`, but `deep` is a large fraction of it (roughly half or more), typically in one hump | **Read it before you prescribe anything.** Numeric kernels, tree walks, and state machines are *legitimately* dense: the depth is the algorithm. Often the right fix is a comment or a named constant, not a split. | This row is where a metric-driven agent does the most damage. `--expand=SYM` first. If the density is the algorithm, ack it (`--ack-only=`) and move on. |
 | **High fan-in AND untested** — big `in=`/`amp=`, `tested="0"`, or a `--quality-panel` row carrying `join="deep+untested"` | **Test first, refactor second.** The safety net is the fix's precondition, not its follow-up. → **ripwire-write-tests** (`--seams`, the `tested=` lens, `--callers=SYM` for the outside contract). | Confirm the annotation is real: `join=` is suppressed entirely at `tested_scope="0"`, so on an uncrawled-test corpus its *absence* proves nothing. |
-| **Duplication** — a `--quality-delta` `duplication` / `new-clone-of-reused-helper` row, or a `--clones` group | **Consolidate through the repo's own exemplar** — `ripwire <dir> --exemplar="<what this code does>"` names the best-in-class instance to converge on (chosen by ROLE, not text similarity), so the survivor matches house patterns instead of being whichever copy you happened to open. | **Rule of Three** — extract on the third occurrence, not the second; a wrong abstraction is worse than two honest copies. Check `type=` on the clone group: `type="3"` members are gapped near-misses and may differ on purpose. |
+| **Duplication** — a `--quality-delta` `duplication` / `new-clone-of-reused-helper` row, or a `--clones` group | **Consolidate through the repo's own exemplar** — `ripwire <dir> --exemplar="<what this code does>" --legend=compact` names the best-in-class instance to converge on (chosen by ROLE, not text similarity), so the survivor matches house patterns instead of being whichever copy you happened to open. | **Rule of Three** — extract on the third occurrence, not the second; a wrong abstraction is worse than two honest copies. Check `type=` on the clone group: `type="3"` members are gapped near-misses and may differ on purpose. |
 | **Churn-flagged, structurally quiet** — `historical` fires with thin other evidence | **Probably nothing here.** `churn=`/`hrank=` are FILE facts inherited by every symbol in the file. | Confirm at the symbol before acting: `git log -p <file>` or `--hotspots --since=` to see whether *this* function is what keeps moving. |
 
 **None of these has a corpus-derivable "correct" answer** — see the paragraph above the table. The playbook
@@ -296,9 +301,9 @@ answers a question the previous one cannot:
 
 ```bash
 # 1. make the fix (playbook above)
-ripwire <dir> --quality-delta        # 2. did the TARGETED kind improve, and did nothing else regress?
-ripwire <dir> --edit-check=SYM       # 3. is the CONTRACT intact?
-ripwire <dir> --affected=F1,F2       # 4. which tests PROVE it? (then run them)
+ripwire <dir> --quality-delta --legend=compact        # 2. did the TARGETED kind improve, and did nothing else regress?
+ripwire <dir> --edit-check=SYM --legend=compact       # 3. is the CONTRACT intact?
+ripwire <dir> --affected=F1,F2 --legend=compact       # 4. which tests PROVE it? (then run them)
 ```
 
 2. **`--quality-delta`** — the only step with a meaningful exit code, and it is doing *two* jobs here, not
@@ -321,6 +326,37 @@ ripwire <dir> --affected=F1,F2       # 4. which tests PROVE it? (then run them)
 reports the contract you intended, and the `--affected` tests pass. Anything short of all four and the fix is
 still a hypothesis.
 
+## The fix loop — paying down EXISTING debt, one finding per commit
+
+The loop above converges on debt *you* just added. When the task is debt that was already there ("clean up this
+module", "fix the worst of it"), run this instead — bounded, one finding at a time:
+
+1. **Pick the top finding.** Your own open rows first (`gating=`, then `origin="new-symbol"`); otherwise row 1 of
+   `ripwire <dir> --quality-panel=strict --legend=compact` pointed at the area you were asked about. The panel orders
+   by how many independent families agree, not by payoff — no validated value × cost ranking ships yet — so between
+   near-ties take the cheapest: small, tested, few `--callers=SYM`.
+2. **Untested? Write the test first.** `join="deep+untested"` on the row, or `ripwire <dir> --affected=SYM --legend=compact`
+   naming no `<test>` row that carries `hops=` (a `partner="1"` row without `hops=` is co-change, not reach), means
+   the refactor has no safety net. Write one against the UNCHANGED code
+   (→ **ripwire-write-tests**), see it pass, commit it alone. A test written after the refactor pins the new
+   behavior, not the old.
+3. **Apply the recipe the shape calls for** — the drill-down table's Fix column for a regression kind, the playbook
+   row (precondition first) for a measured shape. The one recipe neither table carries:
+   a `--lint --lint-select=magic-number` finding (C/C++/ObjC) → a named constant. "Leave it alone" is still on the menu.
+4. **Prove it** — the closed fix loop above, all four steps, with one rule stricter than its step 2 (**anti-gaming**):
+   the fix must not worsen ANY other kind. Measure BEFORE you commit, one fix per commit, so a bare `--quality-delta`
+   (working tree vs `git HEAD`; re-pin after each commit if you pinned `--quality-baseline`) covers exactly this fix — after the commit it reads `regressions="0"` trivially
+   (`head_basis="identity"`); to check a fix already committed, run `ripwire <dir> --quality-delta=HEAD --legend=compact`
+   (that commit vs its parent). Then `regressions=` must be `0`, not just `gating=`, and `acked=` must not rise (a
+   pre-ack hides a row). The one exemption: a `kind="short-horizon-churn"` row with `churn="self"` on a function this
+   session already fixed is the loop's own commits, not a regression — better, take the next row from a different
+   function. A fix that trades its target for a row of any other kind — a `duplication`, a `params`, a public
+   `api-surface` helper that should have been file-local — is a lateral move: revert it, don't ack it.
+   `--quality-delta` only lists what got worse, so confirm the target moved by re-running the command that ranked it.
+5. **Stop at 3 fixes per session** (a default, not a measured optimum). Guardrail 3 bounds each fix to 1–2 rounds;
+   this bounds the session. End by naming the next row, not starting it — a long unreviewed chain of mechanical
+   refactors is where gaming hides.
+
 ## The four guardrails (why this loop converges instead of degrading)
 1. **Deterministic oracle, not self-critique.** The delta is *computed* — it cannot hallucinate or reinforce
    a bad regression. Trust it over a vibe.
@@ -336,7 +372,7 @@ still a hypothesis.
 `--quality-delta` exits 2 **only when a finding is preexisting-worse AND major AND unacked** — the
 `gating="N"` header count. Minor-tier, acked, and `origin="new-symbol"` findings all report but never gate,
 so **a green hook does not mean the diff added no debt** — it means nothing that already existed got worse.
-Non-zero is the hook contract, no wrapper needed: `ripwire <dir> --quality-delta || exit 1`. If you want CI
+Non-zero is the hook contract, no wrapper needed: `ripwire <dir> --quality-delta --legend=compact || exit 1`. If you want CI
 to also block on the debt a change ADDS, exit 2 will not do it for you — parse `new-symbol="N"` from the
 header (`--json` is supported for this verb) and apply your own policy. Chain the
 other deterministic gates in the same hook: det-gate (`diff <(ripwire <dir>) <(ripwire <dir>)`, must be

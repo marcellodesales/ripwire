@@ -2,12 +2,13 @@
 # codexdoctorcheck.sh — isolated active-surface gate for `--doctor --agent=codex`.
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 HOME_FAKE="$TMP/home"; CODEX_FAKE="$TMP/codex"; AGENTS_FAKE="$TMP/agents"
@@ -51,11 +52,13 @@ run_doctor()
 {
     HOME="$HOME_FAKE" CODEX_HOME="$CODEX_FAKE" AGENTS_HOME="$AGENTS_FAKE" \
         PATH="$BINDIR:/usr/bin:/bin" TMPDIR="$CACHE" \
-        "$BINDIR/ripwire" "$REPO" --doctor --agent=codex --no-cache 2>&1
+        "$BINDIR/ripwire" "$REPO" --doctor --agent=codex --no-cache "$@" 2>&1
 }
 
-OUT="$( run_doctor )"; RC=$?
-[ "$RC" -eq 0 ] && ok "fully wired fake Codex surface exits 0" || no "healthy Codex doctor exited $RC: $OUT"
+# L1 (2026-09-19): the CLI default is the compact posture, whose root leads with schema=; the checks= read below
+# anchors on the full-posture `<doctor checks=` shape, so this run asks for --legend=full (rows identical).
+OUT="$( run_doctor --legend=full )"; RC=$?
+if [ "$RC" -eq 0 ]; then ok "fully wired fake Codex surface exits 0"; else no "healthy Codex doctor exited $RC: $OUT"; fi
 # DERIVED, not pinned at 10: what this arm actually asserts is that --agent=codex adds exactly FOUR rows to
 # whatever the base doctor emits, that every row passed on a fully wired surface, and that the report is
 # labelled. A literal total measures the BASE check count instead — it was 10, then 11 when the base grew an
@@ -82,7 +85,7 @@ printf '%s' "$OUT" | grep -q 'DO_NOT_PRINT_CODEX_DOCTOR_SECRET' \
 before="$( cksum "$CODEX_FAKE/hooks.json" "$CODEX_FAKE/config.toml" "$AGENTS_FAKE/skills/.ripwire-manifest-v1"; find "$AGENTS_FAKE/skills" -mindepth 1 -maxdepth 1 -print | sort )"
 run_doctor >/dev/null
 after="$( cksum "$CODEX_FAKE/hooks.json" "$CODEX_FAKE/config.toml" "$AGENTS_FAKE/skills/.ripwire-manifest-v1"; find "$AGENTS_FAKE/skills" -mindepth 1 -maxdepth 1 -print | sort )"
-[ "$before" = "$after" ] && ok "Codex doctor is read-only" || no "Codex doctor mutated the active surface"
+if [ "$before" = "$after" ]; then ok "Codex doctor is read-only"; else no "Codex doctor mutated the active surface"; fi
 
 declared="$( sed -n 's/^skill=//p' "$AGENTS_FAKE/skills/.ripwire-manifest-v1" | head -1 )"
 mv "$AGENTS_FAKE/skills/$declared" "$TMP/$declared"
@@ -93,10 +96,25 @@ printf '%s' "$SOUT" | grep -q 'skills/install.sh --codex' \
     && ok "skill failure names the exact repair command" || no "skill failure omitted repair command"
 mv "$TMP/$declared" "$AGENTS_FAKE/skills/$declared"
 mkdir "$AGENTS_FAKE/skills/ripwire-undocumented"
+printf -- '---\nname: ripwire-undocumented\n---\n' >"$AGENTS_FAKE/skills/ripwire-undocumented/SKILL.md"
 SOUT="$( run_doctor )"
 printf '%s' "$SOUT" | grep -q '<c n="codex-skills" ok="0"' \
     && ok "undeclared live skill fails parity" || no "undeclared live skill did not fail parity"
-rmdir "$AGENTS_FAKE/skills/ripwire-undocumented"
+rm -rf "$AGENTS_FAKE/skills/ripwire-undocumented"
+# A declared name that is only an EMPTY directory (0.6.3's Git Bash `ln -sfn` leftover, #334) loads no skill, so
+# it is not live and parity fails. RED on 0.6.4, which counted any `ripwire-*` directory as live.
+mv "$AGENTS_FAKE/skills/$declared" "$TMP/$declared"
+mkdir "$AGENTS_FAKE/skills/$declared"
+EOUT="$( run_doctor )"; ERC=$?
+[ "$ERC" -eq 1 ] && printf '%s' "$EOUT" | grep -q '<c n="codex-skills" ok="0"' \
+    && ok "a declared skill left as an empty directory fails parity (no SKILL.md, not live)" \
+    || no "a declared skill left as an empty directory still passed parity (exit $ERC): $( printf '%s' "$EOUT" | grep -o '<c n="codex-skills"[^>]*>' )"
+rmdir "$AGENTS_FAKE/skills/$declared"
+mv "$TMP/$declared" "$AGENTS_FAKE/skills/$declared"
+EOUT="$( run_doctor )"
+printf '%s' "$EOUT" | grep -q '<c n="codex-skills" ok="1"' \
+    && ok "restoring the skill restores parity (the empty-directory arm above can pass)" \
+    || no "parity did not come back after restoring $declared: $( printf '%s' "$EOUT" | grep -o '<c n="codex-skills"[^>]*>' )"
 
 chmod -x "$HOOKDIR/ripwire-codex-route.sh"
 HOUT="$( run_doctor )"; HRC=$?

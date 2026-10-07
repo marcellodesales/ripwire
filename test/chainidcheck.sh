@@ -16,18 +16,25 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 cd "$ROOT"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN"; exit 2; }
 
 echo "chainidcheck: BIN=$BIN"
 
 # 1) harvest a REAL scoped id straight out of a --for bundle — never a hand-written literal, so the gate
-#    keeps testing the actual emitted shape if the id format ever changes.
-ID="$( "$BIN" . --for="serialize xml writer" 2>/dev/null \
-      | grep -oE '<d [^>]*id="[^"]+"' | head -1 | grep -oE 'id="[^"]+"' | sed 's/id="//;s/"$//' )"
-if [ -n "$ID" ] && [ "${ID#*::}" != "$ID" ]; then ok "harvested a scoped id from --for ($ID)"
-else no "no scoped id= in --for output — lane F's chain key is missing"; echo "ALL FAIL"; exit 1; fi
+#    keeps testing the actual emitted shape if the id format ever changes. Row 6 (2026-09-12): the row prints
+#    the SHORT id (sc=, the enclosing scope) beside its own p=; the chain key composes as p::sc::n, exactly
+#    the spelling the legend states and the selectors accept.
+ID="$( "$BIN" . --for="serialize xml writer" 2>/dev/null | python3 -c '
+import re, sys
+for row in re.finditer( r"<d\b([^>]*)>", sys.stdin.read() ):
+    a = dict( re.findall( r"\s([\w:.-]+)=\"([^\"]*)\"", row.group( 1 ) ) )
+    if "sc" in a and "p" in a:
+        print( a[ "p" ] + "::" + a[ "sc" ] + "::" + a[ "n" ] ); break
+' )"
+if [ -n "$ID" ] && [ "${ID#*::}" != "$ID" ]; then ok "composed a scoped id from a --for row's p= sc= n= ($ID)"
+else no "no scoped sc= row in --for output — lane F's chain key is missing"; echo "ALL FAIL"; exit 1; fi
 
 # 2) producer -> consumer: that id resolves on each nav verb (exit 0 AND the verb echoes it back).
 for v in expand callers impact uses; do
@@ -46,8 +53,9 @@ else no "id + range did not slice (the :: was probably eaten as a range separato
 
 # 4) consumer -> producer: the pre-existing forms are untouched (this change must be purely additive).
 NAME="${ID##*::}"
-"$BIN" . "--callers=$NAME"  2>/dev/null | grep -q "<callers of=\"$NAME\"" && ok "bare name still resolves" || no "bare-name resolution regressed"
-"$BIN" . --callers="serialize.h:$NAME" 2>/dev/null | grep -q '<callers of=' && ok "file:name still resolves" || no "file:name disambiguation regressed"
+# L1 (2026-09-19): the CLI default legend is compact, whose root tag leads with schema=; these arms pin the full default's `<callers of=` spelling, so they ask for it.
+if "$BIN" . "--callers=$NAME" --legend=full 2>/dev/null | grep -q "<callers of=\"$NAME\""; then ok "bare name still resolves"; else no "bare-name resolution regressed"; fi
+if "$BIN" . --callers="serialize.h:$NAME" --legend=full 2>/dev/null | grep -q '<callers of='; then ok "file:name still resolves"; else no "file:name disambiguation regressed"; fi
 
 # 5) a malformed range on a NON-id token must still degrade loudly to whole-body (the old contract).
 #    REPINNED (§P8 seam 1, 2026-07-28): a tail that does NOT start with a digit is now a file:name selector
@@ -55,7 +63,7 @@ NAME="${ID##*::}"
 #    reached with a digit-leading malformed tail instead. The contract under test — degrade + loud note,
 #    never a hard error — is unchanged; only the token that triggers it moved. See selectorchaincheck.sh.
 err="$( "$BIN" . --top-k=1 --expand=blobChecksum:5x-9 2>&1 >/dev/null )"
-printf '%s' "$err" | grep -qi 'malformed range' && ok "malformed range on a bare name still warns" || no "lost the malformed-range degrade note"
+if printf '%s' "$err" | grep -qi 'malformed range'; then ok "malformed range on a bare name still warns"; else no "lost the malformed-range degrade note"; fi
 
 # 6) a genuine typo must still be refused — the "::" branch must not swallow unknown names.
 "$BIN" . "--callers=./src/nope.h::Nope::nope" >/dev/null 2>&1 && no "a bogus canonical id was accepted" || ok "a bogus canonical id is still refused"

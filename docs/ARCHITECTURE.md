@@ -38,6 +38,8 @@ sections in call order: the lazy tags.scm prewarm (`ingest_prewarm.h`), the para
 (`ingest_parsepool.h`), the document post-pass (`ingest_docpass.h`), and the build-model tail —
 dedup, symbol assignment, span attribution, ordered emit (`ingest_model.h`).
 
+`--doctor`'s `layout` row compares the shared model's recorded `sizeof`/`alignof` facts across translation units and reports evidence of a possible mixed binary instead of guessing which object is stale; agreement covers only the registered facts.
+
 **Crawl order is deterministic, and that is load-bearing.** The walk *collects every candidate path
 first*, sorts them lexicographically by byte, and only then assigns node IDs and parses. Node IDs are
 indices into that sorted list, so they are stable across runs of the same tree; if IDs followed
@@ -46,12 +48,15 @@ runs. The parse itself runs one tree-sitter parser per worker thread and merges 
 lists afterwards, which is safe precisely because the definitions and references are re-sorted before
 they are used — collection order never reaches the output.
 
-**`.gitignore` is not consulted.** Skipping is a fixed, committed denylist (`kCrawlSkipDirs[]` in
-`src/ingest.h`, shared with the CMake walk in `darkflags.h` so the two crawlers cannot disagree about
-what counts as source), not a per-repository ignore file. That is a real difference from a
-`.gitignore`-aware tool in both directions: a build directory this repository happens not to ignore is
-still pruned, and a directory a project ignores but that is not on the list is still indexed. What is
-skipped:
+**`.gitignore` is consulted, after the denylist.** Skipping starts from a fixed, committed denylist
+(`kCrawlSkipDirs[]` in `src/ingest.h`, shared with the CMake walk in `darkflags.h` so the two crawlers
+cannot disagree about what counts as source). In a git work tree the crawl then also honours git's own
+ignore verdict — one `git ls-files --others --ignored --exclude-standard --directory` fork per root, so
+the answer is git's and never a re-implemented matcher — and `--no-ignore` turns that half off. The
+denylist still prunes a build directory the repository happens not to ignore; what the repository
+ignores leaves the map and is disclosed as `ignored_files=` / `ignored_dirs=`, and the `--grep`
+unindexed scan reads none of it either (a gitignored file of an unindexed extension is in no class at
+all, the same treatment an `--exclude`'d one gets). What the denylist skips:
 
 - **directories by NAME:** `.git`, `.claude`, `.hg`, `.svn`, `node_modules`, `vendor`, `third_party`,
   `.cache`, `build`, `dist`, `out`, `target`, `.venv`, `venv`, `__pycache__`, `.idea`, `.vscode`,
@@ -91,7 +96,7 @@ can only over-count), and the vendored scanner additionally carries the one-line
   `*_pb2.py`, `*.pb.go`.
 
 Ingest never throws — a bad file, a missing grammar or a corrupt cache degrades and prints a one-line
-`DEGRADED_PATH_ALERT` to stderr. **The ordinary denylist prunes above are silent**, deliberately: they
+`DISCLOSE( msg )` trace to stderr in debug builds. **The ordinary denylist prunes above are silent**, deliberately: they
 are the normal state of every crawl and a note per skipped directory would be noise, not evidence. The
 size-ceiling drops sit between the two — silent on stderr, but *counted* into the header's
 `skipped_oversize=N`, so a corpus that shrank says so in the output rather than vanishing quietly.
@@ -119,30 +124,204 @@ Two of those carry a stated floor rather than a silence. **PHP**: dynamic dispat
 those sites produce no edge; a `use` directive is captured for `--uses`/`--deps` but never narrows a
 call, because PSR-4 maps a namespace onto a directory through a `composer.json` block this tool does
 not read. **Lua**: inheritance *is* `setmetatable( D, { __index = B } )`, an ordinary runtime call
-over an ordinary table, so a Lua corpus correctly reports no inheritance edges at all, and `require`
-is a plain function call rather than an import directive (as in Ruby), so a `.lua` file is never a
-node in the `--deps`/`--arch` graph. Both floors are asserted from the outside by
-`test/phpcheck.sh` and `test/luacheck.sh` so they stay decisions rather than drift.
+over an ordinary table, so a Lua corpus correctly reports no inheritance edges at all. A bare `require`
+call is read the way `package.path` reads it: a string-literal argument that resolves to exactly one
+file adds a dependency edge. Dots become directory separators (`require "a.b"` finds `a/b.lua`), a
+package also resolves through its `init.lua` (`require "pkg"` finds `pkg/init.lua`), and the file is
+looked for from the requiring file's directory up to the crawl root, directly and under `src/` and
+`lua/`. A qualified call (`loader.require "x"` is somebody's own function, not the loader), a dynamic or
+concatenated argument, an external module, or a name that more than one file answers adds no edge. Both
+floors are asserted from the outside by `test/phpcheck.sh`, `test/luacheck.sh` and
+`test/luarequirecheck.sh` so they stay decisions rather than drift.
 
 <a id="elixir-extraction"></a>
 
-Elixir's grammar models definitions as calls. Its tags query selects candidate shapes; the small
-`ingest_elixir.h` capture filter checks definition keywords, excludes declaration-head/pattern references, module attributes and
-quoted AST, and locates block/keyword bodies. `defimpl P, for: T` is indexed as the module Elixir itself
-generates — `P.T`, an ABSOLUTE name that nesting inside a `defmodule` does not qualify — so an implementation
-clause that shares a name with the enclosing module's function is a second row with its own canonical id,
-not a dropped definition. Macros, guards and literal ExUnit tests are parsed `fn` symbols. Local and
-remote calls, executable default expressions and pipes produce references; module scope qualifies definitions.
-Default-expression edges are syntactic possibilities; they are not narrowed by which arguments a caller supplies. Alias/import/use
-resolution, macro expansion, dynamic dispatch and protocol implementation DISPATCH remain outside this
-initial port: implementations are indexed, but a call through a protocol is not narrowed to them. Bare identifiers outside pipes are omitted because they may be variables or
-zero-arity calls. Metrics count syntactic controls, clause arms and boolean joins, not expanded macros;
-arity narrowing is deliberately disabled (default arguments and pipes change call arity).
-`test/elixircheck.sh` covers extraction, call-site mutation, metrics and cold/warm determinism.
+Elixir `.ex` and `.exs` files use the vendored grammar and the shared tags-query engine. No Elixir,
+Mix, language server, compiler, or application execution is required. `ingest_elixir.h` interprets the
+grammar's ordinary call nodes as declarations and collects lexical facts; `elixir_resolve.h` uses those
+facts in the graph and CLI/MCP use-site queries. The existing binding and reference cache records carry
+the facts without adding fields to every language's symbols or references.
+
+The extraction covers nested and explicitly rooted modules, structs/exceptions, protocols, single- and
+multi-target implementations (including an implicit enclosing-module target), public/private functions,
+macros, guards, delegates, operator definitions, guarded clauses, and literal ExUnit tests. Functions
+are identified by **module, name and arity**: `MyApp.Work::run/1` selects one arity; the existing
+`MyApp.Work::run` selector selects all arities. Each written clause retains its source span. Default
+arguments add callable lookup arities that resolve to those source definitions, without fabricated bodies.
+`defimpl P, for: [A, B]` produces separate `P.A` and `P.B` scopes, each with its own calls.
+
+Aliases (including groups and `as:`), `require ... as:`, nested-module aliases, `__MODULE__` and
+`Elixir.` root qualification resolve in lexical source order. Imports support `only`, `except`,
+`:functions` and `:macros`; private functions are callable only locally. Local calls, static remote
+calls, zero-arity bare calls, pipes, named captures, executable defaults, and `defdelegate to:/as:`
+share the arity-aware resolver. Bound parameters and pattern variables are excluded as calls. A
+missing module, excluded import or wrong arity stays unresolved; an unrelated same-named function
+does not supply an edge. Multiple matching clauses remain candidate destinations.
+
+Types (`@type`, `@typep`, `@opaque`) and callbacks (`@callback`, `@macrocallback`) are navigable
+declarations, named `@type name/N` and `@callback name/N`. Ordinary attributes are `@name` symbols;
+their expressions can carry calls and reads appear in `--uses`. Documentation, specs and other
+metadata do not become executable calls. Alias/import/require/use and behaviour declarations supply
+module dependencies resolved through declared module identities, regardless of umbrella/file layout.
+`@behaviour` and `defimpl` supply contract/implementation relationships for `--uses` and `--lego`.
+
+**Static limits:** quoted AST and macro-generated definitions are not expanded. `use` records the
+dependency, but does not execute `__using__`; framework DSLs and generated Phoenix/Ecto functions
+therefore need an explicit source definition to appear. A call that only an injected import could
+answer has no lexical candidate: no edge is minted from a same-named function elsewhere, and the call
+is counted in the map header's `unresolved=` and every answer's `graph_unresolved=` when some
+definition spells the name (an undefined spelling has no header surface, as in every language). Runtime module receivers, `apply`, anonymous
+function dispatch, protocol dispatch by runtime argument type, and HEEx template execution are not
+inferred. Type expressions are indexed as declarations, not type-checked. Default-expression edges
+are narrowed by arity alone, and only where a bodyless head declares the defaults: a call that omits a
+defaulted argument reaches that head beside the clauses, a call that supplies every argument reaches
+the clauses alone (the fifth rule below), and a head that is reached carries every default expression
+it declares, whichever one the call omitted. A default written on a clause that has a body stays on
+that clause's symbol, so every call to it reaches the default expression, supplied argument or not.
+Metrics count written controls, clauses and boolean joins before macro expansion. These limits apply
+to CLI and MCP alike.
+
+Five resolution rules, each reproduced against Elixir 1.20.3 / OTP 29 before the merge and each gated
+with its control in `test/elixirnamearitycheck.sh` (G)–(K) over `test/elixirresolvefix`: a later
+`import M, except: [...]` **subtracts** from the `import M, only: [...]` in force instead of replacing it,
+so a function the only-list never named stays un-imported and the refusal is counted
+(`src/elixir_resolve.h`); a dotted nested declaration such as `defmodule Inner.Deep` inside `defmodule
+Outer` aliases its first segment, `Inner` → `Outer.Inner`, from that point on, so a later
+`Inner.Deep.target()` names the nested module even beside a top-level `Inner.Deep`, and a call written
+before the declaration still names the top-level one (`src/ingest_elixir.h`); inside a multi-target
+`defimpl`, `alias __MODULE__, as: Current` binds each implementation's `Current.f()` to its OWN `f`,
+as `__MODULE__.f()` does, while a literal `P.A.f()` stays literal (`src/ingest_elixir.h`,
+`src/ingest_sidecap.h`); a named capture of an underscore-prefixed function (`&_seed/0`) is a call of
+that function — the underscore rule is for unused variables, and a bare `_seed` read still is one
+(`src/ingest_elixir.h`); and a call that omits a defaulted argument reaches the bodyless head that
+evaluates the default beside the clauses, so `--path` and `--impact` see the default expression's calls
+from that caller, while a call that supplies the argument reaches the clauses alone
+(`src/elixir_resolve.h`). One gap stays open: executable `unquote(...)` and `bind_quoted:` expressions
+under `quote` are omitted with the rest of the quoted-AST filter, so a helper called only from inside
+an `unquote` has no caller edge from its macro.
+
+`test/elixircheck.sh`, `test/eliximportcheck.sh` and `test/elixirsemanticcheck.sh` cover extraction,
+metrics, exact target selection against decoys, lexical boundaries, contracts, CLI/MCP use-site parity,
+call-site mutation and cold/warm determinism; `test/elixirnamearitycheck.sh` covers what the `name/N`
+key must not cost the verbs around it (the counted `use` drop, pattern bindings on the right of `=`,
+`--edit-check` and `--quality-delta` across an arity change, `--for` by exact name) and the five
+resolution rules above. This extraction
+uses parser revision 95 (rich 96), mirrored in `src/quality.h`; record format 21 is unchanged. The
+quality key (`pathQualifiedKey`) folds the arity out of an Elixir name — `run/1` and `run/2` are one
+piece of source, as C++ overloads of `f` are — which is snapshot scheme 11.
+<a id="dart-extraction"></a>
+**Dart extraction.** tree-sitter-dart makes `function_body` a SIBLING of `function_signature` /
+`method_signature`, never a `body` field and never a child. The shared ancestor walk in
+`ingest_sidecap.h` therefore finds no body, the definition's span stops at the signature, and every
+call inside the body attributes to the nearest ENCLOSING symbol instead — measured on
+`test/dartfix` before the fix: `square` landed on the class `Calculator` rather than the method
+`accumulate`, and the three top-level edges were lost entirely (5 edges where 8 were expected). A
+`Lang::Dart` arm adopts the immediately-following `function_body` sibling and runs the span, the
+row extent and `complexityOf` through it — the same shape LB-E already uses for a test-macro
+block. An abstract member (`void f();`) has no such sibling, so it stays a declaration. Every
+other language is byte-identical across the change (verified against the pre-change binary on
+`src/` and on the multi-language `test/` fixture corpus). `test/dartcheck.sh` covers extraction,
+cascades, the constructor floor, call-site mutation, metrics and cold/warm determinism.
+
+<a id="kotlin-extraction"></a>
+**Kotlin extraction.** tree-sitter-kotlin gives its declarations no named fields, so
+`queries/kotlin/tags.scm` captures positionally and two ingest arms follow. `function_body`,
+`class_body` and `enum_class_body` are positional CHILDREN, so the ObjC body fallback in
+`ingest_sidecap.h` covers Kotlin too — without it every Kotlin definition read as bodyless. And
+`kotlinEnclosingScopeOf` (`ingest_names.h`) walks class/object/companion owners by their positional
+`type_identifier`, so members carry scoped canonical ids. A bodyless Kotlin TYPE
+(`data class User(val name: String)`, `class Token`, `interface Marker`) is still a definition —
+Kotlin has no forward declarations — so `isDefinitionNotDeclaration` (`model.h`) keeps the decl/def
+collapse from deleting it, and the collapse never lets a Kotlin body evict another language's
+declaration or the reverse. Kotlin and Java share one call graph through `langCompatible`, and
+`keepOwnJvmLanguageCandidates` (`graph.h`) lets a reference reach the other JVM language only when its
+own defines no candidate of that name, so adding `.kt` files never moves a Java edge (measured on
+square/retrofit: `Response.body` keeps its 279 callers). Stated floors: a navigation receiver (`A.f()`)
+does not narrow candidates, so a qualified call binds a same-named Kotlin definition over the Java class
+it names; that same own-language rule runs before the locality tiers, so a Kotlin call can lose a Java
+target in its own directory to Kotlin definitions elsewhere; an `expect` TYPE is a definition like any
+other, so a multiplatform `expect`/`actual` type pair is two candidates (measured on ktor against a build without the rule, it removes 138 Kotlin (caller, callee)
+pairs and adds 34; 48 of the removed and 4 of the added call a name ktor declares as an `expect`/`actual`
+class, interface or object); `.kts` is not a `kLangTable` row; and
+`ev=` is withheld (`evCountedLang`). A file whose string templates nest past `kMaxKotlinStringNestDepth`
+(128) is refused before the parse and rowed by `--skipped`, and the vendored scanner itself refuses a push
+past its 512-entry stack instead of aborting (`third_party/patches/kotlin/001-stack-push-no-abort`; `002` fixes a
+triple-quoted string that ends in an escaped `$`). `test/kotlincheck.sh`
+covers extraction, both bridge directions in flat and split layouts, the Java-edge invariant, the
+bodyless-type collapse, hostile nesting, metrics and determinism.
 
 Elixir extraction landed at revision 78 (rich 79) — `kParserVer` in `src/ingest_cache.h`, mirrored by
 `kIngestParserVerMirror` in `src/quality.h`. The required `qschemetrip` source-change pin is refreshed
 for this extraction change; snapshot scheme 8 is unchanged.
+
+<a id="gdscript-extraction"></a>
+
+GDScript needs no capture-filter module: unlike Elixir, its grammar carries real definition nodes, so
+`queries/gdscript/tags.scm` alone is the extraction. A `.gd` FILE IS A CLASS BODY — `class_name` names
+the class and file-scope `func`/`var` are its members — so a file-scope `func` is `fn` (as every other
+language treats a file-scope definition) while a `func` inside an explicit `class Inner:` is `method`.
+`enum` rides `@definition.type` as Java/C#/TypeScript do. Two capture choices are forced by gates in
+`ingest_names.h`, not taste: enum MEMBERS ride `@definition.constant` because `@definition.enummember`
+is gated by `isPyEnumMemberTarget` and would silently drop every GDScript enumerator, and member
+variables ride `@definition.var` because `fieldCaptureKept()` returns false for every language but
+Python and C/C++. A `signal` has no SymKind of its own and is DISCLOSED as `t="var"`. The Godot 4
+spellings were read off real parses, not node types; `queries/gdscript/tags.scm` records which shapes
+are not what the node-type list implies.
+
+THE FLOOR, measured before vendoring: 98.88% of 2938 real `.gd` files parse clean. Three upstream
+grammar gaps survive — the `%` unique-name inside a path, a column-0 comment in an indented block, and
+the Godot 3 RPC keywords still reserved — and none is patched (guardrail G3). Recovery is LOCAL, so a
+file holding them still yields every definition and call edge; `test/gdscriptcheck.sh` asserts that
+survival rather than the failure. `preload`/`load("res://…")` resolution is NOT implemented, so a `.gd`
+file is never a node in the `--deps`/`--arch` graph and `dependencyCapable()` is not claimed for it.
+`extends` produces NO inheritance edge yet either: the base name is not captured, so a subclass and
+its base are unrelated in the graph and `--uses` on the base reports no `role="extends"` site.
+`.tscn`, `.tres` and `.gdshader` are not indexed.
+
+GDScript extraction landed at revision 98 — `kParserVer` in `src/ingest_cache.h`, mirrored by
+`kIngestParserVerMirror` in `src/quality.h`; snapshot scheme is unchanged.
+
+<a id="astro-extraction"></a>
+
+Astro is the first extension whose parse is restricted to a SUB-RANGE of the file. An `.astro` file is a
+`---`-fenced frontmatter block (TypeScript) followed by a template, and only the frontmatter is parsed —
+through the one `ts_parser_set_included_ranges()` call in this tree (`src/ingest_sidecap.h`,
+`astroFrontmatterRange`/`IncludedRangeGuard`), applied at all three parse drivers so the symbol index, the
+span tiers and the AST-query pass cannot disagree. The fences are found by BYTES, never by a parse.
+
+THE FLOOR, measured before the row was added, on 1902 real `.astro` files (withastro/{docs,astro,starlight},
+onwidget/astrowind, satnaing/astro-paper and two private sites). Mapping `.astro` to the TypeScript grammar
+WHOLESALE degrades **1878 of 1902** files, median ERROR-byte ratio 0.33–1.00 per corpus — against the 0.0081
+`.metal` ships at and the 0.123 the C grammar was REJECTED at for CUDA. Frontmatter-only degrades **1 of
+1902**, and that one file is `astro-frontmatter-syntax-error.astro`, which Astro ships deliberately to test
+its own error reporting. That gap is why the template is refused rather than error-recovered.
+
+WHAT IT CANNOT SEE, and every item is a real loss, not a rounding:
+- **The template half is not read at all.** A `<script>` body, an `{ expression }` interpolation and a
+  `client:*` directive are all invisible, so a call made ONLY from the template produces no edge. On
+  withastro/docs the wholesale parse found 2375 edges against frontmatter-only's 2309; the difference is
+  template-side calls plus error-recovery noise, and this build takes none of it.
+- **An `.astro` file reports `lang="ts"`.** It rides `Lang::TypeScript` deliberately: `langCompatible()`
+  admits only same-`Lang` pairs, so a `Lang::Astro` of its own would not resolve a frontmatter call into the
+  `.ts` service it imports — which is the entire point of issue #67.
+- **Most recovered callers are `<file-scope>`.** Astro frontmatter is module-level code, so its top-level
+  calls are owned by the module-scope node issue #60 mints, not by a named function.
+- **A `---` inside a template literal or a comment in the frontmatter ends the block early.** The scan is
+  lexical: symbols before the stray fence are kept, the rest are lost, and the file is flagged
+  `degraded-parse`. The two refusals are NOT the same answer: a
+  file with no fence at all is an ordinary template-only component and is silent, while a file that opens
+  `---` and never closes it is frontmatter we can see the start of and cannot extract — that one is
+  disclosed through `ExtractShortfall` and appears as `<f why="extract-partial"/>` under `--skipped`,
+  because a silent zero there is exactly what the honesty guardrail refuses. `test/astrocheck.sh` pins
+  both shapes, including that the ordinary ones stay undisclosed.
+- No Astro grammar is vendored. `virchau13/tree-sitter-astro` at the revision the ecosystem pins
+  (`213f6e69`, 2025-04-19) lexes the whole frontmatter as ONE opaque external token and ships no `tags.scm`,
+  so it yields no definitions; `PRRPCHT/tree-sitter-astro-next` has the same design and no adoption.
+- `.vue`, `.svelte` and `.mdx` are still not indexed as code. The included-range primitive this adds is what
+  each of them would reuse.
+
+Astro extraction landed at revision 122 — `kParserVer` in `src/ingest_cache.h`, mirrored by
+`kIngestParserVerMirror` in `src/quality.h`; snapshot scheme is unchanged.
 
 The three config lanes are *data*, not code: they emit `t="sec"` symbols and **zero call edges**, and
 `langCompatible` keeps a config key from ever resolving a same-spelled code symbol. They differ in
@@ -190,6 +369,17 @@ the affected edges are marked `prov="scip"`.
 **False edges are expected and acceptable.** The deliverable is an importance *ranking*, not a sound
 call graph, and the first XML comment in every run says so.
 
+**References as values are not edges.** A function named in a value position — a struct-field or
+dict/object/array initialiser, a call argument, an assignment, a decorator — is captured by
+`src/ingest_valuerefs.h` as `RefRole::Value`, and a call *through* such a value (a called parameter,
+`tbl[k](…)`) as `RefRole::Through` (the mechanism is ported from codebase-memory-mcp; THIRD_PARTY.md).
+Neither role enters the CSR, PageRank or any count. `src/valuerefs.h` resolves them by name with the
+call graph's visibility (same file first; C `static` stays in its file; JS/TS/Python need a named
+import; Go stays in its package) and serves them as separate `<vr>` rows with `value_refs=N`: where
+the value lands (`into=`), and which functions may call through that slot (`called_by=`/`through=`).
+A row is a clue to follow, not a proven call; `--dead-code` and `--safe-delete` treat a value use as
+a reason a function is not dead.
+
 ### graph — the CSR
 
 **Nodes are symbols. Files are not nodes.** A file is a serialization attribute. If files were
@@ -230,7 +420,9 @@ Edge rules:
 
 ### rank — Personalized PageRank
 
-Power iteration over the in-edge CSR, parallelized over **fixed contiguous row blocks**. Constants
+Power iteration over the in-edge CSR, single-threaded. Every reduction (the dangling mass, the L1 residual)
+folds **fixed contiguous blocks** of `kReductionBlockSize = 1024` in canonical index order, so the summation tree
+is a property of the source, never of thread count or timing. Constants
 live in a named configuration struct, not as literals in the loop: damping `α = 0.85`, L1 residual
 tolerance `τ = 1e-6`, `maxIter = 100`, diff-teleport concentration `β = 0.7`.
 
@@ -293,7 +485,7 @@ the teleport prior — so `residual_k ≤ 2·α^k`, and `2·0.85^k < 1e-6` at `k
 raise `α` toward 1, or hand the ranker a shape the contraction argument stops covering, and the
 attribute is what tells a reader before the ranking does.
 
-The mechanism matters as much as the attribute. `DEGRADED_PATH_ALERT` still fires on the truncating
+The mechanism matters as much as the attribute. `DISCLOSE( msg )` still fires on the truncating
 exit and is still the only thing that names *which site* degraded — but it is `#ifndef NDEBUG`, so
 on every shipped Release binary it is not code at all. Before this contract, `rankGraphTeleport`
 discarded the kernel's return value, which meant a Release build emitted a ranking from an
@@ -337,7 +529,7 @@ The schema is terse by design — a legend comment once at the top, then `<r>` r
 The argument parser is hand-rolled and table-driven. A flagless run emits the core map; every flag is
 additive and gated by a `Config` field.
 
-The MCP server exposes 31 verbs. **All of them** are a thin front door onto **the same
+The MCP server exposes 33 verbs. **All of them** are a thin front door onto **the same
 computation and the same renderer** as a CLI sibling — one output shape, two surfaces. That is a
 deliberate constraint: a verb that rendered differently over MCP would be a second implementation to
 keep honest.
@@ -371,9 +563,12 @@ extraction change bumps the parser version and costs one cold re-parse. Warm out
 **byte-identical** to cold output by a gate — a cache that changes the answer is a bug, not a
 tradeoff.
 
-Its blob holds ONE superset of records per tree and verb class, shared by every configuration run
-against that tree: the key deliberately ignores `--exclude` and `--max-file-size`, because keying on
-them instead was built, measured and reverted (`docs/EVALS.md`, "The auto-cache key ignores
+Its blob holds ONE superset of records per tree, verb class and cache format, shared by every configuration run
+against that tree. The format is in the name (`ripwire-<rootKey>-lean-c<format>p<parser>.bin`: `kCacheVersion` and the
+class's parser version), so two builds of different formats on one tree each keep their own blob instead of
+refusing and rewriting one; an explicit `--cache=PATH` keeps the name the user gave it. Within one format
+the key deliberately ignores `--exclude` and `--max-file-size`, because keying on them instead was built,
+measured and reverted (`docs/EVALS.md`, "The auto-cache key ignores
 `--exclude`"). Sharing is made cheap by the blob's shape rather than by the key. A **record offset
 table** (`pathHash → offset, length, contentHash, recordSum`, ascending, binary-searched) lets a run
 deserialise only the records for the files it crawled, and a save carries over — byte for byte — the
@@ -429,7 +624,8 @@ fixed-canonical-merge-order reduction strategy this one does — independent agr
 strategy is right — and then partitions it by `hardware_concurrency()`, inheriting exactly this
 class. The strategy is only half the property; the partition has to be a property of the source.
 
-The gate is `./build/ripwire DIR > a; ./build/ripwire DIR > b; diff -q a b`, run three times.
+The gate is `t=$(mktemp -d); ./build/ripwire DIR >"$t/a"; ./build/ripwire DIR >"$t/b"; diff -q "$t/a" "$t/b"`, run three
+times, with both outputs outside `DIR` so the second run does not crawl the first run's output.
 Anything that makes output depend on timing is a bug even when the ranking still looks right.
 
 Tests follow from this. Float comparisons assert a **tolerance band** and the top-K **order**, never
@@ -485,14 +681,14 @@ why, in the output, where the caller reads it.
 
 CI builds and runs the full suite twice — once `Release`, once with no build type.
 
-`Release` defines `NDEBUG`. Under `NDEBUG`, `VERIFY` lowers to `__builtin_assume` and
-`DEGRADED_PATH_ALERT` compiles away entirely. Both facts have teeth:
+`Release` defines `NDEBUG`. Under `NDEBUG`, `ASSUME` lowers to `__builtin_assume` and
+the `DISCLOSE( msg )` trace compiles away entirely. Both facts have teeth:
 
-- **Release catches optimizer-only bugs.** With `__builtin_assume` in play, a `VERIFY( p != nullptr )`
+- **Release catches optimizer-only bugs.** With `__builtin_assume` in play, an `ASSUME( p != nullptr )`
   followed by a defensive `if( p == nullptr ) return;` licenses the optimizer to delete the defensive
   branch. Code that is correct at `-O0` can be wrong at `-O2`, and only the Release build sees it.
 - **The plain build catches degrade paths.** A gate that asserts a degrade path asserts on
-  `DEGRADED_PATH_ALERT` output. Compiled out, that gate cannot observe what it asserts — it passes
+  `DISCLOSE( msg )` output. Compiled out, that gate cannot observe what it asserts — it passes
   while being blind. This happened here: for three development cycles, every degrade-path gate in CI
   was green for exactly that reason, and a real fix to one of them was invisible to CI until after it
   landed.

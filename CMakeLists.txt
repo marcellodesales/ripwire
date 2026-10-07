@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 # The version string lives in exactly ONE place — this project() call. --version (main.cpp)
 # reads it via the generated version.h below; test/versioncheck.sh asserts the two never drift.
-project(ripwire VERSION 0.5.0 LANGUAGES C CXX)
+project(ripwire VERSION 0.6.5 LANGUAGES C CXX)
 
 # ---- language standards (C++23 for our own code / C11 for the vendored C dependencies) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -22,6 +22,20 @@ foreach(_ripwire_mode RIPWIRE_ASAN RIPWIRE_TSAN RIPWIRE_FUZZ)
 endforeach()
 if(_ripwire_verification_mode_count GREATER 1)
   message(FATAL_ERROR "RIPWIRE_ASAN, RIPWIRE_TSAN, and RIPWIRE_FUZZ are mutually exclusive; use separate build trees")
+endif()
+
+# ---- the MSVC C runtime the ASan flavour has to use, chosen BEFORE any target exists ----
+# Only the RELEASE DLL runtime (/MD) is shipped with an AddressSanitizer build on the MSVC ABI: clang-cl refuses the
+# debug one at the driver, "invalid argument '-MDd' not allowed with '-fsanitize=address'", and cl.exe's own /fsanitize
+# =address has the same rule. A plain configure (no CMAKE_BUILD_TYPE, which is what CONTRIBUTING.md's ASan tree uses)
+# selects /MDd by default, so the ASan tree could not configure at all on Windows — the third failure of @lennix1337's
+# validation run of #44. CMAKE_MSVC_RUNTIME_LIBRARY is read into each target's MSVC_RUNTIME_LIBRARY property at
+# add_executable/add_library time, so it has to be set here, above every target block, not beside the sanitizer flags
+# far below. Never overridden if the configurer already chose one: an explicit -DCMAKE_MSVC_RUNTIME_LIBRARY is a
+# deliberate answer to this same question and this build has no better one. Inert off Windows and off the ASan tree.
+if(WIN32 AND MSVC AND RIPWIRE_ASAN AND NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+  message(STATUS "RIPWIRE_ASAN: MSVC runtime pinned to MultiThreadedDLL (/MD) — the sanitizer runtime has no debug-CRT build")
 endif()
 
 # A flag probe is insufficient: Apple Clang accepts -fsanitize=fuzzer but some Xcode distributions omit
@@ -50,8 +64,8 @@ if(RIPWIRE_FUZZ)
 endif()
 
 # ---- optimization profile (portable by default) ----
-# default: arch-neutral on anything that isn't Apple Silicon; auto-detected apple-m1 tuning (safe generic
-# tuning, not a native-host bake-in) on real Apple Silicon. -DRIPWIRE_NATIVE=ON: dev-machine-only opt-in
+# default: the TARGET architecture decides — -march=x86-64-v3 for x86-64 (the owner's floor), generic apple-m1
+# tuning (not a native-host bake-in) for Apple Silicon, arch-neutral otherwise. -DRIPWIRE_NATIVE=ON: dev-machine-only opt-in
 # (-march=native bakes in host CPU extensions — never for a binary that ships or runs elsewhere).
 # See cmake/PortableFlags.cmake for the full rationale and the RIPWIRE_PRETEND_LINUX test-only hook.
 # DECLARED here, beside the other five options, rather than left to be conjured by a bare -D on the
@@ -62,15 +76,26 @@ option(RIPWIRE_NATIVE "build with -march=native (DEV MACHINES ONLY — bakes in 
 include(cmake/PortableFlags.cmake)
 add_compile_options(${RIPWIRE_ARCH_FLAGS})
 
+# Windows adds one source (src/infra/os_win32.cpp), a manifest and three system libraries to each target — all in
+# cmake/Windows.cmake. Elsewhere the hook is empty, so the target blocks below call it unconditionally.
+if(WIN32)
+  include(cmake/Windows.cmake)
+else()
+  function(ripwire_windows_target tgt)
+  endfunction()
+endif()
+
 # ---- link-time optimization: -DRIPWIRE_LTO=ON ----
 # The one change the optimization-remarks pass actually justified (docs/OPTREMARKS.md, finding F1).
 #
-# WHAT THE REMARKS SAID. In src/ingest.cpp — where the profiler puts ~26% of a cold run, in
-# `captureTagsFacts` — 397 of 636 distinct `inline/NoDefinition` remarks name a tree-sitter C entry
-# point (ts_node_start_byte, ts_node_end_byte, ts_node_type, ts_query_capture_name_for_id, …). Those
-# are three-line accessors, but they live in separately compiled C objects, so each one is an opaque
-# call that also acts as a memory barrier: 5448 `gvn/LoadClobbered … clobbered by call` remarks in
-# that same TU are the downstream damage. No source edit reaches this — the definitions are in another
+# WHAT THE REMARKS SAID. In the ingest translation unit — where the profiler puts ~24% of a cold run,
+# in `captureTagsFacts` (src/ingest_sidecap.h since the split) — 831 of 1437 distinct
+# `inline/NoDefinition` remarks name a tree-sitter C entry point (ts_node_child_by_field_name,
+# ts_node_is_null, ts_node_type, ts_node_start_byte, …). Those are three-line accessors, but they live
+# in separately compiled C objects, so each one is an opaque call that also acts as a memory barrier:
+# 7683 `gvn/LoadClobbered … clobbered by call` remarks in that same TU are the downstream damage.
+# (Counts re-derived 2026-09-10 over the whole TU; the original 397/636 and 5448 were measured against
+# src/ingest.cpp alone, which after the split is 0.2% of it — docs/OPTREMARKS.md §8.) No source edit reaches this — the definitions are in another
 # translation unit, which is precisely what LTO fixes.
 #
 # WHAT IT MEASURED (this repo as corpus, 937 files, Apple Silicon; FOUR independent interleaved A/Bs,
@@ -90,11 +115,11 @@ add_compile_options(${RIPWIRE_ARCH_FLAGS})
 # trade. The person building to USE ripwire wants the fast binary and is already on Release, so they
 # get it without asking. Both are overridable: -DRIPWIRE_LTO=ON on a dev tree, OFF on Release.
 #
-# DELIBERATELY NOT COUPLED TO NDEBUG/VERIFY. It would be tidier to say "checked build = slow, real
+# DELIBERATELY NOT COUPLED TO NDEBUG/ASSUME. It would be tidier to say "checked build = slow, real
 # build = fast" and fold LTO into the Release flavour, but that puts LTO and the assertions in
 # mutually exclusive builds — and LTO is precisely an OPTIMIZER change, the class of bug CLAUDE.md
 # says the Release leg exists to catch. Keeping the axes independent means a CI leg can run LTO WITH
-# VERIFY and DEGRADED_PATH_ALERT live, which is the only configuration that can catch an
+# ASSUME and the DISCLOSE( msg ) trace live, which is the only configuration that can catch an
 # LTO-induced miscompile the assertions would have flagged. Coupling them would create the blind
 # spot exactly where this optimization can hurt.
 # Determinism is unaffected: pagerank.cpp's -fno-fast-math is a per-function IR attribute that
@@ -117,6 +142,12 @@ else()
 endif()
 if(RIPWIRE_LTO)
   include(CheckIPOSupported)
+  if(WIN32 AND CMAKE_EXE_LINKER_FLAGS)
+    # ClangCL + lld-link does not inherit the SDK /libpath entries from the parent configure during
+    # check_ipo_supported()'s try_compile. Propagate the explicitly selected linker flags so the LTO
+    # capability check exercises the same Windows CRT/toolchain that the real targets will link against.
+    list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_EXE_LINKER_FLAGS)
+  endif()
   check_ipo_supported(RESULT _ripwire_ipo_ok OUTPUT _ripwire_ipo_why LANGUAGES C CXX)
   if(NOT _ripwire_ipo_ok)
     # Fail loudly. A silently-ignored LTO request produces a normal binary that someone then benchmarks
@@ -248,6 +279,8 @@ set(_ripwire_query_names
   java
   javascript
   json
+  gdscript
+  kotlin
   lua
   objc
   php
@@ -256,6 +289,7 @@ set(_ripwire_query_names
   rust
   swift
   toml
+  tsx
   typescript
   yaml)
 set(_ripwire_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -284,17 +318,34 @@ file(APPEND "${_ripwire_embedded_queries}" "}};\n\ninline constexpr std::string_
 # the two can never silently drift. Short build info (compiler id/version, build type) rides along so a
 # bug report's "ripwire --version" line is enough to reproduce the toolchain, no separate --doctor call.
 # CMAKE_BUILD_TYPE is empty for the plain dev configure the house style mandates (CLAUDE.md: "never
-# -DCMAKE_BUILD_TYPE=Release" locally — Release defines NDEBUG, which compiles DEGRADED_PATH_ALERT out).
+# -DCMAKE_BUILD_TYPE=Release" locally — Release defines NDEBUG, which compiles the DISCLOSE( msg ) trace out).
 # "unspecified" told a bug reporter nothing about what they actually ran; "dev" is the honest, specific
 # label for that configure (§P6.10, 2026-07-28 output audit) — it is the first thing a bug report pastes.
-if(NOT CMAKE_BUILD_TYPE)
-  set(_ripwire_build_type_str "dev")
+# A MULTI-CONFIG generator (Ninja Multi-Config, Xcode) has no CMAKE_BUILD_TYPE: the configuration is picked at
+# build time (`cmake --build b --config Release`), so "dev" would mislabel an NDEBUG binary, and gates that read
+# the token to decide whether alerts are compiled in would believe it. The token is `$<CONFIG>` there, and the
+# header is per-configuration too: one shared version.h is rewritten by whichever configuration stamped last, and
+# a cross-config Ninja Multi-Config build collapses the stamp into ONE command, so every configuration's binary
+# carried the first one's token. Each configuration owns generated/<Config>/version.h, searched ahead of
+# generated/. A single-config tree keeps generated/version.h and its exact command line
+# (test/buildtypestampcheck.sh).
+get_property(_ripwire_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(_ripwire_multi_config)
+  set(_ripwire_build_type_str "$<CONFIG>")
+  set(_ripwire_version_header "${_ripwire_generated_dir}/$<CONFIG>/version.h")
+  set(_ripwire_generated_include_dirs "${_ripwire_generated_dir}/$<CONFIG>" "${_ripwire_generated_dir}")
 else()
-  set(_ripwire_build_type_str "${CMAKE_BUILD_TYPE}")
+  if(NOT CMAKE_BUILD_TYPE)
+    set(_ripwire_build_type_str "dev")
+  else()
+    set(_ripwire_build_type_str "${CMAKE_BUILD_TYPE}")
+  endif()
+  set(_ripwire_version_header "${_ripwire_generated_dir}/version.h")
+  set(_ripwire_generated_include_dirs "${_ripwire_generated_dir}")
 endif()
-set(_ripwire_version_header "${_ripwire_generated_dir}/version.h")
 # Always run before the two executable targets. copy_if_different inside the script keeps the header's
-# mtime stable when neither HEAD nor tracked bytes changed, so this gives exact provenance without
+# mtime stable when neither HEAD nor tracked bytes changed (per configuration on a multi-config generator,
+# so switching --config does not rewrite the other's header), so this gives exact provenance without
 # recompiling main.cpp on every incremental build.
 add_custom_target(ripwire_version_stamp ALL
   COMMAND ${CMAKE_COMMAND}
@@ -306,6 +357,24 @@ add_custom_target(ripwire_version_stamp ALL
     -DRIPWIRE_COMPILER_VER=${CMAKE_CXX_COMPILER_VERSION}
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/version_stamp.cmake
   BYPRODUCTS ${_ripwire_version_header}
+  VERBATIM)
+
+# The producer identity (cmake/source_identity.cmake): one generated DEFINITION, compiled into both
+# executables, that src/quality.h keys its Snapshot caches on — so a blob one build computed is never
+# served to a build whose sources differ. A .cpp rather than a header: see src/sourceidentity.h.
+# It is a hash of src/ and queries/ only, the same for every configuration, so it is ONE shared file with its
+# OWN always-run target, never a second COMMAND of ripwire_version_stamp. In a cross-config Ninja Multi-Config
+# build, a target with a shared byproduct runs one configuration's commands only, so it cannot also write the
+# per-configuration version.h. Every other configuration's header is then "missing and no known rule"
+# (test/buildtypestampcheck.sh #6). Collapsing is harmless for the identity alone, whose command does not
+# depend on the configuration. copy_if_different keeps an unchanged tree from recompiling it.
+set(_ripwire_source_identity_cpp "${_ripwire_generated_dir}/source_identity.cpp")
+add_custom_target(ripwire_source_identity ALL
+  COMMAND ${CMAKE_COMMAND}
+    -DRIPWIRE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+    -DRIPWIRE_OUTPUT=${_ripwire_source_identity_cpp}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/source_identity.cmake
+  BYPRODUCTS ${_ripwire_source_identity_cpp}
   VERBATIM)
 
 # ---- tree-sitter CORE (static) ----
@@ -436,12 +505,6 @@ add_ts_grammar(markdown https://github.com/tree-sitter-grammars/tree-sitter-mark
 # LANGUAGE_VERSION]=[13,15] for core v0.26.9. Ships a scanner.c (raw/interpolated string literals)
 # which the macro picks up.
 add_ts_grammar(csharp https://github.com/tree-sitter/tree-sitter-c-sharp.git     cac6d5fb595f5811a076336682d5d595ac1c9e85)  # v0.23.5
-# Dart (.dart): nielsenko/tree-sitter-dart. Evaluated against pinned real corpora before vendoring:
-# dart-lang/pub @ 3c752254847aa09b28df821f3074283cc52a2ebd and flutter/packages @
-# 956ba9e272db9b04b90b3f27ba189e8fb4627975 both parsed 100% (537/537, 3894/3894), and this grammar
-# outperformed the alternate UserNobody14/tree-sitter-dart on the larger sdk stress corpus too. Ships a
-# scanner.c for template strings, block comments and metadata parens.
-add_ts_grammar(dart   https://github.com/nielsenko/tree-sitter-dart.git          b57d734c84f510bbd524097902cab671e4dbfca9)  # main @ 2026-09-09, MIT
 # C (.c): the official tree-sitter org grammar (structs/unions/enums/typedefs/function definitions +
 # object-like & function-like #define macros + calls). v0.24.1 -> ABI 15, in [MIN_COMPATIBLE,
 # LANGUAGE_VERSION]=[13,15] for core v0.26.9 (same ABI as csharp above). No external scanner (pure
@@ -456,6 +519,7 @@ add_ts_grammar(c      https://github.com/tree-sitter/tree-sitter-c.git          
 # LANGUAGE_VERSION]=[13,15] for core v0.26.9. Ships a scanner.c (inherited from cpp: raw strings)
 # which the macro picks up. The tag is lightweight, so the SHA below IS the tagged commit.
 add_ts_grammar(cuda   https://github.com/tree-sitter-grammars/tree-sitter-cuda.git 48b066f334f4cf2174e05a50218ce2ed98b6fd01)  # v0.21.1
+add_ts_grammar(dart   https://github.com/UserNobody14/tree-sitter-dart.git be07cf7118d3dba06236a3f19541685a68209934)  # ABI 15
 add_ts_grammar(elixir https://github.com/elixir-lang/tree-sitter-elixir.git 4b0c7118760af58a2e7081bbc8396e136f820b37)  # ABI 14
 # Lua (.lua): tree-sitter-grammars/tree-sitter-lua — there is no first-party Lua grammar under
 # tree-sitter/. v0.5.0 → ABI 15, in [MIN_COMPATIBLE, LANGUAGE_VERSION]=[13,15] for core v0.26.9.
@@ -464,6 +528,29 @@ add_ts_grammar(elixir https://github.com/elixir-lang/tree-sitter-elixir.git 4b0c
 # serialize (unlike toml's stateless one), but through create/destroy/serialize callbacks the core
 # owns — no new leak surface, and the G1 leg is run with the existing suppressions unchanged.
 add_ts_grammar(lua    https://github.com/tree-sitter-grammars/tree-sitter-lua.git 10fe0054734eec83049514ea2e718b2a56acd0c9)  # v0.5.0
+
+# Kotlin (.kt): fwcd/tree-sitter-kotlin — the only actively maintained Kotlin grammar. Pinned
+# to a bare commit on `main`, not the last tag (v0.3.8, Aug 2024): that tag predates a scanner
+# segfault fix (upstream #136), and main's scanner.c is still plain C, so add_ts_grammar's
+# scanner.c-only glob applies unchanged. Local-corpus probe (501 real .kt files, 2026-09-07):
+# 0.03% of bytes fall in ERROR subtrees, concentrated in one understood construct
+# (`@Composable () -> Unit`-shaped annotated function-type parameters: ~23% of Composable-heavy files
+# carry one, localized to a few bytes each with the enclosing declaration intact); zero ASan/UBSan
+# reports parsing the same corpus, despite the grammar's own scanner-segfault history. `.kts` is
+# deliberately not a kLangTable row yet — see the note there.
+add_ts_grammar(kotlin https://github.com/fwcd/tree-sitter-kotlin.git 1852ea17b7f60fb3f9d84e0b1555d56b46b39fb1)  # main, post-0.3.8
+
+# GDScript (.gd): PrestonKnopp/tree-sitter-gdscript — the only maintained GDScript grammar; there is no
+# first-party one under tree-sitter/. LANGUAGE_VERSION 14, inside [MIN_COMPATIBLE, LANGUAGE_VERSION]=[13,15]
+# for the vendored core. Ships a scanner.c (significant indentation: INDENT/DEDENT/NEWLINE, like Python's)
+# which the macro picks up. The SHA below is 12 commits ahead of upstream's newest tag — `git describe
+# --tags` reports v6.1.0-12-gc5c8fa4 — so it is a master commit by choice, not for want of a tag.
+# PARSE RATE MEASURED, not assumed, before vendoring (STEP 0 of prompts/add-a-language.md): 98.88% of 2938
+# real .gd files parse with zero ERROR/MISSING nodes — 13 open-source Godot projects (2611 files, 98.81%)
+# plus a private 327-file game (99.39%); 8159 error bytes out of 25.3 MB (0.032%). The three known blind
+# spots are disclosed in queries/gdscript/tags.scm and test/gdscriptcheck.sh; all three are upstream grammar
+# gaps, NOT patched here (guardrail G3 — this repo carries no grammar fork).
+add_ts_grammar(gdscript https://github.com/PrestonKnopp/tree-sitter-gdscript.git c5c8fa4861b5a4f04a7e60d97587fc3b6cc5639e)  # master, ABI 14
 
 # PHP (.php): the official tree-sitter org grammar. Like TypeScript this repo hosts TWO sub-grammars
 # in subdirectories — `php/` (the full one: HTML text interleaved with `<?php … ?>` blocks) and
@@ -497,16 +584,59 @@ add_ts_object(tstsx ${ts_typescript_SOURCE_DIR}/tsx/src)
 
 # ---- explicit, easy-to-extend executable source list ----
 # Later stages (graph/rank/serialize/main) get appended here. ingest.cpp + infra's
-# diagnostics.cpp (VERIFY/DEGRADED handlers link partner) are the foundation.
+# diagnostics.cpp (ASSUME/DEGRADED handlers link partner) are the foundation.
 set(RIPWIRE_SRCS
   src/ingest.cpp
   src/pagerank.cpp
   src/infra/diagnostics.cpp
 )
 
+# ---- RIPWIRE_LAYOUT_TU: the translation unit's own identity, where __BASE_FILE__ does not exist ----
+# src/structlayout.h registers each TU's struct layouts under a name that must differ per TU, so that two
+# objects compiled from one header with disagreeing layouts can be told apart (that is the whole point of the
+# registry, and --doctor's `layout` row reads it). __FILE__ is the wrong identity: the registration macro is
+# expanded inside headers, so it names the header and every TU would register the same string. GCC and Clang
+# spell the right one __BASE_FILE__; it is a compiler EXTENSION, not a platform feature, and cl.exe has no
+# counterpart, so structlayout.h #errors rather than guess (three C1189s on the cl leg, windows-latest CI,
+# 2026-09-20). The header documents the override and test/structlayoutcheck.sh already drives it with
+# -DRIPWIRE_LAYOUT_TU; this supplies it from the build system for the front end that needs it.
+#
+# Keyed on the COMPILER, never the platform: clang-cl targets Windows and HAS __BASE_FILE__, so a condition on
+# MSVC-ness (the CMAKE_CXX_COMPILER_FRONTEND_VARIANT test used for /fp:precise just below) would wrongly claim
+# this leg too.
+#
+# The value is the path RELATIVE to the source root, not ${CMAKE_CURRENT_SOURCE_DIR}/... . Relative is the
+# reproducible choice: two checkouts in different directories then register byte-identical strings, where
+# __BASE_FILE__ on the GNU legs already carries whatever absolute path CMake passed. Nothing here reaches the
+# map — LayoutRecord::unit is read in exactly two places, both in structlayout.h, a sort comparator and the
+# mismatch report — but a build-system value that differs by checkout directory is the shape that makes a build
+# non-reproducible later, and relative costs nothing.
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  set(_ripwire_layout_tus
+    src/main.cpp
+    src/tsprobe.cpp
+    ${RIPWIRE_SRCS}
+    test/verify_csr.cpp
+    test/verify_pagerank.cpp
+    test/verify_radix.cpp
+    test/verify_strkern.cpp
+    test/verify_os_win32_logic.cpp)
+  foreach(_ripwire_tu IN LISTS _ripwire_layout_tus)
+    set_property(SOURCE ${_ripwire_tu} APPEND PROPERTY COMPILE_DEFINITIONS "RIPWIRE_LAYOUT_TU=\"${_ripwire_tu}\"")
+  endforeach()
+  # The generated identity TU is written into the build tree, so its source path is absolute and varies by
+  # build directory; it registers under its bare name for the same reproducibility reason as above.
+  set_property(SOURCE ${_ripwire_source_identity_cpp} APPEND PROPERTY
+    COMPILE_DEFINITIONS "RIPWIRE_LAYOUT_TU=\"source_identity.cpp\"")
+endif()
+
 # The global profile uses -ffast-math, but PageRank reductions must not reassociate (the determinism
 # contract's no-reassociation rule — docs/ARCHITECTURE.md §3).
-set_source_files_properties(src/pagerank.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  set_source_files_properties(src/pagerank.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+else()
+  set_source_files_properties(src/pagerank.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+endif()
 
 # All grammar OBJECT files, gathered once so every target links the same set.
 set(RIPWIRE_TS_OBJECTS
@@ -524,12 +654,14 @@ set(RIPWIRE_TS_OBJECTS
   $<TARGET_OBJECTS:ts_ruby>
   $<TARGET_OBJECTS:ts_json>
   $<TARGET_OBJECTS:ts_lua>
+  $<TARGET_OBJECTS:ts_dart>
+  $<TARGET_OBJECTS:ts_kotlin>
+  $<TARGET_OBJECTS:ts_gdscript>
   $<TARGET_OBJECTS:ts_elixir>
   $<TARGET_OBJECTS:ts_php>
   $<TARGET_OBJECTS:ts_toml>
   $<TARGET_OBJECTS:ts_yaml>
   $<TARGET_OBJECTS:ts_csharp>
-  $<TARGET_OBJECTS:ts_dart>
   $<TARGET_OBJECTS:ts_c>
   $<TARGET_OBJECTS:ts_cuda>
   $<TARGET_OBJECTS:ts_markdown>
@@ -548,30 +680,34 @@ find_package(Threads REQUIRED)
 add_executable(ripwire_probe
   src/tsprobe.cpp
   ${RIPWIRE_SRCS}
+  ${_ripwire_source_identity_cpp}
   ${RIPWIRE_TS_OBJECTS})
 target_link_libraries(ripwire_probe PRIVATE tree-sitter Threads::Threads)
+ripwire_windows_target(ripwire_probe)
 target_include_directories(ripwire_probe PRIVATE
   ${tree_sitter_SOURCE_DIR}/lib/include
-  ${_ripwire_generated_dir}
+  ${_ripwire_generated_include_dirs}
   src/infra
   third_party
   src)
-add_dependencies(ripwire_probe ripwire_version_stamp)
+add_dependencies(ripwire_probe ripwire_version_stamp ripwire_source_identity)
 
 # ---- the real ripwire binary: full pipeline (ingest → graph → PageRank → minified XML) ----
 # main.cpp forward-declares rw::ingest(); linking ingest.cpp supplies the real tree-sitter one.
 add_executable(ripwire
   src/main.cpp
   ${RIPWIRE_SRCS}
+  ${_ripwire_source_identity_cpp}
   ${RIPWIRE_TS_OBJECTS})
 target_link_libraries(ripwire PRIVATE tree-sitter Threads::Threads)
+ripwire_windows_target(ripwire)
 target_include_directories(ripwire PRIVATE
   ${tree_sitter_SOURCE_DIR}/lib/include
-  ${_ripwire_generated_dir}
+  ${_ripwire_generated_include_dirs}
   src/infra
   third_party
   src)
-add_dependencies(ripwire ripwire_version_stamp)
+add_dependencies(ripwire ripwire_version_stamp ripwire_source_identity)
 
 # ---- small-vector A/B knobs (bench/svectorab.py drives both; see bench/SVECTORAB.md) ----
 # RIPWIRE_SMALLVEC selects which container src/smallvec.h's `rw::SmallVec` alias resolves to:
@@ -643,6 +779,40 @@ if(RIPWIRE_TESTS)
     src/infra/diagnostics.cpp)
   target_include_directories(ripwire_test_radix PRIVATE src/infra third_party src)
   add_test(NAME ripwire.radix COMMAND ripwire_test_radix)
+
+  # src/infra/strkern.h's SIMD-vs-scalar parity, src/lexindex.h's tokenizer equivalence, and the three
+  # emit escapers' byte-identity — one target, driven by test/strkerncheck.sh and test/emitescapecheck.sh
+  # (each adds its own mutation and cross-arch arms, which are compile flags a second configure cannot
+  # express in this tree). RIPWIRE_TEST_ROOT is the repo whose src/ and docs/ the real-text arms read, so
+  # a bare `ctest` is as honest as a gate run; the gates override it with RIPWIRE_ROOT in the environment.
+  add_executable(ripwire_test_strkern
+    test/verify_strkern.cpp
+    src/infra/diagnostics.cpp)
+  target_include_directories(ripwire_test_strkern PRIVATE src/infra third_party src)
+  target_compile_definitions(ripwire_test_strkern PRIVATE RIPWIRE_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(ripwire_test_strkern PRIVATE doctest::doctest)
+  add_test(NAME ripwire.strkern COMMAND ripwire_test_strkern)
+
+  # src/infra/os_win32_logic.h — the Windows port's pure logic (Win32→errno table, UTF-8/UTF-16 and WidePath,
+  # path spelling, CreateProcessW quoting, reparse/st_mode classification, wait-status and timeout conversions,
+  # trusted-shell predicates). It has no <windows.h> and no platform test, so every leg compiles and runs it;
+  # driven by test/oswin32logiccheck.sh (which adds the sanitizer and can-go-red arms).
+  # diagnostics.cpp is not optional here, for the same reason the four targets above carry it: os_win32_logic.h states
+  # its invariants with the self-check macros, and every one of them calls ::Diagnostics::ConsoleLog::handleAssert,
+  # which lives out of line in that file (Diagnostics.h §"out of the static analyzer's reach"). A toolchain that keeps
+  # the call — clang-cl on a plain configure — then fails to link it; the POSIX legs happened to fold every one of
+  # these checks away and never referenced the symbol, so the gap was invisible until @lennix1337 linked the target
+  # on Windows for #44. Listing it makes the target's sources complete rather than optimizer-dependent.
+  add_executable(ripwire_test_oswin32logic
+    test/verify_os_win32_logic.cpp
+    src/infra/diagnostics.cpp)
+  target_include_directories(ripwire_test_oswin32logic PRIVATE src/infra third_party src)
+  target_link_libraries(ripwire_test_oswin32logic PRIVATE doctest::doctest)
+  add_test(NAME ripwire.oswin32logic COMMAND ripwire_test_oswin32logic)
+
+  foreach(_ripwire_test_target ripwire_test_csr ripwire_test_pagerank ripwire_test_radix ripwire_test_strkern ripwire_test_oswin32logic)
+    ripwire_windows_target(${_ripwire_test_target})   # the manifest too: a test binary runs under the same code page as the product
+  endforeach()
 endif()
 
 # ---- self-profiling build (src/infra/profileScope.h): -DRIPWIRE_PROFILE=ON ----
@@ -663,7 +833,7 @@ endforeach()
 #
 # Three properties this option deliberately keeps:
 #   * SEPARATE BUILD TREE, no build type. Remarks only describe an OPTIMIZED build, but the repo forbids
-#     -DCMAKE_BUILD_TYPE=Release in a dev tree (NDEBUG compiles DEGRADED_PATH_ALERT out and blinds the
+#     -DCMAKE_BUILD_TYPE=Release in a dev tree (NDEBUG compiles the DISCLOSE( msg ) trace out and blinds the
 #     degrade-path gates — CONTRIBUTING.md §5). No build type is needed here: RIPWIRE_ARCH_FLAGS already
 #     puts the plain configuration at -O2, so build_remarks/ describes the SAME codegen build/ ships,
 #     with the degrade paths still compiled in. The option is nonetheless refused inside build/ below.
@@ -722,16 +892,16 @@ endif()
 set(RIPWIRE_GRAMMAR_TARGETS
   ts_cpp ts_python ts_go ts_rust ts_tsts ts_tstsx ts_swift ts_objc
   ts_javascript ts_bash ts_java ts_ruby ts_json ts_toml ts_yaml ts_csharp ts_c ts_cuda ts_markdown
-  ts_php ts_lua ts_elixir ts_dart)
+  ts_php ts_lua ts_elixir ts_dart ts_kotlin ts_gdscript)
 set(RIPWIRE_RUNTIME_COMPILE_TARGETS ripwire_probe ripwire tree-sitter ${RIPWIRE_GRAMMAR_TARGETS})
 set(RIPWIRE_RUNTIME_LINK_TARGETS ripwire_probe ripwire)
 # The C++ subset of the compile list — the only targets that include a C++ standard library at all, and so
 # the only ones the libstdc++ header exemption below has anything to say about (the grammars are C).
 set(RIPWIRE_OWNED_CXX_TARGETS ripwire_probe ripwire)
 if(RIPWIRE_TESTS)
-  list(APPEND RIPWIRE_RUNTIME_COMPILE_TARGETS ripwire_test_csr ripwire_test_pagerank ripwire_test_radix)
-  list(APPEND RIPWIRE_RUNTIME_LINK_TARGETS ripwire_test_csr ripwire_test_pagerank ripwire_test_radix)
-  list(APPEND RIPWIRE_OWNED_CXX_TARGETS ripwire_test_csr ripwire_test_pagerank ripwire_test_radix)
+  list(APPEND RIPWIRE_RUNTIME_COMPILE_TARGETS ripwire_test_csr ripwire_test_pagerank ripwire_test_radix ripwire_test_strkern ripwire_test_oswin32logic)
+  list(APPEND RIPWIRE_RUNTIME_LINK_TARGETS ripwire_test_csr ripwire_test_pagerank ripwire_test_radix ripwire_test_strkern ripwire_test_oswin32logic)
+  list(APPEND RIPWIRE_OWNED_CXX_TARGETS ripwire_test_csr ripwire_test_pagerank ripwire_test_radix ripwire_test_strkern ripwire_test_oswin32logic)
 endif()
 # G1's `integer` is a CLANG-ONLY UBSan group (unsigned-integer-overflow, implicit-*-truncation,
 # implicit-integer-sign-change — the defined-but-suspicious conversions, not UB). GCC has no such group
@@ -834,14 +1004,59 @@ file(WRITE "${_ripwire_libstdcxx_ignorelist}"
   "src:*/include/c\\+\\+/*/print\n"
   "[implicit-unsigned-integer-truncation]\nsrc:*/include/c\\+\\+/*/format\n"
   "src:*/include/c\\+\\+/*/print\n")
+if(WIN32)
+  # MSVC STL _Is_drive_prefix performs a defined unsigned wrap; third-party header, Windows-only.
+  # A single file-scoped rule below covers every function in the vendor header, so no function-name
+  # pattern (which g1configcheck.sh's audited list bans outright — a wildcard by name is the easy way
+  # to smuggle an unrelated symbol out of the sanitizer) is needed; project arithmetic elsewhere,
+  # including in this same header should it ever gain project-authored code, stays covered by G1.
+  file(APPEND "${_ripwire_libstdcxx_ignorelist}"
+    "[unsigned-integer-overflow]\nsrc:*/include/filesystem\n")
+endif()
 
 if(RIPWIRE_ASAN)
+  # AppleClang 17's ASan runtime hangs in its own start-up on macOS 26 (Darwin 25), before main, so every
+  # sanitizer run times out. CI's Xcode 26.6 AppleClang 21 is unaffected. A warning, not an error: the
+  # tree still builds, and CONTRIBUTING's sanitizer section has the Homebrew LLVM 22 recipe.
+  if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 21
+     AND CMAKE_HOST_SYSTEM_VERSION VERSION_GREATER_EQUAL 25)
+    message(WARNING "RIPWIRE_ASAN: AppleClang ${CMAKE_CXX_COMPILER_VERSION} on macOS 26 is known to hang in "
+      "ASan start-up before main. Configure this tree with Homebrew LLVM 22 (CONTRIBUTING.md, Sanitizer build).")
+  endif()
+  set(_ripwire_windows_clangcl_asan OFF)
+  set(_ripwire_no_omit_frame_pointer -fno-omit-frame-pointer)
+  # The optimization and debug-info spellings the sanitizer arm needs, in the driver's own dialect. clang-cl only
+  # WARNS on a GNU-spelled -O2/-g ("unknown argument ignored in clang-cl"), which is the worst of the two outcomes:
+  # the flavour silently builds unoptimized and without line tables, so a sanitizer report has no frames. Chosen here
+  # beside /Oy- rather than at the two foreach loops below, so the dialect is decided once.
+  set(_ripwire_asan_opt_debug -O2 -g)
+  # CMake's MSVC linker rule invokes CMAKE_LINKER directly. With ClangCL, passing the LLVM
+  # -fsanitize flags to link.exe instruments the objects but never loads the Clang sanitizer
+  # runtime, leaving __asan_* unresolved. Use clang-cl as the link driver for this one flavour;
+  # its driver preserves the MSVC ABI/import libraries and adds the matching runtime.
+  if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(_ripwire_windows_clangcl_asan ON)
+    set(_ripwire_no_omit_frame_pointer /Oy-)
+    set(_ripwire_asan_opt_debug /O2 /Z7)
+    string(REPLACE "<CMAKE_LINKER>" "<CMAKE_CXX_COMPILER>" CMAKE_CXX_LINK_EXECUTABLE
+      "${CMAKE_CXX_LINK_EXECUTABLE}")
+    # The replacement template does not carry the generator's per-target FLAGS. Keep the
+    # sanitizer thunk and the instrumented objects on the same dynamic CRT as the compile rule.
+    string(REPLACE "<CMAKE_CXX_COMPILER> ${CMAKE_CL_NOLOGO} <OBJECTS>"
+      "<CMAKE_CXX_COMPILER> ${CMAKE_CL_NOLOGO} /MD <OBJECTS> ${RIPWIRE_G1_SANITIZERS}"
+      CMAKE_CXX_LINK_EXECUTABLE "${CMAKE_CXX_LINK_EXECUTABLE}")
+    string(REPLACE " /out:<TARGET>" " /link /out:<TARGET>"
+      CMAKE_CXX_LINK_EXECUTABLE "${CMAKE_CXX_LINK_EXECUTABLE}")
+    message(STATUS "RIPWIRE_ASAN: using the ClangCL driver for Windows sanitizer links")
+  endif()
   foreach(_t IN LISTS RIPWIRE_RUNTIME_COMPILE_TARGETS)
     target_compile_options(${_t} PRIVATE ${RIPWIRE_G1_SANITIZERS}
-      -fno-sanitize-recover=all -fno-omit-frame-pointer -O2 -g)
+      -fno-sanitize-recover=all ${_ripwire_no_omit_frame_pointer} ${_ripwire_asan_opt_debug})
   endforeach()
   foreach(_t IN LISTS RIPWIRE_RUNTIME_LINK_TARGETS)
-    target_link_options(${_t} PRIVATE ${RIPWIRE_G1_SANITIZERS})
+    if(NOT _ripwire_windows_clangcl_asan)
+      target_link_options(${_t} PRIVATE ${RIPWIRE_G1_SANITIZERS})
+    endif()
   endforeach()
   # Every exemption below names a check inside the Clang-only `integer` group, or uses
   # -fsanitize-ignorelist=, which GCC does not implement. With `integer` absent there is nothing to
@@ -859,15 +1074,47 @@ if(RIPWIRE_ASAN)
     endforeach()
   endif()
 
-  # Xcode's arm64 Darwin runtime rejects both the standalone leak sanitizer and detect_leaks=1 at startup.
-  # Keep the local ASan/UBSan gate executable and explicit; LeakSanitizer remains a Linux/upstream-runtime
-  # CI gate using the committed tree-sitter suppressions rather than being falsely claimed on Apple Clang.
-  if(APPLE)
+  # Darwin and Windows runtimes reject detect_leaks=1 at startup. Keep the local ASan/UBSan gate
+  # executable and explicit; LeakSanitizer remains a Linux/upstream-runtime CI gate using the
+  # committed tree-sitter suppressions rather than being falsely claimed on either platform.
+  if(APPLE OR WIN32)
     set(_ripwire_asan_options "detect_leaks=0:halt_on_error=1:abort_on_error=1")
   else()
     set(_ripwire_asan_options "detect_leaks=1:halt_on_error=1:abort_on_error=1")
   endif()
+  set(_ripwire_asan_runtime_copy_command)
+  if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # clang-cl links the ASAN dynamic runtime, but Windows does not search Clang's resource
+    # directory for DLLs. Discover the matching directory from the active compiler so the fixture
+    # exercises this build without requiring a system-wide DLL installation. Copying beside the
+    # executable is deliberate: putting a semicolon-separated Windows PATH in a CMake command is
+    # parsed as a list of unrelated arguments by the Ninja generator.
+    execute_process(
+      COMMAND "${CMAKE_CXX_COMPILER}" -print-resource-dir
+      OUTPUT_VARIABLE _ripwire_clang_resource_dir
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if(_ripwire_clang_resource_dir)
+      file(TO_CMAKE_PATH "${_ripwire_clang_resource_dir}/lib/windows" _ripwire_asan_runtime_dir)
+      list(APPEND _ripwire_asan_runtime_copy_command
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${_ripwire_asan_runtime_dir}/clang_rt.asan_dynamic-x86_64.dll"
+          "$<TARGET_FILE_DIR:ripwire>")
+      message(STATUS "RIPWIRE_ASAN: fixture copies the runtime DLL from ${_ripwire_asan_runtime_dir}")
+    else()
+      message(WARNING "RIPWIRE_ASAN: clang resource directory was not discoverable; runtime fixture may miss the ASAN DLL")
+    endif()
+  endif()
+  if(WIN32 AND _ripwire_asan_runtime_dir)
+    foreach(_t IN LISTS RIPWIRE_RUNTIME_LINK_TARGETS)
+      add_custom_command(TARGET ${_t} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${_ripwire_asan_runtime_dir}/clang_rt.asan_dynamic-x86_64.dll"
+          "$<TARGET_FILE_DIR:${_t}>")
+    endforeach()
+  endif()
   add_custom_target(ripwire_asan_fixture
+    ${_ripwire_asan_runtime_copy_command}
     COMMAND ${CMAKE_COMMAND} -E env
       "ASAN_OPTIONS=${_ripwire_asan_options}"
       "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
@@ -876,6 +1123,81 @@ if(RIPWIRE_ASAN)
     DEPENDS ripwire
     COMMENT "Run the G1 fixture with the platform leak-detection policy")
 endif()
+
+# ---- compile-time fences: warnings that are errors on OUR C++ targets, every compiler, every flavour ----
+# The tree passes no warning set (no -Wall), so until this block a check only a warning could make was a check nobody
+# read, and on GCC -Wswitch did not run at all: GCC enables it only under -Wall, Clang by default.
+#   -Werror=switch                  a switch over an enum with no `default:` must name every enumerator, so appending
+#                                   one (a Lang, a SymKind, a RefRole) is a compile error at every per-value switch that
+#                                   has to decide it. The house rule that makes this bite: a switch returning one answer
+#                                   PER ENUMERATOR carries no `default:`, and ends with a plain `return` for a byte past
+#                                   the enum (a corrupt cache value); GCC's -Wreturn-type needs that line and Clang
+#                                   accepts it. A switch over a deliberate SUBSET keeps its `default:`.
+#   -Werror=implicit-fallthrough    a case body that falls into the next label says so with [[fallthrough]].
+# Both were measured at 0 diagnostics on this tree before they became errors (AppleClang and Homebrew clang, debug and
+# -DNDEBUG), so they cost nothing today and fence the next edit. GCC's first run of them is CI's.
+# OUR TARGETS ONLY, the same rule the sanitizer and separate-storage blocks follow: the tree-sitter core and the grammar
+# objects are generated C we do not own, and their scanners fall through by design.
+#
+# PER COMPILER, in ONE place. `-Werror=switch` is a GCC/Clang driver spelling. clang-cl takes it (its driver accepts
+# clang's own warning flags beside the MSVC ones — @lennix1337's Windows run compiled with these two attached and
+# reported one warning, not a flag error), but plain cl.exe reads `-W` + a number and refuses the whole command line:
+# "command line error D8021: invalid numeric argument '/Werror=switch'", the fifth failure of that run. cl.exe's
+# nearest equivalent to -Wswitch is C4062 (an enumerator not handled and no `default:`), promoted to an error with
+# /we4062; it has no counterpart for -Wimplicit-fallthrough at all — MSVC spells that one only as the /analyze-only
+# C26819 — so on cl.exe that half of the fence is NOT held, and the [[fallthrough]] rule is enforced by every other
+# leg instead. This is the only clang-dialect flag set in this file that is not already chosen per compiler
+# (cmake/PortableFlags.cmake branches on the same two conditions; the -mllvm option below is probed before use).
+#
+# UB-CLASS FENCES (0.6.3): diagnostics whose every hit is a program that computes a silently wrong answer — a value
+# read before it was written, a function that falls off its end, a pointer to a dead frame, a printf whose arguments
+# do not match its format, an index past a fixed array. NOT a style set: nothing here is -Wall, -Wextra or -Wshadow.
+# Measured 2026-09-24 on 60b65f02 over all 11 owned TUs (ripwire, ripwire_probe, the five RIPWIRE_TESTS verifiers),
+# each flag as a plain -W first: AppleClang 17 and Homebrew clang 22 (-fsyntax-only, debug and -DNDEBUG), GCC 13.4,
+# 14.4 and 16.2 (a real compile, -O0 and -O3 -DNDEBUG): 0 hits for every flag kept below, on every one of them. A
+# planted instance of each fires, so the zero is not a flag that never ran. cl.exe: 0 of the mapped C-numbers in the
+# last full-matrix Windows log (the default /W1, where each one below is on). Windows-only code (src/infra/os_win32.cpp)
+# compiles only there, so the two Windows legs are the first run of these errors on it, as they were for the two above.
+#   return-type          a non-void function that can reach its closing brace (C4715 on cl.exe).
+#   uninitialized        a read of a local that no path wrote (C4700). Clang adds sometimes-uninitialized (one branch
+#                        skips the write) and conditional-uninitialized (a loop may skip it): both front-end CFG
+#                        passes, identical at every -O. GCC's -Werror=uninitialized ALSO promotes -Wmaybe-uninitialized
+#                        (verified on gcc 16: a loop-conditional write is a hard error with the one flag), and that
+#                        one is the optimizer's guess — it moves with -O level and GCC release — so -Wno-maybe-
+#                        uninitialized keeps it exactly as off as it was before this block.
+#   format format-security  printf-family argument/format mismatch, and a non-literal format (C4477/C4473 on
+#                        cl.exe; the non-literal half is C4774, a level-4 warning never measured on this tree: not held).
+#                        On GCC, -Werror=format also makes -Wformat-overflow=1 and -Wformat-truncation=1 errors (a
+#                        planted sprintf/snprintf overflow is a hard error on g++ 13/14/16 at -O0 and -O2). Both are
+#                        middle-end passes that read value ranges, like the ones ruled out here, but level 1 fires only
+#                        on a certain or likely overflow, the snprintf-truncation class this repo has shipped as a bug,
+#                        and both are 0 on this tree: kept. If one proves optimizer-noisy on a CI GCC, drop it on GCC
+#                        with -Wno-error=format-truncation / -Wno-error=format-overflow and write it down here.
+#   return-stack-address (GCC: return-local-addr) the address of a local or a temporary returned (C4172).
+#   dangling             Clang only: the -Wdangling group (a view or pointer that outlives the object it names —
+#                        string_view of a temporary, a dangling member, a gsl::Pointer from a dead owner). cl.exe has
+#                        only the /analyze-only C26815/C26816: not held there.
+#   array-bounds         Clang only: a constant index past a fixed-size array, decided in Sema. GCC's -Warray-bounds is a
+#                        different pass: it needs -O2 and reads the optimizer's value ranges, so its answer moves with
+#                        -O level, inlining and GCC release — the property that rules out maybe-uninitialized. It is 0
+#                        here on GCC 13/14/16 at -O3 too, and still OFF on GCC for that reason. cl.exe's C4789 is a
+#                        backend warning of optimised builds, which the plain Windows legs never run: not held.
+# A flag that is noise on one compiler is dropped on that compiler and written down here, never silenced by a pragma.
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(RIPWIRE_COMPILE_TIME_FENCE_FLAGS /we4062
+    /we4715 /we4700 /we4477 /we4473 /we4172)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(RIPWIRE_COMPILE_TIME_FENCE_FLAGS -Werror=switch -Werror=implicit-fallthrough
+    -Werror=return-type -Werror=uninitialized -Werror=sometimes-uninitialized -Werror=conditional-uninitialized
+    -Werror=format -Werror=format-security -Werror=return-stack-address -Werror=dangling -Werror=array-bounds)
+else()
+  set(RIPWIRE_COMPILE_TIME_FENCE_FLAGS -Werror=switch -Werror=implicit-fallthrough
+    -Werror=return-type -Werror=uninitialized -Wno-maybe-uninitialized
+    -Werror=format -Werror=format-security -Werror=return-local-addr)
+endif()
+foreach(_t IN LISTS RIPWIRE_OWNED_CXX_TARGETS)
+  target_compile_options(${_t} PRIVATE ${RIPWIRE_COMPILE_TIME_FENCE_FLAGS})
+endforeach()
 
 # ---- G-race ThreadSanitizer build (the qsnap-prefetch worker vs the request loop) ----
 # A SEPARATE target/dir from ASan (TSan and ASan are mutually exclusive). Vets the one concurrent path in the
@@ -889,6 +1211,91 @@ if(RIPWIRE_TSAN)
   foreach(_t IN LISTS RIPWIRE_RUNTIME_LINK_TARGETS)
     target_link_options(${_t} PRIVATE -fsanitize=thread)
   endforeach()
+endif()
+
+# ---- separate-storage alias analysis: -mllvm -basic-aa-separate-storage (LLVM 17 keeps it OFF) ----
+# src/infra/Diagnostics.h §6's ASSUME_NO_ALIAS lowers, in release, to `llvm.assume [ "separate_storage"(a, b) ]`
+# through __builtin_assume_separate_storage. The FRONT END has emitted that bundle since clang 17; whether BasicAA
+# READS it is a separate switch inside the optimizer, llvm/lib/Analysis/BasicAliasAnalysis.cpp:
+#     static cl::opt<bool> EnableSeparateStorageAnalysis("basic-aa-separate-storage", cl::Hidden, cl::init(false))
+# in LLVM 17, and cl::init(true) from LLVM 18 on. So on an LLVM-17 toolchain — AppleClang 16.0.0.16000026 (Xcode
+# 16.2: the macos-14 CI runners and release.yml's macos-arm64 leg through 0.6.1) — the header compiles, the IR carries the bundle,
+# and codegen is byte-identical to no promise at all. Found by CI job "release (macos-14, plain, appleclang, shard
+# 4/4)" on PR #200: test/noaliascheck.sh arms 2, 2/3 and 6 red ("accNew still reloads a after the store", "NO
+# CONTRAST", "not at least 2 below plain"), arm 7 and the IR-bundle row green — the front-end half worked, the
+# optimizer half was off. Reproduced on Apple clang 21: the arm-2 probe is 5 instructions by default, 9 with
+# `-mllvm -basic-aa-separate-storage=false`, 5 with `=true`.
+#
+# Why LLVM 17 left it off, and why turning it on there is safe: llvm/llvm-project#76864 "[BasicAA] Enable separate
+# storage hints by default" (merged 2024-01-03) flipped the default because "a few months of experimentation in a
+# large codebase did not reveal any significant build speed regressions" — the LLVM-17 default was a compile-time
+# hedge, not a soundness one; #76770 the same week only makes the hint fire in more contexts. LLVM 17 with the option
+# on runs the analysis LLVM 18+ runs unconditionally.
+#
+# The option's name is the same from LLVM 17 through 21 and clang takes it as a compile flag, so it is passed
+# wherever the compiler accepts it: on LLVM 17 it turns the analysis on, on 18+ it restates the default (a no-op).
+# What the option buys on LLVM 17 is the SCALAR half only: the reload after a store through a possibly-aliasing
+# pointer goes away, but the loop vectorizer's overlap checks stay, because LLVM 17 consults the hint only at the
+# assume's own context and LoopAccessAnalysis never supplies one (llvm/llvm-project#64666, fixed in LLVM 18 by
+# #76770). CI showed exactly that split on PR #200 head 5156d668: noaliascheck arm 2 green, arm 6 at plain.
+# Probed, never assumed — GCC rejects -mllvm outright and a clang whose LLVM had dropped the name would reject the
+# option; either way the check says no, the build keeps the compiler default, and the header's debug check still
+# runs. The two-token option rides in CMAKE_REQUIRED_FLAGS (a whitespace-split string, the way the libFuzzer probe
+# above passes its flags). Verified 2026-09-12 in a scratch configure: Apple clang 21 says yes, and the same probe
+# over `-mllvm -bogus-option-xyz` says no (clang exits 1 on an unknown -mllvm name). test/noaliascheck.sh reads the
+# cached answer back out of build/CMakeCache.txt and fails if its own probe of the same compiler disagrees.
+#
+# OUR TARGETS ONLY, via target_compile_options — never add_compile_options: the tree-sitter core and the grammar
+# objects are C that never spells the builtin, and per-target attachment is the rule this file already follows for
+# the remarks and sanitizer flags. RIPWIRE_OWNED_CXX_TARGETS is ripwire, ripwire_probe and the test executables, in
+# every flavour (plain, Release, asan, tsan): the list is flavour-independent, so nothing here is.
+#
+# LTO. With -flto the compile step still runs the PRE-link pipeline (which already removes the arm-2 reload under
+# this option — measured: compile default + link `=false` gives 5), and ld64's libLLVMLTO runs the POST-link one,
+# whose BasicAA reads the same cl::opt. So under LTO the option must reach the link as well, or every inlining
+# opportunity the link step creates on an LLVM-17 toolchain is analysed with the promise off. Apple ld64 takes it as
+# `-Wl,-mllvm,-basic-aa-separate-storage` — verified: compile `=false` + link `=false` gives 9 instructions, compile
+# `=false` + link `=true` gives 5, and a bogus name fails the link ("libLLVMLTO: Unknown command line argument") —
+# and it is probed below with a real -flto link before it is attached. The ELF spelling
+# (`-Wl,-plugin-opt=-basic-aa-separate-storage` for lld / gold) is deliberately NOT added: it could not be verified
+# on this machine, and no CI or release leg pairs LTO with an LLVM-17 ELF toolchain (ubuntu-24.04's clang is 18,
+# the Linux release leg is gcc, which never sees the builtin). An LTO build on such a toolchain keeps the compile-time
+# option and the linker's default; that limit is stated here rather than papered over with an unverified flag.
+include(CheckCXXCompilerFlag)
+set(_ripwire_required_flags_save "${CMAKE_REQUIRED_FLAGS}")
+set(CMAKE_REQUIRED_FLAGS "-mllvm -basic-aa-separate-storage")
+check_cxx_compiler_flag("" RIPWIRE_CXX_HAS_BASIC_AA_SEPARATE_STORAGE)
+set(CMAKE_REQUIRED_FLAGS "${_ripwire_required_flags_save}")
+if(RIPWIRE_CXX_HAS_BASIC_AA_SEPARATE_STORAGE)
+  foreach(_t IN LISTS RIPWIRE_OWNED_CXX_TARGETS)
+    target_compile_options(${_t} PRIVATE -mllvm -basic-aa-separate-storage)
+  endforeach()
+  set(_ripwire_separate_storage_link "no LTO, so nothing runs at link")
+  if(RIPWIRE_LTO)
+    if(APPLE)
+      include(CheckCXXSourceCompiles)
+      set(_ripwire_required_flags_save "${CMAKE_REQUIRED_FLAGS}")
+      set(_ripwire_required_link_options_save "${CMAKE_REQUIRED_LINK_OPTIONS}")
+      set(CMAKE_REQUIRED_FLAGS "-flto")
+      set(CMAKE_REQUIRED_LINK_OPTIONS "-flto;-Wl,-mllvm,-basic-aa-separate-storage")
+      check_cxx_source_compiles("int main() { return 0; }" RIPWIRE_LD64_HAS_BASIC_AA_SEPARATE_STORAGE)
+      set(CMAKE_REQUIRED_FLAGS "${_ripwire_required_flags_save}")
+      set(CMAKE_REQUIRED_LINK_OPTIONS "${_ripwire_required_link_options_save}")
+      if(RIPWIRE_LD64_HAS_BASIC_AA_SEPARATE_STORAGE)
+        foreach(_t IN LISTS RIPWIRE_OWNED_CXX_TARGETS)
+          target_link_options(${_t} PRIVATE "-Wl,-mllvm,-basic-aa-separate-storage")
+        endforeach()
+        set(_ripwire_separate_storage_link "forced on at the LTO link too (-Wl,-mllvm,-basic-aa-separate-storage)")
+      else()
+        set(_ripwire_separate_storage_link "LTO link keeps the linker default (ld64 refused -Wl,-mllvm,-basic-aa-separate-storage)")
+      endif()
+    else()
+      set(_ripwire_separate_storage_link "LTO link keeps the linker default (the ELF -plugin-opt spelling is unverified — see the comment above)")
+    endif()
+  endif()
+  message(STATUS "separate-storage alias analysis: forced on (-mllvm -basic-aa-separate-storage — turns BasicAA's separate_storage reader on for LLVM 17 / AppleClang 16, a no-op on LLVM 18+); ${_ripwire_separate_storage_link}")
+else()
+  message(STATUS "separate-storage alias analysis: compiler default (${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} does not accept -mllvm -basic-aa-separate-storage; ASSUME_NO_ALIAS keeps its debug check, the release promise is whatever this optimizer does by default)")
 endif()
 
 # ---- opt-in ingestion fuzzing: isolated coverage-instrumented parser objects ----
@@ -958,10 +1365,59 @@ if(RIPWIRE_FUZZ)
   add_ripwire_fuzzer(toml       tree_sitter_toml       toml)
   add_ripwire_fuzzer(yaml       tree_sitter_yaml       yaml)
   add_ripwire_fuzzer(csharp     tree_sitter_c_sharp    csharp)
-  add_ripwire_fuzzer(dart       tree_sitter_dart       dart)
   add_ripwire_fuzzer(c          tree_sitter_c          c)
   add_ripwire_fuzzer(php        tree_sitter_php        php)
+  add_ripwire_fuzzer(dart       tree_sitter_dart       dart)
   add_ripwire_fuzzer(elixir     tree_sitter_elixir     elixir)
   add_ripwire_fuzzer(lua        tree_sitter_lua        lua)
+  add_ripwire_fuzzer(kotlin     tree_sitter_kotlin     kotlin)
+  add_ripwire_fuzzer(gdscript   tree_sitter_gdscript   gdscript)
   add_custom_target(ripwire_fuzzers DEPENDS ${RIPWIRE_FUZZ_TARGETS})
+
+  # ---- reader fuzzers: ripwire's OWN parsers of bytes it did not create (test/fuzz/readers/) ----
+  # The grammar targets above fuzz the vendored parsers; these fuzz the code a hostile cache blob, sidecar, SCIP
+  # index, MCP frame or repository document actually reaches. Each reader family compiles ONCE into the static
+  # library (readers_ingest.cpp IS the ingest translation unit, instrumented); each ripwire_fuzz_reader_<name> is one
+  # tiny entry TU that names its reader, so the linker pulls only the family it calls. Crash oracles only — the
+  # correctness oracles are help-wanted issue #149's.
+  set(RIPWIRE_FUZZ_READER_SOURCES
+    test/fuzz/readers/readers_light.cpp
+    test/fuzz/readers/readers_domain.cpp
+    test/fuzz/readers/readers_mcphttp.cpp
+    test/fuzz/readers/readers_ingest.cpp
+    src/pagerank.cpp
+    src/infra/diagnostics.cpp)
+  set(RIPWIRE_FUZZ_READER_INCLUDES
+    ${tree_sitter_SOURCE_DIR}/lib/include ${_ripwire_generated_dir} src/infra third_party src test/fuzz/readers)
+  add_library(ripwire_fuzz_readers STATIC EXCLUDE_FROM_ALL ${RIPWIRE_FUZZ_READER_SOURCES})
+  target_include_directories(ripwire_fuzz_readers PRIVATE ${RIPWIRE_FUZZ_READER_INCLUDES})
+  target_compile_definitions(ripwire_fuzz_readers PRIVATE PROFILE_ENABLED=0)
+  target_compile_options(ripwire_fuzz_readers PRIVATE ${RIPWIRE_FUZZ_COMPILE_OPTIONS})
+  if(RIPWIRE_HAS_CLANG_INTEGER_SANITIZER)
+    target_compile_options(ripwire_fuzz_readers PRIVATE "-fsanitize-ignorelist=${_ripwire_libstdcxx_ignorelist}")
+  endif()
+  add_dependencies(ripwire_fuzz_readers ripwire_version_stamp)
+  add_library(ripwire_fuzz_reader_grammars STATIC EXCLUDE_FROM_ALL ${RIPWIRE_TS_OBJECTS})
+  set_target_properties(ripwire_fuzz_reader_grammars PROPERTIES LINKER_LANGUAGE C)
+
+  set(RIPWIRE_FUZZ_READER_TARGETS)
+  function(add_ripwire_reader_fuzzer NAME)
+    set(_ripwire_reader_target "ripwire_fuzz_reader_${NAME}")
+    add_executable(${_ripwire_reader_target} EXCLUDE_FROM_ALL test/fuzz/readers/fuzz_reader.cpp)
+    target_compile_definitions(${_ripwire_reader_target} PRIVATE RIPWIRE_FUZZ_READER=${NAME})
+    target_compile_options(${_ripwire_reader_target} PRIVATE ${RIPWIRE_FUZZ_COMPILE_OPTIONS})
+    target_link_options(${_ripwire_reader_target} PRIVATE ${RIPWIRE_FUZZ_LINK_OPTIONS})
+    target_link_libraries(${_ripwire_reader_target} PRIVATE
+      ripwire_fuzz_readers ripwire_fuzz_reader_grammars ripwire_tree_sitter_fuzz Threads::Threads)
+    set(RIPWIRE_FUZZ_READER_TARGETS ${RIPWIRE_FUZZ_READER_TARGETS} ${_ripwire_reader_target} PARENT_SCOPE)
+  endfunction()
+
+  # The reader list is declared ONCE, here; test/fuzz/readers/run.sh and test/g1configcheck.sh derive theirs from it.
+  set(RIPWIRE_FUZZ_READERS
+    mcpjson mcphttp docparse tracein skillscan scip resolvecfg lintrules
+    qsnap qchurn oracle sidecars qscope ingestrecord ingestframe stiermemo)
+  foreach(_ripwire_reader IN LISTS RIPWIRE_FUZZ_READERS)
+    add_ripwire_reader_fuzzer(${_ripwire_reader})
+  endforeach()
+  add_custom_target(ripwire_reader_fuzzers DEPENDS ${RIPWIRE_FUZZ_READER_TARGETS})
 endif()

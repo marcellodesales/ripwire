@@ -34,9 +34,11 @@
 // makes one level up: a number that cannot be a total must not be printed as one.
 
 #include "slice.h"          // SliceScan / SliceOcc / sliceFoldOcc / the rung-3 reach table / sliceScanDefinition
+#include "infra/os.h"   // rw::os::getpid — the per-process slice temp root
 #include "editpreview.h"    // editpreview::ingestOneFile — the ONE single-file parse path (self-contained by its own header note)
 #include "gitmine.h"        // looksLikeDate — the ONE approxidate-garbage gate --hotspots --since already uses
 #include "quality.h"        // gitRepoHasHistory / gitResolveCommitSha / gitOneLine / gitRenameMap / cacheDirLadder / TmpTreeGuard
+#include "gitstamp.h"       // gitstamp::shallowRefHint — the no-baseline refusal's shallow-clone suffix (0.6.7)
 #include "redact.h"         // redactInPlace — the body-emission seam every CDATA payload passes through
 #include "sarif.h"          // rootPrefixOf / rootRelativeUri — the root-relative path identity
 
@@ -304,6 +306,15 @@ struct RevSide
     std::string path;             // the root-relative path READ at REV (may differ from now: renamed_from=)
     std::string src;              // the blob, exactly as both the ingest and the scan below saw it
     SliceScan   scan;
+    // The DISCLOSE sink for a side that could not be parsed: status="unparsed_at_rev" comparable="0" on the row.
+    enum class DisclosureWhy : std::uint8_t
+    {
+        TempRootUnavailable,
+    };
+    void disclose( DisclosureWhy ) noexcept
+    {
+        status = Status::UnparsedAtRev;
+    }
 };
 
 // The blob at `sha:rel`, following a git-RECORDED rename chain (never a similarity guess of our own —
@@ -374,12 +385,11 @@ inline RevSide sliceAtRev( const std::string& root, const std::string& sha, cons
     r.path = pathAtRev;
 
     std::error_code   ec;
-    const std::string tmpRoot = quality::cacheDirLadder() + "/ripwire-slicediff-" + std::to_string( ::getpid() );
+    const std::string tmpRoot = quality::cacheDirLadder() + "/ripwire-slicediff-" + std::to_string( os::getpid() );
     fs::remove_all( fs::path( tmpRoot ), ec );                   // a leftover from a crashed prior run
     if( !fs::create_directories( fs::path( tmpRoot ), ec ) && ec )
     {
-        DEGRADED_PATH_ALERT( "slicediff: cannot create the temp parse root" );
-        r.status = Status::UnparsedAtRev;
+        DISCLOSE( r, RevSide::DisclosureWhy::TempRootUnavailable, "slicediff: cannot create the temp parse root" );
         return r;
     }
     quality::TmpTreeGuard guard{ tmpRoot };
@@ -401,7 +411,15 @@ inline RevSide sliceAtRev( const std::string& root, const std::string& sha, cons
     }
     if( found == 0 )
     {
-        r.status = Status::SymAbsentAtRev;
+        // A6 (found-items 2026-09-17): a blob whose parse at REV held ERROR/MISSING nodes (binary content
+        // committed under a source extension, truncated/corrupt text — anything tree-sitter's error
+        // recovery could not read as this language) can leave `found == 0` for a reason that has nothing
+        // to do with the symbol being new. sym_absent_at_rev claims "the file was there and the definition
+        // was not" (every row then reads "+", the reviewer's cue to read this as newly-added code), which
+        // is a confidently wrong story for a blob that was not parseable source at all. Same errNodes>0
+        // rule fileParseDegraded/grep's parse_degraded=/the selector refusals already share, so "degraded"
+        // means one thing everywhere rather than a second copy of the threshold here.
+        r.status = fileParseDegraded( one, 0 ) ? Status::UnparsedAtRev : Status::SymAbsentAtRev;
         return r;
     }
     if( found > 1 )
@@ -472,9 +490,12 @@ inline std::string legendText( bool compact )
         "sides sliced | \"sym_absent_at_rev\" the file was there and the definition was not (every row reads \"+\") | "
         "\"var_absent_at_rev\" the definition was there and this local was not | \"file_absent_at_rev\" the path is "
         "not in that tree and no recorded rename reaches it | \"ambiguous_at_rev\" several same-named definitions of "
-        "that kind in the file then, never silently narrowed | \"unparsed_at_rev\" the blob is there and the span did "
-        "not locate. comparable=\"0\" = NO COMPARISON WAS MADE: the absence of rows under it is not evidence of no "
-        "change, and must not be read as one. diff_capped=\"1\" = more than 2000 statement rows on a side, aligned to "
+        "that kind in the file then, never silently narrowed | \"unparsed_at_rev\" the blob is there and the parse "
+        "could not be trusted (ERROR/MISSING nodes) — the definition's own span did not locate, or (A6) nothing "
+        "matching the name+kind was found at all in a blob whose parse was this degraded, so sym_absent_at_rev's "
+        "\"new code\" story is not one this run can honestly tell. comparable=\"0\" = NO COMPARISON WAS MADE: the "
+        "absence of rows under it is not evidence of no change, and must not be read as one. diff_capped=\"1\" = "
+        "more than 2000 statement rows on a side, aligned to "
         "that bound and said so. -->";
 }
 
@@ -550,7 +571,7 @@ inline Out compute( const std::string& root, const std::string& sinceSpec, const
     if( sha.empty() )
     {
         out.ok  = false;
-        out.err = sinceNoBaselineRefusal( sinceSpec, root );
+        out.err = sinceNoBaselineRefusal( sinceSpec, root, false, rw::gitstamp::shallowRefHint( root ) );   // 0.6.7: shallow hint
         return out;
     }
 

@@ -24,7 +24,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -72,7 +72,7 @@ hits1="$( attrOf "$TMP/arm1.out" hits )"
 
 # ── arm 2: a query that compiles for the fixture's OWN language — eligible_files must be > 0.
 "$BIN" "$PYFIX" --match='(function_definition) @f' >"$TMP/arm2.out" 2>"$TMP/arm2.err"; rc2=$?
-[ "$rc2" -eq 0 ] && ok "arm2: exit 0" || no "arm2: exit $rc2 (expected 0): $( cat "$TMP/arm2.err" )"
+if [ "$rc2" -eq 0 ]; then ok "arm2: exit 0"; else no "arm2: exit $rc2 (expected 0): $( cat "$TMP/arm2.err" )"; fi
 
 grammars2="$( attrOf "$TMP/arm2.out" grammars )"
 case ",$grammars2," in
@@ -85,7 +85,7 @@ elig2="$( attrOf "$TMP/arm2.out" eligible_files )"
                                     || no "arm2: eligible_files=\"${elig2:-<missing>}\" (expected > 0)"
 
 of2="$( attrOf "$TMP/arm2.out" of_files )"
-[ "$of2" = "1" ] && ok "arm2: of_files=\"1\"" || no "arm2: of_files=\"${of2:-<missing>}\" (expected \"1\")"
+if [ "$of2" = "1" ]; then ok "arm2: of_files=\"1\""; else no "arm2: of_files=\"${of2:-<missing>}\" (expected \"1\")"; fi
 
 hits2="$( attrOf "$TMP/arm2.out" hits )"
 [ "$hits2" = "2" ] && ok "arm2: hits=\"2\" (def foo + def method)" \
@@ -131,6 +131,19 @@ grep -q 'nearest_kind=' "$TMP/arm5.err" && no "arm5: a nearest_kind hint was emi
                                         || ok "arm5: no nearest_kind hint (no candidate was close enough — honest silence, not a guess)"
 grep -q 'compiled for no grammar' "$TMP/arm5.err" && ok "arm5: refusal message present, unchanged shape" \
                                                    || no "arm5: refusal message missing/changed: $( cat "$TMP/arm5.err" )"
+
+# ── arm 6: a query nested past the compiler's stack. ts_query_new recurses per ( / [ level on a worker thread:
+#    4,000 levels died with SIGBUS (exit 138) and 2,000 ran past a minute. Refused by name at 256, before any
+#    compile; a query inside the bound is unaffected (arms 1-2 above).
+DEEPQ="$( python3 -c 'n=4000; print("(function_definition " * n + ")" * n)' )"
+bounded(){ if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else perl -e 'alarm 60; exec @ARGV' "$@"; fi; }
+bounded "$BIN" "$PYFIX" --match="$DEEPQ" >"$TMP/arm6.out" 2>"$TMP/arm6.err"; rc6=$?
+[ "$rc6" -eq 1 ] && ok "arm6: a 4,000-level query refuses: exit 1" \
+                 || no "arm6: exit $rc6 (expected 1; 138 is the compiler's stack overflow, 124/142 a hang)"
+grep -q 'nests deeper than 256 levels' "$TMP/arm6.err" && ok "arm6: the refusal names the nesting bound" \
+                                                        || no "arm6: refusal does not name the bound: $( head -c 200 "$TMP/arm6.err" )"
+grep -q '<match' "$TMP/arm6.out" && no "arm6: a <match> element was printed on the refusal path" \
+                                 || ok "arm6: no <match> element on the refusal path"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

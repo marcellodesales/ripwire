@@ -56,7 +56,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -97,7 +97,7 @@ REC="$( grep -E $'^AGG\trecall\t' "$OUT" )"
 RNK="$( grep -E $'^AGG\tranking\t' "$OUT" )"
 LIV="$( grep -E $'^AGG\trecall_livepol\t' "$OUT" )"
 field(){ printf '%s' "$1" | tr '\t' '\n' | sed -n "s/^$2=//p"; }
-{ [ -n "$REC" ] && [ -n "$RNK" ]; } && ok "both AGG rows present" || no "missing an AGG row"
+if { [ -n "$REC" ] && [ -n "$RNK" ]; }; then ok "both AGG rows present"; else no "missing an AGG row"; fi
 # Each scored lane must announce the corpus it was scored on, and it must be that lane's pinned one — a
 # harness silently falling back to the live root would re-open the ratchet this file retired. Asserted
 # per lane against its OWN lock, because the two corpora are pinned at different commits by design
@@ -347,13 +347,13 @@ KL5="$( field "$RNK" lenient_r5 )"; KMRR="$( field "$RNK" mrr_lenient )"; KPOL="
 #   after the source tree has moved far enough that the frozen corpus no longer resembles what the tool
 #   ships. A RED FLOOR IS NEVER A REASON TO REFRESH — on a frozen corpus a red floor is a ranker
 #   regression, full stop, and "the corpus moved" is no longer available as an explanation.
-floor "$RL5" 71   && ok "recall lane lenient recall@5 ($RL5%) >= floor 71% (frozen-corpus baseline 76.2%)"  || no "recall lane lenient recall@5 ($RL5%) under floor 71% — ranker regression on the FROZEN corpus"
-floor "$RMRR" 0.57 && ok "recall lane lenient MRR ($RMRR) >= floor 0.57 (frozen-corpus baseline 0.619)" || no "recall lane lenient MRR ($RMRR) under floor 0.57 — ranker regression on the FROZEN corpus"
+if floor "$RL5" 71; then ok "recall lane lenient recall@5 ($RL5%) >= floor 71% (frozen-corpus baseline 76.2%)"; else no "recall lane lenient recall@5 ($RL5%) under floor 71% — ranker regression on the FROZEN corpus"; fi
+if floor "$RMRR" 0.57; then ok "recall lane lenient MRR ($RMRR) >= floor 0.57 (frozen-corpus baseline 0.619)"; else no "recall lane lenient MRR ($RMRR) under floor 0.57 — ranker regression on the FROZEN corpus"; fi
 LPOL="$( field "$LIV" pollution5 )"
-ceil  "${LPOL:-999}" 16 && ok "LIVE-corpus pollution@5 ($LPOL%) <= ceiling 16% (the corpus-composition reporter; exported-tree baseline 10.0%)" || no "LIVE-corpus pollution@5 (${LPOL:-missing}%) over ceiling 16% — generated/fixture docs are retaking --recall on the live tree"
-floor "$KL5" 70   && ok "ranking lane lenient recall@5 ($KL5%) >= floor 70% (frozen-corpus baseline 71.9%)"  || no "ranking lane lenient recall@5 ($KL5%) under floor 70% — ranker regression on the FROZEN corpus"
-floor "$KMRR" 0.55 && ok "ranking lane lenient MRR ($KMRR) >= floor 0.55 (frozen-corpus baseline 0.660)"    || no "ranking lane lenient MRR ($KMRR) under floor 0.55 — ranker regression on the FROZEN corpus"
-ceil  "$KPOL" 5    && ok "ranking lane pollution@5 ($KPOL%) <= ceiling 5% (frozen-corpus baseline 0.0%; post-§P4 0.0%)"    || no "ranking lane pollution@5 ($KPOL%) over ceiling 5% — fixtures/present are retaking --for"
+if ceil  "${LPOL:-999}" 16; then ok "LIVE-corpus pollution@5 ($LPOL%) <= ceiling 16% (the corpus-composition reporter; exported-tree baseline 10.0%)"; else no "LIVE-corpus pollution@5 (${LPOL:-missing}%) over ceiling 16% — generated/fixture docs are retaking --recall on the live tree"; fi
+if floor "$KL5" 70; then ok "ranking lane lenient recall@5 ($KL5%) >= floor 70% (frozen-corpus baseline 71.9%)"; else no "ranking lane lenient recall@5 ($KL5%) under floor 70% — ranker regression on the FROZEN corpus"; fi
+if floor "$KMRR" 0.55; then ok "ranking lane lenient MRR ($KMRR) >= floor 0.55 (frozen-corpus baseline 0.660)"; else no "ranking lane lenient MRR ($KMRR) under floor 0.55 — ranker regression on the FROZEN corpus"; fi
+if ceil  "$KPOL" 5; then ok "ranking lane pollution@5 ($KPOL%) <= ceiling 5% (frozen-corpus baseline 0.0%; post-§P4 0.0%)"; else no "ranking lane pollution@5 ($KPOL%) over ceiling 5% — fixtures/present are retaking --for"; fi
 
 # ── #5b: §P4's own number — the adversarial class (queries built to let fixtures/decks win) must stay
 #    de-polluted. Ceiling 8% = one polluted top-5 slot across the class (5 queries × 5 slots → 1/25 = 4%);
@@ -363,28 +363,58 @@ APOL="$( grep -E $'^  CLASS\tranking\tadversarial\t' "$OUT" | sed -n 's/.*pollut
     && ok "ranking adversarial-class pollution@5 ($APOL%) <= ceiling 8% (pre-§P4 28.0%, post-§P4 0.0%)" \
     || no "ranking adversarial-class pollution@5 (${APOL:-missing}) over ceiling 8% — the §P4 class is regressing"
 
-# ── #6: §P4 direct XML assertions over the shipping binary at THIS repo root (the plan's cited repro +
-#    the two interactions the tier down-weight must NOT break). Paths asserted here are pinned by the
-#    label files, whose on-disk presence check #2 already enforces. ──────────────────────────────────────
+# ── #6: §P4 direct XML assertions over the shipping binary (the plan's cited repro + the two
+#    interactions the tier down-weight must NOT break). Paths asserted here are pinned by the label
+#    files, whose on-disk presence check #2 already enforces. ──────────────────────────────────────
 CAND="$TMP/cand.xml"
 
 # 6a — the plan's cited query: the real implementation must outrank every fixture/deck row (RED pre-§P4:
 #      a test/chafix stub held rank 1). Rank of pageRankDouble strictly above the best test/ or present/ row.
-"$BIN" . --for="pagerank power iteration" --format=candidates --top-k=10 >"$CAND" 2>/dev/null
-PRRANK="$( tr '<' '\n' <"$CAND" | sed -n 's/^cand r="\([0-9]*\)" [^>]*n="pageRankDouble".*/\1/p' | head -1 )"
-FIXRANK="$( tr '<' '\n' <"$CAND" | grep -E '^cand ' | grep -E 'p="(\./)?(test|present)/' | sed -n 's/^cand r="\([0-9]*\)".*/\1/p' | sort -n | head -1 )"
-if [ -n "$PRRANK" ] && { [ -z "$FIXRANK" ] || [ "$PRRANK" -lt "$FIXRANK" ]; }; then
-    ok "cited query ranks pageRankDouble (r=$PRRANK) above any test/present row (best fixture r=${FIXRANK:-none in top-10})"
+#      CodeRabbit review on #295: this arm used to rank against the LIVE repo root (".") — an unrelated
+#      comment landing anywhere in the tree (e.g. train 7's own pagerank.cpp doc-comment edits) can move
+#      BM25 length normalization and flip pageRankDouble across the rank-10 cutoff with the ranker
+#      provably neutral, exactly the corpus-composition defect check #0's FROZEN CORPORA header
+#      describes for the recall/ranking lanes above. Move it onto the SAME frozen "src" snapshot those
+#      lanes already score (bench/recalleval/snapshot.srcpack + srcsnapshot.lock), materialized via the
+#      harness's own materialize_snapshot() (run_recalleval.py) — no second unpacker, no second corpus.
+FROZEN_6A="$TMP/frozen_src_6a"
+mkdir -p "$FROZEN_6A"
+if ! FROZEN_6A_INFO="$( python3 -c "
+import sys
+sys.path.insert( 0, '$ROOT/bench/recalleval' )
+from run_recalleval import materialize_snapshot
+commit, count = materialize_snapshot( '$FROZEN_6A', 'src' )
+print( 'commit=%s files=%d' % ( commit, count ) )
+" 2>"$TMP/frozen6a.err" )"; then
+    no "6a: could not materialize the frozen src corpus for the cited-query arm: $( cat "$TMP/frozen6a.err" )"
 else
-    no "cited query: pageRankDouble r=${PRRANK:-absent} vs best fixture/deck row r=${FIXRANK:-none} — §P4 repro is back"
+    ok "6a: frozen src corpus materialized ($FROZEN_6A_INFO) — the cited query now scores this, not the live tree"
+    "$BIN" "$FROZEN_6A" --for="pagerank power iteration" --format=candidates --top-k=10 >"$CAND" 2>/dev/null
+    PRRANK="$( tr '<' '\n' <"$CAND" | sed -n 's/^cand r="\([0-9]*\)" [^>]*n="pageRankDouble".*/\1/p' | head -1 )"
+    FIXRANK="$( tr '<' '\n' <"$CAND" | grep -E '^cand ' | grep -E 'p="(\./)?(test|present)/' | sed -n 's/^cand r="\([0-9]*\)".*/\1/p' | sort -n | head -1 )"
+    if [ -n "$PRRANK" ] && { [ -z "$FIXRANK" ] || [ "$PRRANK" -lt "$FIXRANK" ]; }; then
+        ok "cited query (frozen corpus) ranks pageRankDouble (r=$PRRANK) above any test/present row (best fixture r=${FIXRANK:-none in top-10})"
+    else
+        no "cited query (frozen corpus): pageRankDouble r=${PRRANK:-absent} vs best fixture/deck row r=${FIXRANK:-none} — §P4 repro is back"
+    fi
 fi
 
-# 6b — mention anchor beats the tier penalty: a fixture file literally NAMED in the task still surfaces
-#      in the top 5 (de-prioritized is not unanchorable).
-"$BIN" . --for="fix the virtual dispatch in test/chafix/cha.cpp" --format=candidates --top-k=5 >"$CAND" 2>/dev/null
-tr '<' '\n' <"$CAND" | grep -E '^cand ' | grep -q 'p="\(\./\)\?test/chafix/cha\.cpp"' \
-    && ok "mention anchor survives the penalty: task naming test/chafix/cha.cpp surfaces it in the top 5" \
-    || no "mention anchor lost to the tier penalty: test/chafix/cha.cpp absent from its own task's top 5"
+# 6b — mention anchor beats the tier penalty: a fixture file literally NAMED in the task keeps the anchor's PUBLISHED
+#      promise — its best row scores within 5% of the top score (--help, the `for` header: a score promise, not a rank
+#      one; mentioncheck pins the rank behaviour on frozen fixtures). De-prioritized is still not unanchorable: with the
+#      anchor off (RIPWIRE_NO_MENTION=1) the fixture falls out of the top 50 and this arm is red. It asserted a top-5 RANK
+#      until 2026-09-17, read off the LIVE repo, where unanchored near-ties move with any lane's text: main passed by a 0.7%
+#      score margin and a resolver lane's "virtual"/"dispatch" comments flipped it by 0.013 with no ranking change.
+"$BIN" . --for="fix the virtual dispatch in test/chafix/cha.cpp" --format=candidates --top-k=50 >"$CAND" 2>/dev/null
+TOPSCORE="$( tr '<' '\n' <"$CAND" | grep -E '^cand r="1" ' | sed -n 's/.* s="\([0-9.]*\)".*/\1/p' )"
+FIXSCORE="$( tr '<' '\n' <"$CAND" | grep -E '^cand ' | grep 'p="\(\./\)\?test/chafix/cha\.cpp"' | head -1 | sed -n 's/.* s="\([0-9.]*\)".*/\1/p' )"
+ANCHORED="$( tr '<' '\n' <"$CAND" | grep -E '^candidates ' | sed -n 's/.* anchored="\([0-9]*\)".*/\1/p' )"
+if [ -n "$TOPSCORE" ] && [ -n "$FIXSCORE" ] && [ "${ANCHORED:-0}" -gt 0 ] \
+    && awk -v f="$FIXSCORE" -v t="$TOPSCORE" 'BEGIN { exit !( f >= 0.95 * t - 0.001 ) }'; then
+    ok "mention anchor survives the penalty: test/chafix/cha.cpp scores $FIXSCORE >= 0.95 x top $TOPSCORE (anchored=$ANCHORED)"
+else
+    no "mention anchor lost to the tier penalty: test/chafix/cha.cpp score=${FIXSCORE:-absent from the top 50} vs 0.95 x top ${TOPSCORE:-none} (anchored=${ANCHORED:-none})"
+fi
 
 # 6c — name-exact route beats the tier penalty: a fixture symbol queried by its EXACT name is still rank 1
 #      (its competitors score 0 — shrinking the only hit must not bury it).

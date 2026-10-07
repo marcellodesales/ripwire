@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // skilleval.h — deterministic, LLM-free skill-ROUTING eval (--eval-skills=FILE): given a realistic
 // developer/agent prompt, does the right skill under ROOT (a skills/ directory, one SKILL.md per subdir)
@@ -32,7 +35,7 @@
 #include "lexical.h"            // subtokens() / chooseForRanker / lexicalScores* — the shipping --for ranker
 #include "eval.h"               // maxPoolToFiles — the file-pooling convention shared with --eval-mined
 #include "search.h"             // normSet — sorted-unique for the query token set
-#include "infra/Diagnostics.h"  // VERIFY
+#include "infra/Diagnostics.h"  // ASSUME
 
 #include <algorithm>
 #include <cmath>
@@ -44,6 +47,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace rw
@@ -103,7 +108,7 @@ inline std::vector<std::string> splitTextLines( const std::string& text )
 // parse ONE SKILL.md into {description, body}. The frontmatter is the block between the first two `---`
 // lines; `description:` is a YAML block scalar (`description: >` + indented continuation lines) or a
 // single inline value. Continuation ends at the next unindented `key:` line or the closing `---`.
-inline void parseSkillMd( const std::string& text, std::string& descOut, std::string& bodyOut )
+inline std::pair<std::string, std::string> parseSkillMd( const std::string& text )
 {
     const std::vector<std::string> lines = splitTextLines( text );
 
@@ -118,7 +123,8 @@ inline void parseSkillMd( const std::string& text, std::string& descOut, std::st
     }
 
     // description: value + indented continuations
-    bool inDesc = false;
+    std::string descText;
+    bool        inDesc = false;
     for( int i = 1; i < frontEndLineIndex; ++i )
     {
         const std::string& line = lines[i];
@@ -134,7 +140,7 @@ inline void parseSkillMd( const std::string& text, std::string& descOut, std::st
                 rest.remove_prefix( 1 );
             }
             if( rest != ">" && rest != ">-" && rest != "|" && rest != "|-" && !rest.empty() )
-            { descOut.append( rest ); descOut.push_back( ' ' ); }
+            { descText.append( rest ); descText.push_back( ' ' ); }
             inDesc = true;
             continue;
         }
@@ -148,13 +154,15 @@ inline void parseSkillMd( const std::string& text, std::string& descOut, std::st
         {
             body.remove_prefix( 1 );
         }
-        descOut.append( body );
-        descOut.push_back( ' ' );
+        descText.append( body );
+        descText.push_back( ' ' );
     }
 
     // body = everything after the closing fence
+    std::string bodyText;
     for( int i = frontEndLineIndex + 1; i < int( lines.size() ); ++i )
-    { bodyOut.append( lines[i] ); bodyOut.push_back( '\n' ); }
+    { bodyText.append( lines[i] ); bodyText.push_back( '\n' ); }
+    return { std::move( descText ), std::move( bodyText ) };
 }
 
 struct SkillSet
@@ -168,31 +176,54 @@ inline SkillSet discoverSkills( const std::string& root )
 {
     SkillSet        set;
     std::error_code ec;
-    for( const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator( root, ec ) )
+    // Every filesystem question here takes an error_code. The throwing forms — the range-for's operator++,
+    // directory_entry::is_directory(), filesystem::exists() — turned a symlink loop at SKILL.md, a mode-000 skill
+    // directory or a directory link loop into an uncaught filesystem_error: SIGABRT, exit 134, on a directory the
+    // caller names. Such an entry is not a readable skill: it is skipped, and stderr names it and why.
+    std::filesystem::directory_iterator it( root, ec ), end;
+    if( ec )
     {
-        if( ec )
+        rw::emitTo( stderr, "ripwire --eval-skills: cannot list '{}': {} — no skills were read\n", root, ec.message() );
+        return set;
+    }
+    for( ; !ec && it != end; it.increment( ec ) )
+    {
+        std::error_code entryEc;
+        const bool      isDirectory = it->is_directory( entryEc );
+        if( entryEc && entryEc != std::errc::no_such_file_or_directory )
         {
-            break;
+            // a directory symlink loop (ELOOP) or an entry that cannot be stat'd: not a readable skill, and said so
+            rw::emitTo( stderr, "ripwire --eval-skills: skipping '{}': {}\n", it->path().string(), entryEc.message() );
+            continue;
         }
-        if( !entry.is_directory() )
+        if( !isDirectory )
         {
             continue;
         }
-        const std::filesystem::path md = entry.path() / "SKILL.md";
-        if( !std::filesystem::exists( md ) )
+        const std::filesystem::path md       = it->path() / "SKILL.md";
+        const bool                  regular = std::filesystem::is_regular_file( md, entryEc );
+        if( entryEc && entryEc != std::errc::no_such_file_or_directory )
         {
-            continue;
+            rw::emitTo( stderr, "ripwire --eval-skills: skipping '{}': {}\n", md.string(), entryEc.message() );
+        }
+        if( !regular )
+        {
+            continue;   // absent, unreadable, or not a regular file (a FIFO would block the read below)
         }
 
         SkillDoc doc;
-        doc.dirName = entry.path().filename().string();
-        parseSkillMd( readWholeFileText( md ), doc.descText, doc.bodyText );
+        doc.dirName = it->path().filename().string();
+        std::tie( doc.descText, doc.bodyText ) = parseSkillMd( readWholeFileText( md ) );
 
         if( doc.dirName == "ripwire-router" ) { set.router = std::move( doc ); set.hasRouter = true; }
         else
         {
             set.candidates.push_back( std::move( doc ) );
         }
+    }
+    if( ec )
+    {
+        rw::emitTo( stderr, "ripwire --eval-skills: stopped listing '{}' early: {} — the skills after that point were not read\n", root, ec.message() );
     }
     std::sort( set.candidates.begin(), set.candidates.end(),
                []( const SkillDoc& a, const SkillDoc& b ) { return a.dirName < b.dirName; } );
@@ -202,7 +233,10 @@ inline SkillSet discoverSkills( const std::string& root )
 // ── the labelled corpus: prompt<TAB>skill[,skill]|none<TAB>provenance<TAB>split ─────────────────────────
 
 enum class Prov : std::uint8_t { Router, Desc, Judged, Neg };
+inline constexpr std::size_t kProvCount = static_cast<std::size_t>( Prov::Neg ) + 1;
+static_assert( enumCountIsExact<Prov, kProvCount>(), "kProvCount must name the LAST Prov — move it with the append" );
 inline constexpr const char* kProvName[] = { "router", "desc", "judged", "neg" };
+static_assert( std::size( kProvName ) == kProvCount, "kProvName is indexed by Prov — one name per enumerator" );
 
 // split (added round r26): test = the FROZEN held-out benchmark (never tune a skill
 // description against these SAME rows and re-measure — train-on-test with extra steps); dev = rows
@@ -210,7 +244,10 @@ inline constexpr const char* kProvName[] = { "router", "desc", "judged", "neg" }
 // silently conflated. A row with no 4th column defaults to Test (back-compat for ad-hoc TSVs other
 // gates build on the fly) — the committed test/skillevalfix/prompts.tsv states it explicitly instead.
 enum class Split : std::uint8_t { Test, Dev };
+inline constexpr std::size_t kSplitCount = static_cast<std::size_t>( Split::Dev ) + 1;
+static_assert( enumCountIsExact<Split, kSplitCount>(), "kSplitCount must name the LAST Split — move it with the append" );
 inline constexpr const char* kSplitName[] = { "test", "dev" };
+static_assert( std::size( kSplitName ) == kSplitCount, "kSplitName is indexed by Split — one name per enumerator" );
 
 struct PromptRow
 {
@@ -246,7 +283,7 @@ inline bool parseCorpus( const std::string& path, const std::vector<SkillDoc>& c
                          std::vector<PromptRow>& rows )
 {
     std::ifstream in( path );
-    if( !in ) { std::fprintf( stderr, "ripwire --eval-skills: cannot open '%s'\n", path.c_str() ); return false; }
+    if( !in ) { rw::emitTo( stderr, "ripwire --eval-skills: cannot open '{}'\n", path.c_str() ); return false; }
 
     HashMap<std::string, std::uint32_t> indexOfSkill;
     for( std::uint32_t c = 0; c < candidates.size(); ++c )
@@ -258,7 +295,7 @@ inline bool parseCorpus( const std::string& path, const std::vector<SkillDoc>& c
     std::string line;
     int         lineNumber = 0;
     const auto  bad = [ & ]( const char* why )
-    { std::fprintf( stderr, "ripwire --eval-skills: %s:%d: %s\n", path.c_str(), lineNumber, why ); ok = false; };
+    { rw::emitTo( stderr, "ripwire --eval-skills: {}:{}: {}\n", path.c_str(), lineNumber, why ); ok = false; };
 
     while( std::getline( in, line ) )
     {
@@ -449,7 +486,7 @@ struct RowOutcome
 inline RowOutcome outcomeOf( const std::vector<double>& score, const PromptRow& row )
 {
     const std::vector<std::uint32_t> order = rankCandidates( score );
-    VERIFY( !order.empty() );
+    ASSUME( !order.empty() );
     RowOutcome out;
     out.top1Index = order[0];
     out.top1Score = score[ order[0] ];
@@ -472,7 +509,8 @@ inline RowOutcome outcomeOf( const std::vector<double>& score, const PromptRow& 
 // The retrieval arms, in report order. Namespace scope (not function-local) so the per-split reporter below
 // can be a free function rather than a lambda capturing runEvalSkills' whole frame.
 inline constexpr std::size_t kArmCount = 5;
-inline constexpr const char* kArmName[kArmCount] = { "overlap", "name", "bm25-desc", "bm25-full", "for-routed" };
+inline constexpr const char* kArmName[] = { "overlap", "name", "bm25-desc", "bm25-full", "for-routed" };
+static_assert( std::size( kArmName ) == kArmCount, "kArmName: one name per retrieval arm — a spelled extent would zero-fill a missing one" );
 
 // AUC( positive top-1 scores vs negative top-1 scores ) — threshold-free fire/abstain separation.
 // 0.5 = no signal; < 0.5 = inverted (negatives outscore positives — the failure mode to fail loudly on).
@@ -508,8 +546,8 @@ inline void reportSplit( const std::vector<PromptRow>& rows, const std::vector<R
             ( r.permitted.empty() ? sNeg : sPos )++;
         }
     }
-    std::printf( "  split=%s (N=%zu: %zu positive + %zu negative):\n", label, sPos + sNeg, sPos, sNeg );
-    if( sPos == 0 ) { std::printf( "    split=%s (no positive rows in this split yet)\n", label ); return; }
+    rw::emitTo( stdout, "  split={} (N={}: {} positive + {} negative):\n", label, sPos + sNeg, sPos, sNeg );
+    if( sPos == 0 ) { rw::emitTo( stdout, "    split={} (no positive rows in this split yet)\n", label ); return; }
 
     // Per arm: hit@1 / hit@2 / MRR over this split's positives, plus fire-abstain AUC when it has negatives.
     for( std::size_t a = 0; a < kArmCount; ++a )
@@ -536,12 +574,12 @@ inline void reportSplit( const std::vector<PromptRow>& rows, const std::vector<R
         const double P = double( sPos );
         if( sNeg > 0 )
         {
-            std::printf( "    split=%-5s %-11s %6.1f%% %6.1f%%   %5.3f     %5.3f\n", label, kArmName[a],
+            rw::emitTo( stdout, "    split={:<5} {:<11} {:6.1f}% {:6.1f}%   {:5.3f}     {:5.3f}\n", label, kArmName[a],
                          100.0 * hit1 / P, 100.0 * hit2 / P, mrr / P, separationAuc( posTop, negTop ) );
         }
         else
         {
-            std::printf( "    split=%-5s %-11s %6.1f%% %6.1f%%   %5.3f       n/a (no negative rows in this split)\n",
+            rw::emitTo( stdout, "    split={:<5} {:<11} {:6.1f}% {:6.1f}%   {:5.3f}       n/a (no negative rows in this split)\n",
                          label, kArmName[a], 100.0 * hit1 / P, 100.0 * hit2 / P, mrr / P );
         }
     }
@@ -552,7 +590,7 @@ inline void reportSplit( const std::vector<PromptRow>& rows, const std::vector<R
 inline void reportMisses( const std::vector<PromptRow>& rows, const std::vector<RowOutcome>& outcomes,
                           const std::vector<SkillDoc>& candidates, std::size_t arm )
 {
-    std::printf( "  misses (%s):\n", kArmName[arm] );
+    rw::emitTo( stdout, "  misses ({}):\n", kArmName[arm] );
     std::size_t missCount = 0;
     for( std::size_t i = 0; i < rows.size(); ++i )
     {
@@ -575,12 +613,12 @@ inline void reportMisses( const std::vector<PromptRow>& rows, const std::vector<
         {
             clipped += "...";
         }
-        std::printf( "    line %-3d want=%s got=%s \"%s\"\n", rows[i].lineNumber, want.c_str(),
+        rw::emitTo( stdout, "    line {:<3} want={} got={} \"{}\"\n", rows[i].lineNumber, want.c_str(),
                      candidates[ outcomes[i].top1Index ].dirName.c_str(), clipped.c_str() );
     }
     if( missCount == 0 )
     {
-        std::printf( "    (none)\n" );
+        rw::emitRaw( stdout, "    (none)\n" );
     }
 }
 
@@ -590,7 +628,7 @@ struct OraclePoint { double acc = 0.0; double th = 0.0; };
 
 inline OraclePoint oracleFireAbstain( const std::vector<RowOutcome>& outcomes, const std::vector<PromptRow>& rows )
 {
-    VERIFY( outcomes.size() == rows.size() );
+    ASSUME( outcomes.size() == rows.size() );
     std::vector<double> thresholds;
     thresholds.push_back( -1.0 );                                  // "always fire" (every score is >= 0)
     for( const RowOutcome& o : outcomes )
@@ -654,7 +692,7 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
     const std::size_t skillCount = set.candidates.size();
     if( skillCount < 2 )
     {
-        std::fprintf( stderr, "ripwire --eval-skills: found %zu skill dir(s) under '%s' — ROOT must be a skills directory "
+        rw::emitTo( stderr, "ripwire --eval-skills: found {} skill dir(s) under '{}' — ROOT must be a skills directory "
                               "(one SKILL.md per subdir), e.g. `ripwire skills --eval-skills=test/skillevalfix/prompts.tsv`\n",
                       skillCount, root.c_str() );
         return 1;
@@ -663,7 +701,7 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
     {
         if( s.descText.empty() )
         {
-            std::fprintf( stderr, "ripwire --eval-skills: note: %s has an empty description: block\n", s.dirName.c_str() );
+            rw::emitTo( stderr, "ripwire --eval-skills: note: {} has an empty description: block\n", s.dirName.c_str() );
         }
     }
 
@@ -678,7 +716,7 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
         ( r.permitted.empty() ? negCount : posCount )++;
     }
     if( posCount == 0 )
-    { std::fprintf( stderr, "ripwire --eval-skills: no positive rows in '%s'\n", labelsPath.c_str() ); return 1; }
+    { rw::emitTo( stderr, "ripwire --eval-skills: no positive rows in '{}'\n", labelsPath.c_str() ); return 1; }
     std::size_t testSplitCount = 0, devSplitCount = 0;
     for( const PromptRow& r : rows )
     {
@@ -777,10 +815,10 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
     }
 
     // ---- report ----
-    std::printf( "ripwire --eval-skills  (skill routing over K=%zu candidate skills [ripwire-router excluded]; "
-                 "%zu positive + %zu negative prompts; corpus '%s'; split test=%zu dev=%zu)\n",
+    rw::emitTo( stdout, "ripwire --eval-skills  (skill routing over K={} candidate skills [ripwire-router excluded]; "
+                 "{} positive + {} negative prompts; corpus '{}'; split test={} dev={})\n",
                  skillCount, posCount, negCount, labelsPath.c_str(), testSplitCount, devSplitCount );
-    std::printf( "  %-11s %7s %7s %7s   %7s   %s\n", "arm", "hit@1", "hit@2", "mrr", "sep-auc", "fire/abstain@ORACLE-th (upper bound)" );
+    rw::emitTo( stdout, "  {:<11} {:>7} {:>7} {:>7}   {:>7}   {}\n", "arm", "hit@1", "hit@2", "mrr", "sep-auc", "fire/abstain@ORACLE-th (upper bound)" );
 
     for( std::size_t a = 0; a < kArmCount; ++a )
     {
@@ -803,12 +841,12 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
         const OraclePoint oracle = oracleFireAbstain( outcomes[a], rows );
         if( negCount > 0 )
         {
-            std::printf( "  %-11s %6.1f%% %6.1f%%   %5.3f     %5.3f   %5.1f%% (th=%.3f)\n",
+            rw::emitTo( stdout, "  {:<11} {:6.1f}% {:6.1f}%   {:5.3f}     {:5.3f}   {:5.1f}% (th={:.3f})\n",
                          kArmName[a], 100.0 * hit1 / P, 100.0 * hit2 / P, mrr / P, auc, 100.0 * oracle.acc, oracle.th );
         }
         else
         {
-            std::printf( "  %-11s %6.1f%% %6.1f%%   %5.3f       n/a   n/a (no negative rows)\n",
+            rw::emitTo( stdout, "  {:<11} {:6.1f}% {:6.1f}%   {:5.3f}       n/a   n/a (no negative rows)\n",
                          kArmName[a], 100.0 * hit1 / P, 100.0 * hit2 / P, mrr / P );
         }
     }
@@ -831,14 +869,16 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
             }
         }
         const double P = double( posCount );
-        std::printf( "  %-11s %6.1f%% %6.1f%%   %5.3f     0.500   <- floor (uniform-random ranking; auc 0.5 by definition)\n",
+        rw::emitTo( stdout, "  {:<11} {:6.1f}% {:6.1f}%   {:5.3f}     0.500   <- floor (uniform-random ranking; auc 0.5 by definition)\n",
                      "random", 100.0 * hit1 / P, 100.0 * hit2 / P, mrr / P );
     }
 
     // provenance split for the diagnostics arm — desc rows echo skill wording, so they are the EASY set;
     // judged rows share no description vocabulary by construction and are the number that matters.
     {
-        std::size_t provHit[3] = { 0, 0, 0 }, provN[3] = { 0, 0, 0 };
+        // sized by the enum, not by the three provenances the line below prints: a row's prov is indexed straight in,
+        // and a literal 3 left Prov::Neg one past the end with only a debug check in front of it
+        std::size_t provHit[kProvCount] = {}, provN[kProvCount] = {};
         for( std::size_t i = 0; i < rows.size(); ++i )
         {
             if( rows[i].permitted.empty() )
@@ -846,11 +886,11 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
                 continue;
             }
             const std::size_t p = std::size_t( rows[i].prov );
-            VERIFY( p < 3 );
+            ASSUME( p < kProvCount );
             ++provN[p];
             provHit[p] += outcomes[kDiagArm][i].hit1 ? 1 : 0;
         }
-        std::printf( "  provenance hit@1 (%s): router %zu/%zu, desc %zu/%zu, judged %zu/%zu "
+        rw::emitTo( stdout, "  provenance hit@1 ({}): router {}/{}, desc {}/{}, judged {}/{} "
                      "(desc rows quote the descriptions - expect them easiest; judged is the honest number)\n",
                      kArmName[kDiagArm], provHit[0], provN[0], provHit[1], provN[1], provHit[2], provN[2] );
 
@@ -858,7 +898,7 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
         // description vocabulary by construction) — the echo-free number every arm must be judged on.
         if( provN[2] > 0 )
         {
-            std::printf( "  judged-only hit@1 per arm:" );
+            rw::emitRaw( stdout, "  judged-only hit@1 per arm:" );
             for( std::size_t a = 0; a < kArmCount; ++a )
             {
                 std::size_t judgedHit = 0;
@@ -869,16 +909,16 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
                         ++judgedHit;
                     }
                 }
-                std::printf( "%s %s %zu/%zu", a ? "," : "", kArmName[a], judgedHit, provN[2] );
+                rw::emitTo( stdout, "{} {} {}/{}", a ? "," : "", kArmName[a], judgedHit, provN[2] );
             }
-            std::printf( "\n" );
+            rw::emitRaw( stdout, "\n" );
         }
     }
 
     if( set.hasRouter )
     {
-        std::printf( "  router-magnet: with ripwire-router ADMITTED as a candidate it takes top-1 on %zu/%zu positive prompts "
-                     "(%s arm) - why it is excluded above\n", routerMagnetWins, posCount, kArmName[kDiagArm] );
+        rw::emitTo( stdout, "  router-magnet: with ripwire-router ADMITTED as a candidate it takes top-1 on {}/{} positive prompts "
+                     "({} arm) - why it is excluded above\n", routerMagnetWins, posCount, kArmName[kDiagArm] );
     }
 
     // per-skill table (diagnostics arm): which skills never win when permitted (mis-described), which
@@ -905,10 +945,10 @@ inline int runEvalSkills( const std::string& root, const IngestResult& ing, cons
                 }
             }
         }
-        std::printf( "  per-skill (%s): name / permitted-rows / won / pos-fires / false-fires / neg-fires\n", kArmName[kDiagArm] );
+        rw::emitTo( stdout, "  per-skill ({}): name / permitted-rows / won / pos-fires / false-fires / neg-fires\n", kArmName[kDiagArm] );
         for( std::size_t c = 0; c < skillCount; ++c )
         {
-            std::printf( "    %-26s %3zu %5zu %5zu %5zu %5zu%s\n", set.candidates[c].dirName.c_str(),
+            rw::emitTo( stdout, "    {:<26} {:>3} {:>5} {:>5} {:>5} {:>5}{}\n", set.candidates[c].dirName.c_str(),
                          tally[c].permittedRows, tally[c].won, tally[c].posFires, tally[c].falseFires, tally[c].negFires,
                          ( tally[c].permittedRows >= 2 && tally[c].won == 0 ) ? "   <- never wins its own rows (mis-described?)" : "" );
         }

@@ -23,7 +23,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN (build first)"; exit 1; }
@@ -32,7 +32,8 @@ no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 # regardless of the caller's own working-tree dirtiness, which a bare `--test-gate` does not — this repo's
 # own worktree may carry uncommitted work while this gate runs. src/model.h is chosen because it is stable,
 # widely depended on, and unrelated to this lane's own edits (src/graphlegend.h, src/situ.h).
-"$BIN" "$ROOT" --test-gate=src/model.h >"$TMP/tg.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; every arm here budgets and reads the FULL legend, so the runs ask for it.
+"$BIN" "$ROOT" --test-gate=src/model.h --legend=full >"$TMP/tg.xml" 2>/dev/null
 grep -q '<test-gate ' "$TMP/tg.xml" || { echo "no <test-gate> in output — cannot measure"; exit 1; }
 
 read -r total legend payload <<EOF
@@ -90,10 +91,57 @@ EOF
 # --affected/--situ/--test-gate alike so the emitters cannot drift. Written long (477 B), measured, cut to
 # the shortest honest form (281 B). Measured on this fixture: 2205 -> 2486 B; 2540 leaves ~54 B — the same
 # posture as every pin above.
-if [ "$legend" -le 2720 ]; then
-    ok "(a) --test-gate legend is $legend B (<= 2540 B budget; total=$total payload=$payload)"
+# RE-PINNED 2720 -> 2900 (2026-09-12, output-routing loop E1 / A4-2, owner call). ONE new FACT, in the SAME
+# row-gated clause (testmap.h kRunHintLegendClause, so the zero-row report still pays nothing):
+#   +180 B  the <g> group row — 2+ runner-less rows with equal evidence attributes served as ONE row, n= how
+#           many, p= their paths in list order, every path verbatim. It is what lets the not-derivable
+#           disclosure be said once per GROUP instead of once per row (rocksdb, 127 rows: 126
+#           `run_unknown="1"` -> 10, test-gate 13,242 -> 9,633 B) and legendcoveragecheck wants n= defined
+#           wherever a document carries it.
+# Measured on this fixture: 2663 -> 2843 B.
+# RE-PINNED 2900 -> 3000 (2026-09-13, review of #214). TWO facts a consumer of a <g> row cannot do without,
+# both in the same row-gated clause, so a zero-row report still pays nothing:
+#   +65 B   a path holding ',' is NEVER grouped, so p= splits into exactly n= paths. The seam used to spell
+#           such a path &#44; and say so here; every XML parser undoes that entity BEFORE a consumer splits
+#           on the delimiter, so the escape was a promise the format could not keep. Refusing to group the
+#           row is the only spelling that is right in all three dialects, and this sentence is what makes
+#           `split( p, "," )` a safe thing for a reader to write.
+#   +49 B   a section's shown=/total= over these rows count test FILES, so a <g n=N> row is N of them. Same
+#           finding from the other side: --pack-task prints <tests shown="54" total="109"> above 30-odd
+#           RENDERED rows, and the bundle legend's own "shown=rows kept" sentence flatly contradicted it.
+#           Said HERE rather than in that always-on bundle legend, which is charged against the ceiling it
+#           describes: unconditional it put packtaskcheck's 2000-token arm 5620 B over a 5428 B ceiling
+#           (measured), and a bundle with no <tests> section has no use for it.
+# Measured on this fixture: 2843 -> 2957 B; 3000 leaves ~43 B — the same posture as every pin above.
+# RE-PINNED 3000 -> 3070 (2026-09-13, review of #219). ONE new FACT, in the same row-gated clause, and
+# CONDITIONAL on top of that (testmap.h kRunRootRelSentence, spliced only when runsAreRootRelative — a
+# multi-root run declares no root= and pays 0 B):
+#   +56 B   "A run= command is relative to root=: run it from there." The run= commands themselves became
+#           root-relative in this lane, which is what makes the document independent of where the tree is
+#           checked out — and a relative command whose anchor is not stated is a command the reader cannot
+#           paste. The rule is said where it is consumed, beside the rows it is about.
+# Measured on this fixture: 2957 -> 3013 B; 3070 leaves ~57 B — the same posture as every pin above.
+# RE-PINNED 3070 -> 3400 (rv-test-gate-tsjs fix round, F3). ONE new FACT, row-gated on untested_modscope=N > 0
+# (this fixture's own blast radius over src/model.h has real <file-scope> callers reaching it, so the clause
+# fires here, not just on a synthetic fixture):
+#   "untested_modscope=N counts <file-scope> owners excluded from untested= ... read this as the excluded
+#   count alone, not a sum term." — the disclosure #324 owed once it started excluding a real obligation
+#   from untested= without saying so (a silent pass a review caught: exit 0 with nothing explaining why).
+# Measured on this fixture: 3013 -> 3305 B; 3400 leaves ~95 B — the same posture as every pin above.
+# RE-PINNED 3400 -> 3730 (lane/builtin-bind-065 fix round, review finding M1). ONE new FACT, gated on declined_calls=K > 0:
+# the radius over src/model.h is reached by call sites the resolver declined to bind (tier-3 splits, and on this tree the
+# builtin-method gate's declines in bench/ and test/ scripts), and a test behind one of them is in no row — --test-gate
+# was the one caller-reading verb that said nothing about them. The clause is --test-gate's own short form
+# (graphlegend.h kDeclinedCallsTestGateLegend, 186 B, not the 620 B shared one) plus the gate sentence (143 B) that rides
+# only a graph where the builtin-method gate declined a call. Measured on this fixture: 3305 -> 3634 B; 3730 leaves ~95 B.
+# RE-PINNED 3730 -> 3930 (lane/answer-honesty-067, comparison table hono-20/textual-20). ONE new FACT, gated on
+# run_first=N being on the root (it rides only when the run-first tier splits the <t> rows, as it does over src/model.h):
+# testmap.h kRunFirstLegend, 237 B (renamed from must_run= in review, with the not-a-skip-list reading). Measured on this fixture: 3634 -> 3871 B; 3930 leaves
+# ~59 B — the same posture as every pin above.
+if [ "$legend" -le 3930 ]; then
+    ok "(a) --test-gate legend is $legend B (<= 3930 B budget; total=$total payload=$payload)"
 else
-    no "(a) --test-gate legend is $legend B (> 2540 B budget) — the essay re-inflated"
+    no "(a) --test-gate legend is $legend B (> 3930 B budget) — the essay re-inflated"
 fi
 
 # (b) the honesty vocabulary + the §B12.5 cross-verb UNIT-collision anchors (test/testgatecheck.sh arm (g)
@@ -103,7 +151,8 @@ for phrase in \
     'UNIT: untested= here counts impacted SYMBOLS' 'call EDGES' 'defs a gate lights' \
     'shown_tests=' 'shown_untested=' 'script_gates_unmodelled=' 'script_gates_registered=' \
     'script_gates_mapped=' 'script_gates_unresolved_dynamic=' 'evidence=script_literal' \
-    'evidence=manifest_declared' 'counts_floor=1' 'REPEAT VERBATIM' 'exit 4'
+    'evidence=manifest_declared' 'counts_floor=1' 'REPEAT VERBATIM' 'exit 4' \
+    'untested_modscope=N counts <file-scope> owners excluded from untested='
 do
     case "$L" in
         *"$phrase"*) ok "(b) legend keeps: $phrase" ;;
@@ -113,10 +162,10 @@ done
 
 # (c) well-formed + deterministic, unchanged by a prose-only edit.
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/tg.xml" 2>/dev/null && ok "(c) well-formed XML" || no "(c) fails xmllint"
+    if xmllint --noout "$TMP/tg.xml" 2>/dev/null; then ok "(c) well-formed XML"; else no "(c) fails xmllint"; fi
 fi
-"$BIN" "$ROOT" --test-gate=src/model.h >"$TMP/tg2.xml" 2>/dev/null
-diff -q "$TMP/tg.xml" "$TMP/tg2.xml" >/dev/null && ok "(c) deterministic (byte-identical twice)" || no "(c) differs across two runs"
+"$BIN" "$ROOT" --test-gate=src/model.h --legend=full >"$TMP/tg2.xml" 2>/dev/null
+if diff -q "$TMP/tg.xml" "$TMP/tg2.xml" >/dev/null; then ok "(c) deterministic (byte-identical twice)"; else no "(c) differs across two runs"; fi
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

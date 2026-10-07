@@ -11,22 +11,31 @@
 # ── THE ORACLE, AND WHY IT IS INDEPENDENT ────────────────────────────────────────────────────────────────
 # Arm (E) does NOT trust a number this lane wrote down. It RE-RUNS the hand-built overlay recipe above, live,
 # with the same binary, and requires the new code path to agree with it row for row. The overlay reaches its
-# answer through a completely different mechanism — a real checked-out git worktree, a serialized
+# answer through a completely different mechanism — a real checked-out git tree, a serialized
 # `.ripwire_quality_baseline` sidecar round-tripped through disk, and the ordinary working-tree comparison —
 # and shares no code with the ref-pair path beyond computeDelta itself. It also cannot go stale, because it
 # is recomputed on every run rather than pinned as a literal.
 #
 # Two literals ARE pinned, and only as a cross-check that the two shas still name the round the comment
 # above describes: the harvest round record (PLAN_HARVEST_REPORTS_2026-08-15/ROUTING_LEDGER.md) states
-# `--dmm=4b9386c..ba380b5` = 0.530 and 18 gating rows. Both reproduce.
+# `--dmm=4b9386c..ba380b5` = 0.530 and 18 gating rows.
 #
-# ── THE ONE DEFENSIBLE DISCREPANCY: 18 vs 11 ─────────────────────────────────────────────────────────────
-# The overlay reports 18 gating rows; the ref-pair form reports 11. The difference is exactly the 7
-# short-horizon-churn rows, and it is a property of the QUESTION, not a bug:
+# THE 18 IS A HISTORICAL READING, AND IT MOVED — 2026-09-10, the per-kind dial round (test/qddialscheck.sh).
+# 18 is what the kinds reported when churn="self" gated on its own, when verbosity counted physical lines,
+# when any growth over the bar was major, and when every new export was a row. Four of those changed on
+# purpose, so the same two shas now report 8. The literal is re-pinned to 8 rather than deleted, because what
+# it checks is unchanged: that these shas still name a wave with regressions in it. dmm is a different
+# instrument and does not read the gating tiers, so 0.530 is untouched — which is itself the cross-check that
+# the CORPUS did not move, only the tiers.
+#
+# ── THE ONE DEFENSIBLE DISCREPANCY: the overlay's total exceeds the ref-pair form's ───────────────────────
+# The overlay's gating total is higher than the ref-pair form's, and the difference is exactly the
+# short-horizon-churn rows (7 of the historical 18; the dial round left fewer). It is a property of the
+# QUESTION, not a bug:
 #
 #   The churn kind needs git history AT THE TREE BEING JUDGED — it counts commits per file in a recent
 #   window and compares body hashes against a window-reference commit. The overlay's judged tree is a real
-#   worktree with a real .git, so churn evaluates there (against HEAD = the BASE commit, which is itself a
+#   checkout with a real .git, so churn evaluates there (against HEAD = the BASE commit, which is itself a
 #   quirk of the overlay: the window is anchored at the wrong end of the range). The ref-pair form
 #   materializes BOTH trees out of the object store into temp dirs that are not repositories at all, so the
 #   kind cannot be computed and the report says so — `churn="unavailable"` on the root element, which arm
@@ -42,14 +51,13 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
-TMP="$( mktemp -d )"
-WT=""
-cleanup(){ [ -n "$WT" ] && git -C "$ROOT" worktree remove --force "$WT" >/dev/null 2>&1; rm -rf "$TMP"; git -C "$ROOT" worktree prune >/dev/null 2>&1; }
-trap cleanup EXIT
+. "$ROOT/test/lib/headbinlib.sh"                       # ripwire_private_checkout, for arm (E)'s scratch tree
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT        # (E)'s tree is a private clone in here: nothing registered, nothing to prune
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 skip(){ printf '  SKIP  %s\n' "$*"; }
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN"; exit 2; }
@@ -127,7 +135,7 @@ hdr "$TMP/syn.xml" | grep -q ' at="' \
 
 # G4 well-formedness, and determinism on the exact same question
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/syn.xml" 2>/dev/null && ok "(A) output is well-formed XML" || no "(A) xmllint rejected the output"
+    if xmllint --noout "$TMP/syn.xml" 2>/dev/null; then ok "(A) output is well-formed XML"; else no "(A) xmllint rejected the output"; fi
 else
     skip "(A) xmllint not installed"
 fi
@@ -141,7 +149,7 @@ grep -q 'qdpair' "$TMP/syn.xml" \
 
 # ── (B) A==B is a legal, empty, exit-0 comparison ─────────────────────────────────────────────────────────
 "$BIN" . "--quality-delta=$B_SHA..$B_SHA" >"$TMP/same.xml" 2>/dev/null; sameRc=$?
-[ "$sameRc" = 0 ] && ok "(B) A==B exits 0" || no "(B) A==B exit was $sameRc, expected 0"
+if [ "$sameRc" = 0 ]; then ok "(B) A==B exits 0"; else no "(B) A==B exit was $sameRc, expected 0"; fi
 [ "$( attr "$TMP/same.xml" regressions )" = "0" ] && [ "$( attr "$TMP/same.xml" gating )" = "0" ] \
     && ok "(B) A==B is an empty delta" || { no "(B) A==B was not empty"; hdr "$TMP/same.xml"; }
 [ "$( attr "$TMP/same.xml" base_ref )" = "$( attr "$TMP/same.xml" target_ref )" ] \
@@ -149,7 +157,7 @@ grep -q 'qdpair' "$TMP/syn.xml" \
 
 # ── (C) refusals: a bad ref, the three-dot form, and a half-typed value ───────────────────────────────────
 "$BIN" . --quality-delta=nosuchref..HEAD >/dev/null 2>"$TMP/badrev.err"; badRc=$?
-[ "$badRc" = 1 ] && ok "(C) an unresolvable ref exits 1" || no "(C) unresolvable ref exit was $badRc, expected 1"
+if [ "$badRc" = 1 ]; then ok "(C) an unresolvable ref exits 1"; else no "(C) unresolvable ref exit was $badRc, expected 1"; fi
 grep -q "nosuchref" "$TMP/badrev.err" && ok "(C) the refusal NAMES the offending token" \
                                       || { no "(C) refusal does not name the bad token"; head -2 "$TMP/badrev.err"; }
 grep -qi "rev-parse" "$TMP/badrev.err" && ok "(C) the refusal offers an adjacent probe to run" \
@@ -174,16 +182,39 @@ hdr "$TMP/bare.xml" | grep -q 'base_ref=' \
     || no "(D) the bare form reported baseline=ref-pair"
 
 # ── (E) DECISIVE: ripwire's own recorded harvest wave, against the live-recomputed overlay oracle ─────────
+# RE-PIN LOG for the recorded literal below (it is a bare number, so its justification has to live here).
+# 2026-09-20, integration/train-13 (lane/t13-honesty-fixes fix 2): 9 → 8 gating rows on this wave, and the
+#   row that left is EXACTLY the row train 12 added below. Fix 2 gives `reuse-decline`
+#   (new-clone-of-reused-helper) the two demotions its sibling `duplication` already had, one of which is
+#   the ALL-TEST-SCRIPT skip. Train 12's extra row was
+#     <r kind="new-clone-of-reused-helper" sym="curl | http_call" p="test/mcpremotecheck.sh:51" .../>
+#   whose every member is a `test/`-pathed `.sh` gate script — precisely the population the skip exempts,
+#   and precisely the shape research-ai-smells measured as the kind's one real-history firing. `duplication`
+#   was already silent on that group; the two reporters now agree on it. Checked on the merged binary: the
+#   overlay carries NO new-clone-of-reused-helper row at all, and arm (E)'s row-for-row oracle comparison
+#   (5 rows) and its churn disclosure arm (3) both stayed green, so 5 + 3 = 8. Nothing else moved: the
+#   recorded dmm 0.530 reproduces unchanged.
+#   FOUND LATE, and worth recording as such: this gate greps src/quality.h and was missed by train 13's
+#   first-round gate selection, then caught by the wider sweep in the fix round.
+# 2026-09-20, integration/train-12 (issue #60, lane/t12-filescope-calls): 8 → 9 gating rows on this wave.
+#   The message below offers three candidate causes — "the shas, the corpus or a kind's tier moved". It was a
+#   FOURTH: a kind's EVIDENCE moved, in the direction #60 exists to move it. The extra row is
+#     <r kind="new-clone-of-reused-helper" sym="curl | http_call" p="test/mcpremotecheck.sh:51" was="0" now="6"/>
+#   and the cause is checkable in one command on the wave's B tree: --callers=http_call reports count="0" on
+#   755f9026 and count="1" on this train. The kind fires only when the clone group's maxFanin reaches
+#   kReusedHelperMinFanin (3); a shell top-level call had no caller node before #60, so those call sites
+#   conferred no fan-in and the group never qualified. The clone is not new and no bar moved — only the
+#   evidence that the helper it duplicates is REUSED. The row-for-row oracle comparison and the churn
+#   disclosure arm above both stayed green across the change (6 non-churn + 3 churn = 9).
 WAVE_A=4b9386c
 WAVE_B=ba380b5
 if ! git -C "$ROOT" rev-parse -q --verify "$WAVE_A^{commit}" >/dev/null 2>&1 \
    || ! git -C "$ROOT" rev-parse -q --verify "$WAVE_B^{commit}" >/dev/null 2>&1; then
     skip "(E) $WAVE_A..$WAVE_B not in this checkout (shallow clone or foreign repo) — the wave-level arm needs ripwire's own history"
 else
-    WT="$TMP/wave"
-    if ! git -C "$ROOT" worktree add --detach "$WT" "$WAVE_A" >/dev/null 2>&1; then
-        WT=""
-        skip "(E) could not create a scratch worktree at $WAVE_A"
+    WT="$TMP/wave"                                  # a private clone, never a registered worktree (test/worktreeleakcheck.sh)
+    if ! ripwire_private_checkout "$ROOT" "$WAVE_A" "$WT" >/dev/null 2>&1; then
+        skip "(E) could not check out a scratch tree at $WAVE_A"
     else
         # --- the INDEPENDENT oracle: the hand-built overlay, recomputed here, sharing no code path with A..B
         "$BIN" "$WT" --quality-baseline >/dev/null 2>&1
@@ -217,9 +248,9 @@ else
 
         # the two RECORDED literals from the round record — a cross-check that these shas still name that wave
         overlayTotal=$(( oracleN + overlayChurn ))
-        [ "$overlayTotal" = 18 ] \
-            && ok "(E) the overlay reproduces the RECORDED 18 gating rows (= $oracleN + $overlayChurn churn)" \
-            || no "(E) the overlay gave $overlayTotal gating rows; the round record states 18 — the shas or the corpus moved"
+        [ "$overlayTotal" = 8 ] \
+            && ok "(E) the overlay reproduces the pinned 8 gating rows (= $oracleN + $overlayChurn churn; 9 between #60 and reuse-decline's test-script skip, 8 before #60, 18 pre-dial)" \
+            || no "(E) the overlay gave $overlayTotal gating rows; this binary is pinned at 8 (9 between #60's file-scope callers and reuse-decline's all-test-script skip, 8 before #60, 18 before the 2026-09-10 dial round) — the shas, the corpus, a kind's tier or a kind's EVIDENCE moved; the RE-PIN LOG above arm (E) records how the last move was justified"
         dmmVal="$( "$BIN" "$ROOT" "--dmm=$WAVE_A..$WAVE_B" 2>/dev/null | grep -o ' dmm="[0-9.]*"' | head -1 | sed -E 's/.*"([0-9.]*)".*/\1/' )"
         # tolerance band, not equality: dmm is a float printed to 3 places (house float rule).
         if [ -n "$dmmVal" ] && awk -v v="$dmmVal" 'BEGIN{ exit !(v > 0.525 && v < 0.535) }'; then
@@ -241,7 +272,8 @@ else
         #
         # GIT_CONFIG_* is the non-destructive way to say "a developer had this configured" — it injects
         # config for the spawned git without writing to $ROOT's real config file, which a `git config` call
-        # in a gate would clobber (the worktree shares its repo's config with the developer's own checkout).
+        # in a gate would clobber (it did while this scratch tree was a worktree sharing the developer's config; as
+        # a private clone it has its own, and GIT_CONFIG_* still writes no config file at all).
         # Both directions are pinned: pointing AT this repo's ignore list (the exact value that caused the
         # incident) and at an empty list (the CI-shaped value). RED BEFORE GREEN: against a binary built
         # before the pin, the first of the two differs from the unconfigured run by exactly the one

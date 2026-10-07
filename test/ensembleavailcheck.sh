@@ -58,7 +58,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -123,7 +123,9 @@ fi
 # repository anywhere above it — mktemp -d is outside the ripwire checkout by construction.
 RUSTNOGIT="$TMP/rustnogit"; mkdir -p "$RUSTNOGIT"; cp "$RUSTGIT/lib.rs" "$RUSTNOGIT/"
 
-ensembleOn(){ "$BIN" "$1" --ensemble --no-cache 2>/dev/null; }
+# L1 (2026-09-19): the CLI default legend is compact and spells a <s ...> row shape inside its comment; the arms
+# count real rows, so they ask for the full legend (the pre-change default).
+ensembleOn(){ "$BIN" "$1" --ensemble --no-cache --legend=full 2>/dev/null; }
 rootElem(){ grep -o '<ensemble [^>]*>' "$1" | head -1; }
 rootAttr(){ # rootAttr <file> <name> — the value of the FIRST occurrence of name="…" on the root element
     rootElem "$1" | grep -o " $2=\"[^\"]*\"" | head -1 | sed "s/^ $2=\"//; s/\"$//"

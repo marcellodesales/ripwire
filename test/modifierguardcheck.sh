@@ -30,7 +30,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 cd "$ROOT"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
 
@@ -84,8 +84,15 @@ guard "--limit on the default map"    'honored only by'                     "$NO
 guard "--offset on the default map"   'honored only by'                     "$NOROOT" --offset=3
 guard "--limit on the default map (names --top-k)" '--top-k'                "$NOROOT" --limit=3
 guard "--limit with --report"         'honored only by'                     "$NOROOT" --report --limit=3
-guard "--limit with --for"            'honored only by'                     "$NOROOT" --for=x --limit=3
+# L-W (2026-09-13, forpage.h): `--for --limit=N` is VALID now — it selects the file-grain widening page, so the
+# refusal this row pinned no longer exists. What still refuses beside the page is a byte budget (the page has
+# none to shape against; validateShapingFlagsHonored fires because --for joins the honoring set when a window
+# is asked for). The page itself is asserted below, after the guard table (test/forwidencheck.sh owns its shape).
+guard "--token-budget beside --for --limit (the page has no budget)" 'in the --limit/--offset-honoring set' "$NOROOT" --for=x --limit=3 --token-budget=1000
 guard "--offset with --metrics"       'honored only by'                     "$NOROOT" --metrics --offset=2
+# the positive half of the L-W row above: --for --limit=N answers with the <files> page (exit 0), on a real corpus
+"$BIN" "$ROOT/test/fixture" --for=x --limit=3 --no-cache >"$TMP/forpage.out" 2>"$TMP/forpage.err" </dev/null; forpage_rc=$?
+if [ "$forpage_rc" = 0 ] && grep -q '^<files ' "$TMP/forpage.out"; then ok "--for --limit=3: the file-grain page (exit 0, <files> root), not a refusal"; else no "--for --limit=3: rc=$forpage_rc, $( head -c 120 "$TMP/forpage.err" "$TMP/forpage.out" | tr '\n' ' ' )"; fi
 # §P15/§P16: --zoom/--stray-content joined the honoring set, but their fixed-shape sub-modes did not —
 # --zoom --mermaid stays a diagram (like plain --mermaid), --stray-content --plan/--abi route to emitters
 # that window nothing (landingplan::writePlan / abicheck::writeAbiCheck).
@@ -154,7 +161,7 @@ sz_comp="$(  "$BIN" "$FIX" --expand=computeArea --compress --no-cache 2>/dev/nul
 
 # --with-history: --doc-drift --with-history still exits 0 (historyoraclecheck.sh owns the full contract).
 "$BIN" "$SRC" --doc-drift --with-history --no-cache >/dev/null 2>"$TMP/wh.err"
-[ "$?" = 0 ] && ok "--doc-drift --with-history: still exits 0" || no "--doc-drift --with-history: broke ($(cat "$TMP/wh.err"))"
+if [ "$?" = 0 ]; then ok "--doc-drift --with-history: still exits 0"; else no "--doc-drift --with-history: broke ($(cat "$TMP/wh.err"))"; fi
 
 # --grep-context: still widens the hit context (grep gates own the full contract; spot-check row count grows).
 n0="$( "$BIN" "$FIX" --grep=computeArea --no-cache 2>/dev/null | grep -o '<hit' | wc -l | tr -d ' ' )"
@@ -166,15 +173,15 @@ rc_gc=$?
 
 # --no-prefilter: still exits 0 alongside --grep (soundness-oracle contract owned elsewhere).
 "$BIN" "$FIX" --grep=computeArea --no-prefilter --no-cache >/dev/null 2>"$TMP/np.err"
-[ "$?" = 0 ] && ok "--grep --no-prefilter: still exits 0" || no "--grep --no-prefilter: broke ($(cat "$TMP/np.err"))"
+if [ "$?" = 0 ]; then ok "--grep --no-prefilter: still exits 0"; else no "--grep --no-prefilter: broke ($(cat "$TMP/np.err"))"; fi
 
 # --detail: within the ranked head still works (detailcheck.sh owns the full contract).
 "$BIN" "$SRC" --for="distance" --detail=3 --no-cache >/dev/null 2>"$TMP/d.err"
-[ "$?" = 0 ] && ok "--for --detail=3 (within the head): still exits 0" || no "--for --detail=3: broke ($(cat "$TMP/d.err"))"
+if [ "$?" = 0 ]; then ok "--for --detail=3 (within the head): still exits 0"; else no "--for --detail=3: broke ($(cat "$TMP/d.err"))"; fi
 
 # --since: still exits 0 alongside --hotspots (a git repo — use ROOT itself, read-only).
 "$BIN" "$ROOT/src" --hotspots --since="2 weeks ago" --no-cache >/dev/null 2>"$TMP/s.err"
-[ "$?" = 0 ] && ok "--hotspots --since: still exits 0" || no "--hotspots --since: broke ($(cat "$TMP/s.err"))"
+if [ "$?" = 0 ]; then ok "--hotspots --since: still exits 0"; else no "--hotspots --since: broke ($(cat "$TMP/s.err"))"; fi
 
 # --with-graph: still splices a mermaid block into --pack-task's bundle.
 graph_out="$( "$BIN" "$FIX" --pack-task="compute area" --with-graph --no-cache 2>/dev/null )"
@@ -209,7 +216,8 @@ printf '%s' "$graph_out" | grep -q 'mermaid' \
 # M16 — the honouring side of the four. --lint --naming-locals still fires AND the modifier is STAMPED on the
 # root (naming_locals="1"), the way --lint-select stamps selected=/select=: lens 0 measured 3717 -> 4898
 # findings with no attribute saying why. Plain --lint must not carry the stamp.
-"$BIN" "$SRC" --lint --naming-locals --no-cache >"$TMP/nl.xml" 2>"$TMP/nl.err"; rcNL=$?
+# L1 (2026-09-19): the CLI default legend is compact; the legend arm below reads the FULL legend's naming_locals= clause, so it asks for it.
+"$BIN" "$SRC" --lint --naming-locals --no-cache --legend=full >"$TMP/nl.xml" 2>"$TMP/nl.err"; rcNL=$?
 { [ "$rcNL" -eq 0 ] && grep -qE '<lint [^>]*naming_locals="1"' "$TMP/nl.xml"; } \
     && ok "--lint --naming-locals: exits 0 and the <lint> root carries naming_locals=\"1\"" \
     || no "--lint --naming-locals: exit $rcNL, or the root does not stamp naming_locals=\"1\": $( grep -oE '<lint [^>]*>' "$TMP/nl.xml" | head -c 200 ) $( head -1 "$TMP/nl.err" )"
@@ -224,9 +232,9 @@ grep -qF 'naming_locals="1" on the root' "$TMP/nl.xml" \
     && ok "--lint --naming-locals output is well-formed XML (the legend clause carries no double-hyphen)" \
     || no "--lint --naming-locals output is MALFORMED XML"
 "$BIN" "$FIX" --expand=computeArea --no-redact --no-cache >/dev/null 2>"$TMP/nr.err"
-[ "$?" = 0 ] && ok "--expand --no-redact: still exits 0 (a body-serving verb composes)" || no "--expand --no-redact: broke ($(head -1 "$TMP/nr.err"))"
+if [ "$?" = 0 ]; then ok "--expand --no-redact: still exits 0 (a body-serving verb composes)"; else no "--expand --no-redact: broke ($(head -1 "$TMP/nr.err"))"; fi
 "$BIN" "$SRC" --for="distance" --no-redact --no-cache >/dev/null 2>"$TMP/nr2.err"
-[ "$?" = 0 ] && ok "--for --no-redact: still exits 0" || no "--for --no-redact: broke ($(head -1 "$TMP/nr2.err"))"
+if [ "$?" = 0 ]; then ok "--for --no-redact: still exits 0"; else no "--for --no-redact: broke ($(head -1 "$TMP/nr2.err"))"; fi
 
 # --baseline: full four-step contract owned by baselinecheck.sh; not re-verified here.
 

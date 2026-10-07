@@ -59,7 +59,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative binary
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -271,6 +271,10 @@ VAL = {
     "handle": '"a.h::alpha"', "trace": '"  File \\"a.h\\", line 4, in alpha"',
     "new_body": '"int alpha( int x )\\n{\\n    return 5;\\n}"', "text": '"// note\\n"',
     "queries": '[{"verb":"grep","pattern":"alpha"}]', "symbols": '["alpha","beta"]',
+    # lane/t10-mcp-coverage: affected's Required `files` — a comma-separated path/symbol spec (same STRING
+    # shape as situational_awareness's optional `files`, which never needed a VAL row: it has no Required
+    # rule of its own to test).
+    "files": '"a.h"',
 }
 # ── ITEM B: the WRITE set comes from src/mcp.h's VERB REGISTRY, parsed — never restated here ──────────────
 #

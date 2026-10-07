@@ -101,6 +101,48 @@ tools = json.loads( line )[ "result" ][ "tools" ]
 # obliges), +1,568 B in all; nothing else moved. The same rule (a DECLARED argument, its bytes attributed, never
 # prose) and the same posture (159 B of headroom). What this buys back per session: every XML answer under
 # legend:"compact" drops 2.9–5.2 KB of repeated legend (compactlegendcheck (M): edit_check 5,561 → 582 B).
+# RE-ANCHORED 2026-09-10 (--edit-check answer-safe window): 41,000 → 41,300, measured 41,129 (from 40,895).
+# TWO declared optional arguments, `limit` and `offset`, on ONE verb — `edit_check`, which now honors them
+# (it windows its UNFLAGGED caller rows; the flagged callers, their sites_l= and the def census are never
+# paged, so the verdict cannot be paged away). Attributed against a build of the parent commit: edit_check
+# +234 B and nothing else moved — 92 B for the `limit` property entry and 92 B for `offset` (the schema
+# envelope plus the description arm (A/M12) obliges every declared property to carry), plus the 49 B clause
+# in the tool description that says WHAT they page, without which a router reads a paging verb whose page is
+# undefined. Same rule as the two re-anchors above (a DECLARED argument, its bytes attributed here, in the
+# commit that lands it, never prose) and the same posture: 171 B of headroom, less than one more argument.
+# RE-ANCHORED 2026-09-10 (C1 F-07/F-10, the listing-paging round): 41,300 -> 42,000, measured 41,830 (from
+# 41,220). TWO declared optional arguments, `limit` and `offset`, on TWO verbs — `flags` and
+# `situational_awareness`, which joined cli.h's honorsPaging set in the same commit (--flags windows the read
+# SITES under a gate and --flip its six context listings; --situ windows its blast-radius and co-change
+# sections — in both, the answer rows, the gate rows and tests_to_run, are never paged). Attributed tool by
+# tool against a build of the parent commit (6afaa457), by this gate's own metric:
+#   flags                  +329 = +184 B schema (92 for the `limit` property entry, 92 for `offset`: the
+#                                 envelope plus the description arm (A/M12) obliges every declared property
+#                                 to carry) +145 B of description, the clause saying WHAT they page — this
+#                                 verb has TWO lenses (the gate table and --flip), and a router that cannot
+#                                 tell which rows page from which rows are the answer has an undefined page
+#   situational_awareness  +281 = +184 B schema, same two entries, +97 B of description — shorter because
+#                                 the clause has one lens to describe, and it has to say the DEFAULT differs
+#                                 from the CLI's (unbounded here; the payload always served every row, so
+#                                 limit is relief for a caller who wants less, never a new cut)
+#   nothing else moved.
+# Same rule as the three re-anchors above (a DECLARED argument, its bytes attributed here, in the commit
+# that lands it, never prose) and the same posture: 170 B of headroom, less than one more argument entry.
+#
+# RE-ANCHORED 2026-09-10 (MCP no_route, audit F-R1-07): 41,300 → 41,650, measured 41,474 (from 41,220).
+# ONE declared optional argument, `no_route`, on the TWO verbs that ROUTE — `for` and `explore` (and its
+# `pack_task` alias, which shares explore's stanza) — the MCP twin of the CLI --no-route. Attributed against
+# a build of the parent commit: schemas 17,161 → 17,415 B (+254, two property stanzas at +127 each: the
+# schema envelope plus the description every declared property is obliged to carry) and DESCRIPTIONS
+# BYTE-IDENTICAL at 19,632 B. A first draft added a pointer clause to both tool descriptions (+43 B after
+# trimming to one); it was removed rather than re-anchored around, because this file's rule is that the
+# ceiling moves for a declared argument's obliged bytes and never for prose, and the schema property is
+# where a client renders an argument anyway. Same posture as the three re-anchors above: 176 B of headroom.
+# What it buys: `for`'s header names WHICH ranker answered and why, and until now an agent that read route=
+# and disagreed had no way to ask for the other one — the CLI's own recovery from a route mis-fire was
+# unreachable from MCP (measured: --for="parse tree" on this repo routes name-exact and returns three rows
+# from bench/ and test/, missing parseTree, which --no-route finds at rank 1).
+#
 # ── THE CEILING, DECIDED 2026-09-05 (terminality round A, lane M / M2): IT STAYS 41,000. ─────────────
 # Registered as an OWNER DECISION with the arithmetic, so it can be overruled with numbers rather than
 # re-litigated. Measured on this tree at the M1 commit: manifest 40,841 B (~10,210 tokens), descriptions
@@ -150,7 +192,99 @@ tools = json.loads( line )[ "result" ][ "tools" ]
 #   TOTAL        40,986 -> 40,902 B; nothing else moved. Raw wire bytes (this gate measures json.dumps
 #                      with ensure_ascii, which spends 6 for each em dash instead of 3): 40,901 -> 40,811.
 # Headroom goes back UP, 14 B -> 98 B. That is item 5 below working, not a new allowance.
-CEILING = 41000
+# RE-ANCHORED 2026-09-10 (the string/perf round's integration, two lanes each declaring arguments):
+#   for, explore      +127 B each = +254 B: `no_route` (mirrors the CLI --no-route so an MCP agent that reads
+#                      route= and disagrees has a recovery path — R1 finding F-R1-07)
+#   flags             +329 B (+145 B description, `limit`/`offset` properties): the dark-flag site listing and
+#                      the six --flip listings join the paging family and disclose their cuts (C1 F-07)
+#   situational_awareness +281 B (+97 B description, `limit`/`offset`): --situ's blast-radius and co-change
+#                      listings page instead of cutting silently at 8 (C1 F-10)
+#   TOTAL             41,220 -> 42,084 B on the merged tree, attributed tool by tool against main's binary
+#                      (both lanes had re-anchored alone — 41,650 and 42,000 — and the sum is what ships).
+# Headroom after this line: 116 B, less than one declared argument, which is rule 5 above working.
+# RE-ANCHORED 2026-09-12 (lane for-widen, L-W): 42,200 → 42,384 = +184 B, EXACTLY the two declared optional arguments
+# `limit`/`offset` on `for` (the `for` schema 525 → 709 B in this arm's own json.dumps metric: the envelope plus the
+# description the contract obliges each property to carry), measured against a build of the lane's base (1cf3086e:
+# 42,177 B here, 23 B under the old ceiling) — the file-grain widening page (forpage.h) joins the paging family on
+# this twin. Its description gained NO prose: a first draft named coverage= and the page there (+109 B) and was
+# removed rather than re-anchored around, the L7 precedent above — the schema properties are where a client renders
+# an argument, and the answer's own legend defines coverage= and the page. Headroom after this line: 23 B.
+#   RE-ANCHORED 2026-09-13 (PR #215, owner question "how does an agent ask for the longer answer"): 42,200 -> 42,700,
+#   measured 42,636 B. The `legend` field's description gains one clause — "full (restores the full legend)",
+#   +32 B on each of the 17 tools that declare the field (+544 B) — so the schema an agent reads when choosing the
+#   argument's value says what "full" does. This is PROSE on a declared argument, which rule 5 above does not move
+#   the ceiling for; the owner asked for exactly this clause and authorized moving the pin with the measured number
+#   (2026-09-13 06:30), and that authority and this attribution are the whole justification. Headroom after: 64 B.
+#   MERGED 2026-09-13 (lane/sc-legend + lane/for-widen): both anchors above are real and they add. 42,200 -> 42,900,
+#   RE-MEASURED on the merged tree at 42,820 B (descriptions 19,967, schemas 18,426, 31 tools), not summed from the two
+#   lanes' separate anchors (42,384 and 42,700), because neither lane could see the other's bytes. Headroom after this
+#   line: 80 B, less than one declared argument, which is rule 5 above working.
+# RE-ANCHORED 2026-09-13 (review of #214): 42,384 → 42,800 = +416 B, EXACTLY the one 207-byte clause plus the
+# single space that separates it from the sentence before it (208 B), spliced into EACH of the TWO tool
+# descriptions that serve tests_to_run rows as JSON — `situational_awareness` and `explore`; 2 × 208 = 416
+# (measured against a build of ff8d77a1: 42,361 B here, 23 B under the old ceiling). It is NOT the L7 case the
+# line above declines. That one removed prose describing an ARGUMENT, because the schema properties are where a
+# client renders an argument and the answer's own legend defines the rest. This clause describes the RESPONSE:
+# E1 made a tests_to_run row's `p` a path string OR an array of paths beside `n`, and these two answers carry
+# no legend of any kind — `situational_awareness` returns bare JSON with no vocabulary block — so a caller that
+# parses `p` as a string has nowhere else to learn otherwise before it breaks. ONE wording (mcp.h
+# kTestRowJsonShapeClause), spliced twice, never a third paraphrase. Headroom after this line: 23 B.
+# RE-ANCHORED 2026-09-13 (CodeRabbit on #214): 42,800 -> 43,000 = +200 B for a MEASURED +196, the clause 207
+# -> 305 B plus its one-space separator, in each of the same two descriptions (2 x 98). The first wording
+# named the key `p` and only one of the three producers spells it that way: situational_awareness emits
+# `test` (mcpverbs.h), explore (packtask.h) and the edit receipt (mcpedit.h) emit `p`. A clause that names
+# the wrong key is worse than no clause, because a caller reads it as a contract — so it now names both, per
+# producer, and everything the three DO share (string-or-array, `n` beside an array, run/run_unknown) is
+# still said once. The quotes around the two keys are SINGLE: this string is spliced straight into the
+# tools/list JSON, and the first draft's double quotes made the manifest unparseable — which this gate
+# caught as a JSONDecodeError, not as a byte count. Measured 42,973. Headroom after this line: 27 B.
+# MERGED 2026-09-14 (lane/sc-legend + main at 0b118ac1): 43,000 -> 43,500, RE-MEASURED on the merged tree at
+# 43,432 B (descriptions 20,579, schemas 18,426, 31 tools). NEITHER side's ceiling holds and neither is wrong:
+# this lane re-anchored to 42,900 from a measurement of 42,820, #214 re-anchored to 43,000 from 42,973, and
+# the two clauses are DIFFERENT bytes in different stanzas, so they add. Not summed from the two anchors —
+# the lanes did not share a base and neither could see the other's bytes — and not derived from the deltas
+# either; measured on the tree that ships, the 2026-09-10 two-lane precedent above verbatim. No NEW allowance
+# is taken here: both adds were justified where they landed (this lane's is prose on a declared argument the
+# owner authorized on 2026-09-13 with the measured number; #214's names the response shape for two answers
+# that carry no legend at all), and the merge only makes them visible together. Headroom after this line:
+# 68 B, again less than one declared argument, which is rule 5 above working.
+# RE-ANCHORED 2026-09-19 (lane/t10-mcp-coverage): 43,500 -> 46,600, measured 46,371 (from 43,432, 31 tools).
+# TWO NEW ADVERTISED TOOLS, not a prose trim: `rank_by` (the --rank-by=pagerank|authority|hub|rrf MCP twin)
+# and `affected` (the --affected=F1,F2|SYM MCP twin) — closing the exact ref-eligibility gap
+# graft-iter2a.md §9 measured (these two verbs had no MCP form at all). Each carries a routing sentence
+# (pinned below) plus its own declared argument list, same as every tool already in the manifest.
+# Attributed tool by tool against a build of origin/main (561636336): rank_by +636 B description +481 B
+# schema = 1,117 B; affected +790 B description +610 B schema = 1,400 B; the remaining +422 B is JSON
+# envelope structure (two more {"name":…,"annotations":{…}} objects in the tools array, not counted in
+# either sum above) — 2,939 B in all, nothing else moved. Same rule as every entry above: the ceiling moves
+# UP only for a DECLARED tool or argument the contract obliges to carry a description, in the commit that
+# lands it, with its bytes attributed here — never for prose. Headroom after this line: 229 B.
+# RE-MEASURED 2026-09-19, TRAIN 10 (integration/train-10 on main 59b241d7): 46,371 B on the merged tree —
+# the lane's number reproduces exactly, and the ceiling is unmoved at 46,600 with the same 229 B of headroom.
+# The BASE reading in the line above is the one that does not reproduce. Measured here with THIS file's own
+# formula against three builds — 56163633 (the lane's base), 1b772eac and 59b241d7 (main) — all three answer
+# 43,500 B, descriptions 20,579, schemas 18,494, 31 tools. The 43,432 B / schemas 18,426 B pair has been
+# carried in this block since 2026-09-14 and the lane copied it forward; descriptions match to the byte on
+# every build, so the 68 B sits in the schemas alone and predates both sides of this train. Two consequences,
+# neither of them a defect in the lane: the pre-lane manifest was sitting EXACTLY on the 43,500 ceiling with
+# zero headroom rather than the 68 B this block claimed (the arm asserts <=, so it passed on the number, not
+# on the margin), and the delta this train lands is 2,871 B rather than 2,939. The per-tool attribution above
+# is unaffected — it was measured tool by tool, not as a difference of two totals.
+# TRAIN 10 FIX ROUND (CodeRabbit 4056211645): 46,371 -> 46,493 B, the ceiling UNMOVED at 46,600. The rank_by
+# description claimed its default was "byte-identical to 'analyze'", which is false on a tree with uncommitted
+# changes — `analyze` serves the warm index's working-set-PERSONALIZED rank and rankByText deliberately does
+# not, which is the divergence that lane fixed. +122 B of description to say what is true instead; no schema
+# byte moved and no tool was added. Spent from the 229 B this block already held, not from a raise: correcting
+# a claim the manifest itself makes is what headroom is for. Headroom after this line: 107 B.
+# RE-ANCHORED 2026-10-03 (lane/refval-edges, reference-as-value rows): 46,600 -> 46,750, measured 46,722 (from 46,581,
+# 33 tools). The #214 precedent above, not the L7 one: these clauses describe the RESPONSE of two answers that carry no
+# legend of any kind. find_symbol and find_referencing_symbols now serve `valueRefs` (and find_symbol `valueCallees`):
+# a function USED AS A VALUE — stored in a dispatch table or passed as an argument — which is NOT a call. A JSON client
+# that met those keys with no reading would sum them into its callers; the one place an MCP client reads prose is this
+# description, so each says "value uses (tables, args), not a proven call" (+70 B and +71 B, 141 B in all, no schema
+# byte moved, no tool added). Headroom after this line: 28 B (the final review tightened a first 46,800 anchor to the
+# #214-sized margin: 78 B of unattributed headroom was wider than any re-anchor here has taken).
+CEILING = 46750
 manifest = len( json.dumps( { "tools": tools }, separators = ( ",", ":" ) ) )
 descBytes   = sum( len( t[ "description" ] ) for t in tools )
 schemaBytes = sum( len( json.dumps( t[ "inputSchema" ], separators = ( ",", ":" ) ) ) for t in tools )
@@ -158,6 +292,28 @@ print( "  INFO  %d tools, manifest %d B (~%d tokens): descriptions %d B, schemas
        % ( len( tools ), manifest, manifest // 4, descBytes, schemaBytes ) )
 check( manifest <= CEILING,
        "(1) tools/list is %d B, within the %d B per-session ceiling" % ( manifest, CEILING ) )
+
+# ── (1b) the CHANGELOG's own copy of this figure does not silently rot ──────────────────────────────
+# train10.md's "manifest anchor" finding: the byte figure above lives in two places — this file's own
+# RE-ANCHORED/RE-MEASURED comment history (checked live, every run) and CHANGELOG.md's prose restating it
+# for readers. The comment history is self-correcting because it is this script; the CHANGELOG copy is not
+# — it sat wrong for five days (43,432 carried forward as 43,500) before a lane happened to re-derive it by
+# hand. While the entry is still under [Unreleased] (mutable — later work can still move the manifest before
+# release), assert the CHANGELOG's stated post-change byte count against the SAME live measurement above, so
+# a future change that moves the manifest without updating CHANGELOG's prose is a red here, not a rediscovery.
+# Once the entry rolls under a dated release heading it is a historical record of what was true when it was
+# measured, same as the dated blocks train10.md declined to touch, so this only reads inside [Unreleased].
+changelog = open( os.path.join( ROOT, "CHANGELOG.md" ), encoding = "utf-8" ).read()
+_, _, afterHeading = changelog.partition( "## [Unreleased]" )
+unreleased = afterHeading.split( "\n## [", 1 )[ 0 ]  # [Unreleased]'s body, up to the next dated heading
+m = re.search( r"tools/list.? manifest grows [\d,]+[^\d]+([\d,]+) B", unreleased )
+if m is None:
+    print( "  INFO  (1b) no 'tools/list manifest grows N -> N B' claim in CHANGELOG's [Unreleased] section (nothing to check)" )
+else:
+    claimed = int( m.group( 1 ).replace( ",", "" ) )
+    check( claimed == manifest,
+           "(1b) CHANGELOG's [Unreleased] manifest-growth claim (%d B) matches the live tools/list measurement (%d B)"
+           % ( claimed, manifest ) )
 
 if os.environ.get( "RIPWIRE_MANIFEST_DUMP" ):
     for db, sb, n in sorted( ( ( len( t[ "description" ] ),

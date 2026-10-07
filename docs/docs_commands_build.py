@@ -99,6 +99,131 @@ def scrub_author_attrs( text ):
 # Internal-only document names from the private development tree, if a sample happens to rank one.
 INTERNAL_DOC = re.compile( r'\b(?:PLAN_|AUDIT|NEXT_SESSION|KICKOFF_|HANDOFF_|IDEAS_|REPORT_|DESIGN_|RESEARCH_)[A-Za-z0-9_.-]*' )
 
+# A row whose PATH was anonymised is a row from an INTERNAL document, and its section HEADINGS are
+# internal too. INTERNAL_DOC above only ever matches the FILENAME token: on a `<sym p= id=>` row it
+# rewrites the path, while id= carries the section HEADING as bare text — no filename in it at all,
+# so nothing there matches and it survives untouched. That is how 21 internal planning headings reached
+# docs/captures/COMMANDS_showcase_2026-08-10.md and public main (4d40fa8a) — the scrub was hiding
+# the name and publishing the contents, which is the wrong half. Redact the identifying payload of
+# any row whose p= is already the anonymised name, keeping the row so counts and structure still
+# read true. No example is spelled out here on purpose: an internal filename written literally in
+# this comment is itself a finding, and test/ripwirepubliccheck.sh is right to say so.
+INTERNAL_ROW  = re.compile( r'<[A-Za-z][A-Za-z0-9_]*\b[^>]*\bp="NOTES\.md"[^>]*/?>' )
+INTERNAL_ATTR    = re.compile( r'\b(id|n)="[^"]*"' )
+INTERNAL_ATTR_KV = re.compile( r'\b(id|n)="([^"]*)"' )
+
+
+def redactable_internal_value( value ):
+    """A heading is text; a COUNT is not. `test/docdriftfix/NOTES.md` is a tracked PUBLIC fixture and
+    doc-drift emits `<weak-file-line p="NOTES.md" n="1">` for it, where n= is the number of weak
+    anchors. Redacting that would corrupt a number and ship it as the tool's answer — worse than the
+    leak this function exists to stop, by this file's own standard. A purely numeric value cannot be
+    a heading, so it is never redacted."""
+    return not value.isdigit()
+
+
+def unredacted_internal_row( line ):
+    """The leak PREDICATE for the shape scrub_internal_rows removes, shared with `assert_scrubbed`
+    so the two cannot disagree — the same discipline `find_address` uses. Returns the offending row,
+    or None."""
+    for row in INTERNAL_ROW.finditer( line ):
+        if any( v != '<internal>' and redactable_internal_value( v )
+                for _, v in INTERNAL_ATTR_KV.findall( row.group( 0 ) ) ):
+            return row.group( 0 )
+    return None
+
+
+def scrub_internal_rows( text ):
+    """Redact id=/n= on rows already anonymised to NOTES.md — the heading text is internal too."""
+    def redact( row ):
+        return INTERNAL_ATTR_KV.sub(
+            lambda a: a.group( 0 ) if not redactable_internal_value( a.group( 2 ) )
+                                   else '%s="<internal>"' % a.group( 1 ),
+            row.group( 0 ) )
+    return INTERNAL_ROW.sub( redact, text )
+
+
+# ── the project's own rebrand, withheld from every published sample ───────────────────────────────
+# `--naming-calibration` mines THIS repository's git history for old->new identifier renames, and the
+# largest family it finds is the project's own rebrand: rows whose NEW spelling carries the public name
+# as one `_`-delimited part and whose OLD spelling is the same identifier with only that part swapped.
+# That old part is a private pre-release identifier, and a capture of a real run on this repository
+# publishes it at exit 0, clean on every class above.
+#
+# The rule keys on the PUBLIC side on purpose. It never spells what it withholds, so this file, the
+# capture harness and the gate can be read and published without naming it — and the count is still
+# exact, because that shape (one part swapped for the public name) IS the family.
+#
+# Withheld, never silently dropped: ONE comment replaces the rows, with the exact count, where the first
+# of them stood. Rows shown + rows withheld + rows past the display cut therefore still add up to the
+# pairs= the tool reported, and test/docscommandscheck.sh arm (E) checks that sum on every capture.
+PUBLIC_NAME_PART      = 'ripwire'
+RENAME_ROW            = re.compile( r'<p\s[^<>]*>?' )
+RENAME_ROW_ATTR       = re.compile( r'(?<=\s)([on])="([^"]*)"' )
+REBRAND_DISCLOSURE    = "<!-- %d rename row%s withheld: the project's own rebrand, which names a private pre-release identifier -->"
+REBRAND_DISCLOSURE_RE = re.compile( r"<!-- ([0-9]+) rename rows? withheld: the project's own rebrand" )
+
+
+def is_rebrand_rename( old, new ):
+    """True when NEW holds the public name as a whole `_`-delimited part (in any case, or as the whole
+    identifier) and OLD is NEW with exactly that one part replaced by a different single part.
+
+    A re-casing of the public name itself (`Ripwire` -> `RIPWIRE`) is not a rebrand and is kept, and so is
+    a rename whose changed part is some OTHER part (`RIPWIRE_OLD` -> `RIPWIRE_REPO`)."""
+    oldParts = old.split( '_' )
+    newParts = new.split( '_' )
+    if len( oldParts ) != len( newParts ):
+        return False
+    changed = [ i for i in range( len( newParts ) ) if oldParts[ i ] != newParts[ i ] ]
+    if len( changed ) != 1:
+        return False
+    swapped = changed[ 0 ]
+    return ( newParts[ swapped ].lower() == PUBLIC_NAME_PART
+             and oldParts[ swapped ] != ''
+             and oldParts[ swapped ].lower() != PUBLIC_NAME_PART )
+
+
+def rebrand_rename_row( line ):
+    """The leak PREDICATE for the rows `withhold_rebrand_rows` removes, shared with `assert_scrubbed`, the
+    capture harness and the gate so none of them can disagree. Returns the offending row, or None.
+
+    The closing `>` is optional so a row the capture's 300-byte display cut truncated is still seen."""
+    for row in RENAME_ROW.finditer( line ):
+        attrs = dict( RENAME_ROW_ATTR.findall( row.group( 0 ) ) )
+        if 'o' in attrs and 'n' in attrs and is_rebrand_rename( attrs[ 'o' ], attrs[ 'n' ] ):
+            return row.group( 0 )
+    return None
+
+
+def rebrand_row_public_side( row ):
+    """How a report NAMES an offending row: by its new spelling only. Printing the row would publish the
+    old spelling in the log of every run that goes red, CI logs included."""
+    return 'n="%s"' % dict( RENAME_ROW_ATTR.findall( row ) ).get( 'n', '' )
+
+
+def withhold_rebrand_rows( lines ):
+    """LINES without the project's own rebrand rows -> ( lines, withheld ).
+
+    One disclosure comment with the exact count stands where the first withheld row stood; every other
+    line comes back byte-identical and in order, and a second pass withholds nothing. Only a row that is
+    its line's whole content is withheld: cutting one out of the middle of other output would edit the
+    tool's answer, so such a row is left in place for the callers' refuse-to-write check to stop."""
+    out      = []
+    withheld = 0
+    firstAt  = -1
+    for line in lines:
+        row = rebrand_rename_row( line )
+        if row is not None and line.strip() == row:
+            if firstAt < 0:
+                firstAt = len( out )
+            withheld += 1
+            continue
+        out.append( line )
+    if withheld:
+        out.insert( firstAt, REBRAND_DISCLOSURE % ( withheld, '' if withheld == 1 else 's' ) )
+    return out, withheld
+
+
 MAX_SAMPLE_LINES = 14
 MAX_SAMPLE_BYTES = 1600
 
@@ -118,7 +243,7 @@ def tool_name_of( binPath ):
 
 def help_text_of( binPath ):
     try:
-        run = subprocess.run( [ binPath, '--help' ], capture_output = True, text = True, timeout = 120 )
+        run = subprocess.run( [ binPath, '--help=all' ], capture_output = True, text = True, timeout = 120 )
     except OSError as exc:
         sys.exit( 'docs_commands_build: cannot run %s (%s)' % ( binPath, exc ) )
     if run.returncode != 0 and not run.stdout:
@@ -200,15 +325,22 @@ def parse_help( helpText ):
     """--help -> ( preamble, [ ( sectionTitle, [ entry, ... ] ) ] ).
 
     An entry is { 'flags': [ '--for', ... ], 'spec': '--for=TASK', 'text': 'the prose' }.
-    Section headings are 2-space indented; flag entries are 4- to 6-space indented and start with a
-    dash; everything else at those indents is continuation prose for the entry above it.
+    Section headings are 2-space indented; a flag entry is indented EXACTLY four and starts with a
+    dash; everything deeper is continuation prose for the entry above it.
+
+    The four is not a style choice, it is the same single definition src/cli.h's classifyHelpLine()
+    applies — and this parser used to accept 4..6 while the binary accepted only 4. Being the more
+    permissive of the two is what hid the divergence: twelve six-space flag rows read as entries here
+    (so docs/COMMANDS.md listed them) and as continuation prose there (so `--help` culled fifteen real
+    flags, and `--help=--and` refused while --and worked). Two readers of one text must not disagree
+    about what a row is; test/helpbudgetcheck.sh arm (K) is the fence that now says so out loud.
     """
     sections   = []
     preamble   = []
     current    = None
     entry      = None
     reSection  = re.compile( r'^  (\S.*?)\s*$' )
-    reIndent   = re.compile( r'^( {4,6})(\S.*)$' )
+    reIndent   = re.compile( r'^( {4})(\S.*)$' )
 
     for line in helpText.split( '\n' ):
         mSection = reSection.match( line ) if not line.startswith( '   ' ) else None
@@ -226,6 +358,13 @@ def parse_help( helpText ):
             flags   = normalize_flags( spec )
             entry   = { 'flags': flags, 'spec': spec, 'text': [ content[ end: ].strip() ] }
             current[ 1 ].append( entry )
+            continue
+
+        if mIndent:
+            # Four spaces and no dash: a sub-heading ("the pre-PR family — …:") or a shared legend row
+            # (counts_floor="1", pr_iters="N"). classifyHelpLine() gives either its own line, never the
+            # flag above it; appending it here put the next family's heading inside --mentions' prose.
+            entry = None
             continue
 
         stripped = line.strip()
@@ -310,6 +449,17 @@ def pick_sample( entry, captures ):
     return best
 
 
+def pattern_sample( captures, marker ):
+    """A hand-authored PATTERN subsection (see render_recall_pattern) needs ONE specific real
+    invocation, not pick_sample's generic per-flag pick — several captured commands can share a flag,
+    and pick_sample would happily hand back a different one. MARKER is a substring unique to the
+    intended command; the first captured item containing it, with a non-empty body, wins."""
+    for item in captures:
+        if marker in item[ 'cmd' ] and item[ 'body' ]:
+            return item
+    return None
+
+
 # ── scrubbing + trimming ──────────────────────────────────────────────────────────────────────────
 
 def scrub( text, name ):
@@ -319,6 +469,7 @@ def scrub( text, name ):
     text = scrub_author_attrs( text )
     text = scrub_emails( text )
     text = INTERNAL_DOC.sub( 'NOTES.md', text )
+    text = scrub_internal_rows( text )
     return text
 
 
@@ -350,6 +501,10 @@ def trim_sample( body, name ):
     # seams, so an element can be the only thing on its line but its ownership context is the block.
     # No substitution above adds or removes a newline, so the split below is line-for-line with `body`.
     scrubbedBody = scrub( '\n'.join( body ), name ).split( '\n' )
+    # The project's own rebrand rows are the one class withheld by whole LINE, so this is the one step that
+    # changes the line count: every count below is taken over the withheld body, whose disclosure comment
+    # accounts for what left. A no-op on a capture the harness already withheld them from.
+    scrubbedBody, _withheld = withhold_rebrand_rows( scrubbedBody )
     kept    = []
     total   = 0
     dropped = 0
@@ -370,7 +525,7 @@ def trim_sample( body, name ):
         kept.append( line )
         if not isLegend:
             total += len( line )
-    more = len( body ) - len( kept ) - dropped
+    more = len( scrubbedBody ) - len( kept ) - dropped
     if more > 0:
         kept.append( '... [%d more line(s); run it to see the whole thing]' % more )
     if dropped:
@@ -414,8 +569,125 @@ def shaped_by( entry, sections ):
 
 # ── rendering ─────────────────────────────────────────────────────────────────────────────────────
 
-def anchor_of( spec ):
-    return re.sub( r'[^a-z0-9]+', '-', spec.lower() ).strip( '-' )
+# THE ANCHOR THE HEADING ACTUALLY MINTS, which is not the one this function used to compute. Every
+# section is rendered as ``### `SPEC` ``, and the renderer (GitHub's slugger, and markdownlint's MD051
+# with it) lower-cases the heading text, DELETES every character that is not a word character, a hyphen
+# or a space, then turns the spaces into hyphens. Nothing is substituted and nothing is trimmed, so
+# `--in=DIR` becomes `--indir`: the two leading dashes survive and the `=` is gone.
+#
+# The old spelling replaced every RUN of non-alphanumerics with a hyphen and stripped the ends
+# (`--in=DIR` -> `in-dir`) — a plausible slug, and not this document's. CodeRabbit named it on the --in
+# row; the real count is the whole table of contents (all 169 links resolved to nothing), which is also
+# why the report arrived as 28 MD051 warnings on a single line. Gate: docscommandscheck arm (J), which
+# states the renderer's rule INDEPENDENTLY rather than importing this function — a gate that asks the
+# generator what the anchor should be agrees with whatever the generator says.
+def anchor_of( heading_text ):
+    return re.sub( r'[^\w\- ]', '', heading_text.strip().lower() ).replace( ' ', '-' )
+
+
+def assign_anchors( sections ):
+    """Give every entry the anchor its own heading will mint, in DOCUMENT order.
+
+    Per ENTRY and not per spec, because the renderer's rule for a repeated heading is to append `-1`
+    to the second one, and only a walk in emission order can know which one IS the repeat. No spec
+    repeats today (measured: 176 entries, 180 headings, no duplicate slug), so the suffix branch is
+    dormant — what it buys is that a repeat lands as TWO anchors the renderer agrees with, instead of
+    two contents links pointing at the first section. Recomputing from the spec in the contents loop
+    cannot do that, and the wrong link it would emit resolves, so no anchor gate would see it.
+    """
+    seen = {}
+    for _title, entries in sections:
+        for entry in entries:
+            base = anchor_of( '`%s`' % entry[ 'spec' ] )   # backticks fall to the same rule that drops `=`
+            n    = seen.get( base, 0 )
+            seen[ base ]      = n + 1
+            entry[ 'anchor' ] = base if n == 0 else '%s-%d' % ( base, n )
+
+
+# The --recall FLAG's own --help text says nothing about pointing it at a directory that is not a
+# source repo, because that usage needs no new flag at all — it is documented here as a hand-authored
+# subsection, not derived from --help like every other section in this file. The one real invocation
+# is still pulled from the SAME showcase capture every other sample in this document comes from (see
+# pattern_sample), so the doc's "everything here is either read from --help or a real recorded run"
+# contract holds for this subsection too.
+#
+# NO `**Caveats:**` BLOCK HERE, deliberately — do not add one back. This document's own "How to read a
+# section" defines Caveats as "the limits the binary itself states for this flag ... extracted from its
+# own help text, so they cannot drift from the code". A hand-authored bullet under that heading claims a
+# provenance it does not have, and this subsection had exactly that: a KNOWN LIMIT describing --recall
+# serving a document-order PREFIX instead of the ranked sections, still printed after the passage-serving
+# fix landed in src/recall.h, because nothing derived it from anything and so nothing could retire it.
+# The two conditions that DO govern this pattern (a `.md` extension, and `##` headings in the dump) are
+# not defects and will not expire, so they belong in the prose above, where they read as instructions for
+# writing the dump rather than as apologies for the tool.
+RECALL_PATTERN_MARKER = 'field affinity cache line data layout which fields are read together'
+
+
+def render_recall_pattern( captures, name ):
+    out = []
+    w   = out.append
+    sample = pattern_sample( captures, RECALL_PATTERN_MARKER )
+
+    w( '#### Pattern: a directory of dumped tool output as a knowledge base' )
+    w( '' )
+    w( '**Answers:** can `--recall` serve as a zero-setup knowledge base over dumped tool output — a' )
+    w( '`git log`, an API response dump, a fetched doc, `<tool> --help` text — sitting in a scratch' )
+    w( 'directory, instead of a source repo?' )
+    w( '' )
+    w( 'Yes, unmodified. `--recall` never distinguishes "a codebase" from any other directory it can' )
+    w( 'walk: point it at the scratch dir and query it. No index to build, no daemon, no mutable store' )
+    w( 'between runs — the whole cost is one cold parse. Two conditions decide whether it works at all,' )
+    w( 'and both are yours, because the file you write is the only thing that sets them:' )
+    w( '' )
+    w( '1. **Dump to `.md`.** `--recall` ranks DOCUMENT files: `.md`, plus the docparse\'d' )
+    w( '   `.ipynb`/`.html`/`.csv` (and Office/PDF through the optional markitdown bridge). `.txt`,' )
+    w( '   `.log`, `.json` and extensionless files are **not** documents to it. A directory of those' )
+    w( '   answers `0 relevant of 0 document files` and exits 0 — which reads like "nothing matched' )
+    w( '   your terms" when what happened is "nothing was indexed at all". Redirect to `notes.md`,' )
+    w( '   never `notes.txt`. The recorded run below is that rule\'s own demonstration: its scratch dir' )
+    w( '   holds five dumps, and the header says `2 relevant of 2 document files` because only the two' )
+    w( '   `.md` ones are documents — the `git log`, the `--help` text and the JSON access log are not' )
+    w( '   in the population at all.' )
+    w( '' )
+    w( '2. **Keep `##` headings in the dump.** A headed document is served as whole ranked SECTIONS, so' )
+    w( '   an answer buried mid-file arrives at a small `--max-tokens`, and — while the served document' )
+    w( '   SET stays fixed — a larger ceiling returns a strict superset of it; the `[sections: S of R' )
+    w( '   selected (N in doc) … lines="…"; dropped_by_budget=D]` note names the ranges you actually got' )
+    w( '   and what the ceiling cost. A HEADLESS dump has no sections to rank, so it is cut front-first' )
+    w( '   and carries no such note.' )
+    w( '' )
+    w( '   That per-document guarantee is not global: dump SEVERAL headed documents into the same' )
+    w( '   scratch dir and a larger ceiling can admit another one, which re-divides the shared budget' )
+    w( '   and can shrink an already-served document\'s own slice — `share_bytes=` in the header' )
+    w( '   discloses exactly that redivision when it happens.' )
+    w( '' )
+    w( '   Measured on a 73811-byte, 2001-line dump whose answer sat at line 1748: the headed copy' )
+    w( '   served exactly that answer at `--max-tokens=1000` (`lines="1748-1752"`, est_tokens=194),' )
+    w( '   while the headless copy of the same content withheld it at 1000, 2000, 4000, 8000 and 16000' )
+    w( '   and produced it only at 40000 — by which point the front-first cut had emitted the whole' )
+    w( '   file.' )
+    w( '' )
+    if sample:
+        w( '**Try it**' )
+        w( '' )
+        caption = scrub( sample[ 'caption' ], name )
+        if caption and not COORD.search( caption ):
+            w( '_%s_' % caption )
+            w( '' )
+        w( '```' )
+        w( '$ ' + rewrite_command( sample[ 'cmd' ], name ) )
+        for line in trim_sample( sample[ 'body' ], name ):
+            w( line )
+        w( '```' )
+        w( '' )
+    return out
+
+
+def recall_pattern_if_due( spec, captures, name ):
+    """The one line render()'s entry loop calls — kept a plain call, no `if`, so this hand-authored
+    subsection adds zero branches to render() itself (already well past its own complexity bar; the
+    branch belongs here, on a fresh symbol, not stacked onto that one)."""
+    return render_recall_pattern( captures, name ) if spec == '--recall=TASK' else []
 
 
 def render( name, preamble, sections, captures, capturePath ):
@@ -463,12 +735,13 @@ def render( name, preamble, sections, captures, capturePath ):
     w( '' )
 
     # ── table of contents ──
+    assign_anchors( sections )   # in emission order: the anchors below are read, never recomputed
     w( '## Contents' )
     w( '' )
     for title, entries in sections:
         if not entries:
             continue
-        w( '**%s** — %s' % ( title, ' · '.join( '[`%s`](#%s)' % ( e[ 'flags' ][ 0 ], anchor_of( e[ 'spec' ] ) )
+        w( '**%s** — %s' % ( title, ' · '.join( '[`%s`](#%s)' % ( e[ 'flags' ][ 0 ], e[ 'anchor' ] )
                                                 for e in entries ) ) )
         w( '' )
 
@@ -522,6 +795,8 @@ def render( name, preamble, sections, captures, capturePath ):
                     w( '- %s' % scrub_prose( c, name ) )
                 w( '' )
 
+            out.extend( recall_pattern_if_due( spec, captures, name ) )
+
     w( '---' )
     w( '' )
     w( '_Generated by `docs/docs_commands_build.py`. See `docs/README.md` for the documentation index._' )
@@ -533,7 +808,13 @@ def assert_scrubbed( text, what = 'refusing to write' ):
     """The generator must not be able to emit — or bless — what the public-export gate forbids."""
     bad = []
     for i, line in enumerate( text.split( '\n' ), 1 ):
-        if HOME_PATH.search( line ):
+        rebrandRow = rebrand_rename_row( line )
+        if rebrandRow is not None:
+            # checked FIRST, and named by its public side only: a report that printed this line would
+            # publish the old spelling in the log of every run that fails here
+            bad.append( '%d: the project\'s own rebrand rename row, which names a private pre-release identifier: %s'
+                        % ( i, rebrand_row_public_side( rebrandRow ) ) )
+        elif HOME_PATH.search( line ):
             bad.append( '%d: absolute home path' % i )
         elif COORD.search( line ):
             bad.append( '%d: internal coordinate shape: %s' % ( i, line.strip()[ :90 ] ) )
@@ -541,6 +822,10 @@ def assert_scrubbed( text, what = 'refusing to write' ):
             bad.append( '%d: email address: %s' % ( i, line.strip()[ :90 ] ) )
         elif INTERNAL_DOC.search( line ):
             bad.append( '%d: internal document name: %s' % ( i, line.strip()[ :90 ] ) )
+        elif unredacted_internal_row( line ) is not None:
+            # the shape that shipped once: path anonymised, heading text not
+            bad.append( '%d: internal document HEADING on an anonymised row: %s'
+                        % ( i, unredacted_internal_row( line )[ :90 ] ) )
     if bad:
         sys.exit( 'docs_commands_build: %s — scrub violations:\n  %s' % ( what, '\n  '.join( bad[ :20 ] ) ) )
 

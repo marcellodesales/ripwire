@@ -12,8 +12,7 @@
 #include <iterator>
 #include <string>
 #include <string_view>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "infra/os.h"   // rw::os::which / stat — the PATH search and the same-file check
 #include <vector>
 
 namespace rw::codexdoctor
@@ -47,37 +46,16 @@ inline std::string readSmallFile( const std::filesystem::path& path, bool& ok )
 
 inline std::string resolveExecutable( std::string_view command )
 {
-    if( command.empty() ) { return {}; }
-    const auto executable = []( const std::string& path )
-    {
-        return ::access( path.c_str(), X_OK ) == 0;
-    };
-    if( command.find( '/' ) != std::string_view::npos )
-    {
-        const std::string path( command );
-        return executable( path ) ? path : std::string();
-    }
-    const char* pathEnv = std::getenv( "PATH" );
-    std::string_view remaining = pathEnv ? std::string_view( pathEnv ) : std::string_view();
-    while( !remaining.empty() )
-    {
-        const std::size_t split = remaining.find( ':' );
-        const std::string_view dir = remaining.substr( 0, split );
-        const std::string candidate = std::string( dir.empty() ? "." : dir ) + "/" + std::string( command );
-        if( executable( candidate ) ) { return candidate; }
-        if( split == std::string_view::npos ) { break; }
-        remaining.remove_prefix( split + 1 );
-    }
-    return {};
+    return os::which( command );   // POSIX: the PATH walk this function used to hold; Windows: ';', PATHEXT, no relative entries
 }
 
 inline Check binaryCheck( const std::string& selfPath )
 {
     const std::string active = resolveExecutable( "ripwire" );
-    struct stat selfSt {};
-    struct stat activeSt {};
-    const bool haveSelf = !selfPath.empty() && ::stat( selfPath.c_str(), &selfSt ) == 0;
-    const bool haveActive = !active.empty() && ::stat( active.c_str(), &activeSt ) == 0;
+    os::stat_t selfSt {};
+    os::stat_t activeSt {};
+    const bool haveSelf = !selfPath.empty() && os::stat( selfPath.c_str(), &selfSt ) == 0;
+    const bool haveActive = !active.empty() && os::stat( active.c_str(), &activeSt ) == 0;
     const bool same = haveSelf && haveActive && selfSt.st_dev == activeSt.st_dev && selfSt.st_ino == activeSt.st_ino;
     const bool copied = haveSelf && haveActive && selfSt.st_mtime == activeSt.st_mtime && selfSt.st_size == activeSt.st_size;
     // `copied` is a HEURISTIC pass (mtime+size equality, the cp -p install shape) — it cannot prove byte
@@ -115,6 +93,9 @@ inline SkillManifest skillManifest( const std::filesystem::path& path )
     return out;
 }
 
+// A `ripwire-*` directory is a LIVE skill only when it holds a `SKILL.md` an agent can load: an empty directory
+// (0.6.3's Git Bash `ln -sfn` leftover, #334) or a link whose target is gone loads nothing, so it must not read
+// as manifest parity. train20-cr follow-up: before, any directory counted.
 inline std::vector<std::string> liveSkills( const std::filesystem::path& skillHome, bool& scanned )
 {
     std::vector<std::string> live;
@@ -124,7 +105,11 @@ inline std::vector<std::string> liveSkills( const std::filesystem::path& skillHo
     {
         const std::string name = it->path().filename().string();
         std::error_code sec;
-        if( name.rfind( "ripwire-", 0 ) == 0 && it->is_directory( sec ) && !sec ) { live.push_back( name ); }
+        std::error_code fec;
+        if( name.rfind( "ripwire-", 0 ) == 0 && it->is_directory( sec ) && !sec && std::filesystem::is_regular_file( it->path() / "SKILL.md", fec ) )
+        {
+            live.push_back( name );
+        }
         it.increment( ec );
     }
     std::sort( live.begin(), live.end() );
@@ -290,7 +275,12 @@ inline void retargetHint( Check& check, std::string_view claudeHint )
 
 inline std::vector<Check> claudeInspect( const std::string& selfPath )
 {
-    const std::filesystem::path claudeHome = envOr( "HOME", "" ) + "/.claude";
+    // CLAUDE_CONFIG_DIR relocates Claude Code's WHOLE config directory — skills/ and settings.json
+    // together — so reading $HOME/.claude here would report a correct relocated install as missing
+    // skills and an unregistered hook, with a hint telling the user to re-run an installer that had
+    // already succeeded. Same envOr() shape as CODEX_HOME/AGENTS_HOME below, including its rule that
+    // an env var set to the empty string is UNSET (the shell installers spell that as ${VAR:-...}).
+    const std::filesystem::path claudeHome = envOr( "CLAUDE_CONFIG_DIR", envOr( "HOME", "" ) + "/.claude" );
     Check binary = binaryCheck( selfPath );
     binary.name = "claude-binary";
     retargetHint( binary, "reinstall the current build so Claude Code shell calls and this doctor resolve the same ripwire binary" );

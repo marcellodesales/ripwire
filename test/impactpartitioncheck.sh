@@ -48,8 +48,10 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 
 cd "$ROOT"
 
-python3 - "$BIN" <<'PY'
-import re, subprocess, sys
+ROOT="$ROOT" python3 - "$BIN" <<'PY'
+import os, re, subprocess, sys
+sys.path.insert(0, os.path.join(os.environ.get("ROOT", "."), "test"))
+import testrowpaths                                   # THE shared tests_to_run row reader
 
 BIN = sys.argv[1]
 fail = [0]
@@ -106,10 +108,27 @@ if dup_count:
     print("  INFO  --test-gate=%s: %d row(s) share a (name,file) key with another row (no line= on <u> to disambiguate) — collapses identically on both sides" % (SAMPLE_FILE, dup_count))
 ok("--test-gate=%s: parsed %d <u> rows into %d distinct (name,file) keys (shown_untested=%s)" % (SAMPLE_FILE, len(testgate_untested_raw), len(testgate_untested), tg_attrs.get("shown_untested")))
 
-testgate_testfiles = set(norm_path(m.group(1)) for m in re.finditer(r'<t p="([^"]+)"', tg))
+# E1 / review of #214: a tests_to_run row may name SEVERAL files (`<g … p="a,b,c" run_unknown="1"/>`),
+# and this set was built from the single rows alone — on a corpus where the rows group, a grouped test file
+# was missing from the set and its <s> row was then counted as an untested one. Read through the shared
+# reader (test/testrowpaths.py), which knows both shapes in every dialect.
+testgate_testfiles = set(norm_path(p) for p in testrowpaths.xml_paths(tg))
 
-# ── union every --impact=src/graph.h:SYM call's rows, keyed (name, normalized path) -> tested bool ─────
-impact_rows = {}          # key -> tested (bool)
+# ── union every --impact=src/graph.h:SYM call's rows ─────────────────────────────────────────────────────
+# KEYED PER DEFINITION, (name, file, line), for the consistency check. Keyed (name, file) it read two OVERLOADS as one
+# symbol: on train 1b quality.h's readAckRecords( path ) (untested) and readAckRecords( path, badLines ) (tested)
+# were reported as "tested=True from one seed and tested=False from another" on every leg (#277). A per-definition
+# key makes that check mean what it says: ONE definition read two ways by two seeds. The set comparison with
+# --test-gate below is still over (name, file), because <u> carries no line: the projection is a key being untested
+# when ANY of its overloads is (exactly how <u> collapses them), and tested only when ALL of them are.
+def observe(store, def_key, tested):
+    """record one --impact observation; True when THIS definition was already seen with the other tested= value"""
+    if def_key in store and store[def_key] != tested:
+        return True
+    store[def_key] = tested
+    return False
+
+impact_rows = {}          # (name, file, line) -> tested (bool)
 row_count_ok = True
 radius_sum_ok = True
 for name in seed_names:
@@ -119,7 +138,12 @@ for name in seed_names:
         no("--impact=%s:%s produced no <impact> root" % (SAMPLE_FILE, name))
         continue
     attrs = dict(re.findall(r'(\w[\w-]*)="([^"]*)"', root.group(1)))
-    rows = re.findall(r'<s t="\w+" n="([^"]+)" p="([^"]+)"( tested="1")?/>', doc)
+    # t= is captured (not just matched) so the loop below can single out t="modscope" — #324's <file-scope>
+    # exclusion — without changing what THIS list counts: reaches= still counts every caller row, module
+    # scope included, so len(rows) == reaches stays the row-count invariance it always was.
+    # 0.6.5 (depth-labelled --impact): a row may carry d= (its hop depth, run-length) between p= and tested=; the
+    # row COUNT this invariance reads is unchanged by it (test/impactdepthcheck.sh gates the depths themselves).
+    rows = re.findall(r'<s t="(\w+)" n="([^"]+)" p="([^"]+)"(?: d="\d+")?( tested="1")?/>', doc)
     reaches = int(attrs.get("reaches", "-1"))
     if len(rows) != reaches:
         row_count_ok = False
@@ -130,25 +154,42 @@ for name in seed_names:
         no("--impact=%s:%s: radius_tested(%d) + radius_untested(%d) != reaches(%d)" % (SAMPLE_FILE, name, rt, ru, reaches))
     if attrs.get("capped") not in ("0", None):
         no("--impact=%s:%s: capped=%s at --limit=5000 — raise the limit in this script" % (SAMPLE_FILE, name, attrs.get("capped")))
-    for rn, rp, rtested in rows:
+    for rkind, rn, rp, rtested in rows:
         np = norm_path(rp)
         if np == SAMPLE_FILE:
             continue                       # the changed file's own symbols — excluded, as --test-gate excludes them
         if np in testgate_testfiles:
             continue                       # a test-file row — --test-gate folds these into <t>, never <u>
-        key = (rn, np)
+        if rkind == "modscope":
+            continue                       # #324: a synthetic <file-scope> owner is a legitimate CALLER row
+                                            # here (t="modscope", unchanged) but --test-gate's <u> listing now
+                                            # excludes it on purpose — nothing can call it, so no test can ever
+                                            # be written FOR it, and situ.h's computeTestGateFor drops it before
+                                            # <u> is built (model.h::isUntestableOwner). Keeping it on THIS side
+                                            # of the comparison would fail assertion (1) on a correct fix, not a
+                                            # real regression — it stays counted in reaches=/row-count above,
+                                            # only excluded from the untested/tested SET EQUALITY projection.
+        line = rp.split(":", 1)[1] if ":" in rp else ""
+        def_key = (rn, np, line)
         tested = bool(rtested)
-        if key in impact_rows and impact_rows[key] != tested:
-            no("internal inconsistency: %s is tested=%s from one seed and tested=%s from another" % (str(key), impact_rows[key], tested))
-        impact_rows[key] = tested
+        previous = impact_rows.get(def_key)
+        if observe(impact_rows, def_key, tested):
+            no("internal inconsistency: %s is tested=%s from one seed and tested=%s from another" % (str(def_key), previous, tested))
 
 if row_count_ok:
     ok("row-count invariance: every --impact call's printed row count equals its own reaches=")
 if radius_sum_ok:
     ok("row-count invariance: radius_tested= + radius_untested= == reaches= on every call")
 
-impact_untested = set(k for k, t in impact_rows.items() if not t)
-impact_tested    = set(k for k, t in impact_rows.items() if t)
+# the (name, file) projection --test-gate's <u> can be compared with (see the keying note above the loop)
+impact_by_file = {}
+for (n, f, _line), t in impact_rows.items():
+    impact_by_file.setdefault((n, f), []).append(t)
+impact_untested = set(k for k, ts in impact_by_file.items() if not all(ts))   # any overload untested
+impact_tested    = set(k for k, ts in impact_by_file.items() if all(ts))      # every overload tested
+mixed_overloads = sorted(k for k, ts in impact_by_file.items() if any(ts) and not all(ts))
+if mixed_overloads:
+    print("  INFO  %d (name,file) key(s) hold overloads with DIFFERENT tested= (e.g. %s) — compared per definition above, projected as untested below" % (len(mixed_overloads), str(mixed_overloads[0])))
 
 # ── (1) SET EQUALITY ─────────────────────────────────────────────────────────────────────────────────
 missing = testgate_untested - impact_untested   # test-gate says untested, --impact disagrees (or never saw it)
@@ -180,6 +221,19 @@ if testgate_untested:
 else:
     no("MUTATION CONTROL: testgate_untested is empty, nothing to mutate — the sample is not exercising real cases")
 
+# ── (3b) OVERLOAD CONTROL — the per-definition key tells one definition from two overloads ───────────────
+# The same observe() the loop uses, fed planted rows: one definition seen tested and then untested MUST be an
+# inconsistency (so the consistency check can still fail), and two same-named overloads in one file with different
+# tested= must NOT be (the #277 false alarm), while the projection still reads that (name, file) as untested.
+probe = {}
+observe(probe, ("f", "a.h", "10"), True)
+same_def_conflict = observe(probe, ("f", "a.h", "10"), False)
+overload_conflict = observe(probe, ("f", "a.h", "20"), False)
+if same_def_conflict and not overload_conflict:
+    ok("OVERLOAD CONTROL: one definition read tested and untested is flagged; two overloads with different tested= are not")
+else:
+    no("OVERLOAD CONTROL: same-definition conflict flagged=%s (want True), overload conflict flagged=%s (want False)" % (same_def_conflict, overload_conflict))
+
 # ── (4) F-02 — THE LENS'S BLIND SPOT IS DISCLOSED WHERE THE PARTITION IS READ, AND NOWHERE ELSE ────────
 # testSymbolForwardReach only sees a caller through a CALL EDGE from an indexed test symbol, so a shell or
 # CLI-level test that drives the built binary as a subprocess contributes nothing to it. On this repo's own
@@ -202,8 +256,10 @@ def legend_of(doc):
 CARRIES = [ ("--impact=isPublicApi",  "radius_tested="),
             ("--callers=buildGraph",  "hop_tested="),
             ("--callees=buildGraph",  "hop_tested=") ]
+# L1 (2026-09-19): the CLI default legend is compact; arms (4)/(5) read the FULL legend's caveat and row reading, so the XML
+# runs ask for it (the inertness arm too: the full legend is where a stray caveat would ride).
 for flag, partition_attr in CARRIES:
-    doc = run([flag])
+    doc = run([flag, "--legend=full"])
     lg  = legend_of(doc)
     if partition_attr not in doc:
         no("(4) %s no longer carries %s — this arm measured nothing" % (flag, partition_attr))
@@ -216,13 +272,56 @@ for flag, partition_attr in CARRIES:
 
 INERT = [ "--uses=rootRelPathsLegend", "--for=resolve call edges by name" ]
 for flag in INERT:
-    doc = run([flag])
+    doc = run([flag, "--legend=full"])
     if "radius_tested=" in doc or "hop_tested=" in doc:
         no("(4) %s unexpectedly carries a tested PARTITION — the inertness arm's premise is gone" % flag)
     elif any(a in doc for a in BLIND_ANCHORS):
         no("(4) %s pays for the partition caveat without carrying the partition (should be 0 bytes)" % flag)
     else:
         ok("(4) %s pays 0 bytes for the caveat (no tested partition on it)" % flag)
+
+# ── (5) EACH FORM'S LEGEND READS THE TESTED LENS AS THAT FORM PRINTS IT (2026-09-12) ─────────────────────────────────────
+# kTestedRowLegend says tested="1" is "never 0, omitted when it does not", which is true of the XML rows: they print the
+# attribute only where the lens holds. The columnar form of the same three verbs carries the lens as a DENSE <tested> column
+# (columnar.h emitColumnarTestedColumn), one value per row and 0 on every row the lens does not accept, a test row included,
+# and it printed the row sentence anyway: test/fixture's --callers=distance --format=columnar read "never 0" beside
+# <tested>0,0</tested>. So the columnar legend must read the column and not carry the row sentence, and the XML legend must
+# keep the row sentence, carry no column reading, and print no <s tested="0">. test/fixture holds no test, so every value in
+# its columns is 0 and the control is certain. The needles are the two readings' own words (graphlegend.h).
+# RED on 036c827d (plain): the three columnar rows FAILed and nothing else did, for example
+#   FAIL  (5) --callers=distance --format=columnar: prints <tested>0,0</tested> under a legend that says tested is never 0
+ROW_READING = "never 0, omitted when it does not"
+COL_READING = "0 = none found, or a test row"
+
+def run_fixture(args):
+    p = subprocess.run([BIN, "test/fixture"] + args, capture_output=True, text=True, timeout=60)
+    return p.stdout
+
+for args in (["--callers=distance", "--format=columnar"], ["--callees=total_area", "--format=columnar"], ["--impact=distance", "--format=columnar"]):
+    doc, label = run_fixture(args), " ".join(args)
+    lg     = legend_of(doc)
+    fields = re.search(r'<cols [^>]*fields="([^"]*)"', doc)
+    col    = re.search(r'<tested>([^<]*)</tested>', doc)
+    if not fields or "tested" not in fields.group(1).split(",") or not col or "0" not in col.group(1).split(","):
+        no("(5) %s: control broken — no tested column holding a 0, so the legend has nothing to disagree with" % label)
+    elif ROW_READING in lg:
+        no("(5) %s: prints <tested>%s</tested> under a legend that says tested is never 0" % (label, col.group(1)))
+    elif COL_READING not in lg:
+        no("(5) %s: prints <tested>%s</tested> and its legend never reads the column's 0" % (label, col.group(1)))
+    else:
+        ok("(5) %s: the legend reads the column it prints (<tested>%s</tested>)" % (label, col.group(1)))
+
+for args in (["--callers=distance", "--legend=full"], ["--impact=distance", "--legend=full"]):
+    doc, label = run_fixture(args), " ".join(args)
+    lg = legend_of(doc)
+    if not re.search(r'<s [^>]*>', doc):
+        no("(5) %s: control broken — no <s> row, so the row reading has nothing to agree with" % label)
+    elif re.search(r'<s [^>]* tested="0"', doc):
+        no("(5) %s: an <s> row prints tested=\"0\" beside a row reading that says never 0" % label)
+    elif ROW_READING not in lg or COL_READING in lg:
+        no("(5) %s: the XML legend %s" % (label, "lost the row reading" if ROW_READING not in lg else "reads a column this form does not print"))
+    else:
+        ok("(5) %s: the row reading rides the XML form, whose rows never print tested=\"0\", and the column reading does not" % label)
 
 print()
 if fail[0]:

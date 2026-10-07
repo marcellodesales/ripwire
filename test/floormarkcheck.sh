@@ -57,11 +57,12 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -139,6 +140,10 @@ sys.stdout.write(m.group(0) if m else "")
 
 echo
 echo "=== (1) PRESENCE — the marker on all SEVEN graph-count roots, XML form ==="
+# L1 (2026-09-19): the CLI default legend is compact. (3) reads the FULL legend's sentences and (4) compares full with
+# full across transports, so these seven captures ask for the full legend by name; (3c) below reads the same seven at
+# the DEFAULT posture, where the floor anchor must hold too.
+cap(){ local name="$1"; shift; "$BIN" "$@" --legend=full >"$TMP/$name" 2>"$TMP/$name.err"; }
 cap callers.xml     src --callers="$SYM"
 cap callees.xml     src --callees="$SYMC"
 cap uses.xml        src --uses="$SYM"
@@ -154,6 +159,7 @@ cap graphquery.xml  src --graph-query="callers(name(\"$SYM\"),1)"
 # Pinned to HEAD~1 for the same reason legendcoveragecheck's roster is: the bare working-tree form's element
 # set depends on whether the agent running the suite has uncommitted edits, which is a flake.
 cap prcontext.xml   .   --pr-context=HEAD~1
+cap(){ local name="$1"; shift; "$BIN" "$@" >"$TMP/$name" 2>"$TMP/$name.err"; }   # back to the caller's own posture
 
 for v in callers callees uses impact editcheck graphquery prcontext; do
     ROOTTAG="$( grep -o "<[a-z-]*[^>]*$MARK_XML[^>]*>" "$TMP/$v.xml" | head -1 )"
@@ -242,6 +248,30 @@ case "$( leadComment "$TMP/impact.xml" )" in
     *)               no "(3b) impact: the reach-SET unit is not stated" ;;
 esac
 
+# (3c) THE DEFAULT POSTURE (L1): the same seven verbs with no --legend flag. The compact dialect keeps the floor anchor
+# verbatim (compactlegend.h's counts_floor reading), so a reader of the DEFAULT answer is told the counts are floors
+# wherever the root says counts_floor="1". Red on a binary whose compact reading loses the anchor; the full-dialect
+# clauses (cause, counting unit) are --legend=full's and are asserted in (3) above.
+for v in callers callees uses impact editcheck graphquery prcontext; do
+    case "$v" in
+        callers)    set -- src --callers="$SYM" ;;
+        callees)    set -- src --callees="$SYMC" ;;
+        uses)       set -- src --uses="$SYM" ;;
+        impact)     set -- src --impact="$SYM" ;;
+        editcheck)  set -- . --edit-check="$SYM" ;;
+        graphquery) set -- src --graph-query="callers(name(\"$SYM\"),1)" ;;
+        prcontext)  set -- . --pr-context=HEAD~1 ;;
+    esac
+    cap "$v.def.xml" "$@"
+    if ! grep -q "$MARK_XML" "$TMP/$v.def.xml"; then
+        no "(3c) $v at the default posture carries no $MARK_XML — the marker must not depend on the legend posture"
+    elif grep -o '<!--.*-->' "$TMP/$v.def.xml" | grep -qF "$FLOOR_ANCHOR"; then
+        ok "(3c) $v at the default posture: $MARK_XML rides with its reading '$FLOOR_ANCHOR'"
+    else
+        no "(3c) $v at the default posture carries $MARK_XML with NO legend saying '$FLOOR_ANCHOR'"
+    fi
+done
+
 echo
 echo "=== (4) CLI ≡ MCP — the shared disclosure tail is byte-identical across transports ==="
 # tail FILE — everything from the floor anchor's sentence start to the end of the leading comment. That is
@@ -317,7 +347,7 @@ HITS="$HITS$( grep -ni "$RETIRED" "$ROOT/test/showcase_capture.py" 2>/dev/null |
 [ -z "$HITS" ] \
     && ok "(5) the phrase \"$RETIRED\" appears in no emitted string in src/, and nowhere at all in README.md or skills/" \
     || { no "(5) the retired phrase \"$RETIRED\" is still in the tree:"; printf '%s\n' "$HITS" | sed 's/^/          /' | head -8; }
-"$BIN" --help >"$TMP/help.txt" 2>&1
+"$BIN" --help=all >"$TMP/help.txt" 2>&1
 grep -qi "$RETIRED" "$TMP/help.txt" \
     && no "(5) --help still promises \"$RETIRED\"" \
     || ok "(5) --help does not promise \"$RETIRED\""
@@ -368,19 +398,18 @@ for spec in "callers:--callers=$SYM" "callees:--callees=$SYMC" "uses:--uses=$SYM
         fi
     done
 done
-# --edit-check sits OUTSIDE the --limit/--offset family, so it takes the §B9.2 NOTICE instead of a refusal.
-# That asymmetry is DELIBERATE (R12: disclose, do not refuse, out here — refusing would break
-# `--for=X --max-tokens=5000`), so the gate pins the notice rather than demanding a refusal it should not get.
+# --edit-check took the §B9.2 NOTICE while it sat OUTSIDE the --limit/--offset family. On 2026-09-10 it JOINED
+# that family (it windows its unflagged caller rows; the flagged callers and their sites_l= never page), and
+# cli.h's own invariant is that a verb holds a row in kShapingVerbs OR honorsPaging, never both — so it now
+# takes the family REFUSAL like its five neighbours above, and this arm pins that instead. The asymmetry the
+# old wording protected still exists; it just no longer covers this verb.
 for flag in --token-budget=200 --max-tokens=200; do
     ERR="$( "$BIN" . --edit-check="$SYM" "$flag" 2>&1 >/dev/null )"; rc=$?
-    OUT="$( "$BIN" . --edit-check="$SYM" "$flag" 2>/dev/null | wc -c | tr -d ' ' )"
-    case "$rc:$ERR" in
-        0:*"is not read by --edit-check"*)
-            [ "$OUT" -gt 0 ] \
-                && ok "(8) edit-check $flag: warns and emits ($OUT B, rc=0) — the deliberate outside-the-family shape" \
-                || no "(8) edit-check $flag: warned but emitted nothing" ;;
-        *)  no "(8) edit-check $flag: rc=$rc and no 'is not read by' notice — it is silently ignoring the flag: $( printf '%s' "$ERR" | head -c 120 )" ;;
-    esac
+    if [ "$rc" != 0 ] && [ -n "$ERR" ]; then
+        ok "(8) edit-check $flag: refused loudly (rc=$rc, message present) — the paging family's shape"
+    else
+        no "(8) edit-check $flag: rc=$rc with $( printf '%s' "$ERR" | wc -c | tr -d ' ' ) B of stderr — accepted-and-ignored"
+    fi
 done
 # V4 MED-3, the byte half. --pr-context is the ONE marked surface that HONOURS --max-tokens (it is in the
 # honoring set the M-4 work above derived from the read sites), so its marker bytes are not free the way the
@@ -520,8 +549,10 @@ else
         git add -A >/dev/null 2>&1
         git -c commit.gpgsign=false commit -q -m "widen every module" >/dev/null 2>&1
     )
-    FIXFULL="$( "$BIN" "$FIX" --pr-context=HEAD~1 2>/dev/null | wc -c | tr -d ' ' )"
-    "$BIN" "$FIX" --pr-context=HEAD~1 --max-tokens=600 >"$TMP/fix600.xml" 2>/dev/null
+    # L1 (2026-09-19): the fixture's size bar (> 15,000 B un-budgeted) was measured in the full legend, the old default;
+    # both sides of the shrink comparison ask for it, so the budget is judged against the same dialect it trims.
+    FIXFULL="$( "$BIN" "$FIX" --pr-context=HEAD~1 --legend=full 2>/dev/null | wc -c | tr -d ' ' )"
+    "$BIN" "$FIX" --pr-context=HEAD~1 --max-tokens=600 --legend=full >"$TMP/fix600.xml" 2>/dev/null
     FIX600="$( wc -c <"$TMP/fix600.xml" | tr -d ' ' )"
     FIXFILES="$( grep -oE '<pr-context [^>]*files="[0-9]+"' "$TMP/fix600.xml" | grep -oE 'files="[0-9]+"' | head -1 )"
 
@@ -668,7 +699,7 @@ done
 if command -v xmllint >/dev/null 2>&1; then
     for f in path9 connect9 affected9 exercises9 seams9 deadcode9 communities9 community9 zoom9 lego9 mcp_path9 mcp_connect9 mcp_lego9; do
         [ -s "$TMP/$f.xml" ] || { no "(9) $f.xml is empty — nothing was validated"; continue; }
-        xmllint --noout "$TMP/$f.xml" 2>"$TMP/xl9.err" && ok "(9) $f.xml is well-formed" || no "(9) $f.xml FAILED xmllint: $( head -1 "$TMP/xl9.err" )"
+        if xmllint --noout "$TMP/$f.xml" 2>"$TMP/xl9.err"; then ok "(9) $f.xml is well-formed"; else no "(9) $f.xml FAILED xmllint: $( head -1 "$TMP/xl9.err" )"; fi
     done
 fi
 
@@ -688,8 +719,11 @@ src = sys.argv[1]
 # not the member row the communities listing prints under the same tag).
 # `<uses` (fielduses.h / columnar.h) and `<edit-check` (editcheck.h) are 40-line `out +=` builders whose marker
 # lands far past any statement window; arm (1) pins them LIVE, so they are deliberately not re-derived here.
+# NOTE: these are SOURCE literals, so the std::print conversion respelled the conversion specifiers
+# inside them (`blast radius: %zu symbols` -> `blast radius: {} symbols`). A pattern that stops
+# matching after a conversion is this guard working, not noise -- re-pin it to the new spelling.
 PATTERNS = [ r'"<path ', r'"<connect ', r'"<affected ', r'"<exercises ', r'"<seams ', r'"<dead-code ', r'"<communities ',
-             r'"<community id=', r'"<zoom ', r'"<lego', r'\\"dependent_symbols\\"', r'blast radius: %zu symbols',
+             r'"<community id=', r'"<zoom ', r'"<lego', r'\\"dependent_symbols\\"', r'blast radius: {} symbols',
              r'"<impact of=', r'"<query ', r'"<pr-context" \+', r'"<safe-delete ', r'"<test-gate' ]
 fail, found = 0, { p: 0 for p in PATTERNS }
 for fn in sorted( os.listdir( src ) ):

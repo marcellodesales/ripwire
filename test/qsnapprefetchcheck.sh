@@ -19,6 +19,13 @@
 #   (c) DETERMINISM — quality_delta's response body is BYTE-IDENTICAL prefetch-fired vs prefetch-suppressed.
 #   (d) SINGLE-FLIGHT — two rapid HEAD moves: no crash, and at most ONE concurrent worker (observed via the
 #       RIPWIRE_MCP_TIMINGS "prefetch spawn"/"prefetch done" stderr lines — the live count never exceeds 1).
+#   (f) THE PREVIEW INGEST RACE — `edit_check` with `new_body` parses the spliced file through two ingests of its
+#       own (editpreview::ingestOneFile). They ran OUTSIDE headSnapshotIngestMutex, so a prefetch worker kicked by
+#       the read verb just before them ingested concurrently: ingest() installs compiled tags queries into a
+#       process-global cache and deletes the entry each install displaces, single-writer by design. Measured on
+#       the TSan build before the fix: `data race` at ingest.cpp's parse-pool call (prefetch worker vs
+#       ingestOneFile) and the server ABORTED (exit 134) mid-session. Asserted here on every build: each preview
+#       is answered, and the server is still alive afterwards; on a TSan build the (e) assertion is the red one.
 #   (e) TSan — run this whole script with a ThreadSanitizer binary (see below); every scenario asserts the
 #       server stderr carries NO "ThreadSanitizer" warning (trivially true on a normal build; a real check on a
 #       TSan build). Build + run:
@@ -39,13 +46,15 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
+. "$ROOT/test/lib/statcompat.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/fixture"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -103,23 +112,27 @@ wait_for_id() { local i; for i in $( seq 1 200 ); do grep -q "\"id\":$2" "$1" 2>
 blob_paths() { find "$1" -maxdepth 3 -type f -name "$2" 2>/dev/null; }
 blob_first() { blob_paths "$1" "$2" | head -1; }
 qsnap_count() { blob_paths "$1" 'ripwire-qsnap-*.bin' | grep -c . ; }
-# L3 (Linux probe): portable stat reader(s). GNU coreutils and BSD/macOS disagree on both the flag and the
-# format directives, and the `stat -f FMT ... || stat -c FMT ...` fallback this gate used is a TRAP. On GNU,
-# `-f` means FILESYSTEM status and takes NO format argument, so FMT is parsed as a second FILE: measured on
-# coreutils 9.11, `stat -f %i FILE` PRINTS a six-line filesystem block for FILE on stdout and exits 1. The
-# `||` arm then appends the right number under six lines of junk -- so a string compare fails, a numeric
-# compare dies with "integer expression expected", and a `|| echo MISSING` variant reports MISSING forever
-# (a gate that then passes by comparing nothing to nothing). Detect the flavour ONCE, use one form.
-if stat --version >/dev/null 2>&1; then inode_mtime(){ stat -c '%i %Y' "$1" 2>/dev/null || echo "MISSING"; }   # GNU coreutils
-else                                    inode_mtime(){ stat -f '%i %m' "$1" 2>/dev/null || echo "MISSING"; }   # BSD / macOS
-fi
-assert_no_tsan() { grep -q "ThreadSanitizer" "$1" 2>/dev/null && no "TSan WARNING in server stderr ($2)" || ok "no ThreadSanitizer warning in server stderr ($2)"; }
+inode_mtime(){ inode_mtime_of "$1" || echo "MISSING"; }
+skip(){ printf '  SKIP  %s\n' "$*"; }
+# The no-warning row only measures something on a ThreadSanitizer build; on any other binary it is a SKIP by name, never
+# a PASS, because a plain binary prints no warning whether or not the race is there (arm (f) passes on the unfixed
+# plain binary too, and CI has no TSan job — the preview-race fix has no CI guard beyond a local TSan run).
+if LC_ALL=C grep -q -a '__tsan_init' "$BIN" 2>/dev/null; then IS_TSAN=1; else IS_TSAN=0; fi
+assert_no_tsan() {
+    if [ "$IS_TSAN" -ne 1 ]; then skip "no ThreadSanitizer warning in server stderr ($2) — not a TSan build, nothing measured"; return 0; fi
+    if grep -q "ThreadSanitizer" "$1" 2>/dev/null; then no "TSan WARNING in server stderr ($2)"; else ok "no ThreadSanitizer warning in server stderr ($2)"; fi
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 echo
 echo "=== (a) atomic publish: no torn read — tmp+rename, checksum-valid, no residue ==="
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 read A_W A_C <<<"$( new_repo )"
+# #228 part 1 — the IDENTITY BASIS (src/quality.h): a working tree that already IS HEAD is compared with
+# ITSELF and never materializes a HEAD tree, so it never writes a qsnap blob at all. This arm is about the
+# ATOMICITY of that write, so it needs a tree that reaches it: one comment-only line, appended once (HEAD does
+# not move inside this arm), makes `git diff HEAD` non-empty without adding a symbol or a row.
+printf '\n// dirty marker: the identity basis skips the HEAD materialization this arm measures\n' >> "$A_W/geometry.cpp"
 # a background sampler: while quality_delta rewrites the qsnap repeatedly, the file must ALWAYS be ABSENT or
 # checksum-VALID — never a non-empty partial one (the torn-read the direct-ofstream write allowed).
 SAMPLE_BAD=0
@@ -280,6 +293,44 @@ print(mx)
 [ "${MAXLIVE:-0}" -le 1 ] && ok "(d) at most one concurrent prefetch worker (max live=${MAXLIVE:-0}; single-flight holds)" \
                           || no "(d) more than one concurrent worker (max live=$MAXLIVE) — single-flight broken"
 assert_no_tsan "$D_W/err.txt" "d"
+exec 9>&-; kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "=== (f) edit_check new_body preview ingests vs a concurrent prefetch ingest ==="
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+read F_W F_C <<<"$( new_repo )"
+FIFO="$F_W/in.fifo"; mkfifo "$FIFO"
+TMPDIR="$F_C/" RIPWIRE_QSNAP_PREFETCH_MIN_FILES=1 RIPWIRE_MCP_TIMINGS=1 \
+    "$BIN" --mcp <"$FIFO" >"$F_W/out.txt" 2>"$F_W/err.txt" &
+SRV=$!; exec 9>"$FIFO"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize"}' >&9
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"find_symbol\",\"arguments\":{\"path\":\"$F_W\",\"symbol\":\"perimeter\"}}}" >&9
+wait_for_id "$F_W/out.txt" 2 || no "(f) server never answered the warm-up read (id=2)"
+F_BODY='double perimeter( const Point* pts, int n )\n{\n    double total = 0.0;\n    for( int i = 0; i < n; ++i )\n    {\n        total += distance( pts[i], pts[ ( i + 1 ) % n ] ) * 2.0;\n    }\n    return total;\n}'
+F_PREVIEWS=0
+# A preview now WAITS for the worker's whole locked HEAD-snapshot compute, which a sanitizer build takes seconds
+# over — so this arm waits up to 120 s per answer instead of the 10 s wait_for_id gives a plain read.
+wait_long(){ local i; for i in $( seq 1 1200 ); do grep -q "\"id\":$2[,}]" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+for r in 1 2 3; do
+    printf '\n// preview race round %s\n' "$r" >> "$F_W/geometry.cpp"
+    git -C "$F_W" commit -q -am "preview race $r"
+    # the read verb observes the HEAD move and detaches the prefetch worker; the preview is queued right behind it,
+    # so its ingests run while the worker materializes and ingests the new HEAD tree.
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$(( 100 + 2 * r )),\"method\":\"tools/call\",\"params\":{\"name\":\"find_symbol\",\"arguments\":{\"path\":\"$F_W\",\"symbol\":\"perimeter\"}}}" >&9
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$(( 101 + 2 * r )),\"method\":\"tools/call\",\"params\":{\"name\":\"edit_check\",\"arguments\":{\"path\":\"$F_W\",\"symbol\":\"geometry.cpp:perimeter\",\"new_body\":\"$F_BODY\"}}}" >&9
+    wait_long "$F_W/out.txt" $(( 101 + 2 * r )) || break
+    inner_for_id "$F_W/out.txt" $(( 101 + 2 * r )) | grep -q '<overwrite ' && F_PREVIEWS=$(( F_PREVIEWS + 1 ))
+    for i in $( seq 1 100 ); do [ "$( grep -c 'ripwire-prefetch done' "$F_W/err.txt" )" -ge "$r" ] && break; sleep 0.1; done
+done
+[ "$( grep -c 'ripwire-prefetch spawn' "$F_W/err.txt" )" -ge 1 ] && ok "(f) the prefetch worker fired during the preview rounds (non-vacuous)" \
+                                                                 || no "(f) no prefetch spawn — the race this arm exists for never had a second ingest"
+[ "$F_PREVIEWS" -eq 3 ] && ok "(f) all 3 new_body previews answered with the overwrite span" \
+                        || no "(f) only $F_PREVIEWS of 3 new_body previews answered — the server died or refused mid-race"
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":199,\"method\":\"tools/call\",\"params\":{\"name\":\"find_symbol\",\"arguments\":{\"path\":\"$F_W\",\"symbol\":\"distance\"}}}" >&9
+wait_long "$F_W/out.txt" 199 && ok "(f) server still responsive after the preview rounds" \
+                               || no "(f) server unresponsive after the preview rounds (crash?)"
+assert_no_tsan "$F_W/err.txt" "f"
 exec 9>&-; kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 
 echo

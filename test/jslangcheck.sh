@@ -40,7 +40,7 @@ FIX="$ROOT/test/jslangfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -52,9 +52,9 @@ echo "jslangcheck: BIN=$BIN  FIX=$FIX"
 MAP_OUT="$TMP/map.xml"
 $BIN "$FIX" --no-cache >"$MAP_OUT" 2>"$TMP/map.err"
 MAP_EXIT=$?
-[ "$MAP_EXIT" -eq 0 ] && ok "default map: exits 0 on JS/Bash fixture" || no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"
+if [ "$MAP_EXIT" -eq 0 ]; then ok "default map: exits 0 on JS/Bash fixture"; else no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"; fi
 
-command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$MAP_OUT" && ok "default map: passes xmllint --noout" || no "default map: xmllint failed"; }
+command -v xmllint >/dev/null 2>&1 && { if xmllint --noout "$MAP_OUT"; then ok "default map: passes xmllint --noout"; else no "default map: xmllint failed"; fi; }
 
 # ─── parse the per-file symbol + edge structure once, reuse for all checks ────
 python3 - "$MAP_OUT" <<'PYEOF' >"$TMP/parsed.json"
@@ -101,12 +101,12 @@ if grep -q "SYMS:0" "$TMP/js_check"; then
 else
     ok "a.js (JavaScript): extracted $( grep -o 'SYMS:[0-9]*' "$TMP/js_check" | cut -d: -f2 ) symbol(s)"
 fi
-grep -q "SYMS:2" "$TMP/js_check" && ok "a.js: exactly 2 symbols (addOne, addTwo — no phantom nodes)" || no "a.js: expected 2 symbols, got: $( grep SYMS "$TMP/js_check" )"
-grep -q "HAS_ADDONE:True" "$TMP/js_check" && ok "a.js: addOne symbol present" || no "a.js: addOne symbol missing"
-grep -q "HAS_ADDTWO:True" "$TMP/js_check" && ok "a.js: addTwo (arrow-fn const) symbol present" || no "a.js: addTwo symbol missing"
-grep -q "ALL_FN:True" "$TMP/js_check" && ok "a.js: both symbols tagged t=\"fn\"" || no "a.js: symbols not tagged t=\"fn\" as expected"
-grep -q "EDGE:True" "$TMP/js_check" && ok "a.js: intra-file call edge addTwo -> addOne present" || no "a.js: call edge addTwo -> addOne MISSING"
-grep -q "EDGE_N:1" "$TMP/js_check" && ok "a.js: exactly ONE addTwo -> addOne edge (dedup)" || no "a.js: expected a single addTwo -> addOne edge: $( grep EDGE_N "$TMP/js_check" )"
+if grep -q "SYMS:2" "$TMP/js_check"; then ok "a.js: exactly 2 symbols (addOne, addTwo — no phantom nodes)"; else no "a.js: expected 2 symbols, got: $( grep SYMS "$TMP/js_check" )"; fi
+if grep -q "HAS_ADDONE:True" "$TMP/js_check"; then ok "a.js: addOne symbol present"; else no "a.js: addOne symbol missing"; fi
+if grep -q "HAS_ADDTWO:True" "$TMP/js_check"; then ok "a.js: addTwo (arrow-fn const) symbol present"; else no "a.js: addTwo symbol missing"; fi
+if grep -q "ALL_FN:True" "$TMP/js_check"; then ok "a.js: both symbols tagged t=\"fn\""; else no "a.js: symbols not tagged t=\"fn\" as expected"; fi
+if grep -q "EDGE:True" "$TMP/js_check"; then ok "a.js: intra-file call edge addTwo -> addOne present"; else no "a.js: call edge addTwo -> addOne MISSING"; fi
+if grep -q "EDGE_N:1" "$TMP/js_check"; then ok "a.js: exactly ONE addTwo -> addOne edge (dedup)"; else no "a.js: expected a single addTwo -> addOne edge: $( grep EDGE_N "$TMP/js_check" )"; fi
 
 # cross-check via --callees / --callers (independent of the raw-XML parse)
 JS_CE="$( $BIN "$FIX" --callees=addTwo 2>/dev/null )"
@@ -132,9 +132,28 @@ has_square = "square" in names
 has_sos = "sum_of_squares" in names
 all_fn = all(s["t"] == "fn" for s in syms) if syms else False
 edge = any(s["n"] == "sum_of_squares" and "square" in s["calls"] for s in syms)
-# no phantom nodes from bash built-ins (echo/local) — the two functions are the only symbols
+# no phantom nodes from bash built-ins (echo/local). #60 (train-12) adds a THIRD symbol that is not a
+# phantom: the synthetic module-scope owner of b.sh's last line, `sum_of_squares 3 4` — real Bash
+# top-level code, which this file has always had and which had no caller node until now. It is excluded
+# from the phantom list BY ITS LABEL (t="modscope"), never by name, so a genuine `echo`/`local` node
+# would still be caught. all_fn is asked of the two DEFINITIONS only, for the same reason: the owner is
+# not a Bash function_definition and must not be tagged as one. The parser above reads n= straight out of
+# the XML, so the owner's name arrives ESCAPED — comparing against the escaped spelling is what the
+# document says, and a gate that silently unescaped would stop noticing if the escaping ever broke.
+OWNER = "&lt;file-scope&gt;"
+defs = [s for s in syms if s["t"] != "modscope"]
+owners = [s for s in syms if s["t"] == "modscope"]
+names = [s["n"] for s in defs]
+has_square = "square" in names
+has_sos = "sum_of_squares" in names
+all_fn = all(s["t"] == "fn" for s in defs) if defs else False
+edge = any(s["n"] == "sum_of_squares" and "square" in s["calls"] for s in defs)
 phantom = [n for n in names if n not in ("square", "sum_of_squares")]
+owner_ok = len(owners) == 1 and owners[0]["n"] == OWNER
+owner_calls_sos = owner_ok and "sum_of_squares" in owners[0]["calls"]
 print("SYMS:%d" % len(syms))
+print("DEFS:%d" % len(defs))
+print("OWNER:%s OWNER_CALLS_SOS:%s" % (owner_ok, owner_calls_sos))
 print("HAS_SQUARE:%s HAS_SOS:%s ALL_FN:%s EDGE:%s PHANTOM:%s" % (has_square, has_sos, all_fn, edge, ",".join(phantom) or "none"))
 PYEOF
 cat "$TMP/sh_check"
@@ -144,12 +163,19 @@ if grep -q "SYMS:0" "$TMP/sh_check"; then
 else
     ok "b.sh (Bash): extracted $( grep -o 'SYMS:[0-9]*' "$TMP/sh_check" | cut -d: -f2 ) symbol(s)"
 fi
-grep -q "SYMS:2" "$TMP/sh_check" && ok "b.sh: exactly 2 symbols (square, sum_of_squares — bash built-ins not indexed)" || no "b.sh: expected 2 symbols, got: $( grep SYMS "$TMP/sh_check" )"
-grep -q "HAS_SQUARE:True" "$TMP/sh_check" && ok "b.sh: square symbol present" || no "b.sh: square symbol missing"
-grep -q "HAS_SOS:True" "$TMP/sh_check" && ok "b.sh: sum_of_squares symbol present" || no "b.sh: sum_of_squares symbol missing"
-grep -q "ALL_FN:True" "$TMP/sh_check" && ok "b.sh: both symbols tagged t=\"fn\"" || no "b.sh: symbols not tagged t=\"fn\" as expected"
-grep -q "PHANTOM:none" "$TMP/sh_check" && ok "b.sh: no phantom symbol nodes from bash built-ins (echo/local)" || no "b.sh: phantom nodes present: $( grep PHANTOM "$TMP/sh_check" )"
-grep -q "EDGE:True" "$TMP/sh_check" && ok "b.sh: intra-file call edge sum_of_squares -> square present" || no "b.sh: call edge sum_of_squares -> square MISSING"
+# RE-AIMED 2026-09-20 (train-12, issue #60): the count is 3, and the third is not a regression. Bash HAS
+# an executable top level and this fixture uses it — `sum_of_squares 3 4` on the last line. That call had
+# no caller node before #60, so sum_of_squares read as called by nobody; it is now owned by the file's
+# t="modscope" owner. The DEFINITION count is what this arm was really about and it is still 2.
+if grep -q "DEFS:2" "$TMP/sh_check"; then ok "b.sh: exactly 2 definitions (square, sum_of_squares — bash built-ins not indexed)"; else no "b.sh: expected 2 definitions, got: $( grep -E 'SYMS|DEFS' "$TMP/sh_check" | tr '\n' ' ' )"; fi
+if grep -q "OWNER:True" "$TMP/sh_check"; then ok "b.sh: exactly one t=\"modscope\" <file-scope> owner for the top-level invocation"; else no "b.sh: the module-scope owner is missing or not unique: $( grep OWNER "$TMP/sh_check" )"; fi
+# The point of #60 on this fixture, asserted rather than implied: the top-level call is now an EDGE.
+if grep -q "OWNER_CALLS_SOS:True" "$TMP/sh_check"; then ok "b.sh: the owner calls sum_of_squares — the top-level invocation is an edge now (#60)"; else no "b.sh: the top-level line did not mint an owner -> sum_of_squares edge: $( grep OWNER "$TMP/sh_check" )"; fi
+if grep -q "HAS_SQUARE:True" "$TMP/sh_check"; then ok "b.sh: square symbol present"; else no "b.sh: square symbol missing"; fi
+if grep -q "HAS_SOS:True" "$TMP/sh_check"; then ok "b.sh: sum_of_squares symbol present"; else no "b.sh: sum_of_squares symbol missing"; fi
+if grep -q "ALL_FN:True" "$TMP/sh_check"; then ok "b.sh: both DEFINITIONS tagged t=\"fn\" (the owner is t=\"modscope\", not a Bash function)"; else no "b.sh: definitions not tagged t=\"fn\" as expected"; fi
+if grep -q "PHANTOM:none" "$TMP/sh_check"; then ok "b.sh: no phantom symbol nodes from bash built-ins (echo/local)"; else no "b.sh: phantom nodes present: $( grep PHANTOM "$TMP/sh_check" )"; fi
+if grep -q "EDGE:True" "$TMP/sh_check"; then ok "b.sh: intra-file call edge sum_of_squares -> square present"; else no "b.sh: call edge sum_of_squares -> square MISSING"; fi
 
 SH_CE="$( $BIN "$FIX" --callees=sum_of_squares 2>/dev/null )"
 echo "$SH_CE" | grep -q 'count="1"' && echo "$SH_CE" | grep -q 'n="square"' \

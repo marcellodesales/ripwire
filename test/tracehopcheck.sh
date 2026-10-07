@@ -43,7 +43,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -108,7 +108,9 @@ ValueError: boom
 EOF
 
 R="$WORK/repo"
-"$BIN" "$R" --from-trace="$WORK/traces/callee.txt"   > "$WORK/out.callee"   2>"$WORK/err.callee"
+# L1 (2026-09-19): the CLI default legend is compact; (H3b)/(H3c) read the FULL legend's prose, so out.callee and its
+# determinism twins (H8a) ask for --legend=full, the pre-change default.
+"$BIN" "$R" --from-trace="$WORK/traces/callee.txt" --legend=full > "$WORK/out.callee"   2>"$WORK/err.callee"
 "$BIN" "$R" --from-trace="$WORK/traces/basename.txt" > "$WORK/out.basename" 2>/dev/null
 "$BIN" "$R" --from-trace="$WORK/traces/source.txt"   > "$WORK/out.source"   2>/dev/null
 
@@ -181,17 +183,20 @@ else no "(H6) the hopped-to source symbol's body is served too"; fi
 # ── (H7) the counters close ────────────────────────────────────────────────────────────────────────
 attrs="$( sed 's/.*<test_hop \([^>]*\)>.*/\1/' "$WORK/out.callee" )"
 getn(){ printf '%s' "$attrs" | sed -n "s/.*$1=\"\([0-9]*\)\".*/\1/p"; }
-rows="$( getn rows )"; callee="$( getn callee )"; basen="$( getn basename )"; capped="$( getn capped )"
+rows="$( getn rows )"; callee="$( getn callee )"; basen="$( getn basename )"; capped="$( getn dropped )"
+# cut-fix E: the count is dropped=; capped= is a 0|1 bit tool-wide (pageview.h rule 3). RED on 9936ba4e (capped="K").
+if printf '%s' "$attrs" | grep -q ' capped="'; then no "(H7c) <test_hop> still spells its dropped-row COUNT as capped="
+else ok "(H7c) <test_hop> spells its dropped-row count dropped=, never capped="; fi
 actual="$( grep -o '<hop ' "$WORK/out.callee" | wc -l | tr -d ' ' )"
 if [ -n "$rows" ] && [ "$rows" = "$actual" ]; then ok "(H7a) rows=$rows equals the <hop> rows actually emitted"
 else no "(H7a) rows='$rows' vs $actual emitted <hop> rows"; fi
 if [ -n "$callee" ] && [ -n "$basen" ] && [ -n "$capped" ] \
-   && [ "$(( callee + basen ))" = "$(( actual + capped ))" ]; then ok "(H7b) callee+basename = rows+capped (candidates all accounted for)"
-else no "(H7b) callee='$callee' basename='$basen' rows='$actual' capped='$capped' do not close"; fi
+   && [ "$(( callee + basen ))" = "$(( actual + capped ))" ]; then ok "(H7b) callee+basename = rows+dropped (candidates all accounted for)"
+else no "(H7b) callee='$callee' basename='$basen' rows='$actual' dropped='$capped' do not close"; fi
 
 # ── (H8) determinism + well-formedness ─────────────────────────────────────────────────────────────
-"$BIN" "$R" --from-trace="$WORK/traces/callee.txt" > "$WORK/d2" 2>/dev/null
-"$BIN" "$R" --from-trace="$WORK/traces/callee.txt" > "$WORK/d3" 2>/dev/null
+"$BIN" "$R" --from-trace="$WORK/traces/callee.txt" --legend=full > "$WORK/d2" 2>/dev/null
+"$BIN" "$R" --from-trace="$WORK/traces/callee.txt" --legend=full > "$WORK/d3" 2>/dev/null
 if cmp -s "$WORK/out.callee" "$WORK/d2" && cmp -s "$WORK/out.callee" "$WORK/d3"; then ok "(H8a) the hop bundle is byte-identical across three runs"
 else no "(H8a) the hop bundle is byte-identical across three runs"; fi
 if command -v xmllint >/dev/null 2>&1; then

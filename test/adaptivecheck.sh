@@ -18,7 +18,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -107,7 +107,7 @@ FIXN=$( ls "$FIX" | wc -l | tr -d ' ' )
 hdrcut(){ "$BIN" "$@" --no-cache 2>/dev/null | grep -oE 'adaptive: kept [0-9]+ of [0-9]+[^]]*' | head -1; }
 # verify-wave2 F6 re-pin: the route value's stop-anchor is the ATTRIBUTE QUOTE, not a trailing "]" — that
 # bracket was the unbalanced half L10b left behind and is now trimmed at all three construction sites.
-routeof(){ "$BIN" "$@" --no-cache 2>/dev/null | grep -oE 'routed: [^"]*' | head -1; }
+routeof(){ "$BIN" "$@" --no-cache 2>/dev/null | grep -oE 'route="[^"]*' | head -1; }
 SHARPQ="zorbulator telemetry pump"
 BROADQ="widget"
 
@@ -196,6 +196,24 @@ fi
 { [ "$?" -ne 0 ] && grep -q 'adaptive modifies' "$TMP/err"; } \
     && ok "--adaptive alone: clean error (refuses to silently do nothing)" \
     || no "--adaptive alone: did not error clearly ($(cat "$TMP/err" 2>/dev/null))"
+
+# ── (i) T14 REGRESSION (review rv-t14a.md finding 1, 2026-09-20): --no-route --adaptive on a genuine
+#    sharp cliff must NOT be mislabeled a homonym-pool decline. The homonym-decline gate
+#    (lexical.h isAdaptiveHomonymDecline) used to read the route as `!isConceptualRoute(routeTag)` in
+#    runForLens — a DIFFERENT question than "is this route name-exact" (isConceptualRoute only
+#    recognizes "subtoken+body"), whose negation is ALSO true on the third route state, "no-route"
+#    (--no-route's own struct default). So an un-routed, subtoken+body-scored query with a large
+#    positive-score population and a real cliff got declined and told a fabricated same-name count.
+#    Arm (e) above already runs --no-route --adaptive but only checks the FLOOR (>=5), which a
+#    wrongly-declined answer (kept=ceiling=40) still trivially clears — this arm checks the actual
+#    narrowing and the confidence attribute the floor check cannot see.
+HDR_NR=$( "$BIN" src --for="estimateExpandBodyTokens" --no-route --adaptive --no-cache 2>/dev/null )
+D_NR=$( dcount src --for="estimateExpandBodyTokens" --no-route --adaptive )
+{ printf '%s' "$HDR_NR" | grep -q 'confidence="high"' \
+    && ! printf '%s' "$HDR_NR" | grep -q 'adaptive: declined' \
+    && [ "$D_NR" -le 10 ] 2>/dev/null; } \
+    && ok "--no-route --adaptive: a genuine cliff stays confidence=high and narrows (kept $D_NR <d>, not declined)" \
+    || no "--no-route --adaptive: mislabeled as a homonym decline (kept $D_NR <d>, header: $( printf '%s' "$HDR_NR" | grep -oE 'confidence="[^"]*"|adaptive: [a-z]*' | tr '\n' ' ' ))"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

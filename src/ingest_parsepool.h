@@ -3,6 +3,8 @@
 #error "ingest_parsepool.h is a SECTION of src/ingest.cpp's translation unit - include it only from ingest.cpp (see the ingest-family split note there)"
 #endif
 
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 // ingest_parsepool.h — the parallel parse pool, moved VERBATIM out of ingest() in the 2026-08-30
 // decomposition: the per-thread raw-fact accumulators (one RawFacts each), the cold-path reserve
 // calibration, the lock-free work-stealing worker (cache-hit reuse, hostile-input guards, the
@@ -69,8 +71,8 @@ inline ColdParseReserve coldParseReserve( std::span<const LangEntry* const> file
                                           std::span<const std::uintmax_t> fileByteSize,
                                           unsigned nthreads ) noexcept
 {
-    VERIFY( nthreads >= 1 );   // caller derives it from min( hardware_concurrency, nfiles ) with nfiles >= 1
-    VERIFY( fileLang.size() == fileByteSize.size() );
+    ASSUME( nthreads >= 1 );   // caller derives it from min( hardware_concurrency, nfiles ) with nfiles >= 1
+    ASSUME( fileLang.size() == fileByteSize.size() );
 
     std::size_t parseableBytes = 0;
     for( std::size_t fileId = 0; fileId < fileLang.size(); ++fileId )
@@ -102,10 +104,10 @@ inline ColdParseReserve coldParseReserve( std::span<const LangEntry* const> file
 
     // The two properties the whole argument above rests on: every value is a power of two (so the doubling
     // ladder is unchanged) and none exceeds the cap (so the waste stays bounded).
-    VERIFY( r.defs  <= kCapPerThread && ( r.defs  == 0 || std::has_single_bit( r.defs  ) ) );
-    VERIFY( r.refs  <= kCapPerThread && ( r.refs  == 0 || std::has_single_bit( r.refs  ) ) );
-    VERIFY( r.incs  <= kCapPerThread && ( r.incs  == 0 || std::has_single_bit( r.incs  ) ) );
-    VERIFY( r.binds <= kCapPerThread && ( r.binds == 0 || std::has_single_bit( r.binds ) ) );
+    ASSUME( r.defs  <= kCapPerThread && ( r.defs  == 0 || std::has_single_bit( r.defs  ) ) );
+    ASSUME( r.refs  <= kCapPerThread && ( r.refs  == 0 || std::has_single_bit( r.refs  ) ) );
+    ASSUME( r.incs  <= kCapPerThread && ( r.incs  == 0 || std::has_single_bit( r.incs  ) ) );
+    ASSUME( r.binds <= kCapPerThread && ( r.binds == 0 || std::has_single_bit( r.binds ) ) );
     return r;
 }
 
@@ -128,21 +130,27 @@ struct RawFacts
 
 // A parsed-but-unqueried file waiting for the tags-query gate: owns its bytes and its TSTree until
 // the flush hands them to captureTagsFacts (move-only; the tree is freed on destruction if unflushed).
+// It also owns the file's decided-dead byte ranges (#72 follow-up): those are walked ONCE, beside the
+// side captures, and the tags pass that consumes them can run several files later — so they ride here
+// rather than being re-derived at the flush, which would pay preprocdead.h's walk twice on every
+// C-family file that owns an include guard (the shape whose cost audit P1-0 measured at 56.67% of busy
+// leaf samples before the cursor fix).
 struct PendingParsedFile
 {
     std::uint32_t   fileId = 0;
     const LangEntry* le    = nullptr;
     std::string     bytes;
     TSTree*         tree   = nullptr;
+    std::vector<PreprocDeadRange> ppDead;
 
-    PendingParsedFile( std::uint32_t fileIdIn, const LangEntry* leIn, std::string&& bytesIn, TSTree* treeIn )
-        : fileId( fileIdIn ), le( leIn ), bytes( std::move( bytesIn ) ), tree( treeIn )
+    PendingParsedFile( std::uint32_t fileIdIn, const LangEntry* leIn, std::string&& bytesIn, TSTree* treeIn, std::vector<PreprocDeadRange>&& ppDeadIn )
+        : fileId( fileIdIn ), le( leIn ), bytes( std::move( bytesIn ) ), tree( treeIn ), ppDead( std::move( ppDeadIn ) )
     {
     }
     PendingParsedFile( const PendingParsedFile& ) = delete;
     PendingParsedFile& operator=( const PendingParsedFile& ) = delete;
     PendingParsedFile( PendingParsedFile&& other ) noexcept
-        : fileId( other.fileId ), le( other.le ), bytes( std::move( other.bytes ) ), tree( other.tree )
+        : fileId( other.fileId ), le( other.le ), bytes( std::move( other.bytes ) ), tree( other.tree ), ppDead( std::move( other.ppDead ) )
     {
         other.tree = nullptr;
     }
@@ -158,6 +166,7 @@ struct PendingParsedFile
             le     = other.le;
             bytes  = std::move( other.bytes );
             tree   = other.tree;
+            ppDead = std::move( other.ppDead );
             other.tree = nullptr;
         }
         return *this;
@@ -173,8 +182,31 @@ struct PendingParsedFile
 
 // an unchanged file's cached facts, re-labelled with today's fileId and appended to the worker's
 // accumulators — the warm path's whole per-file cost (health is a cached FACT, not a re-derivation).
-inline void appendCacheHitFacts( FileFacts& hit, std::uint32_t fileId, IngestFileScan& scan, RawFacts& out )
+// P1-11 (2026-09-10 full audit) — THE WARM-PATH GROWTH OBSERVABLE. §4e of that audit read ~30% of a warm
+// llvm `--grep` as un-reserved vector growth on the cache path (RawRef/RawDef/RawBind push_back 21.7% of
+// busy + 8.4% memmove). Two of the three suspects were already exact — loadCache reserves each per-file
+// family from the record's own count, and mergeThreadFacts reserves each family's exact total — so the
+// only accumulator that could still reallocate is THIS one, the per-thread warm-hit accumulator. Counting
+// is what settles it: `growths` is incremented once per family per file when the append is about to cross
+// capacity, and runParsePool publishes the total as `warm_growths=` on the RIPWIRE_CACHE_STATS line. That
+// makes "the warm path does not reallocate" an executable fact instead of a profile reading — the same
+// posture `reparsed=`/`cached_records=` already take for their claims. One capacity() compare per family
+// per file; nothing in the per-element loops changes.
+inline std::size_t appendCacheHitFacts( FileFacts& hit, std::uint32_t fileId, IngestFileScan& scan, RawFacts& out )
 {
+    const auto willGrow = []( const auto& dst, std::size_t need ) noexcept
+    {
+        return std::size_t( need > dst.capacity() - dst.size() );
+    };
+    const std::size_t growths = willGrow( out.defs, hit.defs.size() )
+                              + willGrow( out.refs, hit.refs.size() )
+                              + willGrow( out.incs, hit.incs.size() )
+                              + willGrow( out.binds, hit.binds.size() )
+                              + willGrow( out.ffis, hit.ffis.size() )
+                              + willGrow( out.routeDefs, hit.routeDefs.size() )
+                              + willGrow( out.routeUses, hit.routeUses.size() )
+                              + willGrow( out.constOpens, hit.constOpens.size() );
+
     scan.health[ fileId ] = hit.health;   // §L1
     for( RawDef& d : hit.defs )
     {
@@ -216,6 +248,78 @@ inline void appendCacheHitFacts( FileFacts& hit, std::uint32_t fileId, IngestFil
         co.fileId = fileId;
         out.constOpens.push_back( std::move( co ) );
     }
+    return growths;
+}
+
+// P1-11 — the warm accumulators' EXACT sizing material: every cache hit's per-family fact count, summed.
+// Four of these (defs/refs/incs/binds) were already summed inline in runParsePool; the other four were not,
+// so ffis/routeDefs/routeUses/constOpens doubled up from zero on every warm run. The cold path skips those
+// four ON PURPOSE (coldParseReserve's closing note: it has only a bytes-based ESTIMATE, and estimating a
+// family that is empty on most workers is pure waste) — but this path is not estimating. The cached
+// FileFacts carry the exact counts, summing them is one more add in a loop that already runs, and
+// reserve( 0 ) is a no-op, so an empty family costs nothing and a non-empty one stops reallocating.
+struct WarmHitTotals
+{
+    std::size_t defs = 0, refs = 0, incs = 0, binds = 0;
+    std::size_t ffis = 0, routeDefs = 0, routeUses = 0, constOpens = 0;
+};
+
+// One pass over the fileId space: fill `candidates` (path present in the cache, hash not yet compared) and
+// `hits` (hash-verified), and total the hits' eight families on the way through. Body moved verbatim out of
+// runParsePool, plus the four families it never summed.
+inline WarmHitTotals markCacheHits( const std::vector<std::string>& files, const IngestFileScan& scan,
+                                    HashMap<std::string, FileFacts>& cache,
+                                    std::vector<FileFacts*>& candidates, std::vector<FileFacts*>& hits )
+{
+    ASSUME_NO_ALIAS( candidates, hits );
+    WarmHitTotals tot;
+    for( std::size_t fileId = 0; fileId < files.size(); ++fileId )
+    {
+        const auto it = cache.find( files[ fileId ] );
+        if( it == cache.end() )
+        {
+            continue;
+        }
+        candidates[ fileId ] = &it->second;
+        if( it->second.hash != scan.hash[ fileId ] )
+        {
+            continue;
+        }
+        hits[ fileId ]   = &it->second;
+        tot.defs        += it->second.defs.size();
+        tot.refs        += it->second.refs.size();
+        tot.incs        += it->second.incs.size();
+        tot.binds       += it->second.binds.size();
+        tot.ffis        += it->second.ffis.size();
+        tot.routeDefs   += it->second.routeDefs.size();
+        tot.routeUses   += it->second.routeUses.size();
+        tot.constOpens  += it->second.constOpens.size();
+    }
+    return tot;
+}
+
+// Each worker gets its 1/nthreads share of every family. Exact when the pool runs one thread; on more, a
+// worker that draws more than its share off the lock-free queue still reallocates, which is what
+// `warm_growths=` on the RIPWIRE_CACHE_STATS line measures (golang/go, 11,003 files warm on 18 threads:
+// 29-36 across 8 families x 18 workers). Ceiling division, so a family with fewer entries than threads
+// still gets 1 apiece rather than 0.
+inline void reserveWarmFamilies( std::vector<RawFacts>& tFacts, const WarmHitTotals& tot, unsigned nthreads )
+{
+    const auto share = [ nthreads ]( std::size_t total ) noexcept
+    {
+        return ( total + std::size_t( nthreads ) - 1 ) / std::size_t( nthreads );
+    };
+    for( RawFacts& tf : tFacts )
+    {
+        tf.defs.reserve( share( tot.defs ) );
+        tf.refs.reserve( share( tot.refs ) );
+        tf.incs.reserve( share( tot.incs ) );
+        tf.binds.reserve( share( tot.binds ) );
+        tf.ffis.reserve( share( tot.ffis ) );
+        tf.routeDefs.reserve( share( tot.routeDefs ) );
+        tf.routeUses.reserve( share( tot.routeUses ) );
+        tf.constOpens.reserve( share( tot.constOpens ) );
+    }
 }
 
 // Everything one parse worker touches, by reference, under one name — the worker function's whole
@@ -234,9 +338,11 @@ struct ParsePoolShared
     std::atomic<std::size_t>&        nextFile;              // lock-free work queue cursor
     std::atomic<bool>&               dirty;                 // any file re-parsed ⇒ cache must be re-saved
     std::atomic<std::size_t>&        reparsedCount;         // A1 drift observable
+    std::atomic<std::size_t>&        warmGrowths;           // P1-11: warm-hit accumulator reallocations (RIPWIRE_CACHE_STATS)
     std::size_t                      nfiles;
     bool                             needsCacheHash;
     bool                             captureValueUses;
+    memguard::Watch*                 memWatch;              // #350: null = unguarded; else checked before each claim
 };
 
 // one worker's whole life: grab files off the shared cursor, reuse cache hits, parse+capture misses,
@@ -246,19 +352,13 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
 {
     IngestFileScan& scan = sh.scan;
     RawFacts&       out  = sh.tFacts[ t ];
+    std::size_t     warmGrowths = 0;   // P1-11: thread-local, folded into sh.warmGrowths once at the end (never an atomic in the loop)
 
+    // Neither allocation can come back null: tree-sitter's allocator aborts rather than return null (third_party/deps/tree_sitter/lib/src/alloc.c), and no ripwire code calls ts_set_allocator — so there is no degrade here to disclose.
     ParserGuard pg;
-    if( pg.p == nullptr )
-    {
-        DEGRADED_PATH_ALERT( "ingest: ts_parser_new failed on a worker — its files skipped" );
-        return;
-    }
+    ASSUME( pg.p != nullptr, "ts_parser_new: the default tree-sitter allocator aborts on failure" );
     TSQueryCursor* cursor = ts_query_cursor_new();
-    if( cursor == nullptr )
-    {
-        DEGRADED_PATH_ALERT( "ingest: ts_query_cursor_new failed on a worker — its files skipped" );
-        return;
-    }
+    ASSUME( cursor != nullptr, "ts_query_cursor_new: the default tree-sitter allocator aborts on failure" );
 
     // B0.2: per-worker subtoken-stats builder — after a file's defs are extracted (and the file's
     // bytes are STILL in memory), tokenize each new def's doc/body spans ONCE into its persisted
@@ -269,6 +369,8 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
     {
         lexScratch.reserve( 1024 );
     }
+    MemberMacroReparse macroWork;                        // member-macro re-parse (src/macroreparse.h): per-worker scratch
+    macroWork.captureValueUses = sh.captureValueUses;
     const auto buildLexForNewDefs = [ & ]( std::vector<RawDef>& defs, std::size_t firstNewDefIndex, const std::string& fileBytes )
     {
         if( !sh.captureValueUses )
@@ -304,7 +406,9 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
                 }
                 const TSNode root = ts_tree_root_node( pending.tree );
                 const std::size_t firstNewDefIndex = out.defs.size();
-                captureTagsFacts( cursor, *pending.le, pending.fileId, pending.bytes, root, out.defs, out.refs );
+                ExtractShortfall  tagsShortfall;
+                captureTagsFacts( cursor, *pending.le, pending.fileId, pending.bytes, root, out.defs, out.refs, out.binds, out.incs, pending.ppDead, tagsShortfall );
+                notePartialExtract( scan, pending.fileId, tagsShortfall, pending.bytes.size() );
                 buildLexForNewDefs( out.defs, firstNewDefIndex, pending.bytes );   // B0.2: bytes still in memory
                 ts_tree_delete( pending.tree );
                 pending.tree = nullptr;
@@ -315,6 +419,7 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
     };
 
     std::string bytes;
+    bool        claimedAny = false;   // #350: the file this worker claimed last has finished by the loop's top
     for( ;; )   // lock-free work-stealing: grab the next file via the atomic counter (balances the big-file tail)
     {
         if( sh.prewarm.ready.load( std::memory_order_acquire ) && !pendingParsed.empty() )
@@ -322,11 +427,34 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
             flushPendingParsed();
         }
 
+        // #350: the memory guard. The previous file is done (every path through the body below ends its iteration),
+        // so report it; then look at the stop flag BEFORE claiming, which is what keeps the finished set an unbroken
+        // prefix of the work order — a file once claimed is always completed.
+        if( sh.memWatch != nullptr )
+        {
+            if( claimedAny )
+            {
+                sh.memWatch->parseFileDone();
+            }
+            if( sh.memWatch->isStopped() )
+            {
+                break;
+            }
+        }
+
         const std::size_t orderIndex = sh.nextFile.fetch_add( 1, std::memory_order_relaxed );
         if( orderIndex >= sh.nfiles )
         {
             break;
         }
+        // #350, the parse seam (parse:N): the claim of work-order slot N and later is abandoned unparsed and trips the
+        // stop, so exactly the first N files of the parse order are parsed (applyMemoryParseCut counts them the same way)
+        if( sh.memWatch != nullptr && orderIndex >= sh.memWatch->seamParseCutoff() )
+        {
+            sh.memWatch->tripParseSeam();
+            break;
+        }
+        claimedAny = true;
         const std::size_t fileId = sh.parseOrder.empty() ? orderIndex : sh.parseOrder[ orderIndex ];
         // per-file try/catch: a throw (bad_alloc, filesystem_error, …) escaping a
         // std::thread entry would std::terminate the whole process. Degrade per file,
@@ -391,7 +519,7 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
                 }
                 if( hit != nullptr )   // unchanged → reuse cached facts, skip parse
                 {
-                    appendCacheHitFacts( *hit, std::uint32_t( fileId ), scan, out );
+                    warmGrowths += appendCacheHitFacts( *hit, std::uint32_t( fileId ), scan, out );
                     continue;
                 }
             }
@@ -420,40 +548,19 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
                 }
             }
 
-            // hostile/degenerate JSON guard — must run BEFORE the parse (that is the whole point);
-            // the skip is a degrade with a one-line stderr note, matching the house skip style.
-            if( le->lang == Lang::Json && jsonNestsTooDeep( bytes ) )
+            // hostile/degenerate nesting guard — MUST run BEFORE the parse (that is the whole point). #157:
+            // one call (ingest_prewarm.h refuseNesting), covering json/yaml/markdown/kotlin — json is a
+            // performance guard, the other three are MEMORY-SAFETY / PROCESS-SURVIVAL load-bearing (see
+            // ingest.h's per-ceiling comments for each defect's arithmetic; the vendored scanner patches
+            // under third_party/patches/ are the SECOND, independent layer for those three).
+            // Itemized in --skipped (why="nest-refused") for every language now, not just Kotlin.
+            if( refuseNesting( *le, bytes, path.c_str(), fileId, scan ) )
             {
-                std::fprintf( stderr, "[ripwire] %s: json nesting > %u levels — treated as data, not config (skipped)\n",
-                              path.c_str(), kMaxJsonNestDepth );
-                continue;
-            }
-
-            // hostile/degenerate YAML guard — MEMORY-SAFETY load-bearing, not just a perf guard:
-            // tree-sitter-yaml's scanner serialize() corrupts memory past ~253 block indent levels
-            // (see kMaxYamlNestDepth in ingest.h; the vendored scanner also carries the bounds fix
-            // under third_party/patches/yaml/, so this is the FIRST of two independent layers).
-            // Same house skip style as the JSON guard above: refuse BEFORE the parse, one stderr line.
-            if( le->lang == Lang::Yaml && yamlNestsTooDeep( bytes ) )
-            {
-                std::fprintf( stderr, "[ripwire] %s: yaml nesting > %u levels — treated as data, not config (skipped)\n",
-                              path.c_str(), kMaxYamlNestDepth );
                 continue;
             }
 
             if( le->lang == Lang::Markdown )
             {
-                // hostile/degenerate markdown guard — MEMORY-SAFETY load-bearing, the yaml pair's
-                // twin: tree-sitter-markdown's scanner serialize() memcpys its open-blocks stack
-                // with NO bounds check (OOB at ~255 nested blockquote/list markers; see
-                // kMaxMdBlockDepth in ingest.h). The vendored scanner also carries the clamp under
-                // third_party/patches/markdown/, so this is the FIRST of two independent layers.
-                if( mdNestsTooDeep( bytes ) )
-                {
-                    std::fprintf( stderr, "[ripwire] %s: markdown blockquote/list nesting > %u levels — treated as data, not a doc (skipped)\n",
-                                  path.c_str(), kMaxMdBlockDepth );
-                    continue;
-                }
                 if( !prepareParserFor( pg.p, *le ) )
                 {
                     continue;
@@ -476,15 +583,42 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
                     continue;
                 }
 
+                // .astro: restrict the parse to the `---` frontmatter. The guard lifts the restriction on
+                // EVERY exit from this scope, including the queued-tags `continue` below — pg.p is reused.
+                IncludedRangeGuard rangeGuard;
+                const AstroFrontmatter astro = restrictAstroToFrontmatter( pg.p, *le, bytes, rangeGuard );
+                if( astro != AstroFrontmatter::Ok )
+                {
+                    // A template-only .astro is ordinary and says nothing. An UNTERMINATED fence is a file whose
+                    // frontmatter we can see the start of and cannot extract — a silent zero unless disclosed, so
+                    // it rides the existing extract-partial channel and lands in --skipped rather than vanishing.
+                    if( astro == AstroFrontmatter::Unterminated )
+                    {
+                        ExtractShortfall astroShort;
+                        DISCLOSE( astroShort, ExtractShortfall::DisclosureWhy::AstroFrontmatterUnterminated,
+                                  "ingest: an .astro opened a `---` fence and never closed it — frontmatter not extracted (--skipped why=extract-partial)" );
+                        notePartialExtract( scan, fileId, astroShort, bytes.size() );
+                    }
+                    continue;
+                }
+
                 TreeGuard tree( parseTree( pg.p, bytes ) );
                 if( tree.get() == nullptr )
                 {
                     continue;
                 }
 
+                // §L1 — before `bytes` can be moved below. May swap `tree` for the member-macro re-parse (macroreparse.h).
+                scan.health[ fileId ] = measureHealthAdoptingMemberMacroReparse( pg.p, le->lang, bytes, tree, macroWork );
                 const TSNode root = ts_tree_root_node( tree.get() );
-                scan.health[ fileId ] = measureFileHealth( root, bytes );   // §L1 — before `bytes` can be moved below
-                captureSideFacts( *le, static_cast<std::uint32_t>( fileId ), bytes, root, out.refs, out.incs, out.binds, out.ffis, out.routeDefs, out.routeUses, out.constOpens, sh.captureValueUses );
+                // #72 follow-up: ONE preprocdead.h walk per file, shared by both capture drivers. It must
+                // be taken from the ADOPTED tree (the member-macro re-parse may have swapped it just
+                // above), which is why it is computed here and not inside either driver.
+                std::vector<PreprocDeadRange> ppDead = preprocDeadRangesFor( *le, root, bytes );
+                ExtractShortfall shortfall;   // every pass's disclosure for THIS file; noted on its slot once both have run
+                captureSideFacts( *le, static_cast<std::uint32_t>( fileId ), bytes, root, out.refs, out.incs, out.binds, out.ffis, out.routeDefs, out.routeUses, out.constOpens, sh.captureValueUses, ppDead, shortfall );
+                notePartialExtract( scan, fileId, shortfall, bytes.size() );   // before a queued file's tags pass, which notes its own
+                appendBlankedMacroUses( macroWork, le->lang, static_cast<std::uint32_t>( fileId ), bytes, out.refs, ppDead );
 
                 const bool canQueueParsed = !sh.prewarm.ready.load( std::memory_order_acquire )
                                          && pendingParsed.size() < kMaxPendingParsedFiles
@@ -492,7 +626,8 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
                 if( canQueueParsed )
                 {
                     pendingParsedBytes += bytes.size();
-                    pendingParsed.emplace_back( static_cast<std::uint32_t>( fileId ), le, std::move( bytes ), tree.release() );
+                    pendingParsed.emplace_back( static_cast<std::uint32_t>( fileId ), le, std::move( bytes ), tree.release(), std::move( ppDead ) );
+                    bytes.clear();   // moved-from is "valid but unspecified": make it empty. Every path refills it (readFile) before a read
                     continue;
                 }
 
@@ -501,23 +636,28 @@ inline void runParseWorker( ParsePoolShared& sh, unsigned t )
                     waitForQueryPrewarm( &sh.gate );
                 }
                 const std::size_t firstNewDefIndex = out.defs.size();
-                captureTagsFacts( cursor, *le, static_cast<std::uint32_t>( fileId ), bytes, root, out.defs, out.refs );
+                captureTagsFacts( cursor, *le, static_cast<std::uint32_t>( fileId ), bytes, root, out.defs, out.refs, out.binds, out.incs, ppDead, shortfall );
+                notePartialExtract( scan, fileId, shortfall, bytes.size() );
                 buildLexForNewDefs( out.defs, firstNewDefIndex, bytes );   // B0.2: bytes still in memory
             }
         }
         catch( ... )
         {
-            DEGRADED_PATH_ALERT( "ingest: worker exception on a file — skipped" );
+            // the facts gathered before the throw are KEPT, so this is a partial file, not a skipped one
+            DISCLOSE( ( FileExtractThrew{ scan, fileId } ), FileExtractThrew::DisclosureWhy::WorkerThrew,
+                      "ingest: worker exception on a file — its facts so far are kept and it is marked extract-partial" );
         }
     }
     flushPendingParsed();
     ts_query_cursor_delete( cursor );
+    sh.warmGrowths.fetch_add( warmGrowths, std::memory_order_relaxed );   // P1-11: one relaxed add per worker, ordered by the pool join
 }
 
 // merge per-thread results into one RawFacts (cross-thread order is irrelevant — everything is
 // re-sorted by the model-build tail), reserving each family's exact total first.
 inline RawFacts mergeThreadFacts( std::vector<RawFacts>& tFacts )
 {
+    PROFILE_SCOPE_DESCRIBE( "ingest/parse-pool: merge per-thread facts" );
     RawFacts raw;
     std::size_t totDefs = 0, totRefs = 0, totIncs = 0, totBinds = 0, totFfis = 0, totRouteDefs = 0, totRouteUses = 0, totConstOpens = 0;
     for( const RawFacts& tf : tFacts )
@@ -582,9 +722,37 @@ inline RawFacts mergeThreadFacts( std::vector<RawFacts>& tFacts )
 //    model-build tail, so collection order is irrelevant. Also owns the two flags that ride the
 //    pool (the Win-2 dirty flag and the A1 reparsed counter), the install/gate-open moment, and
 //    the dirty-gated saveCache — everything between the prewarm launch and the doc post-pass.
+// #350: after the pool join, a memory-guard stop while files remained. Workers look at the stop flag BEFORE claiming a
+// file, so every claimed file completed and the parsed set is the first K entries of the parse ORDER (cache misses,
+// then cache hits, then grammarless files, each largest first, then fileId — or plain fileId order when the query
+// prewarm was already ready, i.e. no grammar-bearing file needed a fresh parse (every one an ingest-cache hit, so the
+// prewarm had nothing to compile: ingest_prewarm.h builds toCompile from cache-miss files only); deterministic
+// for a given tree and cache), which is what memory_parsed=K counts (claimed slots: one may reuse cached facts or fail
+// to read); a partial answer therefore repeats for a given K. Under the parse seam an abandoned claim at slot N or later
+// is not a parse, hence the min with the seam's cutoff. A stop after the last claim cut nothing. Returns whether cut.
+inline bool applyMemoryParseCut( IngestResult& result, memguard::Watch* memWatch, std::size_t claimedSlots, std::size_t nfiles )
+{
+    const std::size_t parsed = std::min( { claimedSlots, nfiles, memWatch != nullptr ? memWatch->seamParseCutoff() : nfiles } );
+    if( memWatch == nullptr || !memWatch->tripped() || parsed >= nfiles )
+    {
+        return false;
+    }
+    result.memoryStop.limitBytes  = memWatch->hardBytes();
+    result.memoryStop.parsedFiles = static_cast<std::uint32_t>( parsed );
+    if( memWatch->trippedByPressure() )
+    {
+        DISCLOSE( result.memoryStop, MemoryStop::DisclosureWhy::ParseUnderPressure, "ingest: the memory guard stopped the parse pool — the files after the parsed prefix of the parse order carry no facts" );
+    }
+    else
+    {
+        DISCLOSE( result.memoryStop, MemoryStop::DisclosureWhy::ParseOverLimit, "ingest: the memory guard stopped the parse pool — the files after the parsed prefix of the parse order carry no facts" );
+    }
+    return true;
+}
+
 inline RawFacts runParsePool( IngestResult& result, const char* rootDir, std::string_view cacheFile, bool captureValueUses,
                               HashMap<std::string, FileFacts>& cache, const CacheLoadStats& cacheStats,
-                              IngestFileScan& scan, QueryPrewarm& prewarm )
+                              IngestFileScan& scan, QueryPrewarm& prewarm, memguard::Watch* memWatch = nullptr )
 {
     RawFacts raw;
     const bool needsCacheHash = !cacheFile.empty();
@@ -602,6 +770,12 @@ inline RawFacts runParsePool( IngestResult& result, const char* rootDir, std::st
     // counter whose only reader is the post-join print, ordered by the pool join below.
     std::atomic<std::size_t> reparsedCount{ 0 };
 
+    // P1-11: how many times a warm-hit append had to reallocate its accumulator. Zero is the contract on a
+    // fully warm single-threaded run; a non-zero number on a multi-threaded one is the work-queue's own
+    // skew (a worker that draws more than its 1/nthreads share), not a missing reserve. Reported only under
+    // RIPWIRE_CACHE_STATS, like reparsed=/cached_records= beside it.
+    std::atomic<std::size_t> warmGrowths{ 0 };
+
     const std::size_t nfiles = result.files.size();
     if( nfiles )
     {
@@ -609,7 +783,7 @@ inline RawFacts runParsePool( IngestResult& result, const char* rootDir, std::st
         // scan.hash is already pre-sized to nfiles (done by makeFileScan, before the prewarm).
         // Entries pre-filled by the prewarm miss-detection pass (cache-present files that were read+hashed
         // there) stay as-is. Workers fill the remaining 0-valued entries for files they process.
-        VERIFY( scan.hash.size() == nfiles );
+        ASSUME( scan.hash.size() == nfiles );
         unsigned hw = std::thread::hardware_concurrency();
         if( hw == 0 )
         {
@@ -648,41 +822,7 @@ inline RawFacts runParsePool( IngestResult& result, const char* rootDir, std::st
         {
             PROFILE_SCOPE_DESCRIBE( "ingest/parse-pool: prepare cache-hit reuse" );
 
-            std::size_t hitDefs = 0, hitRefs = 0, hitIncs = 0, hitBinds = 0;
-            for( std::size_t fileId = 0; fileId < nfiles; ++fileId )
-            {
-                const std::uint64_t h = scan.hash[ fileId ];
-                const auto it = cache.find( result.files[ fileId ] );
-                if( it == cache.end() )
-                {
-                    continue;
-                }
-                cacheCandidateFacts[ fileId ] = &it->second;
-                if( it->second.hash != h )
-                {
-                    continue;
-                }
-                cacheHitFacts[ fileId ] = &it->second;
-                hitDefs  += it->second.defs.size();
-                hitRefs  += it->second.refs.size();
-                hitIncs  += it->second.incs.size();
-                hitBinds += it->second.binds.size();
-            }
-            const auto perThreadReserve = [ nthreads ]( std::size_t total ) noexcept
-            {
-                return ( total + std::size_t( nthreads ) - 1 ) / std::size_t( nthreads );
-            };
-            const std::size_t defsPerThread  = perThreadReserve( hitDefs );
-            const std::size_t refsPerThread  = perThreadReserve( hitRefs );
-            const std::size_t incsPerThread  = perThreadReserve( hitIncs );
-            const std::size_t bindsPerThread = perThreadReserve( hitBinds );
-            for( unsigned t = 0; t < nthreads; ++t )
-            {
-                tFacts[ t ].defs.reserve( defsPerThread );
-                tFacts[ t ].refs.reserve( refsPerThread );
-                tFacts[ t ].incs.reserve( incsPerThread );
-                tFacts[ t ].binds.reserve( bindsPerThread );
-            }
+            reserveWarmFamilies( tFacts, markCacheHits( result.files, scan, cache, cacheCandidateFacts, cacheHitFacts ), nthreads );
         }
         else
         {
@@ -746,21 +886,32 @@ inline RawFacts runParsePool( IngestResult& result, const char* rootDir, std::st
         std::atomic<std::size_t>          nextFile{ 0 };   // lock-free work queue: threads fetch_add for the next parseOrder slot
 
         ParsePoolShared shared{ result.files, cache, scan, prewarm, queryReadyGate, cacheCandidateFacts, cacheHitFacts,
-                                tFacts, parseOrder, nextFile, dirty, reparsedCount, nfiles, needsCacheHash, captureValueUses };
+                                tFacts, parseOrder, nextFile, dirty, reparsedCount, warmGrowths, nfiles, needsCacheHash, captureValueUses,
+                                memWatch };
 
         for( unsigned t = 0; t < nthreads; ++t )
         {
-            pool.emplace_back( [ &shared, t ]() { runParseWorker( shared, t ); } );
+            pool.emplace_back( [ &shared, t ]() noexcept { runParseWorker( shared, t ); } );
         }
 
         installCompiledQueriesAndOpenGate( prewarm );   // join async compiles, publish, open the gate (ingest_prewarm.h)
 
+        {
+            PROFILE_SCOPE_DESCRIBE( "ingest/parse-pool: workers run + join" );
         for( std::thread& th : pool )
         {
             th.join();
         }
+        }
 
         raw = mergeThreadFacts( tFacts );
+
+        const bool parseCut = applyMemoryParseCut( result, memWatch, nextFile.load( std::memory_order_relaxed ), nfiles );   // #350
+
+        // The aggregate owns the moved fact payloads now. Release the per-thread vector storage before the
+        // cache write and before returning to the model-build tail; keeping these empty-but-capacious vectors
+        // alive needlessly raises the cold-run peak on large trees.
+        std::vector<RawFacts>().swap( tFacts );
 
         // P1-15: the SAME drift count, carried out of the function instead of only to stderr. The MCP
         // server discloses it per incremental pass (`_reingest`), which it could not do from an env-gated
@@ -778,15 +929,20 @@ inline RawFacts runParsePool( IngestResult& result, const char* rootDir, std::st
         if( std::getenv( "RIPWIRE_CACHE_STATS" ) != nullptr )
         {
             const std::size_t reparsed = reparsedCount.load( std::memory_order_relaxed );
-            std::fprintf( stderr, "ripwire: cache-stats reparsed=%zu reused=%zu files=%zu cached_records=%zu blob_entries=%zu\n",
+            rw::emitTo( stderr, "ripwire: cache-stats reparsed={} reused={} files={} cached_records={} blob_entries={} warm_growths={}\n",
                           reparsed, ( nfiles >= reparsed ? nfiles - reparsed : std::size_t( 0 ) ), nfiles,
-                          cacheStats.recordsRead, cacheStats.blobEntries );
+                          cacheStats.recordsRead, cacheStats.blobEntries, warmGrowths.load( std::memory_order_relaxed ) );
         }
 
         // Win 2: rewrite cache only when at least one file changed (dirty flag set by workers above).
         // Skips the ~11ms / 7 MB serialization+write on a no-change warm run.
-        if( !cacheFile.empty() && dirty.load() )
+        if( parseCut && !cacheFile.empty() && dirty.load() )
         {
+            DISCLOSE( Diagnostics::answerUnchanged, "ingest: a memory-guard partial parse is not written to the cache — the next run re-parses instead of serving the gap as empty files" );
+        }
+        if( !parseCut && !cacheFile.empty() && dirty.load() )
+        {
+            forgetNestRefusalsForCache( scan );   // a refused file is written UNKNOWN, so a warm run re-refuses it (ingest_prewarm.h)
             saveCache( std::string( cacheFile ), rootDir, result.files, scan.hash, scan.statSize, scan.statMtime, scan.statCtime, scan.health, raw.defs, raw.refs, raw.incs, raw.binds, raw.ffis, raw.routeDefs, raw.routeUses, raw.constOpens, captureValueUses );
         }
     }

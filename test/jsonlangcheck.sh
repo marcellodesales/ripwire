@@ -39,7 +39,7 @@ FIX="$ROOT/test/jsonfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -49,18 +49,20 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 required for XML assertion
 echo "jsonlangcheck: BIN=$BIN  FIX=$FIX"
 
 MAP_OUT="$TMP/map.xml"
-$BIN "$FIX" --no-cache >"$MAP_OUT" 2>"$TMP/map.err"
+# L1 (2026-09-19): the CLI default legend is compact and its prose spells "edges= distinct call edges"; the
+# edges= reads below take the first match, so these maps ask for the full legend (rows identical across postures).
+$BIN "$FIX" --no-cache --legend=full >"$MAP_OUT" 2>"$TMP/map.err"
 MAP_EXIT=$?
-[ "$MAP_EXIT" -eq 0 ] && ok "default map: exits 0 on JSON fixture" || no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"
+if [ "$MAP_EXIT" -eq 0 ]; then ok "default map: exits 0 on JSON fixture"; else no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"; fi
 
-command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$MAP_OUT" && ok "default map: passes xmllint --noout" || no "default map: xmllint failed"; }
+command -v xmllint >/dev/null 2>&1 && { if xmllint --noout "$MAP_OUT"; then ok "default map: passes xmllint --noout"; else no "default map: xmllint failed"; fi; }
 
 # no degrade / ABI-mismatch warning must reach stderr on the clean fixture
 [ -s "$TMP/map.err" ] && no "default map: unexpected stderr (ABI/degrade?): $( cat "$TMP/map.err" )" || ok "default map: clean stderr (no ABI mismatch / degrade)"
 
 # edges=0: JSON is data, no call graph
 EDGES="$( grep -o 'edges=[0-9]*' "$MAP_OUT" | head -1 )"
-[ "$EDGES" = "edges=0" ] && ok "default map: $EDGES (JSON is data — no call edges)" || no "default map: expected edges=0, got $EDGES"
+if [ "$EDGES" = "edges=0" ]; then ok "default map: $EDGES (JSON is data — no call edges)"; else no "default map: expected edges=0, got $EDGES"; fi
 
 # ─── parse per-file symbols once ────────────────────────────────────────────
 python3 - "$MAP_OUT" <<'PYEOF' >"$TMP/parsed.json"
@@ -108,9 +110,9 @@ print("DOTTED_OK:%s" % ("lodash.merge" in names and "merge" not in names))
 PYEOF
 cat "$TMP/pkg_check"
 grep -q "SYMS:0" "$TMP/pkg_check" && no "package.json: extracted ZERO symbols — JSON ingest may be broken" || ok "package.json: extracted $( grep -o 'SYMS:[0-9]*' "$TMP/pkg_check" | cut -d: -f2 ) key symbol(s)"
-grep -q "TOP_OK:True"  "$TMP/pkg_check" && ok "package.json: all 6 top-level keys present as symbols" || no "package.json: missing top-level keys: $( grep MISSING_TOP "$TMP/pkg_check" )"
-grep -q "LVL2_OK:True" "$TMP/pkg_check" && ok "package.json: second-level keys present (scripts/deps entries)" || no "package.json: missing second-level keys: $( grep MISSING_LVL2 "$TMP/pkg_check" )"
-grep -q "ALL_SEC:True" "$TMP/pkg_check" && ok "package.json: every key tagged t=\"sec\"" || no "package.json: some keys not t=\"sec\""
+if grep -q "TOP_OK:True"  "$TMP/pkg_check"; then ok "package.json: all 6 top-level keys present as symbols"; else no "package.json: missing top-level keys: $( grep MISSING_TOP "$TMP/pkg_check" )"; fi
+if grep -q "LVL2_OK:True" "$TMP/pkg_check"; then ok "package.json: second-level keys present (scripts/deps entries)"; else no "package.json: missing second-level keys: $( grep MISSING_LVL2 "$TMP/pkg_check" )"; fi
+if grep -q "ALL_SEC:True" "$TMP/pkg_check"; then ok "package.json: every key tagged t=\"sec\""; else no "package.json: some keys not t=\"sec\""; fi
 grep -qF '"lodash.merge"' "$FIX/package.json" || no "jsonfix LOST its dotted key — the arm below would pass by finding nothing"
 grep -q "DOTTED_OK:True" "$TMP/pkg_check" \
     && ok "package.json: dotted key \`lodash.merge\` survives whole (not truncated to \`merge\`)" \
@@ -139,9 +141,9 @@ cat > "$XL/app.js" <<'JSEOF'
 function react() { return 1; }
 function main() { return react(); }
 JSEOF
-XL_OUT="$( $BIN "$XL" --no-cache 2>/dev/null )"
+XL_OUT="$( $BIN "$XL" --no-cache --legend=full 2>/dev/null )"
 XL_EDGES="$( echo "$XL_OUT" | grep -o 'edges=[0-9]*' | head -1 )"
-[ "$XL_EDGES" = "edges=1" ] && ok "mixed JSON+JS: $XL_EDGES (only the JS-internal main->react edge)" || no "mixed JSON+JS: expected edges=1, got $XL_EDGES"
+if [ "$XL_EDGES" = "edges=1" ]; then ok "mixed JSON+JS: $XL_EDGES (only the JS-internal main->react edge)"; else no "mixed JSON+JS: expected edges=1, got $XL_EDGES"; fi
 XL_CR="$( $BIN "$XL" --callers=react --no-cache 2>/dev/null )"
 echo "$XL_CR" | grep -q 'count="1"' && echo "$XL_CR" | grep -q 'app.js' \
     && ok "--callers=react: count=1, from app.js (JSON \"react\" key is NOT a caller/target)" \
@@ -149,8 +151,8 @@ echo "$XL_CR" | grep -q 'count="1"' && echo "$XL_CR" | grep -q 'app.js' \
 
 # mutation: rename the JS call site → the ONLY edge must vanish (non-tautological)
 sed 's/return react()/return reactX()/' "$XL/app.js" >"$XL/app.js.tmp" && mv "$XL/app.js.tmp" "$XL/app.js"
-XL_MUT="$( $BIN "$XL" --no-cache 2>/dev/null | grep -o 'edges=[0-9]*' | head -1 )"
-[ "$XL_MUT" = "edges=0" ] && ok "mutation: renamed JS call site → edges=0 (the edge assertion is real)" || no "mutation: expected edges=0 after rename, got $XL_MUT"
+XL_MUT="$( $BIN "$XL" --no-cache --legend=full 2>/dev/null | grep -o 'edges=[0-9]*' | head -1 )"
+if [ "$XL_MUT" = "edges=0" ]; then ok "mutation: renamed JS call site → edges=0 (the edge assertion is real)"; else no "mutation: expected edges=0 after rename, got $XL_MUT"; fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo
@@ -203,6 +205,70 @@ grep -q 'json nesting' "$TMP/hostile_err.txt" \
 printf '%s' "$OHOST" | grep -q 'deep_string\|realkey' \
     && ok "hostile nesting: brackets inside a JSON STRING do not count (quote-aware scan)" \
     || no "hostile nesting: quote-blind scan skipped a legitimate config file"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== #157: a refused JSON file is rowed in --skipped cold AND warm, and --match refuses it consistently ==="
+# ═══════════════════════════════════════════════════════════════════════════
+# The JSON twin of yamllangcheck.sh / mdsectioncheck.sh's #157 block. refuseNesting (ingest_prewarm.h) now
+# itemizes JSON's guard the same way it always did Kotlin's — a row in --skipped, forgotten from the cache
+# on save so a warm run re-refuses and re-rows it — and the structural-query walk behind --match checks the
+# same per-file refusal (IngestResult::nestRefusedFile) so it cannot return a hit from a file ingest refused.
+# BALANCED brackets this time (deep_data.json), unlike hostile_nest.json above: an unclosed "[[[[" would be
+# all ERROR nodes even if parsed, so it cannot prove --match is refusing the file rather than just finding
+# nothing to match. '['*600 + ']'*600 is 600 levels deep, well past kMaxJsonNestDepth=512.
+KGJ="$TMP/kgjson"; mkdir -p "$KGJ"
+python3 -c "open('$KGJ/deep_data.json','w').write('['*600 + ']'*600)"
+# The sibling holds an ARRAY so the --match='(array)' arm below has a positive control: a walk that skipped
+# EVERY file would also return zero hits in deep_data.json plus nest_refused="1" (CodeRabbit on #331).
+printf '{"kgsiblingkey": [1]}\n' > "$KGJ/sibling.json"
+$BIN "$KGJ" --cache="$TMP/kgjson.cache" >"$TMP/kgj_cold.xml" 2>"$TMP/kgj_cold.err"; KGJ_COLD_RC=$?
+$BIN "$KGJ" --cache="$TMP/kgjson.cache" >"$TMP/kgj_warm.xml" 2>"$TMP/kgj_warm.err"; KGJ_WARM_RC=$?
+KGJ_LIVE=0
+if [ "$KGJ_COLD_RC" -eq 0 ] && [ "$KGJ_WARM_RC" -eq 0 ] && grep -q 'deep_data.json: json nesting' "$TMP/kgj_cold.err" \
+   && grep -q 'kgsiblingkey' "$TMP/kgj_warm.xml" && cmp -s "$TMP/kgj_cold.xml" "$TMP/kgj_warm.xml"; then
+    ok "(kg-json) presence: the cold run refuses deep_data.json on stderr; the warm run serves the same map from the cache, sibling indexed"
+    KGJ_LIVE=1
+else
+    no "(kg-json) presence: expected rc=0 twice, a cold refusal note for deep_data.json and a warm map identical to the cold one (cold rc=$KGJ_COLD_RC, warm rc=$KGJ_WARM_RC) — the arms below would be vacuous: $( head -2 "$TMP/kgj_cold.err" )"
+fi
+if [ "$KGJ_LIVE" -eq 1 ]; then
+    for mode in cold warm; do
+        if [ "$mode" = cold ]; then
+            $BIN "$KGJ" --no-cache --skipped >"$TMP/kgj_sk_$mode.xml" 2>/dev/null; SK_RC=$?
+        else
+            $BIN "$KGJ" --cache="$TMP/kgjson.cache" --skipped >"$TMP/kgj_sk_$mode.xml" 2>/dev/null; SK_RC=$?
+        fi
+        DJ_BYTES="$( wc -c < "$KGJ/deep_data.json" | tr -d ' ' )"
+        if [ "$SK_RC" -ne 0 ] || ! grep -q '<skipped indexed="2"' "$TMP/kgj_sk_$mode.xml"; then
+            no "(kg-json) $mode --skipped: exit $SK_RC or no <skipped indexed=\"2\"> report — the arm cannot observe the fix"
+        elif ! grep -qE "<f p=\"[^\"]*deep_data\\.json\" why=\"nest-refused\" bytes=\"$DJ_BYTES\" ext=\"\\.json\"/>" "$TMP/kgj_sk_$mode.xml"; then
+            no "#157 REGRESSED: $mode --skipped has no exact nest-refused row for deep_data.json (why=/bytes=$DJ_BYTES/ext=.json): $( grep -o '<f p="[^"]*deep_data[^/]*/>' "$TMP/kgj_sk_$mode.xml" )"
+        elif ! grep -q 'nest_refused="1"' "$TMP/kgj_sk_$mode.xml"; then
+            no "#157 REGRESSED: $mode --skipped header is missing nest_refused=\"1\": $( grep -o '<skipped [^>]*>' "$TMP/kgj_sk_$mode.xml" )"
+        elif ! grep -qF 'nest_refused= counts indexed files a pre-parse nesting guard' "$TMP/kgj_sk_$mode.xml"; then
+            no "#157 REGRESSED: $mode --skipped legend carries no nest_refused= clause"
+        else
+            ok "#157: $mode --skipped rows deep_data.json (why=\"nest-refused\" bytes=\"$DJ_BYTES\" ext=\".json\"), header nest_refused=\"1\", legend present"
+        fi
+        grep -qE '<f p="[^"]*sibling\.json" why="nest-refused"' "$TMP/kgj_sk_$mode.xml" \
+            && no "#157 REGRESSED: $mode --skipped rows sibling.json as nest-refused too — the guard is refusing the whole tree, not the one hostile file"
+    done
+fi
+$BIN "$KGJ" --no-cache --match='(array)' >"$TMP/kgj_match.xml" 2>"$TMP/kgj_match.err"; KGJ_M_RC=$?
+if [ "$KGJ_M_RC" -ne 0 ]; then
+    no "(kg-json) --match over the refused deep_data.json exited $KGJ_M_RC: $( head -2 "$TMP/kgj_match.err" )"
+elif ! grep -q 'deep_data.json: json nesting' "$TMP/kgj_match.err"; then
+    no "(kg-json) --match: the same run's ingest did not refuse deep_data.json — the arm cannot show the two paths agree"
+elif grep -q '<m p="deep_data\.json:' "$TMP/kgj_match.xml"; then
+    no "#157 REGRESSED: --match returns hits INSIDE deep_data.json in the same run whose ingest refused it — the bypass is back"
+elif ! grep -q 'nest_refused="1"' "$TMP/kgj_match.xml"; then
+    no "#157 REGRESSED: --match's answer does not disclose nest_refused=\"1\" over a tree holding one refused file: $( grep -o '<match [^>]*>' "$TMP/kgj_match.xml" )"
+elif ! grep -q '<m p="sibling\.json:' "$TMP/kgj_match.xml"; then
+    no "(kg-json) --match: no hit in sibling.json, the positive control — a walk that skipped every file would pass the arms above: $( grep -o '<match [^>]*>' "$TMP/kgj_match.xml" )"
+else
+    ok "#157: --match returns zero hits inside the refused deep_data.json, still hits sibling.json, and discloses nest_refused=\"1\""
+fi
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo

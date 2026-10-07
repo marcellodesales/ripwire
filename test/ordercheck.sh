@@ -24,7 +24,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -94,7 +94,7 @@ BADRC=$?
     || no "--order=bogus did not refuse loudly (exit $BADRC)"
 
 # ── (d) --help surface ───────────────────────────────────────────────────────────────────────────────
-HELP="$( "$BIN" --help 2>&1 )"
+HELP="$( "$BIN" --help=all 2>&1 )"
 printf '%s\n' "$HELP" | grep -q -- '--order=' \
     && ok "--help lists --order=" || no "--help is missing --order="
 printf '%s\n' "$HELP" | grep -q -- '--no-stable' \
@@ -114,7 +114,7 @@ diff -q "$TMP/d1.xml" "$TMP/d2.xml" >/dev/null \
     && ok "determinism (--order=stable byte-identical run-to-run)" \
     || no "non-deterministic --order=stable output"
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/d1.xml" 2>/dev/null && ok "xml well-formed (--order=stable)" || no "xml malformed (--order=stable)"
+    if xmllint --noout "$TMP/d1.xml" 2>/dev/null; then ok "xml well-formed (--order=stable)"; else no "xml malformed (--order=stable)"; fi
 else
     ok "xml well-formed (xmllint absent — skipped)"
 fi

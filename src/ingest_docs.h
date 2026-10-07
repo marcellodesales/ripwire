@@ -111,6 +111,11 @@ inline void mdWalk( TSNode node, std::string_view src, bool inQuote, std::uint32
         out.opaque.emplace_back( a, b );
         return;   // nothing inside is structure, mention or link
     }
+    // Every indexed named-child loop in this walker stays indexed ON PURPOSE (src/infra/tschildren.h's
+    // one-line test): the markdown grammar declares NO extras — its vendored parser.c carries zero
+    // SHIFT_EXTRA actions — so nothing is ever spliced into a child array here, and every list below is a
+    // balanced grammar repeat that ts_node__child skips in O(1). Measured: a 16 000-paragraph document is
+    // flat on the indexed form (lane W3's sweep, test/childwalkscalecheck.sh).
     if( std::strcmp( type, "link_reference_definition" ) == 0 )
     {
         out.opaque.emplace_back( a, b );   // not mention-scanned …
@@ -221,11 +226,11 @@ void extractMarkdown( std::uint32_t fileId, std::string_view src, std::string_vi
     mdtier::MdWalkOut walk;
     mdtier::mdWalk( root, src, false, 0, walk );
 
-    // The walk is preorder ⇒ headings and opaque ranges arrive in byte order; VERIFY rather than re-sort
+    // The walk is preorder ⇒ headings and opaque ranges arrive in byte order; ASSUME rather than re-sort
     // (a re-sort would hide a walk-order bug behind deterministic-looking output).
     for( std::size_t i = 1; i < walk.headings.size(); ++i )
     {
-        VERIFY( walk.headings[ i - 1 ].startByte <= walk.headings[ i ].startByte );
+        ASSUME( walk.headings[ i - 1 ].startByte <= walk.headings[ i ].startByte );
     }
 
     // (2) section spans + hierarchy over the MERGED heading list: endByte = next same-or-higher heading's

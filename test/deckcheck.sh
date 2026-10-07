@@ -6,7 +6,7 @@
 # This gate makes that grep automatic and runs it on every prose source that quotes ripwire flags.
 #
 # Scope (what counts as "prose that quotes flags") — EVERY shipped prose surface in this export:
-#   README.md, AGENTS.md, CLAUDE.md, CONTRIBUTING.md, CHANGELOG.md — the public-facing and
+#   README.md, INSTALL.md, AGENTS.md, CLAUDE.md, CONTRIBUTING.md, CHANGELOG.md — the public-facing and
 #                    agent-facing docs at the root; same fabrication risk as a slide.
 #   docs/*.md      — ARCHITECTURE / EVALS / METHODOLOGY and the docs index, EXCEPT the generated
 #                    docs/COMMANDS.md (see the skip below it).
@@ -52,7 +52,7 @@
 # below): `--rank-by=bogus` is as false a claim as `--bogus`, and --help prints those enums verbatim.
 #
 # A token is allowed if EITHER:
-#   (a) it appears in `$BIN --help` (the ground truth: what the shipped binary actually parses), or
+#   (a) it appears in `$BIN --help=all` (the ground truth: what the shipped binary actually parses), or
 #   (b) it is listed in test/deckcheck_allowlist.txt with a reason — genuine prose false positives:
 #       a REAL ripwire flag --help deliberately omits (RIPWIRE_DEV-gated experiment, deprecated
 #       --order alias, a `wrap`-subcommand-only flag), or a flag that belongs to a DIFFERENT tool
@@ -95,7 +95,7 @@ TOKEN_RE='--[A-Za-z][A-Za-z0-9_-]*'
 PROSE_RE='(^|[^-/_A-Za-z0-9])'"$TOKEN_RE"
 
 # ── ground truth: every --flag token the shipped binary's own --help prints ─────────────────────────
-"$BIN" --help >"$TMP/help.txt" 2>&1
+"$BIN" --help=all >"$TMP/help.txt" 2>&1
 grep -oE -- "$TOKEN_RE" "$TMP/help.txt" | sort -u >"$TMP/valid.txt"
 validCount=$( wc -l <"$TMP/valid.txt" | tr -d ' ' )
 [ "$validCount" -gt 0 ] || { echo "deckcheck: --help printed zero --flag tokens — broken build or empty help; refusing to run"; exit 2; }
@@ -169,6 +169,7 @@ addSource() {  # addSource <path> <family: root|docs|skills|prompts|paper|presen
     esac
 }
 addSource "$ROOT/README.md" root      # arrives with the public-README lane; addSource no-ops until then
+addSource "$ROOT/INSTALL.md" root     # install/uninstall steps quote installer and binary flags verbatim
 addSource "$ROOT/AGENTS.md" root
 addSource "$ROOT/CLAUDE.md" root
 addSource "$ROOT/CONTRIBUTING.md" root
@@ -194,7 +195,7 @@ for f in "$ROOT"/present/*.js;              do addSource "$f" present; done
 # surviving family could satisfy while another vanished entirely — the failure that let this gate go
 # inert (mutation-proven: `rm -rf prompts/` left the total at exactly the old floor, still a PASS).
 # Each glob family must contribute at least one source, independent of what the others total.
-[ "$rootCount"    -ge 1 ] || { echo "deckcheck: 0 root-doc prose source(s) found (README.md/AGENTS.md/CLAUDE.md/CONTRIBUTING.md/CHANGELOG.md) — refusing to run"; exit 2; }
+[ "$rootCount"    -ge 1 ] || { echo "deckcheck: 0 root-doc prose source(s) found (README.md/INSTALL.md/AGENTS.md/CLAUDE.md/CONTRIBUTING.md/CHANGELOG.md) — refusing to run"; exit 2; }
 [ "$docsCount"    -ge 1 ] || { echo "deckcheck: 0 docs/*.md prose source(s) found — refusing to run"; exit 2; }
 [ "$skillsCount"  -ge 1 ] || { echo "deckcheck: 0 skills/*/*.md prose source(s) found — refusing to run"; exit 2; }
 [ "$promptsCount" -ge 1 ] || { echo "deckcheck: 0 prompts/*.md prose source(s) found — refusing to run"; exit 2; }
@@ -260,7 +261,7 @@ echo "deckcheck: scanned ${#SOURCES[@]} file(s), ${usedCount} distinct --flag to
 # ── §P9 "amp= definition": --help must define amp= numerically and distinguish it from --impact's
 # reaches=, not just print the bare token — a stray-flag scan (the rest of this gate) can't catch a
 # documented-but-undefined attribute, so this is a narrow, separate content assertion.
-HELPTXT="$( "$BIN" --help 2>&1 )"
+HELPTXT="$( "$BIN" --help=all 2>&1 )"
 printf '%s' "$HELPTXT" | grep -q 'amp = |direct callers|' \
     && ok_amp=1 || ok_amp=0
 printf '%s' "$HELPTXT" | grep -q 'NOT the same quantity as --impact'"'"'s reaches=' \
@@ -270,6 +271,68 @@ if [ "$ok_amp" = 1 ] && [ "$ok_ampvsreaches" = 1 ]; then
 else
     echo "  FAIL  --help is missing the amp= numeric definition and/or its contrast with reaches= (amp_defined=$ok_amp vs_reaches=$ok_ampvsreaches)"
     fail=1
+fi
+
+# ── §P10 CHANGELOG HEADING INTEGRITY (added 2026-09-23, lane/ack-backfill-followups incident) ──────
+# A CHANGELOG edit that added an `## [Unreleased]` section REPLACED the `## [0.6.2] — 2026-09-21`
+# heading outright instead of inserting above it — ~2,870 lines of shipped 0.6.2 release notes silently
+# read as unreleased, and nothing in the gate suite caught it: the flag-fabrication scan above only
+# reads CHANGELOG.md's PROSE, never its heading STRUCTURE. A narrow, separate content assertion, same
+# shape as §P9 above: every `## [...]` release heading committed on origin/main must still be present
+# here, in the same relative order (a new heading may be ADDED anywhere, including above the pinned
+# ones, but none of the pinned ones may be dropped, reordered, or renamed), and at most one
+# `## [Unreleased]` heading may exist, sitting above every real release heading, never below one.
+if MAINCHANGELOG="$( git -C "$ROOT" show origin/main:CHANGELOG.md 2>/dev/null )" && [ -n "$MAINCHANGELOG" ]; then
+    printf '%s' "$MAINCHANGELOG" >"$TMP/changelog_main.md"
+    if python3 - "$ROOT/CHANGELOG.md" "$TMP/changelog_main.md" <<'PYEOF'
+import re, sys
+localPath, mainPath = sys.argv[1], sys.argv[2]
+pat = re.compile(r'^(## \[.*)$', re.M)
+local = pat.findall(open(localPath, encoding='utf-8').read())
+main  = pat.findall(open(mainPath, encoding='utf-8').read())
+mainReleases = [h for h in main if '[Unreleased]' not in h]
+
+ok = True
+missing = [h for h in mainReleases if h not in local]
+for h in missing:
+    print("  FAIL  CHANGELOG heading missing (present on origin/main): %s" % h)
+    ok = False
+
+# subsequence order: each pinned heading, in turn, must be found no earlier than the previous one.
+idx = 0
+for h in mainReleases:
+    if h in missing:
+        continue
+    found = local.index(h, idx) if h in local[idx:] else -1
+    if found == -1:
+        print("  FAIL  CHANGELOG heading out of order: %s" % h)
+        ok = False
+        continue
+    idx = found + 1
+
+unreleased = [h for h in local if '[Unreleased]' in h]
+if len(unreleased) > 1:
+    print("  FAIL  CHANGELOG carries %d [Unreleased] headings — at most one is allowed" % len(unreleased))
+    ok = False
+# Against EVERY local release heading, not only origin/main's first: a release heading this branch adds
+# above the pinned ones is a release too, and [Unreleased] below it would file notes under the wrong one.
+localReleases = [h for h in local if '[Unreleased]' not in h]
+if unreleased and localReleases:
+    if local.index(unreleased[0]) > local.index(localReleases[0]):
+        print("  FAIL  CHANGELOG's [Unreleased] heading sits BELOW a release heading (%s) — it must sit above every release" % localReleases[0])
+        ok = False
+
+if ok:
+    print("  PASS  CHANGELOG heading integrity — every origin/main release heading is present, in order, and at most one [Unreleased] sits above them")
+sys.exit(0 if ok else 1)
+PYEOF
+    then
+        :
+    else
+        fail=1
+    fi
+else
+    echo "  SKIP  CHANGELOG heading integrity — origin/main not in this checkout (shallow clone or foreign repo)"
 fi
 
 if [ "${badAllow:-0}" = "1" ]; then

@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // packtask.h — the shared task-bundle assembler behind --pack-task (CLI) and the MCP explore/pack_task verb
 // (L4). ONE function builds the fixed 5-section budget-shared bundle (routed lens
@@ -15,6 +18,7 @@
 #include "graph.h"
 #include "graphlegend.h"   // R-E fix (2026-08-19): rw::rootRelPathsLegend — the ONE root= definition
 #include "lexical.h"       // RouteAnchorDef — the resolved form of the route's own `anchors:` clause
+#include "compactlegend.h"   // L1 fix round: compactDeliveredBytes — the ceiling ladder at the delivered price
 #include "serialize.h"     // packSignatures / packBodies / escapeXml / kMinBytesPerToken / kBudgetHeadroom
 #include "redact.h"
 #include "notes.h"
@@ -27,6 +31,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>       // std::numeric_limits — the mask-width static_assert: an index shifted into a mask must fit it
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -45,12 +50,26 @@ struct LensRanking
     std::string        routeNote;
     std::string        mentionNote;
     std::string        boostNote;
+    std::string        sibliftNote;                // r4 EXPERIMENT (siblift.h) — "" unless RIPWIRE_SIBLIFT
+                                                    // actually promoted a symbol.
+    std::string        expandNote;                 // r6 EXPERIMENT (expand.h) — "" unless RIPWIRE_EXPAND
+                                                    // actually promoted a symbol.
     std::string        docMentionNote;             // R5: doc<->code mention-edge surfacing (see mention.h
                                                     // applyDocMentionBoost) — "" unless a resolved symbol's
                                                     // g.mentions docs actually got lifted.
     std::uint32_t      docMentionCount = 0;        // §L10b: docMentionInfo.docCount, the machine form of the
                                                     // note above (0 = the boost moved nothing) — the doc_mentions=
                                                     // root attribute reads this, mirroring anchorLifts below.
+    // The INDEXING caps that cut this ranking, accumulated across the three lift passes in the order they
+    // run (mention.h CapDisclosure). Both "" on the overwhelmingly common run where no cap bit, so a bundle
+    // that lost nothing pays nothing. The prose half already rides mentionNote/boostNote/docMentionNote,
+    // which is how --pack-task and both JSON dialects get the same fact for free.
+    std::string        capAttrs;                   // ` mention_syms_capped="1" …` — spliced onto the XML root
+    std::string        capJson;                    // `,"mention_syms_capped":true,…` — the --json twin
+    std::string        capNote;                    // the self-defining prose clause (mention.h capDisclosureNote).
+                                                    // Deliberately NOT folded into the three notes above: on --for
+                                                    // it is spliced in AFTER the sigs ladder has run, so a
+                                                    // disclosure is paid for in bytes and never in ranked rows.
     float              maxLexicalScore = 0.0f;    // R4: top raw BM25 score BEFORE --anchor/mention/cochange
                                                    // reshape it — the honest "how much real textual evidence
                                                    // is there" number the weak="1" signal reads.
@@ -66,6 +85,10 @@ struct LensRanking
     // for words that named something. The T3 auto-body allowance reads it so the bundle serves the anchor's
     // OWN body or none at all (docs/EVALS.md, the anchor-only substitution round).
     std::vector<RouteAnchorDef> anchorDefs;
+    // L-W (forpage.h): the term evidence behind the RAW lexical pass — which query subtokens each symbol
+    // matched and how rare each is — read back out of the scorer (lexical.h LexTermEvidence) so coverage=
+    // and the --for --limit=N file page are computed from the same integers that ranked the head.
+    LexTermEvidence             evidence;
 };
 
 inline constexpr int         kPackTaskDefaultTokens  = 6000;   // the default budget when no explicit budget is given
@@ -127,6 +150,10 @@ inline constexpr int kPackTaskQuotaTestsPct   = 10;   // the cascaded remainder 
 static_assert( kPackTaskQuotaRankingPct + kPackTaskQuotaBodiesPct + kPackTaskQuotaCallersPct
              + kPackTaskQuotaNotesPct + kPackTaskQuotaTestsPct == 100, "pack-task section quotas must sum to 100%" );
 
+// E1 / review of #214: one entry, one unit again. The <tests> section is CUT over single rows — one row per
+// test file, whose rendered bytes are exactly what the cut measures — and only the KEPT prefix is grouped
+// afterwards (see the tests section below), so shown=/total= count rows and test files at the same time and
+// the per-entry `units` arithmetic this struct carried for one release is gone with the estimate that needed it.
 struct PackTaskSection { std::string xml; std::size_t kept = 0; };
 
 // W3FIX H2/M1 — the pieces the header comment is made of, so the header can be REBUILT in three shapes (as
@@ -139,6 +166,7 @@ struct PackTaskHeaderParts
     std::string_view rootOpenStr;      // ctxRootOpen( task, routeNote ), pre-built (its size is charged)
     std::string_view taskNote;         // the comment's scrubbed echo of `task` (xmlCommentText)
     std::string_view mentionNote, boostNote, docMentionNote;   // L1: no routeNote — route= is the one copy
+    std::string_view sibliftNote, expandNote;   // r4/r6 EXPERIMENTS — present only when the env-gated lift actually promoted something
     std::string_view report;           // the per-section truncation ledger
     // M1 (terminality round A, 2026-09-05): root attributes this bundle owes, spliced onto BOTH root
     // spellings below (the pre-built one and the ladder's route-dropped rebuild). Today that is exactly
@@ -147,6 +175,8 @@ struct PackTaskHeaderParts
     std::string_view rootArg;          // R-E (2026-08-17): the single-root run's own root= — the ladder's
                                         // route-dropped rebuild below calls ctxRootOpen a second time and
                                         // must carry the SAME root as the pre-built rootOpenStr did.
+    std::string_view runClause;        // M21(b)/E1: testmap.h's run=/run_unknown=/<g> clause — ROWS-GATED (empty when
+                                        // the tests section kept no row), so a bundle that omits tests pays nothing
 };
 
 // P10 (L7): the bundle legend's BODY, one constant, spliced by the standalone header (packTaskHeaderText) and
@@ -178,6 +208,12 @@ inline constexpr const char* kPackTaskBundleLegendBody =
          // thereby keep fewer, bigger ones — a falling count is not lost content, and the reader should not have
          // to infer that from a number that went down. Stated once, here, where the count itself is printed.
          "bodies fill rank-first, so a bigger budget can keep FEWER, larger bodies — the count is not a quality measure. "
+         // t14-cleanup #6 / rv-t12-3.md LOW-1: bodyless= can ride EITHER <bodies> shape this bundle emits —
+         // the packBodies-rendered one (its own kBodylessBodiesLegend rides beside it, gated on the count)
+         // and the bare-wrapper placeholder a too-tight budget falls back to (which never calls packBodies,
+         // so it cannot write that comment itself). Defined here, unconditionally, once, so neither shape
+         // can emit it undefined.
+         "bodies: bodyless=N of total= are module-scope owners with no body by construction, never in shown=, never raising capped=. "
          // §B7.5 (CA4): this dictionary is EXPLICIT — it says "Row keys:" and then lists three of them — so
          // every key it omits reads as "not a row key" rather than "look elsewhere". It omitted l=, cx= and
          // ccx=, which every ranking row carries, plus t=/p=/rel= on the name-only rows, and left the whole
@@ -193,7 +229,7 @@ inline constexpr const char* kPackTaskBundleLegendBody =
          // measured, not estimated. Every key is still named; the prose around them is what went.
          // deep-tail d1 (2026-08-29): r= joins the explicit dictionary — same trap-#8 terseness, one key
          // (the full deep-tail contract lives in the --for legend's own clause, docs/EVALS.md registration).
-         "Row keys: n=name (chain it), id=canonical(when scoped), in=reuse-count (absent = not measured, never a false 0)"
+         "Row keys: n=name (chain it), sc=enclosing scope (when scoped; the full id is p::sc::n), in=reuse-count (absent = not measured, never a false 0)"
          ", l=line, p=path, t=kind, cx=cyclomatic, ccx=cognitive, rel=caller|callee, r=rank in this ranking "
          "(rows in r= order); far=ranked but over 1 hop out; "
          "of_top denominator is per-section. "
@@ -206,6 +242,22 @@ inline constexpr const char* kPackTaskBundleLegendBody =
          // F2: over_ceiling= is now the property those two numbers state, on every rung — not only the
          // last-rung case the old wording described. Same length class, one clause, unconditional as before.
          "budget_tokens= is the token target; over_ceiling= is 1 when est_tokens exceeds it (the bundle is then complete, not trimmed). ";
+
+// r4/r6 (2026-09-10 lift-disclosure round): append the two experimental lift notes' JSON keys — same
+// absent-unless-present convention as the mention/boost/doc_mention keys beside them. Factored out (unlike
+// those three, which predate this round) purely to keep packTaskBundleText's own complexity/verbosity from
+// growing on a shape that is otherwise just two more copies of the same three-line conditional.
+inline void appendLiftJsonKeys( std::string& j, const std::string& sibliftNote, const std::string& expandNote )
+{
+    if( !sibliftNote.empty() )
+    {
+        j += ",\"siblift\":\"" + jsonStr( sibliftNote ) + "\"";
+    }
+    if( !expandNote.empty() )
+    {
+        j += ",\"expand\":\"" + jsonStr( expandNote ) + "\"";
+    }
+}
 
 // One spelling of --pack-task's header, three shapes of it. `withTaskEcho=false` replaces the comment's echo
 // with a note pointing at the task= attribute that still holds the verbatim copy — nothing is lost, only the
@@ -238,8 +290,11 @@ inline std::string packTaskHeaderText( const PackTaskHeaderParts& p, bool withRo
     // route= attribute byte-for-byte in meaning; the attribute is the one copy (test/routeoncecheck.sh).
     h.append( p.mentionNote );
     h.append( p.boostNote );
+    h.append( p.sibliftNote );
+    h.append( p.expandNote );
     h.append( p.docMentionNote );
     h += kPackTaskBundleLegendBody;   // P10 (L7): the body is ONE constant — the partitioned document states it once for all slices
+    h.append( p.runClause );          // M21(b)/E1: the <test> row's run=/run_unknown= rule and the <g> group row, testmap.h's ONE wording — rows-gated
     h.append( p.report );
     h.append( extraNotes );
     h += " -->";
@@ -283,8 +338,7 @@ inline PackTaskSection packTaskListSection( std::string_view tag, std::string_vi
         return out;
     }
     char open[ 160 ];
-    std::snprintf( open, sizeof( open ), "<%.*s%.*s shown=\"%zu\" total=\"%zu\" capped=\"%d\">",
-                   int( tag.size() ), tag.data(), int( extraAttr.size() ), extraAttr.data(), out.kept, entries.size(),
+    rw::formatTo( open, sizeof( open ), "<{}{} shown=\"{}\" total=\"{}\" capped=\"{}\">", std::string_view( tag.data(), tag.size() ), std::string_view( extraAttr.data(), extraAttr.size() ), out.kept, entries.size(),
                    out.kept < entries.size() ? 1 : 0 );
     out.xml = open;
     for( std::size_t i = 0; i < out.kept; ++i )
@@ -292,6 +346,88 @@ inline PackTaskSection packTaskListSection( std::string_view tag, std::string_vi
         out.xml += entries[i];
     }
     out.xml += "</";  out.xml.append( tag );  out.xml += ">";
+    return out;
+}
+
+// ── THE <tests> SECTION — the one list whose entries are not independent ────────────────────────────────
+// Every other section here is a list of rows the budget can cut anywhere: entry i costs entry i's bytes,
+// whatever its neighbours are. Test rows are not like that. E1 serves a run of runner-less rows with equal
+// attributes as ONE <g> row, so admitting one more FILE can cost a whole new row or just `,path` on the row
+// already there — the cost of the k-th file depends on the k-1 before it, and packTaskListSection's
+// "used += e.size()" has no way to say that.
+//
+// The first attempt grouped FIRST and handed the group rows to that helper under a per-row byte cap, with a
+// cap estimate of `attrs + 48 + Σ( path + 1 )` computed on UNESCAPED paths. Review of #214: a corpus whose
+// test paths hold '&' or '<' renders wider than the estimate admitted, the helper broke at the first
+// over-budget entry, and the whole tail of the section went with it — `run=` singles included. Measured on a
+// ten-test fixture at --token-budget=1440, `_`-named paths served 5 files and the same fixture with `&` in
+// every name served NONE: the section vanished rather than shrank.
+//
+// So this section CUTS WHERE THE BYTES ARE. It asks the only question that matters — what is the largest
+// PREFIX of the row list whose GROUPED, ESCAPED rendering fits the budget — and answers it by rendering
+// candidate prefixes and measuring them. Cutting a prefix and grouping it afterwards would also have been
+// safe (grouping only shrinks), but it cuts over the single rows' bytes and then spends fewer of them: on
+// that same fixture it served 2 files where grouping-first served 5, which throws away the win E1 exists for.
+//
+// The search is a bisection, which is exact because `bodyOf` is monotone in k: extending the prefix by one
+// row either appends a row or extends the last group by `,path` (a group of one is rendered as a single
+// <test> row, and the two-member <g> that replaces it is strictly wider), so the rendered size never falls
+// as k rises. ~log2(n) renders of an O(n) body, against a list that is a few hundred rows at most.
+//
+// shown=/total= therefore count test FILES — one qualifying file, one entry, on both sides of the cut — and
+// a <g n="N"> row carries N of them, which is exactly what the bundle legend now says.
+template<class EscapeFn>
+inline PackTaskSection packTaskTestsSection( const rw::TestRunnerIndex& runners, std::span<const rw::TestRowOut> rows,
+                                             std::size_t budget, std::size_t wrapReserve, EscapeFn esc,
+                                             std::vector<std::vector<std::uint32_t>>* partitionOut )
+{
+    PackTaskSection out;
+    if( partitionOut )
+    {
+        partitionOut->clear();
+    }
+    const auto bodyOf = [ & ]( std::size_t k, std::vector<std::vector<std::uint32_t>>* keepPart ) -> std::string
+    {
+        const std::span<const rw::TestRowOut>   prefix( rows.data(), k );
+        std::vector<std::vector<std::uint32_t>> part = rw::partitionTestRows( runners, prefix );
+        std::string                             body;
+        for( const rw::RenderedTestRow& r : rw::testRowsRendered( runners, prefix, rw::TestRowShape{ rw::RowDialect::Xml, "test" }, esc, &part ) )
+        {
+            body += r.text;
+        }
+        if( keepPart )
+        {
+            *keepPart = std::move( part );
+        }
+        return body;
+    };
+    if( rows.empty() || budget <= wrapReserve )
+    {
+        return out;
+    }
+    std::size_t lo = 0;              // always fits (an empty body is wrapReserve alone)
+    std::size_t hi = rows.size();    // may not
+    while( lo < hi )
+    {
+        const std::size_t mid = lo + ( hi - lo + 1 ) / 2;   // lo < mid <= hi
+        if( wrapReserve + bodyOf( mid, nullptr ).size() <= budget )
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid - 1;
+        }
+    }
+    out.kept = lo;
+    if( out.kept == 0 )
+    {
+        return out;
+    }
+    const std::string body = bodyOf( out.kept, partitionOut );
+    char              open[ 160 ];
+    rw::formatTo( open, sizeof( open ), "<tests shown=\"{}\" total=\"{}\" capped=\"{}\">", out.kept, rows.size(), out.kept < rows.size() ? 1 : 0 );
+    out.xml = std::string( open ) + body + "</tests>";
     return out;
 }
 
@@ -306,14 +442,10 @@ inline std::string packTaskOmittedBodiesJson( const IngestResult& ing, const rw:
         return {};
     }
     std::string out = ",\"bodies_omitted\":[";
-    for( std::size_t i = 0; i < emitted.omitted.size(); ++i )
+    appendJoinedSymbolNames( out, ing, emitted.omitted, ",", []( std::string& o, std::string_view name )
     {
-        if( i )
-        {
-            out += ",";
-        }
-        out += "\"" + jsonStr( ing.symbols[ emitted.omitted[i] ].name ) + "\"";
-    }
+        o += "\"" + jsonStr( name ) + "\"";   // serialize.h's one join loop, this dialect's quoting
+    } );
     return out + "]";
 }
 
@@ -322,6 +454,45 @@ inline std::string packTaskOmittedBodiesJson( const IngestResult& ing, const rw:
 // nullptr-omits-the-attr contract), so a caller with NONE of these (a bare MCP call) still gets a complete,
 // correctly-shaped bundle — matching how a plain CLI `--pack-task` run (without `--for`/`--metrics` also set)
 // already leaves fanIn/impure/churn/tested/amp unset today.
+// The DISCLOSE sink for a pack-task section whose render degraded (infra/emit.h renderToString: Rendered::ok == false,
+// empty text). Such a section is EMPTY because its render failed — not because the budget omitted it, and not because
+// nothing matched — so the bundle marks the section itself (render_failed="1") and names it on the root
+// (render_failed="ranking,bodies"), in the XML and the JSON dialect alike. A body-cost PROBE that fails prices that body
+// as unaffordable (it is then omitted like any over-budget body) and is named on the root as "body-probe".
+struct PackTaskRenderFaults
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        RankingRenderFailed,
+        BodiesRenderFailed,
+        BodyProbeRenderFailed,
+    };
+    std::uint8_t failedMask = 0;   // bit i ⇔ DisclosureWhy value i
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        failedMask = std::uint8_t( failedMask | ( 1u << unsigned( why ) ) );
+    }
+    bool hasFailed( DisclosureWhy why ) const noexcept
+    {
+        return ( failedMask & ( 1u << unsigned( why ) ) ) != 0;
+    }
+    // "ranking,bodies,body-probe" in DisclosureWhy order — the root attribute's value ("" when nothing failed)
+    std::string names() const
+    {
+        static constexpr const char* kNames[] = { "ranking", "bodies", "body-probe" };
+        std::string out;
+        for( unsigned i = 0; i < std::size( kNames ); ++i )
+        {
+            if( ( failedMask & ( 1u << i ) ) != 0 )
+            {
+                out += out.empty() ? "" : ",";
+                out += kNames[ i ];
+            }
+        }
+        return out;
+    }
+};
+
 struct PackTaskInputs
 {
     std::size_t                        budgetTokens         = 0;       // 0 = kPackTaskDefaultTokens
@@ -338,6 +509,16 @@ struct PackTaskInputs
     // the real fix is (the CalleeCallsSink no-defaults-on-any-member shape).
     RedactCounts*                      redact = nullptr;
     const notes::NoteIndex*            notes  = nullptr;
+    // L3 follow-up (CodeRabbit 4053600616): read BEFORE the caller nulls `notes` for emptiness, so a sidecar
+    // that left EVERY line unparsed (notes empty, but the read was not clean) still reaches this bundle's root
+    // — the same reason MainDispatch carries notesDegraded beside notesPtr (main.cpp).
+    bool                                notesDegraded = false;
+
+    // Query relevance for ORDERING each emitted body's <calls> callee listing when the 16-row cap or the
+    // byte budget CUTS it — serialize.h CalleeCallsSink::rank carries the finding and the measurement.
+    // packTaskBundleText fills this from its own LensRanking (below, beside the fanIn self-supply), so
+    // every caller — CLI --pack-task and the MCP verb alike — gets the ranked cut without spelling it.
+    const std::vector<float>*          calleeRank = nullptr;
 
     // §6 --partition: a PRE-COMPUTED Q3 clone-membership lens. findClones() is a pure function of `ing`, so a
     // fan-out that assembles N+1 bundles from the SAME index would otherwise pay for N+1 identical clone
@@ -361,6 +542,18 @@ struct PackTaskInputs
     // here, at the two places the budget is spent: the section shares trim to leave room for it, and the ladder
     // prices it, so the label fires when the trim cannot get there. 0 ⇒ every other caller, byte-identical.
     std::size_t                        trailingSectionBytes = 0;
+    // The caller's trailing section could not be charged (its chargeSection degraded, so trailingSectionBytes is 0 and
+    // it streams directly): est_tokens leaves those bytes out and the root labels itself est_measured="0".
+    bool                               isTrailingUncharged  = false;
+    // Where this bundle's section renders record a failure (see PackTaskRenderFaults). packTaskBundleText points it at
+    // its own local; nullptr ⇒ a render failure is still returned as empty text, just not recorded.
+    PackTaskRenderFaults*              renderFaults         = nullptr;
+
+    // L1 fix round (rv-r1-L1 MED-4): the run's legend posture is compact, so the ceiling ladder's rungs (drop the task echo,
+    // then route=, then label over_ceiling) are judged on the bytes the compact layer DELIVERS — the task echo lives in the
+    // prose the layer strips, and dropping it for a full-dialect price cut a fact the compact answer had room for. The
+    // section shares are unchanged (their reserve is posture-free), so rows(default) == rows(full) here.
+    bool                               compactLegend = false;
 
     // R-E (2026-08-17 harvest): the single-root run's OWN root argument — same convention serialize()'s
     // rootArg takes (empty ⇒ multi-root, or a caller that never resolved one, e.g. an MCP call against a
@@ -678,6 +871,7 @@ inline void partitionByEligibility( const std::vector<NodeId>& topRanked, const 
                                     const std::vector<char>& d1Mark,
                                     std::vector<NodeId>& eligibleIds, std::vector<NodeId>& d2plusIds )
 {
+    ASSUME_NO_ALIAS3( topRanked, eligibleIds, d2plusIds );
     for( NodeId id : topRanked )
     {
         ( ( id < d0Mark.size() && d0Mark[id] ) || ( id < d1Mark.size() && d1Mark[id] ) ? eligibleIds : d2plusIds ).push_back( id );
@@ -701,18 +895,29 @@ inline std::vector<float> buildMaskedRank( const IngestResult& ing, const std::v
     return masked;
 }
 
-// a generic "render into a memstream, DEGRADED_PATH_ALERT + \"\" on failure" wrapper — shared by every
-// packTaskBundleText section (and renderRankingWithFar below) so none of them hand-roll the memstream dance.
-template<class Emit>
-inline std::string packTaskRenderToString( Emit&& emit )
+// every packTaskBundleText section (and renderRankingWithFar below) renders through infra/emit.h's ONE
+// renderToString seam. A section whose render degrades comes back EMPTY; this wrapper records WHICH one in the
+// bundle's PackTaskRenderFaults, so the caller can mark the section and the root instead of letting an empty
+// string read as a budget omission (or, in the JSON dialect, as a missing value after its key).
+struct PackTaskRendered
 {
-    char* buf = nullptr;  std::size_t sz = 0;
-    std::FILE* m = open_memstream( &buf, &sz );
-    if( !m ) { DEGRADED_PATH_ALERT( "pack-task: open_memstream failed — section skipped from the budget" ); return {}; }
-    emit( m );
-    std::fflush( m );  std::fclose( m );
-    std::string s;  if( buf ) { s.assign( buf, sz );  std::free( buf ); }
-    return s;
+    std::string text;
+    bool        ok = false;
+};
+
+template<PackTaskRenderFaults::DisclosureWhy kWhy, class Emit>
+inline PackTaskRendered packTaskRender( Emit&& emit, PackTaskRenderFaults* faults )
+{
+    rw::Rendered r = rw::renderToString( std::forward<Emit>( emit ) );
+    if( !r.ok )
+    {
+        ASSUME( r.text.empty() );   // renderToString's contract: a failed render hands back no partial buffer
+        if( faults != nullptr )
+        {
+            DISCLOSE( *faults, kWhy, "pack-task: a section's render failed — the section is marked render_failed and named on the root" );
+        }
+    }
+    return PackTaskRendered{ std::move( r.text ), r.ok };
 }
 
 // R2: section 1 as ONE cohesive unit — the distance-masked packSignatures call (eligibleIds only) PLUS the
@@ -735,13 +940,98 @@ struct RankingSection
     std::size_t farTotal = 0, farKept = 0;
     std::string farXml;         // the raw <far>…</far> (or "" if omitted) — for the header's listStatus
     std::size_t droppedPositive = 0;   // A2 (survey card, 2026-09-03): rank>0 eligibleIds cut by the ladder's step F
+    rw::SigsCutReport sigsCut;         // cut-fix lane A: the <sigs> tag's cut readings — their clauses ride the ledger
 };
+// WHERE packBodies' OWN `<bodies …>` OPEN TAG STARTS AND ENDS — by structure, never by punctuation.
+// The document is `<!-- legend --><!-- legend --><bodies …>…</bodies>`: packBodies writes zero or more
+// COMMENT nodes ahead of the tag, and since #60 one of them (kBodylessBodiesLegend) contains
+// `n=<file-scope>` — an angle bracket inside legend prose. `find( '>' )` used to be the end of the open
+// tag; with that comment present it is a byte inside the comment, so the wrapper spliced mid-legend and
+// emitted TWO opens and one close: malformed XML, past every gate (nothing ran xmllint over a --pack-task
+// document holding an owner). The lesson generalises past this one legend — a document that can carry a
+// tag-like NAME in prose can never be parsed by matching punctuation — so this skips comment nodes
+// explicitly and then takes the '>' that closes the element it actually found.
+// #60: how many of these candidates have NO BODY BY CONSTRUCTION — a module-scope owner, whose Symbol
+// extent is empty (ingest_model.h assignSymbols). Such a candidate can never be in `emitted.kept`, so
+// counting it as an over-budget omission is the same false cap --expand was fixed for, one verb over: the
+// wrapper below used to write `<!-- body omitted (over budget): <file-scope> -->` and restamp capped="1"
+// over a body that never existed. The ledger and the monotone roll read this same count, so the document
+// cannot say capped="0" bodyless="1" in the tag and "(capped)" in its own ledger.
+inline std::size_t countBodylessCandidates( const IngestResult& ing, const std::vector<NodeId>& bodyIds ) noexcept
+{
+    std::size_t n = 0;
+    for( NodeId id : bodyIds )
+    {
+        n += ( id < ing.symbols.size() && ing.symbols[id].kind == SymKind::ModuleScope ) ? 1u : 0u;
+    }
+    return n;
+}
+
+struct SectionOpenTag
+{
+    std::size_t start = std::string::npos;   // offset of the element's '<'
+    std::size_t end   = std::string::npos;   // offset of the '>' that closes THAT tag
+};
+inline SectionOpenTag findSectionOpenTag( std::string_view xml, std::string_view element ) noexcept
+{
+    SectionOpenTag t;
+    std::size_t    i = 0;
+    while( i < xml.size() )
+    {
+        if( xml.compare( i, 4, "<!--" ) == 0 )
+        {
+            const std::size_t close = xml.find( "-->", i );
+            if( close == std::string_view::npos )
+            {
+                return t;   // an unterminated comment: refuse rather than guess where the element begins
+            }
+            i = close + 3;
+            continue;
+        }
+        if( xml.compare( i, element.size(), element ) == 0 )
+        {
+            const std::size_t close = xml.find( '>', i );
+            if( close != std::string_view::npos )
+            {
+                t.start = i;
+                t.end   = close;
+            }
+            return t;
+        }
+        return t;   // something other than a comment or the element we restate — refuse
+    }
+    return t;
+}
+
+// P10 (partitioncheck): packBodies writes kTruncatedBodyLegend, then kOverCeilingBodyLegend, right after the <bodies …>
+// open tag of a bundle whose body it cut or served past the budget, and a partitioned answer would then repeat those
+// readings once per slice. A slice drops them and the outer <ctx-partitions> legend states each once (partition.h).
+// POSITIONAL, never a search: a reading is removed only where packBodies put it, so a CDATA body that quotes the same
+// sentence is never touched. Bits: kBodyReadingTruncated / kBodyReadingOverCeiling (what the kept bodies carry).
+inline constexpr std::uint8_t kBodyReadingTruncated   = 1u;
+inline constexpr std::uint8_t kBodyReadingOverCeiling = 2u;
+inline void hoistBodyReadings( std::string& bodiesXml )
+{
+    const SectionOpenTag tag = findSectionOpenTag( bodiesXml, "<bodies" );
+    if( tag.end == std::string::npos )
+    {
+        return;
+    }
+    for( const std::string_view legend : { std::string_view( kTruncatedBodyLegend ), std::string_view( kOverCeilingBodyLegend ) } )
+    {
+        if( bodiesXml.compare( tag.end + 1, legend.size(), legend ) == 0 )
+        {
+            bodiesXml.erase( tag.end + 1, legend.size() );
+        }
+    }
+}
+
 
 template<class EscFn>
 inline RankingSection renderRankingWithFar( const IngestResult& ing, const RankingSectionInputs& ri, EscFn&& ex )
 {
     RankingSection out;
-    out.sigsStr = ri.eligibleIds->empty() ? std::string( "<sigs></sigs>" ) : packTaskRenderToString( [ & ]( std::FILE* m )
+    out.sigsStr = ri.eligibleIds->empty() ? std::string( "<sigs></sigs>" ) : packTaskRender<PackTaskRenderFaults::DisclosureWhy::RankingRenderFailed>( [ & ]( std::FILE* m )
     {
         packSignatures( m, ing, *ri.maskedRank, int( ri.eligibleIds->size() ), ri.in->sigLadderBudgetBytes, /*metrics=*/true,
                         ri.in->fanIn, ri.in->impure, ri.in->redact,
@@ -752,20 +1042,31 @@ inline RankingSection renderRankingWithFar( const IngestResult& ing, const Ranki
                         /*hasRelevanceFloor=*/false, // R2: eligibleIds is ALREADY the curated set (d0∪d1 depth mask),
                                                      //   not a floor-narrowed topN — droppedPositiveCount re-checks
                                                      //   rank>0 per symbol regardless, so this is unaffected either way
-                        &out.droppedPositive );      // A2: exact count, see droppedPositiveCount (serialize.h)
-    } );
+                        &out.droppedPositive,        // A2: exact count, see droppedPositiveCount (serialize.h)
+                        /*shownIdsOut=*/nullptr, /*cappedOut=*/nullptr, /*topRowNext=*/{},
+                        &out.sigsCut );              // cut-fix lane A: docs_dropped= / shrunk readings (defined in the ledger)
+    }, ri.in->renderFaults ).text;
+    if( !ri.eligibleIds->empty() && out.sigsStr.empty() )
+    {
+        out.sigsStr = "<sigs render_failed=\"1\"></sigs>";   // the section is there and says why it is empty
+        return out;
+    }
     // §P8 vocabulary: the ladder's marker is `<sigs shown="S" total="T" capped="1">` (src/pageview.h, THE
     // TRUNCATION VOCABULARY, rule 5) — it was payload="capped", and THIS was the string-match that made a
     // string enum load-bearing. Read off the OPENING TAG only, so a capped= on any nested child can never
     // be read as the ranking section's own verdict.
     {
-        const std::size_t tagEnd = out.sigsStr.find( '>' );
-        out.capped = tagEnd != std::string::npos && out.sigsStr.compare( 0, 6, "<sigs " ) == 0
-                  && out.sigsStr.substr( 0, tagEnd ).find( " capped=\"1\"" ) != std::string::npos;
+        // Structural, not positional. This read was already safe — it required the string to START with
+        // `<sigs `, so no leading comment could move the '>' — but that is the same coupling that broke the
+        // <bodies> splice below the moment packBodies grew a legend comment ahead of its tag. Both now go
+        // through findSectionOpenTag, so a future legend written before <sigs> cannot repeat it.
+        const SectionOpenTag sigsTag = findSectionOpenTag( out.sigsStr, "<sigs " );
+        out.capped = sigsTag.end != std::string::npos
+                  && std::string_view( out.sigsStr ).substr( sigsTag.start, sigsTag.end - sigsTag.start ).find( " capped=\"1\"" ) != std::string_view::npos;
     }
 
     const std::vector<std::string> farRows = renderNameOnlyRows( ing, *ri.d2plusIds, ex, ri.in->rootArg );
-    char farAttr[ 32 ];  std::snprintf( farAttr, sizeof( farAttr ), " of_top=\"%zu\"", ri.topRanked->size() );
+    char farAttr[ 32 ];  rw::formatTo( farAttr, sizeof( farAttr ), " of_top=\"{}\"", ri.topRanked->size() );
     const std::size_t     sigsLeftover = ri.sigsBudget > out.sigsStr.size() ? ri.sigsBudget - out.sigsStr.size() : 0;
     const PackTaskSection far          = packTaskListSection( "far", farAttr, farRows, sigsLeftover, kPackTaskWrapReserve );
     out.farTotal = farRows.size();
@@ -778,7 +1079,7 @@ inline RankingSection renderRankingWithFar( const IngestResult& ing, const Ranki
     }
     else if( !far.xml.empty() )
     {
-        DEGRADED_PATH_ALERT( "pack-task: <sigs> did not end with the expected closing tag — <far> omitted" );
+        DISCLOSE( "pack-task: <sigs> did not end with the expected closing tag — <far> omitted" );
     }
     return out;
 }
@@ -879,16 +1180,23 @@ inline std::size_t reflowListSection( PackTaskSection& section, std::string_view
 // the exact bytes packBodies would emit for ONE node alone, minus the fixed <bodies ...></bodies> wrapper
 // (`wrapperLen`, measured once by the caller) — i.e. this node's own share of `children`. Called under the
 // caller's RedactTallyFreeze, so a probe never bills the redaction tally a second time (§B10.2's rule).
-inline std::size_t probeBodyCost( const IngestResult& ing, const Graph& g, NodeId id, bool compress,
-                                  RedactCounts* redact, std::size_t wrapperLen, std::string_view rootArg = {} )
+inline std::size_t probeBodyCost( const IngestResult& ing, const Graph& g, NodeId id, const PackTaskInputs& in,
+                                  std::size_t wrapperLen )
 {
     EmittedBodies     dummy;
-    const std::string one = packTaskRenderToString( [ & ]( std::FILE* m )
+    // in.calleeRank is threaded through the PROBE, not only the real render: it decides WHICH callee rows
+    // survive the <calls> cut, and different rows are different signature bytes. A probe run without it
+    // would price a listing the bundle will never emit, and every fit decision downstream inherits that.
+    const PackTaskRendered one = packTaskRender<PackTaskRenderFaults::DisclosureWhy::BodyProbeRenderFailed>( [ & ]( std::FILE* m )
     {
-        packBodies( m, ing, { id }, SIZE_MAX, g.outOff, g.outTargets, compress, redact, nullptr, nullptr, &dummy,
-                   /*truncateOversizedFirst=*/true, /*withFileContext=*/false, rootArg );
-    } );
-    return one.size() > wrapperLen ? one.size() - wrapperLen : 0;
+        packBodies( m, ing, { id }, SIZE_MAX, g.outOff, g.outTargets, in.compress, in.redact, nullptr, nullptr, &dummy,
+                   /*truncateOversizedFirst=*/true, /*withFileContext=*/false, in.rootArg, in.calleeRank );
+    }, in.renderFaults );
+    if( !one.ok )
+    {
+        return SIZE_MAX;   // an unmeasured body is never "free": priced out, it is omitted like any over-budget body
+    }
+    return one.text.size() > wrapperLen ? one.text.size() - wrapperLen : 0;
 }
 
 // a mask's "keep the higher ranks" tie-break score: bit i (rank i, 0 = top) contributes a MORE significant
@@ -916,14 +1224,16 @@ inline std::uint32_t bodyMaskRankScore( std::uint32_t mask, std::size_t n )
 // comment; the JSON lists bodies_omitted") still holds for candidates OUR pre-selection dropped, not only
 // ones packBodies itself would have dropped. A no-op (bodiesXml returned unchanged) when every candidate
 // was shown — the common case once the budget clears the whole set.
+
 template<class EscFn>
 inline std::string restatePackTaskBodiesWrapper( const IngestResult& ing, const std::string& bodiesXml,
                                                   const std::vector<NodeId>& bodyIds, EmittedBodies& emitted, EscFn&& ex,
                                                   bool compress = false )
 {
-    if( bodiesXml.empty() || emitted.kept.size() >= bodyIds.size() )
+    const std::size_t bodylessOwners = countBodylessCandidates( ing, bodyIds );   // #60
+    if( bodiesXml.empty() || emitted.kept.size() + bodylessOwners >= bodyIds.size() )
     {
-        return bodiesXml;
+        return bodiesXml;   // nothing was actually dropped: packBodies' own tag already says so
     }
     std::vector<char> keptMark( ing.symbols.size(), 0 );
     for( const EmittedBody& b : emitted.kept )
@@ -936,7 +1246,7 @@ inline std::string restatePackTaskBodiesWrapper( const IngestResult& ing, const 
     std::string markers;
     for( NodeId id : bodyIds )
     {
-        if( id < keptMark.size() && !keptMark[id] )
+        if( id < keptMark.size() && !keptMark[id] && ing.symbols[id].kind != SymKind::ModuleScope )
         {
             markers += "<!-- body omitted (over budget): ";
             markers += ex( xmlCommentText( ing.symbols[id].name ) );
@@ -944,21 +1254,34 @@ inline std::string restatePackTaskBodiesWrapper( const IngestResult& ing, const 
             emitted.omitted.push_back( id );
         }
     }
-    const std::size_t openEnd = bodiesXml.find( '>' );
-    const bool         closesRight = bodiesXml.size() >= 9 && bodiesXml.compare( bodiesXml.size() - 9, 9, "</bodies>" ) == 0;
-    if( openEnd == std::string::npos || !closesRight )
+    const SectionOpenTag    tag         = findSectionOpenTag( bodiesXml, "<bodies" );
+    const bool              closesRight = bodiesXml.size() >= 9 && bodiesXml.compare( bodiesXml.size() - 9, 9, "</bodies>" ) == 0;
+    if( tag.end == std::string::npos || !closesRight )
     {
-        DEGRADED_PATH_ALERT( "pack-task: <bodies> did not have the expected open/close shape — restated omissions dropped" );
+        DISCLOSE( "pack-task: <bodies> did not have the expected open/close shape — restated omissions dropped" );
         return bodiesXml;
     }
     // compress="1" restated with shown=/total=: this wrapper REPLACES packBodies' own open tag, so the
     // per-bundle compression disclosure (serialize.h packBodies) must survive the rewrite or the restated
-    // bundle would silently claim uncompressed bodies (test/forcompresscheck.sh arm 5).
-    char open[ 112 ];
-    std::snprintf( open, sizeof( open ), "<bodies shown=\"%zu\" total=\"%zu\" capped=\"1\"%s>", emitted.kept.size(), bodyIds.size(),
-                   compress ? " compress=\"1\"" : "" );
-    std::string out = open;
-    out += bodiesXml.substr( openEnd + 1, bodiesXml.size() - 9 - ( openEnd + 1 ) );
+    // bundle would silently claim uncompressed bodies (test/forcompresscheck.sh arm 5). Everything BEFORE
+    // the tag — packBodies' legend comments, including the bodyless clause — is kept verbatim.
+    // 40, not 32: ' bodyless="' + '"' is 12 B and bodylessOwners is a std::size_t, 20 digits at absolute
+    // most, so 32 B of text needs 33 with the NUL. formatTo truncates rather than overruns, but a cut here
+    // drops the closing quote and the document stops being well-formed — 39 usable leaves 7 B of margin
+    // and no arithmetic to re-check (test/fixedbufsweep.sh's TABLE states it).
+    char bodylessAttr[ 40 ] = { 0 };
+    if( bodylessOwners > 0 )
+    {
+        rw::formatTo( bodylessAttr, sizeof( bodylessAttr ), " bodyless=\"{}\"", bodylessOwners );   // #60, absent at zero
+    }
+    char open[ 160 ];
+    rw::formatTo( open, sizeof( open ), "<bodies shown=\"{}\" total=\"{}\" capped=\"{}\"{}{}>",
+                   emitted.kept.size(), bodyIds.size(),
+                   emitted.kept.size() + bodylessOwners < bodyIds.size() ? 1 : 0,
+                   rw::cstr( bodylessAttr ), compress ? " compress=\"1\"" : "" );
+    std::string out = bodiesXml.substr( 0, tag.start );
+    out += open;
+    out += bodiesXml.substr( tag.end + 1, bodiesXml.size() - 9 - ( tag.end + 1 ) );
     out += markers;
     out += "</bodies>";
     return out;
@@ -996,25 +1319,29 @@ inline std::string restatePackTaskBodiesWrapper( const IngestResult& ing, const 
 // side of the trade the retrieval contract wants to be on.
 inline std::vector<NodeId> selectMonotoneBodySubset( const IngestResult& ing, const Graph& g,
                                                       const std::vector<NodeId>& bodyIds, std::size_t bodiesBudget,
-                                                      bool compress, RedactCounts* redact, std::string_view rootArg = {} )
+                                                      const PackTaskInputs& in )
 {
     if( bodyIds.empty() )
     {
         return {};
     }
     const std::size_t        n = bodyIds.size();   // kPackTaskBodyCandidates today — small by construction
+    // the subset enumeration below shifts 1u by n: n must stay under the mask's width, which the constant guarantees
+    static_assert( kPackTaskBodyCandidates < std::numeric_limits<std::uint32_t>::digits,
+                   "selectMonotoneBodySubset enumerates subsets in a std::uint32_t — 1u << kPackTaskBodyCandidates must fit" );
+    ASSUME( n <= kPackTaskBodyCandidates );
     std::vector<std::size_t> cost( n, 0 );
     std::size_t               wrapperLen = 0;
     {
-        const RedactTallyFreeze freeze( redact );   // every probe below is off the books
+        const RedactTallyFreeze freeze( in.redact );   // every probe below is off the books
         EmittedBodies            dummy;
-        wrapperLen = packTaskRenderToString( [ & ]( std::FILE* m )
+        wrapperLen = packTaskRender<PackTaskRenderFaults::DisclosureWhy::BodyProbeRenderFailed>( [ & ]( std::FILE* m )
         {
-            packBodies( m, ing, {}, SIZE_MAX, g.outOff, g.outTargets, compress, redact, nullptr, nullptr, &dummy );
-        } ).size();
+            packBodies( m, ing, {}, SIZE_MAX, g.outOff, g.outTargets, in.compress, in.redact, nullptr, nullptr, &dummy );
+        }, in.renderFaults ).text.size();
         for( std::size_t i = 0; i < n; ++i )
         {
-            cost[i] = probeBodyCost( ing, g, bodyIds[i], compress, redact, wrapperLen, rootArg );
+            cost[i] = probeBodyCost( ing, g, bodyIds[i], in, wrapperLen );
         }
     }
     // reserve the measured wrapper cost PLUS kPackTaskWrapReserve's existing generous margin (digit-width
@@ -1081,7 +1408,8 @@ inline std::vector<NodeId> selectMonotoneBodySubset( const IngestResult& ing, co
 // PRE-budget-trim surface (a trimmed tail names slightly fewer) — an honest ceiling, documented as one.
 inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, const std::string& task,
                                        const LensRanking& lr, const PackTaskInputs& inArg,
-                                       std::string* jsonOut = nullptr, std::vector<NodeId>* surfaceOut = nullptr )
+                                       std::string* jsonOut = nullptr, std::vector<NodeId>* surfaceOut = nullptr,
+                                       std::size_t* testsKeptOut = nullptr, std::uint8_t* bodyReadingsOut = nullptr )
 {
     // P2.4 — reuse-count self-supply. --pack-task's CLI/MCP call-sites only compute fan-in when --for or
     // --metrics was ALSO given, so the bundle used to print in="0" on every row while --for reported the real
@@ -1090,9 +1418,12 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
     // `localFanIn` is declared BEFORE `in` so it outlives the pointer `in` holds into it.
     std::vector<std::uint32_t> localFanIn;
     PackTaskInputs             in = inArg;
+    PackTaskRenderFaults       renderFaults;   // every section render below records into it (see PackTaskRenderFaults)
+    in.renderFaults                   = &renderFaults;
     if( !in.fanIn ) { localFanIn = fanInFromInEdges( ing, g );  in.fanIn = &localFanIn; }
 
     const std::vector<float>& rank     = lr.rank;
+    in.calleeRank                      = &rank;   // this bundle HAS a query: its bodies' <calls> listings are cut by relevance, not by node id
     const int                 rankTopN = in.rankTopN > 0 ? int( in.rankTopN ) : kPackTaskRankTopN;
 
     // top ranked ids (score desc, id asc). Body candidates = the top heads with a POSITIVE score.
@@ -1174,7 +1505,11 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
     // one copy (test/routeoncecheck.sh pins it).
     const std::string mentionNote    = xmlCommentText( lr.mentionNote );
     const std::string boostNote      = xmlCommentText( lr.boostNote );
-    const std::string docMentionNote = xmlCommentText( lr.docMentionNote );
+    const std::string sibliftNote    = xmlCommentText( lr.sibliftNote );
+    const std::string expandNote     = xmlCommentText( lr.expandNote );
+    // …plus the indexing-cap clause, which rides the LAST note so it reads after the boosts it qualifies.
+    // "" on every run where no cap fired, and charged exactly here like every other user-length part.
+    const std::string docMentionNote = xmlCommentText( lr.docMentionNote + lr.capNote );
 
     // ── the deterministic byte budget (default 6K tokens; in.budgetTokens overrides) ────────────────────────
     const std::size_t budgetTokens = in.budgetTokens > 0 ? in.budgetTokens : std::size_t( kPackTaskDefaultTokens );
@@ -1189,7 +1524,7 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
     // trim knob of its own, so it belongs in the floor the section shares are divided under, exactly like the
     // header's own user-length parts. 0 for every caller that splices nothing.
     const std::size_t headerFloor = kPackTaskHeaderReserve + rootOpenStr.size() + taskNote.size()
-                                  + mentionNote.size() + boostNote.size() + docMentionNote.size()
+                                  + mentionNote.size() + boostNote.size() + sibliftNote.size() + expandNote.size() + docMentionNote.size()
                                   + in.trailingSectionBytes;
     std::size_t       remaining   = bundleBudget > headerFloor ? bundleBudget - headerFloor : 1;
 
@@ -1233,14 +1568,19 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
     std::string        bodiesStr;
     rw::EmittedBodies emittedBodies;
     const std::size_t  bodiesTotal = bodyIds.size();
+    // #60: candidates that have NO BODY BY CONSTRUCTION (a module-scope owner). They can never be `kept`,
+    // so without this the ledger below reads "kept 1 of 2 (capped)" and the roll reads "capped" on a bundle
+    // the budget did not cut — contradicting the <bodies capped="0" bodyless="1"> the same document emits.
+    const std::size_t  bodiesBodyless = countBodylessCandidates( ing, bodyIds );
     std::size_t        bodiesKept  = 0;
+    std::uint8_t       bodyReadings = 0;   // kBodyReading* bits the kept bodies carry: partition.h's outer-legend gate
 
     // ── section 3 — d1: the anchors' 1-hop callers+callees (computed above), each shown with its OWN one-line
     //    SIGNATURE (R2: d1's detail tier) + its declaration site — never a full body (that stays d0-only).
     const D1Rows d1Rendered = renderD1CallerRows( ing, d1, ex, in.redact, in.rootArg );
     const std::vector<std::string>& callerRows = d1Rendered.xml;
     const std::vector<std::string>& d1SigRaw   = d1Rendered.rawSig;   // unescaped — the L2 --json tail reuses these verbatim
-    char callersAttr[ 32 ];  std::snprintf( callersAttr, sizeof( callersAttr ), " of_top=\"%zu\"", bodiesTotal );
+    char callersAttr[ 32 ];  rw::formatTo( callersAttr, sizeof( callersAttr ), " of_top=\"{}\"", bodiesTotal );
     std::size_t       callersBudget = sectionBudget( kPackTaskQuotaCallersPct, carry );
     PackTaskSection   callers       = packTaskListSection( "callers", callersAttr, callerRows, callersBudget, kPackTaskWrapReserveWide );
     const std::size_t callersTotal  = callerRows.size();
@@ -1317,13 +1657,15 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
     remaining = remaining > notesRoll.charge ? remaining - notesRoll.charge : 0;
 
     // ── section 5 — tests_to_run for the top files (the --affected mining: tests that transitively reach) ───
-    std::vector<std::string>   testRows;
-    std::vector<std::uint32_t> testFiles;   // hoisted for the L2 --json tail below
+    std::vector<std::uint32_t>              testFiles;      // hoisted for the L2 --json tail below
+    std::vector<rw::TestRowOut>             ptRows;         // the seam's row values — one per test FILE, the unit the section cuts in
+    std::vector<std::vector<std::uint32_t>> testPartition;  // E1: the KEPT prefix's single/group partition, reused by the JSON tail so both dialects serve the same rows
+    std::size_t       testsBudget = sectionBudget( kPackTaskQuotaTestsPct, carry );
     {
         std::vector<NodeId> testSeeds;
         for( NodeId b : bodyIds )
         {
-            if( b < ing.symbols.size() && !rw::isTestPath( ing.files[ing.symbols[b].fileId] ) )
+            if( b < ing.symbols.size() && !rw::isTestPath( rw::rootRelPath( ing, ing.symbols[b].fileId ) ) )
             {
                 testSeeds.push_back( b );
             }
@@ -1332,34 +1674,39 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         {
             testSeeds = bodyIds;
         }
+        // DELIBERATELY NOT --affected's row set, and not testmap.h::affectedAnswerForFile. That answers
+        // "which tests cover this CHANGE"; the seeds here are the top-RANKED bodies of a task bundle, which
+        // is a different question: `changed=` is meaningless for them, and "partner of a ranked file" would
+        // be a claim nothing supports. The edit receipt was unified with --affected (2026-09-09) precisely
+        // because it DOES answer the same question and had drifted; this one must not be "fixed" to match.
+        // NOT a clean bill of health: the fallback above (testSeeds = bodyIds when every ranked body is
+        // itself a test) has the SAME reached-minus-seeds blind spot the receipt just lost — a test among
+        // the seeds cannot appear in its own reach. That is worth fixing on its own terms; it is the
+        // UNIFICATION that is refused here, not the defect.
         const std::vector<NodeId>  reach = transitiveCallers( g, testSeeds );
         std::vector<char>          fseen( ing.files.size(), 0 );
         for( NodeId n : reach )
         {
             const std::uint32_t f = ing.symbols[n].fileId;
-            if( f < fseen.size() && !fseen[f] && rw::isTestPath( ing.files[f] ) ) { fseen[f] = 1;  testFiles.push_back( f ); }
+            if( f < fseen.size() && !fseen[f] && rw::isTestPath( rw::rootRelPath( ing, f ) ) ) { fseen[f] = 1;  testFiles.push_back( f ); }
         }
         std::sort( testFiles.begin(), testFiles.end(), [ & ]( std::uint32_t a, std::uint32_t b ) { return ing.files[a] < ing.files[b]; } );
         // §A9.5 / §P11.4: the one-call bundle names the tests you owe; it now also names how to RUN them,
         // from the same TestRunnerIndex --affected / --situ / --test-gate / --exercises read. Built here,
         // inside the section's scope, because it is lazy — a bundle with no test row reads no runner script.
-        const rw::TestRunnerIndex runners( ing );
-        for( std::uint32_t f : testFiles )
+        // §B14 — std::string rows, not char[512]: a row carries TWO unbounded interpolands (the test path AND
+        // the runner command), so it was the widest of the six breaching sites.
+        const std::string ptPrefix = in.rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( in.rootArg );
+        ptRows = rw::testRowsOutOf( testFiles, [ & ]( std::uint32_t f ) -> std::string_view
         {
-            // §B14 — std::string, not char[512]. This row carried TWO unbounded interpolands (the test path
-            // AND the runner command), so it was the widest of the six breaching sites.
-            const std::string_view rp = in.rootArg.empty() ? std::string_view( ing.files[f] ) : rw::sarif::rootRelativeUri( ing.files[f], rw::sarif::rootPrefixOf( in.rootArg ) );
-            std::string row = "<test p=\"";
-            row += ex( rp );
-            row += "\"";
-            row += rw::runAttrDisclosed( runners, f, ex );
-            row += "/>";
-            testRows.emplace_back( std::move( row ) );
-        }
+            return in.rootArg.empty() ? std::string_view( ing.files[f] ) : rw::sarif::rootRelativeUri( ing.files[f], ptPrefix );
+        } );
     }
-    std::size_t       testsBudget = sectionBudget( kPackTaskQuotaTestsPct, carry );
-    PackTaskSection   tests       = packTaskListSection( "tests", "", testRows, testsBudget, kPackTaskWrapReserve );
-    const std::size_t testsTotal  = testRows.size();
+    // E1 / review of #214: the section cuts over its own GROUPED, ESCAPED rendering — see packTaskTestsSection
+    // above for the defect that forced it and for why a bisection answers it exactly.
+    const rw::TestRunnerIndex runners( ing, in.rootArg );   // A3: root-relative run=, same root the p= above are relative to
+    PackTaskSection   tests       = packTaskTestsSection( runners, ptRows, testsBudget, kPackTaskWrapReserve, ex, &testPartition );
+    const std::size_t testsTotal  = ptRows.size();
     const MonotoneRoll testsRoll  = monotoneRoll( tests.kept < testsTotal, testsBudget, tests.xml.size() );
     carry     = testsRoll.carry;
     remaining = remaining > testsRoll.charge ? remaining - testsRoll.charge : 0;
@@ -1379,17 +1726,36 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         // §H5: `emittedBodies` is packBodies' own report of what it emitted. It is the ONE answer to "which
         // bodies?" — the XML is those bytes, the JSON tail below re-serializes the same record, and bodiesKept
         // counts it.
-        const std::vector<NodeId> renderIds = selectMonotoneBodySubset( ing, g, bodyIds, bodiesBudget, in.compress, in.redact, in.rootArg );
-        bodiesStr  = packTaskRenderToString( [ & ]( std::FILE* m )
+        const std::vector<NodeId> renderIds = selectMonotoneBodySubset( ing, g, bodyIds, bodiesBudget, in );
+        const PackTaskRendered bodies = packTaskRender<PackTaskRenderFaults::DisclosureWhy::BodiesRenderFailed>( [ & ]( std::FILE* m )
         {
             packBodies( m, ing, renderIds, bodiesBudget, g.outOff, g.outTargets, in.compress, in.redact,
                         /*ranges=*/nullptr, /*noteIndex=*/nullptr, &emittedBodies, /*truncateOversizedFirst=*/true,
-                        /*withFileContext=*/false, in.rootArg );
-        } );
-        bodiesKept = emittedBodies.kept.size();
-        // §W2-K: restate total=/capped= and splice in omission markers for whatever OUR pre-selection
-        // dropped that packBodies itself never saw — see restatePackTaskBodiesWrapper's own comment.
-        bodiesStr  = restatePackTaskBodiesWrapper( ing, bodiesStr, bodyIds, emittedBodies, ex, in.compress );
+                        /*withFileContext=*/false, in.rootArg, in.calleeRank );
+        }, in.renderFaults );
+        if( bodies.ok )
+        {
+            bodiesKept = emittedBodies.kept.size();
+            // §W2-K: restate total=/capped= and splice in omission markers for whatever OUR pre-selection
+            // dropped that packBodies itself never saw — see restatePackTaskBodiesWrapper's own comment.
+            bodiesStr  = restatePackTaskBodiesWrapper( ing, bodies.text, bodyIds, emittedBodies, ex, in.compress );
+            for( const EmittedBody& e : emittedBodies.kept )
+            {
+                bodyReadings |= ( e.isTruncated ? kBodyReadingTruncated : 0u ) | ( e.isOverCeiling ? kBodyReadingOverCeiling : 0u );
+            }
+            if( bodyReadings != 0 && in.innerBundle )
+            {
+                hoistBodyReadings( bodiesStr );   // P10: a partition slice's readings ride the outer legend once
+            }
+        }
+        else
+        {
+            // Nothing was emitted, so nothing was kept: the JSON tail re-serializes this same (empty) record.
+            emittedBodies = EmittedBodies{};
+            char tag[ 112 ];
+            rw::formatTo( tag, sizeof( tag ), "<bodies shown=\"0\" total=\"{}\" render_failed=\"1\"></bodies>", bodyIds.size() );
+            bodiesStr = tag;
+        }
     }
     else
     {
@@ -1408,15 +1774,30 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         // back 5692 B against a 5428 B allowance). The bare wrapper tag is a FIXED, small cost — the
         // same shape restatePackTaskBodiesWrapper hand-formats a few lines below for the same reason
         // (it cannot call packBodies again either) — so it is safe to emit unconditionally here.
-        char tag[ 112 ];
-        std::snprintf( tag, sizeof( tag ), "<bodies shown=\"0\" total=\"%zu\" capped=\"%d\"%s></bodies>",
-                       bodyIds.size(), bodyIds.empty() ? 0 : 1, in.compress ? " compress=\"1\"" : "" );
+        //
+        // rv-t12-3.md LOW-1 / t14-cleanup #6: this tag used to omit bodyless= even when bodyIds held
+        // module-scope owners (no body by construction, never a budget casualty), which made TWO things
+        // wrong at once — the attribute was silently absent, AND capped="1" was a FALSE positive whenever
+        // every candidate here was bodyless (nothing was actually cut). bodiesBodyless is already computed
+        // above (line ~1546, countBodylessCandidates) for the monotoneRoll below, so it costs nothing extra
+        // to read it here too. The definition lives in kPackTaskBundleLegendBody (this bundle's ONE
+        // unconditional legend, appended to every shape of the header) rather than packBodies' own
+        // kBodylessBodiesLegend, because this path never calls packBodies to write that comment.
+        char bodylessAttr[ 40 ] = { 0 };
+        if( bodiesBodyless > 0 )
+        {
+            rw::formatTo( bodylessAttr, sizeof( bodylessAttr ), " bodyless=\"{}\"", bodiesBodyless );
+        }
+        char tag[ 160 ];
+        rw::formatTo( tag, sizeof( tag ), "<bodies shown=\"0\" total=\"{}\" capped=\"{}\"{}{}></bodies>",
+                       bodyIds.size(), bodiesBodyless < bodyIds.size() ? 1 : 0,
+                       rw::cstr( bodylessAttr ), in.compress ? " compress=\"1\"" : "" );
         bodiesStr = tag;
         // bodiesKept stays 0 (its declared default) — matches shown="0" exactly.
     }
     // §W2-K: bodyIds (the candidate SET) never depends on budgetTokens either, so the same monotoneRoll
     // treatment applies at this handoff too.
-    const MonotoneRoll bodiesRoll = monotoneRoll( bodiesKept < bodiesTotal, bodiesBudget, bodiesStr.size() );
+    const MonotoneRoll bodiesRoll = monotoneRoll( bodiesKept + bodiesBodyless < bodiesTotal, bodiesBudget, bodiesStr.size() );
     remaining = remaining > bodiesRoll.charge ? remaining - bodiesRoll.charge : 0;
 
     // ── §W2-K.2 (K2): the reflow lap — see reflowListSection above for the finding and the argument ──────────
@@ -1431,7 +1812,14 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
     }
     reflow = reflowListSection( callers, "callers", callersAttr, callerRows, callersBudget, kPackTaskWrapReserveWide, reflow );
     reflow = reflowListSection( notes,   "notes",   "",          noteEntries, notesBudget,   kPackTaskWrapReserve,     reflow );
-    reflow = reflowListSection( tests,   "tests",   "",          testRows,    testsBudget,   kPackTaskWrapReserve,     reflow );
+    // The tests section's own reflow lap — reflowListSection's rule (top up a section the first lap capped,
+    // once, and pass nothing further on) over packTaskTestsSection's cut. It is the LAST section to reflow, so
+    // its leftover goes nowhere and is not computed.
+    if( reflow > 0 && tests.kept < testsTotal )
+    {
+        testsBudget += reflow;
+        tests = packTaskTestsSection( runners, ptRows, testsBudget, kPackTaskWrapReserve, ex, &testPartition );
+    }
 
     const std::string& callersStr = callers.xml;
     const std::size_t  callersKept = callers.kept;
@@ -1479,6 +1867,8 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         {
             j += ",\"boost\":\"" + jsonStr( lr.boostNote ) + "\"";
         }
+        appendLiftJsonKeys( j, lr.sibliftNote, lr.expandNote );
+        j += lr.capJson;                       // the --json twin of the root cap attrs; "" unless a cap fired
         if( !lr.docMentionNote.empty() )
         {
             j += ",\"doc_mention\":\"" + jsonStr( lr.docMentionNote ) + "\"";
@@ -1497,12 +1887,12 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         // implies, which is what a consumer checks the bundle against; budget_bytes is the WORKING budget
         // after the headroom factor, and is always the smaller of the two. Same expression as the XML line
         // below, so the two serializations cannot report different ceilings.
-        { char b[ 128 ];  std::snprintf( b, sizeof( b ), ",\"budget_tokens\":%zu,\"budget_bytes\":%zu,\"budget_ceiling_bytes\":%zu",
-                                         budgetTokens, bundleBudget, std::size_t( double( budgetTokens ) * rw::kMinBytesPerToken ) );  j += b; }
+        { char b[ 128 ];  rw::formatTo( b, sizeof( b ), ",\"budget_tokens\":{},\"budget_bytes\":{},\"budget_ceiling_bytes\":{}",
+                                         budgetTokens, bundleBudget, rw::declaredByteCeiling( budgetTokens )  );  j += b; }
 
         // R2: the SAME distance mask the XML <sigs> used (eligibleIds only) — one eligibility decision, two shapes.
         j += std::string( ",\"ranking_capped\":" ) + ( sigsCapped ? "true" : "false" ) + ",\"ranking\":";
-        j += eligibleIds.empty() ? "[]" : packTaskRenderToString( [ & ]( std::FILE* m )
+        const PackTaskRendered rankingJson = eligibleIds.empty() ? PackTaskRendered{ "[]", true } : packTaskRender<PackTaskRenderFaults::DisclosureWhy::RankingRenderFailed>( [ & ]( std::FILE* m )
         {
             packSignaturesJson( m, ing, maskedRank, int( eligibleIds.size() ),
                                 JsonSigLens{ /*metrics=*/true, in.fanIn, in.impure, in.churn, &forClone,
@@ -1510,12 +1900,13 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
                                 in.redact,   // §B0: the same redaction the XML <sigs> above already applied
                                 /*budgetBytes=*/0, /*payloadBudgetBytes=*/0, /*outCapped=*/nullptr, /*outNotes=*/nullptr,
                                 in.rootArg );
-        } );
+        }, in.renderFaults );
+        j += rankingJson.ok ? rankingJson.text : std::string( "null" );   // null, never an empty value after its key
 
         // R2: d2plus — the topRanked members NOT within 1 hop of an anchor, name-only (mirrors XML's <far>).
         const std::size_t farShown = std::min( farKept, d2plusIds.size() );
-        { char b[ 128 ];  std::snprintf( b, sizeof( b ), ",\"far_total\":%zu,\"far_kept\":%zu,\"far_of_top\":%zu,\"far\":[",
-                                         farTotal, farShown, topRanked.size() );  j += b; }
+        { char b[ 128 ];  rw::formatTo( b, sizeof( b ), ",\"far_total\":{},\"far_kept\":{},\"far_of_top\":{},\"far\":[",
+                                         farTotal, farShown, topRanked.size()  );  j += b; }
         for( std::size_t i = 0; i < farShown; ++i )
         {
             const Symbol& s = ing.symbols[ d2plusIds[i] ];
@@ -1530,14 +1921,20 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         // the two dialects reported different SETS under one bodies_kept — and packBodiesJson emitted each body
         // WHOLE, against no budget at all (MEASURED: XML 8 100 B vs JSON 42 200 B under a stated 11 800 B
         // ceiling). Both halves are gone by construction: there is one selection, and this is its record.
-        { char b[ 96 ];  std::snprintf( b, sizeof( b ), ",\"bodies_total\":%zu,\"bodies_kept\":%zu,\"bodies\":",
-                                        bodiesTotal, emittedBodies.kept.size() );  j += b; }
-        j += packTaskRenderToString( [ & ]( std::FILE* m ) { packBodiesJson( m, ing, emittedBodies, in.rootArg ); } );
+        { char b[ 96 ];  rw::formatTo( b, sizeof( b ), ",\"bodies_total\":{},\"bodies_kept\":{},\"bodies\":",
+                                        bodiesTotal, emittedBodies.kept.size()  );  j += b; }
+        const PackTaskRendered bodiesJson = packTaskRender<PackTaskRenderFaults::DisclosureWhy::BodiesRenderFailed>( [ & ]( std::FILE* m ) { packBodiesJson( m, ing, emittedBodies, in.rootArg ); },
+                                                            in.renderFaults );
+        j += bodiesJson.ok && !renderFaults.hasFailed( PackTaskRenderFaults::DisclosureWhy::BodiesRenderFailed ) ? bodiesJson.text : std::string( "null" );
         j += packTaskOmittedBodiesJson( ing, emittedBodies );   // §H5 — see its header
+        if( renderFaults.failedMask != 0 )
+        {
+            j += ",\"render_failed\":\"" + renderFaults.names() + "\"";   // the sections a null above stands for, and any failed probe
+        }
 
         const std::size_t callersShown = std::min( callersKept, d1.ids.size() );
-        { char b[ 128 ];  std::snprintf( b, sizeof( b ), ",\"callers_total\":%zu,\"callers_kept\":%zu,\"callers_of_top\":%zu,\"callers\":[",
-                                         callersTotal, callersShown, bodiesTotal );  j += b; }
+        { char b[ 128 ];  rw::formatTo( b, sizeof( b ), ",\"callers_total\":{},\"callers_kept\":{},\"callers_of_top\":{},\"callers\":[",
+                                         callersTotal, callersShown, bodiesTotal  );  j += b; }
         for( std::size_t i = 0; i < callersShown; ++i )
         {
             const Symbol& s = ing.symbols[ d1.ids[i] ];
@@ -1558,7 +1955,7 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         j += "]";
 
         const std::size_t notesShown = std::min( notesKept, noteEntriesData.size() );
-        { char b[ 96 ];  std::snprintf( b, sizeof( b ), ",\"notes_total\":%zu,\"notes_kept\":%zu,\"notes\":[", notesTotal, notesShown );  j += b; }
+        { char b[ 96 ];  rw::formatTo( b, sizeof( b ), ",\"notes_total\":{},\"notes_kept\":{},\"notes\":[", notesTotal, notesShown );  j += b; }
         for( std::size_t i = 0; i < notesShown; ++i )
         {
             j += ( i == 0 ? "" : "," );
@@ -1571,17 +1968,27 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
             j += "]}";
         }
         j += "]";
+        // L3 follow-up (CodeRabbit 4053600616): the JSON twin of the XML root's notes_degraded= — absent on a
+        // clean read, same condition droppedPositiveAttr above tests.
+        if( in.notesDegraded )
+        {
+            j += std::string( notes::kNotesDegradedJsonKey );
+        }
 
-        const std::size_t testsShown = std::min( testsKept, testFiles.size() );
-        { char b[ 96 ];  std::snprintf( b, sizeof( b ), ",\"tests_total\":%zu,\"tests_kept\":%zu,\"tests_to_run\":[", testsTotal, testsShown );  j += b; }
+        // E1: tests_total/tests_kept count test FILES exactly as the XML section's total=/shown= do — one entry
+        // per file on both sides of the cut. The JSON tail renders the SAME kept prefix through the SAME
+        // partition the XML body was grouped by, so the two dialects cannot list different rows.
+        { char b[ 96 ];  rw::formatTo( b, sizeof( b ), ",\"tests_total\":{},\"tests_kept\":{},\"tests_to_run\":[", testsTotal, testsKept );  j += b; }
         // §A9.5: the JSON sibling of the XML run= above — situ's tests_to_run already carries it, and one
         // computation path must not serialize two different obligations.
-        const rw::TestRunnerIndex jsonRunners( ing );
-        const auto                 jrun = [ & ]( std::string_view s ) { return jsonStr( s ); };
-        for( std::size_t i = 0; i < testsShown; ++i )
+        const rw::TestRunnerIndex   jsonRunners( ing, in.rootArg );
+        const auto                  jrun = [ & ]( std::string_view s ) { return jsonStr( s ); };
+        const std::vector<rw::TestRowOut> jKeptRows = rw::testRowsOutOf( std::span( testFiles ).first( std::min( testsKept, testFiles.size() ) ), jPathRel );
+        bool jFirstTest = true;
+        for( const rw::RenderedTestRow& r : rw::testRowsRendered( jsonRunners, jKeptRows, rw::TestRowShape{ rw::RowDialect::Json, "p" }, jrun, &testPartition ) )
         {
-            j += std::string( i == 0 ? "" : "," ) + "{\"p\":\"" + jsonStr( std::string( jPathRel( testFiles[i] ) ) ) + "\""
-               + rw::runFieldJsonDisclosed( jsonRunners, testFiles[i], jrun ) + "}";
+            j += std::string( jFirstTest ? "" : "," ) + r.text;
+            jFirstTest = false;
         }
         j += "]";
 
@@ -1603,18 +2010,25 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
         char b[ 64 ];
         if( total == 0 )       { return "none"; }
         if( body.empty() )     { return "omitted (budget)"; }
-        std::snprintf( b, sizeof( b ), kept < total ? "kept %zu of %zu" : "%zu of %zu", kept, total );
+        // Split from a ternary over two format strings: std::format_string is consteval, so each format
+        // has to be a literal at its own call site. Same bytes on both branches.
+        if( kept < total ) { rw::formatTo( b, sizeof( b ), "kept {} of {}", kept, total ); }
+        else               { rw::formatTo( b, sizeof( b ), "{} of {}", kept, total ); }
         return b;
     };
     std::string report = "budget=";
-    { char b[ 160 ];  std::snprintf( b, sizeof( b ), "%zu bytes (%zu-token target, ceiling %zu) | ",
-                                    bundleBudget, budgetTokens, std::size_t( double( budgetTokens ) * rw::kMinBytesPerToken ) );  report += b; }
-    report += std::string( "ranking: " ) + ( sigsCapped ? "capped" : "full" ) + " | ";
-    report += "bodies: "  + listStatus( bodiesTotal,  bodiesStr,  bodiesKept )  + ( bodiesTotal > 0 && !bodiesStr.empty() && bodiesKept < bodiesTotal ? " (capped)" : "" ) + " | ";
+    { char b[ 160 ];  rw::formatTo( b, sizeof( b ), "{} bytes ({}-token target, ceiling {}) | ",
+                                    bundleBudget, budgetTokens, rw::declaredByteCeiling( budgetTokens )  );  report += b; }
+    const bool isRankingFailed = renderFaults.hasFailed( PackTaskRenderFaults::DisclosureWhy::RankingRenderFailed );
+    report += std::string( "ranking: " ) + ( isRankingFailed ? "render-failed" : sigsCapped ? "capped" : "full" ) + " | ";
+    report += "bodies: "  + listStatus( bodiesTotal,  bodiesStr,  bodiesKept )  + ( bodiesTotal > 0 && !bodiesStr.empty() && bodiesKept + bodiesBodyless < bodiesTotal ? " (capped)" : "" ) + " | ";
     report += "callers: " + listStatus( callersTotal, callersStr, callersKept ) + " | ";
     report += "notes: "   + listStatus( notesTotal,   notesStr,   notesKept )   + " | ";
-    report += "tests: "   + listStatus( testsTotal,   testsStr,   testsKept );
+    report += "tests: "   + listStatus( testsTotal, testsStr, testsKept );   // E1: test files, as the section's shown=/total= say
     report += " | far: "  + listStatus( farTotal,      rankOut.farXml, farKept );   // R2: d2plus name-only tier (nested in <sigs>)
+    // cut-fix lane A: the <sigs> tag's cut readings, the --for twin's clauses verbatim (serialize.h sigsCutLegendNotes),
+    // present only when the tag carries the case; absorbed by kPackTaskHeaderReserve like the ledger around them.
+    report += rw::sigsCutLegendNotes( rankOut.sigsCut.isCapped, rankOut.sigsCut.shown, rankOut.sigsCut.total, rankOut.sigsCut.docsDropped );
     // A2 (survey card, 2026-09-03) — the pack-task twin of --for's dropped_positive= root fact: how many
     // rank>0 eligibleIds the section-1 ladder cut. Emitted ONLY when nonzero (the pr_converged precedent,
     // src/prconverge.h) — its bytes are absorbed by kPackTaskHeaderReserve's generous fixed allowance (see
@@ -1633,12 +2047,42 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
     std::string droppedPositiveAttr;
     if( rankOut.droppedPositive > 0 )
     {
-        char b[ 96 ];  std::snprintf( b, sizeof( b ), " dropped_positive=\"%zu\"", rankOut.droppedPositive );
+        char b[ 96 ];  rw::formatTo( b, sizeof( b ), " dropped_positive=\"{}\"", rankOut.droppedPositive );
         droppedPositiveAttr = b;
     }
+    // The indexing caps that cut this ranking belong on the root as ATTRIBUTES, not only inside the prose
+    // note at line 1226. --pack-task is the agent-facing bundle: a human reading the XML comment saw
+    // lr.capNote and an agent parsing attributes saw nothing, which is backwards for who consumes this.
+    // Appending here rather than at each buildHeader site is deliberate -- this string is what
+    // appendPackTaskRootExtras splices, so the partition-slice root (in.innerBundle) inherits it too, the
+    // same way M1 gave that path dropped_positive=. Same attribute names as the --for and MCP twins, so
+    // mcpattrparitycheck still sees one spelling on every root.
+    droppedPositiveAttr += lr.capAttrs;
+    if( renderFaults.failedMask != 0 )
+    {
+        // Not a budget fact: these sections' renders FAILED. Marked on the root (and on the section element itself),
+        // with the clause that defines it riding the ledger, so an empty section never reads as an omission.
+        droppedPositiveAttr += " render_failed=\"" + renderFaults.names() + "\"";
+        report += " | render_failed= names sections whose render FAILED (the section is empty and marked render_failed=\"1\"; "
+                  "not a budget omission; body-probe = a body priced out because its cost could not be measured)";
+    }
+    // L3 follow-up (CodeRabbit 4053600616): notes.h's ONE marker, spelled identically on every notes-surfacing
+    // emitter — absent on a clean read (no sidecar, or every line parsed), so the L3 inertness contract holds.
+    if( in.notesDegraded )
+    {
+        droppedPositiveAttr += std::string( notes::kNotesDegradedAttr );
+        report += " | ";  report += notes::kNotesDegradedReading;
+    }
 
+    // The clause is now BUILT (the root-relative sentence is conditional, so the seam composes a string
+    // rather than handing back one of two constants), and PackTaskHeaderParts holds VIEWS — so it is owned
+    // by a named local here, like report and droppedPositiveAttr above it. Binding the view straight to the
+    // returned temporary is a dangling read the moment the full expression ends, and it showed as exactly
+    // that: packtaskcheck's bundle was both malformed and non-deterministic (two runs, two sha256s).
+    const std::string runClauseStr = rw::runHintClauseIfRows( tests.kept, rw::runsAreRootRelative( ing, in.rootArg ) );   // the ONE gate: the section's own kept count
     const PackTaskHeaderParts headerParts{ task, rootOpenStr, taskNote, mentionNote, boostNote,
-                                            docMentionNote, report, droppedPositiveAttr, in.rootArg };
+                                            docMentionNote, sibliftNote, expandNote, report, droppedPositiveAttr, in.rootArg,
+                                            runClauseStr };
     const auto buildHeader = [ & ]( bool withRouteAttr, bool withTaskEcho, std::string_view extraNotes )
     {
         if( in.innerBundle )   // P10 (L7): a partition slice — the outer <ctx-partitions> legend speaks once for all of them
@@ -1703,24 +2147,81 @@ inline std::string packTaskBundleText( const IngestResult& ing, const Graph& g, 
             std::string       attrs       = rw::pricedRootAttr( markupBytes, rw::kBytesPerTokenDefault, bodiesStr.size(), &estTokens );
             attrs += " budget_tokens=\"" + std::to_string( budgetTokens ) + "\"";
             if( lastRungFired || ( budgetTokens > 0 && estTokens > budgetTokens ) ) { attrs += " over_ceiling=\"1\""; }
+            if( in.isTrailingUncharged ) { attrs += " est_measured=\"0\""; }   // defined by the comment spliced in below
             return attrs;
         };
-        const std::size_t rootAttrsBound = rootAttrsFor( whole, /*lastRungFired=*/true ).size();
-        const std::string chosen = climbCeilingLadder( buildHeader, headerStr,
-                                                       whole.size() - headerStr.size() + in.trailingSectionBytes + rootAttrsBound,
-                                                       rw::ceilingAllowanceBytes( budgetTokens ),
-                                                       /*hasRouteAttr=*/!lr.routeNote.empty(), kNotes );
-        if( chosen != headerStr )
+        const std::size_t             rootAttrsBound = rootAttrsFor( whole, /*lastRungFired=*/true ).size();
+        // L1 fix round: under the compact posture a rung fits when the DELIVERED document does — the candidate header plus
+        // the rendered sections, its widest root attributes spliced, compacted by the layer that will print it.
+        const std::string restOfWhole = in.compactLegend ? whole.substr( headerStr.size() ) : std::string();
+        const auto deliveredFits = [ & ]( std::size_t ceiling )
         {
-            whole.replace( 0, headerStr.size(), chosen );
+            return [ &, ceiling ]( std::string_view header )
+            {
+                std::string candidate = std::string( header ) + restOfWhole;
+                rw::spliceRootAttrs( candidate, rootAttrsFor( candidate, /*lastRungFired=*/true ) );
+                const std::size_t delivered = rw::compactDeliveredBytes( candidate, "pack-task" );
+                return ( delivered > 0 ? delivered : candidate.size() ) + in.trailingSectionBytes <= ceiling;
+            };
+        };
+        // The FREE rung (drop the task echo) buys nothing here: the echo lives in prose the compact layer never delivers, so
+        // judging the as-built header at the exact ceiling would take a rung whose note claims a drop the reader cannot
+        // see. Under the compact posture the as-built answer stands when it fits the allowance; route= (a delivered root
+        // attribute) and the over_ceiling rung keep their meaning (compactlegendcheck (FX4)).
+        const rw::CeilingLadderChoice chosen = in.compactLegend && !in.innerBundle
+            ? rw::climbCeilingLadderBy( buildHeader, headerStr, deliveredFits( rw::ceilingAllowanceBytes( budgetTokens ) ),
+                                        deliveredFits( rw::ceilingAllowanceBytes( budgetTokens ) ), /*hasRouteAttr=*/!lr.routeNote.empty(), kNotes )
+            : climbCeilingLadder( buildHeader, headerStr,
+                                                                   whole.size() - headerStr.size() + in.trailingSectionBytes + rootAttrsBound,
+                                                                   // TWO CEILINGS (PR #215 review item 1). This root labels itself
+                                                                   // over_ceiling="1" on `estTokens > budgetTokens` — priced at
+                                                                   // kBytesPerTokenDefault — while every rung was judged at
+                                                                   // kMinBytesPerToken x 1.15, so this lens had --for's defect in the
+                                                                   // same words: a bundle whose root will say it overflowed kept its
+                                                                   // verbatim task echo because the echo rung was against a ceiling
+                                                                   // 15% looser than the verdict. The free rungs now aim at what the
+                                                                   // root promises; route= and the label keep the tolerance.
+                                                                   rw::ceilingBytes( budgetTokens ),
+                                                                   rw::ceilingAllowanceBytes( budgetTokens ),
+                                                                   /*hasRouteAttr=*/!lr.routeNote.empty(), kNotes );
+        if( chosen.header != headerStr )
+        {
+            whole.replace( 0, headerStr.size(), chosen.header );
         }
-        // the ladder's LAST rung is the only text that spells the marker with a colon (kNotes above); the
-        // legend's own definition of over_ceiling= must never read as the label (bundleidcheck trap #15)
-        rw::spliceRootAttrs( whole, rootAttrsFor( whole, chosen.find( "over_ceiling:" ) != std::string::npos ) );
+        // M3 (0.6.1): the rung ARRIVES, and is never recovered from the chosen text. This read
+        // `chosen.find( "over_ceiling:" ) != npos` — the marker word from kNotes, 13 characters, searched for in
+        // a header that echoes the caller's task VERBATIM by contract. So `--token-budget=100000
+        // --pack-task='why does over_ceiling: fire on this root'` shipped `est_tokens="11329"
+        // budget_tokens="100000" over_ceiling="1"`: a root labelled over a ceiling it states itself to be 9x
+        // inside, decided by the caller's own words. The same task without the colon carried no label, which is
+        // what makes it a forgery rather than a coincidence. --for had this defect and had it fixed; this lens
+        // shared the ladder and kept it, because the fixed-payload wrapper returned only a string. It returns the
+        // rung now (serialize.h CeilingLadderChoice). The token comparison beside it is unchanged and is still
+        // what labels an honest overshoot the ladder did not fire on. Gate: test/ceilingverdictcheck.sh (6)-(8).
+        rw::spliceRootAttrs( whole, rootAttrsFor( whole, chosen.rung == rw::CeilingRung::OverCeiling ) );
+        if( in.isTrailingUncharged )
+        {
+            // est_measured= is defined where it is met: the clause rides first inside the root it qualifies
+            const std::size_t rootOpenEnd = whole.find( '>', whole.find( "<ctx" ) );
+            ASSUME( rootOpenEnd != std::string::npos );   // this function composed the <ctx …> start tag itself, above
+            whole.insert( rootOpenEnd + 1, rw::kEstModelledLegend );
+        }
     }
 
     // §6 --partition: the bundle's own surface (see the contract above). topRanked already contains bodyIds
     // (bodies are the positive-score head of the SAME order), so the union is topRanked ∪ d2plus ∪ d1.
+    // E1 / review of #214: the number of test FILES this bundle's <tests> section actually kept. A caller
+    // that must gate the run-hint clause for SEVERAL bundles at once (partition.h's outer legend) needs the
+    // count, not a substring search over the rendered bytes — `<tests ` occurs in this document's own legend
+    // and can occur inside a CDATA body, and a grep for it charged the clause with zero rows.
+    if( testsKeptOut )
+    {
+        *testsKeptOut = testsKept;
+    }
+    if( bodyReadingsOut )
+    {
+        *bodyReadingsOut = bodyReadings;   // lane/cutfix-bodies: the same report-not-grep rule, for the body readings
+    }
     if( surfaceOut )
     {
         surfaceOut->clear();

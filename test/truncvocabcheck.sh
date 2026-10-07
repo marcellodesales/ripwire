@@ -45,7 +45,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -77,13 +77,15 @@ run(){ "$BIN" "$@" 2>/dev/null; }
 # ---------------------------------------------------------------------------------------------------
 cap(){ local name="$1"; shift; run "$@" > "$TMP/sweep_$name.xml"; [ -s "$TMP/sweep_$name.xml" ] || rm -f "$TMP/sweep_$name.xml"; }
 
-cap communities   "$BIG" --communities
+# L1 (2026-09-19): the CLI default legend is compact and spells row shapes (<community <bridge <s <x <seam) inside its
+# comment; the (B)/(C) arithmetic arms count real rows, so the captures they read ask for --legend=full.
+cap communities   "$BIG" --communities --legend=full
 cap seams         "$ROOT" --seams
 cap query         "$BIG" --graph-query='kind(all,fn)'
-cap query_small   "$BIG" --graph-query='kind(all,fn)' --top-k=3
-cap impact        "$BIG" --impact=escapeXml
+cap query_small   "$BIG" --graph-query='kind(all,fn)' --top-k=3 --legend=full
+cap impact        "$BIG" --impact=escapeXml --legend=full
 cap extsurface    "$BIG" --external-surface
-cap extsurface_n  "$BIG" --external-surface --pack-top-n=2
+cap extsurface_n  "$BIG" --external-surface --pack-top-n=2 --legend=full
 cap grep          "$BIG" --grep=capped
 cap match         "$BIG" --match='(call_expression)'
 cap lint          "$BIG" --lint
@@ -208,7 +210,7 @@ while [ $i -lt 25 ]; do
     printf 'int callee%d( int x );\nint caller%d( int x ) { return callee%d( x ); }\n' "$i" "$i" "$i" > "$SEAMSRC/m$i/a.c"
     i=$(( i + 1 ))
 done
-run "$SEAMSRC" --seams > "$TMP/seams_big.xml"
+run "$SEAMSRC" --seams --legend=full > "$TMP/seams_big.xml"
 truncated "$TMP/seams_big.xml" seams seam_pairs shown capped seam "(B) --seams"
 
 # ---------------------------------------------------------------------------------------------------
@@ -284,10 +286,10 @@ untruncated(){
     fi
 }
 
-run "$TINY" --communities                    > "$TMP/tiny_communities.xml"
-run "$TINY" --graph-query='kind(all,fn)'     > "$TMP/tiny_query.xml"
-run "$TINY" --impact=leafOne                 > "$TMP/tiny_impact.xml"
-run "$TINY" --external-surface               > "$TMP/tiny_ext.xml"
+run "$TINY" --communities --legend=full      > "$TMP/tiny_communities.xml"
+run "$TINY" --graph-query='kind(all,fn)' --legend=full > "$TMP/tiny_query.xml"
+run "$TINY" --impact=leafOne --legend=full   > "$TMP/tiny_impact.xml"
+run "$TINY" --external-surface --legend=full > "$TMP/tiny_ext.xml"
 # The untruncated --seams case used to point at "$ROOT" on the assumption that this repo sits under the
 # 20-pair cap. That is a property of the tree, not of the tool, and it stopped holding the moment the
 # source layout grew another directory — the gate then reported a FALSE truncation alarm about itself.
@@ -301,7 +303,7 @@ while [ $i -lt 3 ]; do
     printf 'int callee%d( int x );\nint caller%d( int x ) { return callee%d( x ); }\n' "$i" "$i" "$i" > "$SEAMSMALL/m$i/a.c"
     i=$(( i + 1 ))
 done
-run "$SEAMSMALL" --seams                     > "$TMP/tiny_seams.xml"
+run "$SEAMSMALL" --seams --legend=full       > "$TMP/tiny_seams.xml"
 
 untruncated "$TMP/tiny_communities.xml" communities      shown_modules modules_capped community "(C) --communities modules"
 untruncated "$TMP/tiny_query.xml"       query            shown         capped         s         "(C) --graph-query"
@@ -410,7 +412,10 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "sweep_*.xml"))):
         if a["shown"] != str(rows):
             problems.append(f'{name}: <{tag} shown="{a["shown"]}"> but {rows} <{ROSTER[tag]}> rows emitted')
         try:
-            if (a["capped"] == "1") != (int(a["shown"]) < int(a["total"])):
+            # a <bodies> whose rows are all present but one is CUT (<b truncated="1">, lane/cutfix-bodies) is cut
+            # too: capped="1" with shown == total, the same reading as the lens <sigs> "rows shrunk, none dropped".
+            shrunk = tag == "bodies" and any(b.get("truncated") == "1" for b in el.findall("b"))
+            if (a["capped"] == "1") != (int(a["shown"]) < int(a["total"]) or shrunk):
                 problems.append(f'{name}: <{tag} shown={a["shown"]} total={a["total"]} '
                                 f'capped="{a["capped"]}"> — the bit contradicts the arithmetic')
         except ValueError:
@@ -490,7 +495,7 @@ if command -v xmllint >/dev/null 2>&1; then
         [ -s "$f" ] || continue
         xmllint --noout "$f" 2>/dev/null || bad="$bad $( basename "$f" )"
     done
-    [ -z "$bad" ] && ok "G4: every swept document is xmllint-clean" || no "G4: malformed XML from:$bad"
+    if [ -z "$bad" ]; then ok "G4: every swept document is xmllint-clean"; else no "G4: malformed XML from:$bad"; fi
 else
     ok "G4: xmllint unavailable (skipped)"
 fi

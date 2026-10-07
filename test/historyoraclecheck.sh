@@ -24,11 +24,12 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -116,7 +117,7 @@ grep -q '<history ' "$TMP/plain" \
 # ── 2) WITH the flag: the two names separate ──────────────────────────────────────────────────────────
 TMPDIR="$C1" "$BIN" "$R" --doc-drift --with-history --detail=999 >"$TMP/hist" 2>/dev/null
 rc=$?
-[ "$rc" = "0" ] && ok "--doc-drift --with-history exits 0 (a report, not a gate)" || no "exited $rc, expected 0"
+if [ "$rc" = "0" ]; then ok "--doc-drift --with-history exits 0 (a report, not a gate)"; else no "exited $rc, expected 0"; fi
 
 rows "$TMP/hist" | grep -q "why=\"deleted\" ref=\"vanishedContourWalker\" got=\"removed in $DEL_SHA " \
     && ok "vanishedContourWalker -> why=\"deleted\", naming the commit that removed it ($DEL_SHA)" \
@@ -213,7 +214,7 @@ grep -q '<fate ' "$TMP/w3" \
 C4="$TMP/t4"; mkdir -p "$C4"
 TMPDIR="$C4" "$BIN" "$R" --whereis=vanishedContourWalker --with-history >"$TMP/wc" 2>/dev/null
 TMPDIR="$C4" "$BIN" "$R" --whereis=vanishedContourWalker --with-history >"$TMP/ww" 2>/dev/null
-cmp -s "$TMP/wc" "$TMP/ww" && ok "whereis: warm == cold, byte-identical" || no "whereis warm/cold disagree"
+if cmp -s "$TMP/wc" "$TMP/ww"; then ok "whereis: warm == cold, byte-identical"; else no "whereis warm/cold disagree"; fi
 
 # ONE blob serves both verbs: doc-drift built it above in t2; whereis must not write a second family member.
 nblob="$( find "$C4" -name 'ripwire-qhist-*.bin' | wc -l | tr -d ' ' )"
@@ -236,12 +237,12 @@ rows "$TMP/nogit" | grep -q 'why="undefined"' \
 
 # ── 7) G4: well-formed, minified XML for both verbs under the flag ────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/hist" 2>/dev/null && ok "doc-drift --with-history XML well-formed" || no "doc-drift --with-history XML malformed"
-    xmllint --noout "$TMP/w1"   2>/dev/null && ok "whereis --with-history XML well-formed"   || no "whereis --with-history XML malformed"
+    if xmllint --noout "$TMP/hist" 2>/dev/null; then ok "doc-drift --with-history XML well-formed"; else no "doc-drift --with-history XML malformed"; fi
+    if xmllint --noout "$TMP/w1"   2>/dev/null; then ok "whereis --with-history XML well-formed"; else no "whereis --with-history XML malformed"; fi
 else
     ok "xmllint unavailable — well-formedness skipped"
 fi
-[ "$( grep -c '' "$TMP/hist" )" -le 1 ] && ok "output is minified (no stray newlines)" || no "output contains newlines outside CDATA"
+if [ "$( grep -c '' "$TMP/hist" )" -le 1 ]; then ok "output is minified (no stray newlines)"; else no "output contains newlines outside CDATA"; fi
 
 # ── 8) L10: a symbol still on HEAD must never carry <fate v="removed"> ─────────────────────────────────
 # The oracle's line-removal walk cannot tell "the SYMBOL left" from "a DOC QUOTING the symbol left" — both
@@ -270,7 +271,9 @@ rm "$R2/docs_capture.md"
 git -C "$R2" commit -qam "drop the stale capture doc (the helper itself is untouched)"
 
 C6="$TMP/t6"; mkdir -p "$C6"
-TMPDIR="$C6" "$BIN" "$R2" --whereis=stableOnHeadHelper --with-history >"$TMP/w4" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; L10b reads the FULL legend's prose off w4 (and its w5 negative control
+# must be the same posture to mean anything), so both runs ask for it.
+TMPDIR="$C6" "$BIN" "$R2" --whereis=stableOnHeadHelper --with-history --legend=full >"$TMP/w4" 2>/dev/null
 grep -q 'on-head="1"' "$TMP/w4" \
     && ok "L10 fixture sanity: stableOnHeadHelper is on-head=1 (it is still defined in relief.h)" \
     || { no "L10 fixture broken: expected on-head=1"; cat "$TMP/w4"; }
@@ -289,7 +292,7 @@ grep -q 'head_labels="lexical"' "$TMP/w1" \
     || { no "L10 regression check: expected head_labels=\"lexical\" on the PLAN-doc-only fixture"; cat "$TMP/w1"; }
 
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/w4" 2>/dev/null && ok "L10 fixture: whereis --with-history XML well-formed" || no "L10 fixture: whereis --with-history XML malformed"
+    if xmllint --noout "$TMP/w4" 2>/dev/null; then ok "L10 fixture: whereis --with-history XML well-formed"; else no "L10 fixture: whereis --with-history XML malformed"; fi
 fi
 
 # ── §L10b LOW tail: the <history> element's own attributes (probed=/commits=/removed-names=/truncated=)
@@ -299,7 +302,7 @@ fi
 grep -q 'history probed="1" means the git-log name-history walk ran' "$TMP/w4" \
     && ok "L10b: --whereis --with-history legend now DEFINES the <history> element" \
     || no "L10b: --whereis --with-history legend still does not define <history>"
-"$BIN" "$R2" --whereis=stableOnHeadHelper >"$TMP/w5" 2>/dev/null
+"$BIN" "$R2" --whereis=stableOnHeadHelper --legend=full >"$TMP/w5" 2>/dev/null
 grep -q 'history probed="1" means' "$TMP/w5" \
     && no "L10b: plain --whereis (no --with-history) carries the <history> legend clause it has no element for" \
     || ok "L10b: plain --whereis pays nothing for the <history> clause (no --with-history, no <history> element either)"

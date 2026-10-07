@@ -1,4 +1,6 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // lexical.h — subtoken (camelCase / snake_case) BM25 over symbols, for `--query` / `--for` retrieval.
 // The eval-at-scale showed lexical name-overlap beats pure graph structure for "find related code", so the
@@ -7,27 +9,34 @@
 // and BODY text, so a query matches code by what it DOES, not just what it's named. Deterministic.
 
 #include "model.h"
+#include "elixir_resolve.h"      // elixirBaseName — the arity-less spelling of an Elixir `name/N`, a second whole-name token for the name-exact lane
+#include "docparse.h"            // detail::readWholeFile — THE canonical whole-file byte read (P2-4); never re-rolled
 #include "lexindex.h"            // B0: the ONE subtoken state machine + docCommentStart + persisted-stats types
 #include "sarif.h"               // rootRelativeUri — the ONE root-relative path view, included directly
                                  // rather than reached transitively (recall.h gets it via serialize.h)
                                  // because pass 1.5 SCORES the string recall.h PRINTS. A pure path helper
                                  // over model.h despite the header's name: no cycle.
 #include "infra/profileScope.h"  // PROFILE_SCOPE self-profiling — gated by PROFILE_ENABLED (off unless -DRIPWIRE_PROFILE=ON)
+#include "infra/strkern.h"      // Byteset256 — the head set below is that type, not a second bitmap
 #include "infra/sortutil.h"      // deterministic sanitizer-clean score sorting for adaptive cuts
+#include "infra/namesplit.h"     // hasIdentifierShape — the ONE camel/snake predicate chooseForRanker shares with mention.h
+#include "infra/charconvcompat.h" // rw::parseFloating — envKnob's full-token finite parse of a RIPWIRE_* knob
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <functional>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace rw
@@ -69,6 +78,46 @@ inline void subtokens( std::string_view id, std::vector<std::string>& out )
         out.push_back( std::move( tok ) );
     } );
 }
+
+// ── L-W (routing-loop round 2026-09-12): what the BM25 pass saw, read back out ──────────────────────────
+// Per symbol, which of the query's unique terms it matched, and per term, how many symbols matched it — the
+// integers lexicalScoresTiered accumulates anyway, exposed rather than re-derived by a second tokenizer that
+// could drift from this one. Read by forpage.h (coverage= on the --for root; the --for --limit=N file page).
+// Filled only when a caller passes it; a null caller's scores are byte-identical to before the parameter.
+//   terms[u]    the u-th unique query term (the tf row it owns after the LB-3 fold)
+//   df[u]       symbols with tf > 0 for terms[u] in any field — the document frequency the idf reads
+//   nameMask    per symbol, bit u set iff its NAME field alone carried terms[u] (captured inside pass 1,
+//               before the callee-name, path, doc and body fields land in the same row)
+//   anyMask     per symbol, bit u set iff it carried terms[u] in any field (the final row, after the fold)
+// Masks are maskWords 64-bit words per symbol (maskWords = ceil(terms/64)): a pasted stack trace with a
+// hundred unique terms is tracked in full, nothing silently dropped from the share.
+struct LexTermEvidence
+{
+    std::vector<std::string>   terms;
+    std::vector<std::uint32_t> df;
+    std::vector<std::uint64_t> nameMask;   // symbolCount × maskWords
+    std::vector<std::uint64_t> anyMask;    // symbolCount × maskWords
+    std::size_t                maskWords   = 0;
+    std::size_t                symbolCount = 0;
+
+    // input blow-up disclosure (dedupeQueryTerms / kMaxUniqueQueryTerms): terms.size() is the KEPT unique
+    // term count; termsSeenTotal is every distinct term the query actually contained. Equal unless the
+    // query was capped, in which case termsCapped is true and terms.size() < termsSeenTotal — the header
+    // must say so rather than let a truncated term list read as a complete one.
+    std::size_t                termsSeenTotal = 0;
+    bool                       termsCapped    = false;
+
+    const std::uint64_t* anyMaskOf( std::size_t sym ) const noexcept { return anyMask.data() + sym * maskWords; }
+    static bool          hasBit( const std::uint64_t* mask, std::size_t u ) noexcept { return ( mask[ u / 64 ] >> ( u % 64 ) ) & 1u; }
+
+    // BM25's own idf for term u over `symbolCount` symbols — the exact expression both scoring branches use,
+    // so an absent term (df 0) weighs as the rarest possible term and never as nothing.
+    double idf( std::size_t u ) const noexcept
+    {
+        const double n = double( df[u] );
+        return std::log( ( double( symbolCount ) - n + 0.5 ) / ( n + 0.5 ) + 1.0 );
+    }
+};
 
 // docCommentStart moved to lexindex.h (B0.2): the index-time stats builder must scan the EXACT spans this
 // header's Pass 2 scans, so the span logic lives beside the shared tokenizer. Still visible here (include).
@@ -114,16 +163,54 @@ struct Bm25Params
 
 inline constexpr Bm25Params kBm25Default{ 1.5, 0.75 };
 
+// A RIPWIRE_* calibration knob. Unset, or set empty, is the caller's default. A set value must parse IN FULL as a
+// finite number, or it is refused back to that default with one stderr line naming it, so a sweep cannot run on the
+// default while believing it set something. atof/atoi were unchecked: "nan" read as NaN, which std::clamp passes
+// straight through into every BM25 score; "8x" as 8; "abc" as 0, then clamped to the floor — three rankings nobody
+// configured (test/bm25boundcheck.sh (3b)/(3c), test/lb3namecheck.sh (b-junk)).
+template<class T> requires std::is_arithmetic_v<T>
+inline std::optional<T> envKnob( const char* name ) noexcept
+{
+    const char* const text = std::getenv( name );
+    if( text == nullptr || *text == '\0' )
+    {
+        return std::nullopt;
+    }
+    const char* const      end   = text + std::strlen( text );
+    T                      value = T{};
+    std::from_chars_result parsed{};
+    if constexpr( std::is_floating_point_v<T> )
+    {
+        parsed = rw::parseFloating( text, end, value );
+    }
+    else
+    {
+        parsed = std::from_chars( text, end, value );
+    }
+    if( parsed.ec == std::errc{} && parsed.ptr == end && std::isfinite( double( value ) ) )
+    {
+        return value;
+    }
+    // emitRaw, not emitTo: nothing here needs formatting, and every caller is a noexcept scoring path
+    rw::emitRaw( stderr, "ripwire: ignoring " );
+    rw::emitRaw( stderr, name );
+    rw::emitRaw( stderr, "=\"" );
+    rw::emitRaw( stderr, text );
+    rw::emitRaw( stderr, std::is_floating_point_v<T> ? "\" (not a finite number) — the default applies\n"
+                                                    : "\" (not a whole number in int range) — the default applies\n" );
+    return std::nullopt;
+}
+
 inline Bm25Params resolveBm25Params() noexcept
 {
     Bm25Params p = kBm25Default;
-    if( const char* k1Env = std::getenv( "RIPWIRE_BM25_K1" ) )
+    if( const std::optional<double> k1 = envKnob<double>( "RIPWIRE_BM25_K1" ) )
     {
-        p.k1 = std::clamp( std::atof( k1Env ), 0.1, 10.0 );
+        p.k1 = std::clamp( *k1, 0.1, 10.0 );
     }
-    if( const char* bEnv = std::getenv( "RIPWIRE_BM25_B" ) )
+    if( const std::optional<double> b = envKnob<double>( "RIPWIRE_BM25_B" ) )
     {
-        p.b = std::clamp( std::atof( bEnv ), 0.0, 1.0 );
+        p.b = std::clamp( *b, 0.0, 1.0 );
     }
     return p;
 }
@@ -135,6 +222,77 @@ inline Bm25Params resolveBm25Params() noexcept
 inline double bm25ImpactBound( double idf, double T, const Bm25Params& p ) noexcept
 {
     return idf * ( T * ( p.k1 + 1.0 ) ) / ( T + p.k1 * ( 1.0 - p.b ) ) * ( 1.0 + 1e-9 );
+}
+
+// ── input blow-up guard: bound the UNIQUE term count a query can spend on tfFlat's S×terms allocation ────
+// --for/--pack-task's task string is agent-supplied text, not a hand-typed query — an agent can (and one
+// round did) paste a whole file/log/issue body. A 480 KB task string measured 5.2 GB RSS in ONE tfFlat
+// allocation (S symbols × that many unique query terms × 4 bytes) before this guard existed: a single
+// request pushed the process past the host's memory ceiling. Deduping to unique terms (below) was ALREADY
+// correct — the gap was that "unique" had no ceiling of its own, so a query with little internal repetition
+// (natural-language prose, a pasted diff, a stack trace) stayed as big as the input.
+//
+// The longest REAL --for/--pack-task query on record in this repo (grep -rhoE -- '--for="[^"]{1,}"'
+// bench/ docs/, ranked by word count) is 10 words: "per connection state that holds the active
+// transaction and query" (docs/EVALS.md). This cap sits at ~102× that — the owner's "caps are blow-up
+// guards, not budgets to hug; set them at the pathological tail, not the typical case" ruling (memory
+// owner-quality-first-caps-are-blowup-guards.md) — so an ordinary task description, even an unusually long
+// one, never meets it; only a pathological paste does.
+inline constexpr std::size_t kMaxUniqueQueryTerms = 1024;
+
+// The historical dedupe (first-wins index into the unique-term list, one df/tf row per unique term, every
+// OCCURRENCE still contributing once via uniqueIndexOfQtok), now capped at maxUnique. Byte-identical to the
+// uncapped dedupe for any query with <= maxUnique unique terms — every real query on record clears that by
+// a wide margin — so this only ever changes behaviour on the tail the cap exists for. A term seen after the
+// cap fills gets kDroppedTerm: it owns no tf row, so it scores like any subtoken absent from the match
+// table (zero contribution) rather than growing the S×terms allocation further. Disclosed via .capped /
+// .uniqueSeenTotal so a truncated query never reads as a complete one.
+struct DedupedQueryTerms
+{
+    static constexpr std::size_t kDroppedTerm = std::size_t( -1 );
+
+    std::vector<std::string> uniqueToks;                // size() <= maxUnique passed to dedupeQueryTerms
+    std::vector<std::size_t> uniqueIndexOfQtok;          // one entry per input token; kDroppedTerm past the cap
+    std::size_t              uniqueSeenTotal = 0;        // every DISTINCT term seen, kept or dropped — exact, never an occurrence count
+    bool                     capped          = false;    // uniqueSeenTotal > uniqueToks.size()
+};
+
+inline DedupedQueryTerms dedupeQueryTerms( const std::vector<std::string>& qToks, std::size_t maxUnique )
+{
+    DedupedQueryTerms out;
+    out.uniqueIndexOfQtok.resize( qToks.size() );
+    out.uniqueToks.reserve( std::min( qToks.size(), maxUnique ) );
+    // The spellings the cap DROPPED, so a repeat of one is not counted as a new distinct term (the kept-terms scan
+    // below only sees what was kept: every repeat of a dropped term used to miss it and count again, turning the
+    // disclosed terms_total into an occurrence count — CodeRabbit on #277). Views into qToks, which outlives the
+    // loop, so the set costs no copy and never holds more entries than the query has tokens: no memory beyond the
+    // input already in hand, and O(1) per dropped token where the capped linear scan stays bounded by maxUnique.
+    ankerl::unordered_dense::set<std::string_view> droppedSpellings;
+    for( std::size_t qi = 0; qi < qToks.size(); ++qi )
+    {
+        const auto found = std::find( out.uniqueToks.begin(), out.uniqueToks.end(), qToks[qi] );
+        if( found != out.uniqueToks.end() )
+        {
+            out.uniqueIndexOfQtok[qi] = std::size_t( found - out.uniqueToks.begin() );
+            continue;
+        }
+        if( out.uniqueToks.size() < maxUnique )
+        {
+            ++out.uniqueSeenTotal;                        // a genuinely new distinct term, kept
+            out.uniqueIndexOfQtok[qi] = out.uniqueToks.size();
+            out.uniqueToks.push_back( qToks[qi] );
+        }
+        else
+        {
+            out.uniqueIndexOfQtok[qi] = DedupedQueryTerms::kDroppedTerm;
+            out.capped               = true;
+            if( droppedSpellings.insert( std::string_view( qToks[qi] ) ).second )
+            {
+                ++out.uniqueSeenTotal;                    // a genuinely new distinct term, dropped — counted once
+            }
+        }
+    }
+    return out;
 }
 
 // BM25 score of `query` against each symbol's doc (name subtokens + callees' names + DOC-COMMENT & BODY
@@ -165,11 +323,129 @@ inline double bm25ImpactBound( double idf, double T, const Bm25Params& p ) noexc
 // defined with the LB-2 anchor-plausibility machinery below; the LB-3 variant guard reuses the bound
 inline std::uint32_t routeCarrierCap( const IngestResult& ing ) noexcept;
 
+// ── P2-3: the query-side head mask + length buckets (PLAN_FULL_AUDIT_2026-09-10) ─────────────────────
+//
+// The BM25 pass-2 scan is the hottest loop in the tool — 81.7% of `--pack-task`'s busy time — because for
+// EVERY subtoken of the corpus it walked the WHOLE query match table, string-comparing as it went. That
+// inner loop is linear in the table, and the table grows with the question (and doubles again when
+// RIPWIRE_QSTEM arms its stem variants), so a longer query cost quadratically more for no retrieval gain.
+//
+// Almost every one of those comparisons was decidable from two bytes of metadata. A corpus token can only
+// match a table row of the SAME LENGTH whose FIRST byte agrees. Both facts are precomputed once per query:
+//
+//   headBits   a 256-bit set of the table's (already lowercased) first bytes. A corpus token whose head is
+//              not in the set touches NO string at all — one shift and one test, and the overwhelmingly
+//              common answer is "no".
+//   bucketIdx  the rows grouped by token length, CSR-style (bucketOff[len] .. bucketOff[len+1]), in
+//              ascending row order. A surviving token iterates only the rows that CAN match it.
+//
+// Byte-identity is structural, not measured-and-hoped. The surviving predicate at the call site is
+// character for character the one that was there before (the memcmp fast path AND the
+// lexTokenEqualsLowered acronym fallback, in that order), the rows are visited in ascending m exactly as
+// the linear scan visited them, and the table's strings are distinct so at most one row can ever match.
+// What changed is only WHICH rows are looked at, and every skipped row is one the old predicate would
+// have rejected on its length or its head.
+//
+// kMaxLen is a BUCKETING BOUND, never an answer bound: a row longer than it goes into `longRows`, which is
+// scanned in full with the length test intact. A query subtoken of 65+ bytes is a pathology, not a query,
+// and this keeps it correct rather than special-casing it out.
+struct LexHeadIndex
+{
+    static constexpr std::size_t kMaxLen = 64;
+    static constexpr std::size_t kNoRow  = ~std::size_t( 0 );
+
+    strkern::Byteset256        heads;        // the 256-bit head set — the SAME byte-set type strkern.h
+                                             // already owns, not a second hand-rolled bitmap beside it
+    std::vector<std::uint32_t> bucketOff;    // kMaxLen + 2 entries; CSR offsets by token length
+    std::vector<std::uint32_t> bucketIdx;
+    std::vector<std::uint32_t> longRows;
+
+    // The match-table row this corpus token belongs to, or kNoRow. `tokOf( m )` returns row m's
+    // all-lowercase token; the caller owns the table's storage.
+    //
+    // THE PREDICATE IS THE ORIGINAL ONE, character for character — length, then head, then the memcmp
+    // fast path, then the lexTokenEqualsLowered acronym fallback, in that order. That is what makes the
+    // whole P2-3 change byte-identical by construction rather than by hope: rows are still visited in
+    // ascending m, at most one row can match (the table's strings are distinct), and every row this
+    // skips is one the old linear scan would have rejected on its length or its head alone.
+    template<class TokOfFn>
+    std::size_t matchRow( const char* tok, std::size_t tokLen, TokOfFn&& tokOf ) const
+    {
+        const unsigned char headByte = ( tok[0] >= 'A' && tok[0] <= 'Z' ) ? static_cast<unsigned char>( tok[0] - 'A' + 'a' )
+                                                                         : static_cast<unsigned char>( tok[0] );
+        if( !heads.contains( headByte ) )
+        {
+            return kNoRow;             // no table row starts with this byte — not one string is touched
+        }
+        const char           head  = char( headByte );
+        const std::uint32_t* first = tokLen <= kMaxLen ? bucketIdx.data() + bucketOff[ tokLen ] : longRows.data();
+        const std::uint32_t* last  = tokLen <= kMaxLen ? bucketIdx.data() + bucketOff[ tokLen + 1 ] : longRows.data() + longRows.size();
+        for( ; first != last; ++first )
+        {
+            const std::size_t  m = *first;
+            const std::string& q = tokOf( m );
+            if( q.size() == tokLen && q[0] == head
+                && ( std::memcmp( q.data() + 1, tok + 1, tokLen - 1 ) == 0 || lexTokenEqualsLowered( tok, tokLen, q.data() ) ) )
+            {
+                return m;
+            }
+        }
+        return kNoRow;
+    }
+};
+
+// `tokOf( m )` returns row m's (all-lowercase) token. A template rather than a span of strings because the
+// caller's match table is an array of structs, and copying its strings out to build an index over them
+// would cost more than the index saves.
+template<class TokOfFn>
+inline LexHeadIndex buildLexHeadIndex( std::size_t rowCount, TokOfFn&& tokOf )
+{
+    LexHeadIndex ix;
+    ix.bucketOff.assign( LexHeadIndex::kMaxLen + 2, 0 );
+    for( std::size_t m = 0; m < rowCount; ++m )
+    {
+        const std::string& q = tokOf( m );
+        if( q.empty() )
+        {
+            continue;               // cannot happen (subtokens() drops < 2 bytes), but q[0] is read below
+        }
+        const unsigned char head = static_cast<unsigned char>( q[0] );
+        ix.heads.add( head );
+        if( q.size() <= LexHeadIndex::kMaxLen )
+        {
+            ++ix.bucketOff[ q.size() + 1 ];      // counts, shifted by one: the prefix sum turns them into offsets
+        }
+    }
+    for( std::size_t len = 1; len < ix.bucketOff.size(); ++len )
+    {
+        ix.bucketOff[len] += ix.bucketOff[ len - 1 ];
+    }
+    ix.bucketIdx.resize( ix.bucketOff.back() );
+    std::vector<std::uint32_t> fill( ix.bucketOff.begin(), ix.bucketOff.end() );
+    for( std::size_t m = 0; m < rowCount; ++m )
+    {
+        const std::string& q = tokOf( m );
+        if( q.empty() )
+        {
+            continue;
+        }
+        if( q.size() <= LexHeadIndex::kMaxLen )
+        {
+            ix.bucketIdx[ fill[ q.size() ]++ ] = std::uint32_t( m );   // ascending m within each bucket
+        }
+        else
+        {
+            ix.longRows.push_back( std::uint32_t( m ) );
+        }
+    }
+    return ix;
+}
+
 // THE pass-2 scan text for one file, resolved by ONE rule in ONE place: the docText override when the file
-// has one, else the file's bytes read into `scratch`. An EMPTY string means "skip this file" — what an empty
-// docText override and an unreadable file have always meant. `scratch` is the caller's reusable buffer, so
-// the read allocates once per worker rather than once per file. Extracted 2026-09-06 out of the pass-2
-// worker below, which is the densest branch nest in this function.
+// has one, else the file's bytes moved into `scratch`. An EMPTY string means "skip this file" — what an empty
+// docText override and an unreadable file have always meant. `scratch` owns those bytes for as long as the
+// caller holds the returned pointer. Extracted 2026-09-06 out of the pass-2 worker below, which is the densest
+// branch nest in this function.
 inline const std::string* lexicalScanText( const IngestResult& ing, std::size_t f, std::string& scratch )
 {
     // P1-B: a document file (notebook/html/csv) is indexed by its EXTRACTED text, not its raw bytes, so a
@@ -179,14 +455,15 @@ inline const std::string* lexicalScanText( const IngestResult& ing, std::size_t 
     {
         return &it->second;
     }
-    scratch.clear();
-    std::ifstream in( diskPath( ing, std::uint32_t( f ) ), std::ios::binary );
-    if( in )
-    {
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        scratch = ss.str();
-    }
+    // P2-4 (PLAN_FULL_AUDIT_2026-09-10): this used to be `ifstream` + `ostringstream << rdbuf()` +
+    // `str()`, which is TWO full copies of every file in the corpus — the stream buffer's growth, then
+    // `str()`'s copy out of it — on the path that reads every indexed file once per cold query. The
+    // canonical whole-file read is docparse::detail::readWholeFile (commentcoherence.h, quality.h,
+    // renamemine.h, githarden.h, graph.h and mergescout.h all already reach for it, and mergescout's own
+    // comment records that it used to be a hand-rolled copy): one open, one size probe, one fread into the
+    // string it returns, which is moved into `scratch` — zero intermediate copies. An unreadable file is
+    // nullopt, and value_or's empty string is exactly the "skip this file" contract above.
+    scratch = docparse::detail::readWholeFile( diskPath( ing, std::uint32_t( f ) ) ).value_or( std::string() );
     return &scratch;
 }
 
@@ -194,7 +471,8 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
                                                const std::vector<NodeId>& outTargets, std::string_view query,
                                                std::size_t pruneTopK, const std::vector<char>* alwaysExact,
                                                const std::vector<float>* symbolScoreMul, int pathFieldDefaultW = 0,
-                                               int basenameFieldDefaultW = 0, std::string_view pathRootPrefix = {} )
+                                               int basenameFieldDefaultW = 0, std::string_view pathRootPrefix = {},
+                                               LexTermEvidence* evidenceOut = nullptr )   // L-W: the term evidence, read back out (see the struct)
 {
     PROFILE_SCOPE_DESCRIBE( "lexical: lexicalScores (BM25 over symbols)" );
     const std::size_t S = ing.symbols.size();
@@ -205,23 +483,22 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
     subtokens( query, qToks );
     if( qToks.empty() )
     {
+        if( evidenceOut )
+        {
+            *evidenceOut             = LexTermEvidence{};
+            evidenceOut->symbolCount = S;
+        }
         return std::vector<float>( S, 0.f );
     }
 
     // dedupe to the unique terms whose statistics we need — a duplicated query word must not double-count
-    // tf, but still contributes once PER OCCURRENCE in the scoring loop (uniqueIndexOfQtok maps back)
-    std::vector<std::string> uniqueToks;
-    std::vector<std::size_t> uniqueIndexOfQtok( qToks.size() );
-    for( std::size_t qi = 0; qi < qToks.size(); ++qi )
-    {
-        const auto found      = std::find( uniqueToks.begin(), uniqueToks.end(), qToks[qi] );
-        uniqueIndexOfQtok[qi] = std::size_t( found - uniqueToks.begin() );
-        if( found == uniqueToks.end() )
-        {
-            uniqueToks.push_back( qToks[qi] );
-        }
-    }
-    const std::size_t uniqueCount = uniqueToks.size();
+    // tf, but still contributes once PER OCCURRENCE in the scoring loop (uniqueIndexOfQtok maps back) —
+    // capped (see dedupeQueryTerms above) so a pathologically term-rich query cannot blow up tfFlat's S×terms
+    // allocation below.
+    DedupedQueryTerms         dedup = dedupeQueryTerms( qToks, kMaxUniqueQueryTerms );
+    std::vector<std::string>& uniqueToks         = dedup.uniqueToks;
+    std::vector<std::size_t>& uniqueIndexOfQtok  = dedup.uniqueIndexOfQtok;
+    const std::size_t         uniqueCount        = uniqueToks.size();
 
     // ── LB-3 arm S: conservative query-side stem variants ─────────────────────────────────────────────
     // A plural/participle query token ("splits", "resolved", "hoisting") cannot exact-match the singular
@@ -331,6 +608,10 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
     }
     const std::size_t matchCount = matchToks.size();
 
+    // P2-3: build the head mask + length buckets for THIS query's match table (see LexHeadIndex above).
+    const auto         matchTokOf = [ & ]( std::size_t m ) -> const std::string& { return matchToks[m].tok; };
+    const LexHeadIndex headIndex  = buildLexHeadIndex( matchCount, matchTokOf );
+
     // per-doc integer stats (SoA): dl[i] = weighted subtoken count, tfFlat[i*matchCount+m] = weighted term
     // frequency of match-table row m in doc i. Disarmed, matchCount == uniqueCount and the layout is the
     // historical one byte-for-byte; armed, provisional variant columns sit at m ≥ uniqueCount until the
@@ -365,17 +646,10 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
                 return;
             }
             fieldTokenWt += w;
-            const char* tok  = text.data() + tokStartByte;
-            const char  head = ( tok[0] >= 'A' && tok[0] <= 'Z' ) ? char( tok[0] - 'A' + 'a' ) : tok[0];
-            for( std::size_t m = 0; m < matchCount; ++m )
+            const std::size_t m = headIndex.matchRow( text.data() + tokStartByte, tokLen, matchTokOf );
+            if( m != LexHeadIndex::kNoRow )
             {
-                const std::string& q = matchToks[m].tok;
-                if( q.size() == tokLen && q[0] == head
-                    && ( std::memcmp( q.data() + 1, tok + 1, tokLen - 1 ) == 0 || lexTokenEqualsLowered( tok, tokLen, q.data() ) ) )
-                {
-                    tfRow[m] += w;                    // exact tokens own rows 0..uniqueCount (m == u there)
-                    break;                            // table strings are distinct → at most one can match
-                }
+                tfRow[m] += w;                        // exact tokens own rows 0..uniqueCount (m == u there)
             }
         } );
         wtAccum += fieldTokenWt;
@@ -398,8 +672,8 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
         {
             return 0;
         }
-        const char* bitsEnv = std::getenv( "RIPWIRE_TERMMARGIN_BITS" );
-        return bitsEnv != nullptr ? std::clamp( std::atoi( bitsEnv ), 1, 8 ) : 1;
+        const std::optional<int> bits = envKnob<int>( "RIPWIRE_TERMMARGIN_BITS" );
+        return bits ? std::clamp( *bits, 1, 8 ) : 1;
     }();
     const bool marginArmed = marginBits > 0;
 
@@ -412,11 +686,31 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
     // body, path and basename fields that follow — and because pass 1 runs before the pass-2 branch
     // split, so the scan and persisted-stats paths read the identical integers.
     std::vector<int> nameDf( marginArmed ? matchCount : 0, 0 );
+    // L-W: the name-field mask is separable ONLY here — the callee, path, doc and body fields land in the
+    // same tf row from the next statement on (the nameDf comment below says the same thing for its count).
+    const std::size_t evidenceWords = ( uniqueCount + 63 ) / 64;
+    if( evidenceOut )
+    {
+        evidenceOut->maskWords = evidenceWords;
+        evidenceOut->nameMask.assign( S * evidenceWords, 0u );
+    }
 
     // pass 1 — name (×kwName) + callee-name (×kwCallee) fields need no file text
     for( std::size_t i = 0; i < S; ++i )
     {
         scanField( i, ing.symbols[i].name, kwName );
+        if( evidenceOut )
+        {
+            const int* const nameRow = tfFlat.data() + i * matchCount;   // name field only: nothing else has run
+            std::uint64_t*   words   = evidenceOut->nameMask.data() + i * evidenceWords;
+            for( std::size_t u = 0; u < uniqueCount; ++u )
+            {
+                if( nameRow[u] > 0 )
+                {
+                    words[ u / 64 ] |= std::uint64_t( 1 ) << ( u % 64 );
+                }
+            }
+        }
         if( marginArmed )
         {
             const int* const nameRow = tfFlat.data() + i * matchCount;   // name field only: nothing else has run
@@ -457,9 +751,9 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
     // ing.files already hold "<label>/<root-relative>".
     {
         int kwPath = pathFieldDefaultW;
-        if( const char* pathTokEnv = std::getenv( "RIPWIRE_PATHTOK_W" ) )
+        if( const std::optional<int> pathTokW = envKnob<int>( "RIPWIRE_PATHTOK_W" ) )
         {
-            kwPath = std::clamp( std::atoi( pathTokEnv ), 0, 8 );
+            kwPath = std::clamp( *pathTokW, 0, 8 );
         }
         if( kwPath > 0 )
         {
@@ -487,9 +781,9 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
     // the other already agreeing rather than discovering half the path tokenization was still absolute.
     {
         int kwBase = basenameFieldDefaultW;
-        if( const char* baseEnv = std::getenv( "RIPWIRE_BASENAME_W" ) )
+        if( const std::optional<int> baseW = envKnob<int>( "RIPWIRE_BASENAME_W" ) )
         {
-            kwBase = std::clamp( std::atoi( baseEnv ), 0, 8 );
+            kwBase = std::clamp( *baseW, 0, 8 );
         }
         if( kwBase > 0 )
         {
@@ -711,7 +1005,7 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
             }
         };
         std::atomic<std::size_t> nextFileIndex { 0 };
-        const auto               fileWorker = [ & ]
+        const auto               fileWorker = [ & ]() noexcept
         {
             try
             {
@@ -731,7 +1025,7 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
             }
             catch( ... )   // a throw escaping a worker thread is std::terminate — degrade to partial counts instead
             {
-                std::fprintf( stderr, "ripwire: lexical scan worker degraded (exception swallowed)\n" );
+                rw::emitRaw( stderr, "ripwire: lexical scan worker degraded (exception swallowed)\n" );
             }
         };
         const std::size_t hwThreadCount = std::thread::hardware_concurrency();
@@ -779,7 +1073,7 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
         {
             for( std::size_t v = 0; v < variantCount; ++v )
             {
-                std::fprintf( stderr, "qstem-guard: \"%s\" df=%u cap=%u %s\n",
+                rw::emitTo( stderr, "qstem-guard: \"{}\" df={} cap={} {}\n",
                               matchToks[ uniqueCount + v ].tok.c_str(), dfVariant[v], variantCap,
                               dfVariant[v] <= variantCap ? "admitted" : "rejected" );
             }
@@ -813,6 +1107,31 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
                 if( dfVariant[v] <= variantCap )
                 {
                     nameDf[ matchToks[ uniqueCount + v ].u ] += nameDf[ uniqueCount + v ];
+                }
+            }
+        }
+    }
+
+    // ── L-W: the term evidence, read off the FINAL tf rows (uniqueCount stride, every field, the fold applied)
+    // — one S×U integer scan, the same "tf > 0" fact dfreq counts in both scoring branches below.
+    if( evidenceOut )
+    {
+        evidenceOut->termsSeenTotal = dedup.uniqueSeenTotal;
+        evidenceOut->termsCapped    = dedup.capped;
+        evidenceOut->terms.assign( uniqueToks.begin(), uniqueToks.end() );
+        evidenceOut->df.assign( uniqueCount, 0u );
+        evidenceOut->anyMask.assign( S * evidenceWords, 0u );
+        evidenceOut->symbolCount = S;
+        for( std::size_t i = 0; i < S; ++i )
+        {
+            const int* const row   = tfFlat.data() + i * uniqueCount;
+            std::uint64_t*   words = evidenceOut->anyMask.data() + i * evidenceWords;
+            for( std::size_t u = 0; u < uniqueCount; ++u )
+            {
+                if( row[u] > 0 )
+                {
+                    ++evidenceOut->df[u];
+                    words[ u / 64 ] |= std::uint64_t( 1 ) << ( u % 64 );
                 }
             }
         }
@@ -909,10 +1228,10 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
                         verdict = "kept (name-separates)";
                     }
                 }
-                std::fprintf( stderr, "term-margin: \"%s\" df=%d/%zu nameDf=%d bits=%d %s\n",
+                rw::emitTo( stderr, "term-margin: \"{}\" df={}/{} nameDf={} bits={} {}\n",
                               uniqueToks[u].c_str(), dfMargin[u], S, nameDf[u], marginBits, verdict );
             }
-            std::fprintf( stderr, "term-margin: %zu present, %zu survive, suppression %s\n",
+            rw::emitTo( stderr, "term-margin: {} present, {} survive, suppression {}\n",
                           presentCount, survivorCount, applySuppression ? "applied" : "withheld (sole-anchor)" );
         }
     }
@@ -980,6 +1299,10 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
             std::vector<int> occCount( uniqueCount, 0 );
             for( std::size_t qi = 0; qi < qToks.size(); ++qi )
             {
+                if( uniqueIndexOfQtok[qi] == DedupedQueryTerms::kDroppedTerm )
+                {
+                    continue;               // capped past kMaxUniqueQueryTerms — owns no row, no contribution
+                }
                 ++occCount[uniqueIndexOfQtok[qi]];
             }
             for( std::size_t u = 0; u < uniqueCount; ++u )
@@ -1028,6 +1351,10 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
             for( std::size_t qi = 0; qi < qToks.size(); ++qi )
             {
                 const std::size_t u  = uniqueIndexOfQtok[qi];
+                if( u == DedupedQueryTerms::kDroppedTerm )
+                {
+                    continue;               // capped past kMaxUniqueQueryTerms — owns no row, no contribution
+                }
                 const int         tf = tfRow[u];
                 if( tf == 0 || termKept[u] == 0 )
                 {
@@ -1085,6 +1412,10 @@ inline std::vector<float> lexicalScoresTiered( const IngestResult& ing, const st
         for( std::size_t qi = 0; qi < qToks.size(); ++qi )
         {
             const std::size_t u  = uniqueIndexOfQtok[qi];
+            if( u == DedupedQueryTerms::kDroppedTerm )
+            {
+                continue;                   // capped past kMaxUniqueQueryTerms — owns no row, no contribution
+            }
             const int         tf = tfFlat[ i * uniqueCount + u ];
             if( tf == 0 || termKept[u] == 0 )
             {
@@ -1163,26 +1494,41 @@ inline std::vector<float> lexicalScoresNameExactTiered( const IngestResult& ing,
         return std::vector<float>( S, 0.f );
     }
 
-    // dedupe to unique terms (one df/tf statistic each); each occurrence still contributes in the loop
-    std::vector<std::string> uniqueToks;
-    std::vector<std::size_t> uniqueIndexOfQtok( qToks.size() );
-    for( std::size_t qi = 0; qi < qToks.size(); ++qi )
-    {
-        const auto found      = std::find( uniqueToks.begin(), uniqueToks.end(), qToks[qi] );
-        uniqueIndexOfQtok[qi] = std::size_t( found - uniqueToks.begin() );
-        if( found == uniqueToks.end() )
-        {
-            uniqueToks.push_back( qToks[qi] );
-        }
-    }
-    const std::size_t uniqueCount = uniqueToks.size();
+    // dedupe to unique terms (one df/tf statistic each); each occurrence still contributes in the loop —
+    // capped (dedupeQueryTerms, kMaxUniqueQueryTerms above) against the same S×terms blow-up.
+    DedupedQueryTerms         dedup               = dedupeQueryTerms( qToks, kMaxUniqueQueryTerms );
+    std::vector<std::string>& uniqueToks          = dedup.uniqueToks;
+    std::vector<std::size_t>& uniqueIndexOfQtok   = dedup.uniqueIndexOfQtok;
+    const std::size_t         uniqueCount         = uniqueToks.size();
 
     // per-doc integer stats (SoA): dl[i] = whole-name token count (1, or 2 with a scope), tfFlat = weighted tf
     std::vector<int> dl( S, 0 );
     std::vector<int> tfFlat( S * uniqueCount, 0 );
 
-    // lowercase-compare a symbol's whole name (one token) against every unique query token
-    const auto matchWholeName = [ & ]( std::size_t i, std::string_view name )
+    // does an (already lowercased) query token equal a symbol spelling, compared lowercase?
+    const auto equalsLowered = []( const std::string& q, std::string_view name ) noexcept
+    {
+        if( q.size() != name.size() )
+        {
+            return false;
+        }
+        for( std::size_t k = 0; k < name.size(); ++k )
+        {
+            const unsigned char nc = static_cast<unsigned char>( name[k] );
+            const char          lc = ( nc >= 'A' && nc <= 'Z' ) ? char( nc - 'A' + 'a' ) : char( nc );
+            if( lc != q[k] )
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+    // lowercase-compare a symbol's whole name (ONE document token) against every unique query token. `alt` is
+    // a second spelling the same token may equal: the arity-less form of an Elixir `name/N` — `run` for
+    // `run/2` — so a query that names the function the way Elixir source spells it still hits (PR #81 review
+    // item 5: `generate_phoenix_app` routed name-exact and then scored nothing, no_candidates). Empty for
+    // every other symbol, where the scoring is byte-identical to before; dl counts the name once either way.
+    const auto matchWholeName = [ & ]( std::size_t i, std::string_view name, std::string_view alt )
     {
         if( name.size() < 2 )
         {
@@ -1193,39 +1539,34 @@ inline std::vector<float> lexicalScoresNameExactTiered( const IngestResult& ing,
         for( std::size_t u = 0; u < uniqueCount; ++u )
         {
             const std::string& q = uniqueToks[u];
-            if( q.size() != name.size() )
-            {
-                continue;
-            }
-            bool eq = true;
-            for( std::size_t k = 0; k < name.size() && eq; ++k )
-            {
-                const unsigned char nc = static_cast<unsigned char>( name[k] );
-                const char          lc = ( nc >= 'A' && nc <= 'Z' ) ? char( nc - 'A' + 'a' ) : char( nc );
-                if( lc != q[k] )
-                {
-                    eq = false;
-                }
-            }
-            if( eq )
+            if( equalsLowered( q, name ) || ( !alt.empty() && equalsLowered( q, alt ) ) )
             {
                 ++tfRow[u];
-                break;
-            } // unique tokens distinct → at most one match
+                break; // unique tokens distinct → at most one match
+            }
         }
     };
 
     // document = whole name (+ container::name as a second whole token, when a scope exists)
     for( std::size_t i = 0; i < S; ++i )
     {
-        const Symbol& s = ing.symbols[i];
-        matchWholeName( i, s.name );
+        const Symbol&          s    = ing.symbols[i];
+        const std::string_view base = ( s.lang == Lang::Elixir ) ? elixirBaseName( s.name ) : std::string_view( s.name );
+        const std::string_view alt  = ( base.size() != s.name.size() ) ? base : std::string_view{};
+        matchWholeName( i, s.name, alt );
         if( !s.scope.empty() )
         {
             std::string qualified = s.scope;
             qualified += "::";
             qualified += s.name;
-            matchWholeName( i, qualified );
+            std::string qualifiedAlt;
+            if( !alt.empty() )
+            {
+                qualifiedAlt = s.scope;
+                qualifiedAlt += "::";
+                qualifiedAlt += alt;
+            }
+            matchWholeName( i, qualified, qualifiedAlt );
         }
     }
 
@@ -1257,6 +1598,10 @@ inline std::vector<float> lexicalScoresNameExactTiered( const IngestResult& ing,
         for( std::size_t qi = 0; qi < qToks.size(); ++qi )
         {
             const std::size_t u  = uniqueIndexOfQtok[qi];
+            if( u == DedupedQueryTerms::kDroppedTerm )
+            {
+                continue;                   // capped past kMaxUniqueQueryTerms — owns no row, no contribution
+            }
             const int         tf = tfFlat[ i * uniqueCount + u ];
             if( tf == 0 )
             {
@@ -1321,8 +1666,8 @@ inline std::vector<float> lexicalScoresNameExact( const IngestResult& ing, std::
 // through all of them would let one emitter acquire the fix and another not, and an incoherent bundle
 // (signatures ordered one way, bodies another) is a worse failure than the defect. One seam, one order.
 //
-// The bodyless predicate is the house one, shared verbatim with graph.h's decl/def collapse and arch.h's
-// pure-interface detection: `endByte > sigEndByte`. Deterministic — integer bit patterns, fixed doc
+// The bodyless predicate is the house one, shared with graph.h's decl/def collapse: model.h
+// isDefinitionNotDeclaration (`endByte > sigEndByte`, and a Kotlin type). Deterministic — integer bit patterns, fixed doc
 // order, no float arithmetic beyond one nextafter. Returns the number of rows demoted; 0 means the call
 // was inert and the vector is byte-identical to what the scorer produced.
 inline std::size_t applyDefOverDeclTiebreak( const IngestResult& ing, std::vector<float>& score )
@@ -1333,7 +1678,7 @@ inline std::size_t applyDefOverDeclTiebreak( const IngestResult& ing, std::vecto
         return 0;
     }
 
-    const auto hasBody = [ & ]( std::size_t i ) noexcept { return ing.symbols[i].endByte > ing.symbols[i].sigEndByte; };
+    const auto hasBody = [ & ]( std::size_t i ) noexcept { return isDefinitionNotDeclaration( ing.symbols[ i ] ); };
     const auto scored  = [ & ]( std::size_t i ) noexcept { return score[i] > 0.f && std::isfinite( score[i] ); };
 
     // the distinct POSITIVE scores actually present, ascending. For positive finite floats the IEEE bit
@@ -1459,7 +1804,7 @@ inline std::vector<float> lexicalScoresNameExactRanked( const IngestResult& ing,
 //      (A single generic word that happens to equal a symbol name — "map" — still routes to name-exact, which
 //      is correct: a one-word query whose only word IS a symbol name is an identifier lookup, and name-exact
 //      is the measured winner on that shape; the crater was multi-word phrases, not single-word lookups.)
-enum class LexMode { SubtokenBody, NameExact };
+enum class LexMode : std::uint8_t { SubtokenBody, NameExact };
 
 // ONE anchoring word's resolved DEFINITION — the same (name, defining file) pair the `anchors:` clause
 // below prints, in the form a consumer can compare a symbol against. Only words that actually name a
@@ -1571,7 +1916,7 @@ inline std::string routeAnchorEvidence( const IngestResult& ing, const HashMap<s
     {
         return "syntax";                               // carrier-only entries count commonness, they name nothing
     }
-    std::string evidence = routeAnchorPath( ing.files[at->second.fileId] );
+    std::string evidence = routeAnchorPath( rootRelPath( ing, at->second.fileId ) );   // #228: "/.../x.h" was every absolute root's anchor
     if( at->second.extraDefs != 0 )
     {
         evidence += "+" + std::to_string( at->second.extraDefs );
@@ -1682,9 +2027,10 @@ inline std::string routeLower( std::string_view w )
 // duckdb: `--for="ClientContext"` ranked src/include/duckdb/main/client_context.hpp:65 first and served
 // the body of `class ClientContext;` in extension/parquet/include/geo_parquet.hpp.
 //
-// So the claim passes to the first BODY-CARRYING definition in NodeId order, using the house bodyless
-// predicate shared with graph.h's decl/def collapse, arch.h's pure-interface detection and the ranked-side
-// tiebreak: `endByte > sigEndByte`. Three things about the shape are load-bearing:
+// So the claim passes to the first BODY-CARRYING definition in NodeId order, using the plain span test
+// `endByte > sigEndByte` — a body to SERVE, which is why it is not model.h's isDefinitionNotDeclaration (that
+// predicate also counts a bodyless Kotlin type, a definition with nothing to serve). Three things about the
+// shape are load-bearing:
 //
 //   1. it is a PREFERENCE, not a filter. A name no definition gives a body to — a type this corpus only
 //      ever forward-declares — keeps the first-in-NodeId anchor it always had. There is no case in which
@@ -1699,10 +2045,10 @@ inline std::string routeLower( std::string_view w )
 // one symbol's WHOLE lowercased name enters (or upgrades) its entry: the first definition claims fileId,
 // the first body-carrying one TAKES it, later definitions count into extraDefs either way, and a
 // carrier-only entry created earlier by some other name's subtoken is upgraded rather than shadowed.
-inline void noteWholeNameDef( HashMap<std::string, NameAnchor>& names, const Symbol& s )
+inline void noteWholeNameSpelling( HashMap<std::string, NameAnchor>& names, const Symbol& s, std::string_view spelling )
 {
     const bool hasBody          = s.endByte > s.sigEndByte;
-    const auto [ at, inserted ] = names.try_emplace( routeLower( s.name ), NameAnchor{ s.fileId, 0u, 0u, true, hasBody } );
+    const auto [ at, inserted ] = names.try_emplace( routeLower( spelling ), NameAnchor{ s.fileId, 0u, 0u, true, hasBody } );
     if( inserted )
     {
         return;
@@ -1719,6 +2065,22 @@ inline void noteWholeNameDef( HashMap<std::string, NameAnchor>& names, const Sym
     {
         at->second.fileId  = s.fileId;                 // the first body-carrying definition takes the claim from a
         at->second.bodyDef = true;                     // bodyless incumbent, and only ever from a bodyless one
+    }
+}
+
+// one symbol's whole name enters the index — and, for an Elixir callable indexed as `name/N`, its arity-less
+// spelling too: the source spells it `name`, and so does a query, so a plain word naming an Elixir function
+// is a whole-name hit (the route fires, the anchor names its defining file) rather than a carrier-only miss
+// (PR #81 review item 5). Each arity is a further definition of that spelling; extraDefs counts them.
+inline void noteWholeNameDef( HashMap<std::string, NameAnchor>& names, const Symbol& s )
+{
+    noteWholeNameSpelling( names, s, s.name );
+    if( s.lang == Lang::Elixir )
+    {
+        if( const std::string_view base = elixirBaseName( s.name ); base.size() != s.name.size() )
+        {
+            noteWholeNameSpelling( names, s, base );
+        }
     }
 }
 
@@ -1825,9 +2187,10 @@ inline void noteAnchorPlausibility( ImplausibleAnchor& imp, std::string_view low
 // phrase as a name-exact marker).
 inline std::string declinedRouteReason( const ImplausibleAnchor& imp )
 {
-    return "subtoken+body BM25 — name-exact declined: anchor '" + imp.word + "' is a common name ("
-         + std::to_string( imp.carriers ) + " name-carriers, " + std::to_string( imp.defs )
-         + " defs); conceptual ranker used";
+    // row 6 (2026-09-12): a CODE with the evidence in parentheses — the word that was refused, how many names
+    // carry it and how many definitions it has; the legend's route= reading spells what :declined means.
+    return "subtoken+body:declined(" + imp.word + ";" + std::to_string( imp.carriers ) + "-carriers,"
+         + std::to_string( imp.defs ) + "-defs)";
 }
 
 // split a query on whitespace into raw words (case preserved — camelCase detection needs it)
@@ -1881,21 +2244,9 @@ inline RouteChoice chooseForRanker( const IngestResult& ing, std::string_view qu
         }
         ++nWords;
 
-        // camelCase / snake_case shape: an interior uppercase (aB) or an interior underscore (a_b)
-        bool camel = false, snake = false;
-        for( std::size_t k = 1; k < w.size(); ++k )
-        {
-            const char c = w[k];
-            if( c >= 'A' && c <= 'Z' && w[k - 1] >= 'a' && w[k - 1] <= 'z' )
-            {
-                camel = true;
-            }
-            if( c == '_' && k + 1 < w.size() )
-            {
-                snake = true;
-            }
-        }
-        if( camel || snake )
+        // camelCase / snake_case shape: an interior uppercase (aB) or an interior underscore (a_b) — the ONE
+        // predicate (infra/namesplit.h), shared with the named-identifier mention anchor (mention.h)
+        if( namesplit::hasIdentifierShape( w ) )
         {
             hasCamelSnake = true;
             if( identifierHit.empty() )
@@ -1945,7 +2296,7 @@ inline RouteChoice chooseForRanker( const IngestResult& ing, std::string_view qu
     if( nameExact )
     {
         rc.which  = LexMode::NameExact;
-        rc.reason = "name-exact BM25 — query names a symbol (" + identifierHit + ")";
+        rc.reason = "name-exact(" + identifierHit + ")";   // row 6: a CODE; the reading lives in the legend (route=)
         // The evidence, appended and never substituted: downstream readers (test/taskechocheck.sh) parse the
         // clause above out of this same string. A subtoken+body route names no anchors because nothing
         // anchored it — an anchors list on a route the names did not decide would be evidence after the fact.
@@ -1960,12 +2311,12 @@ inline RouteChoice chooseForRanker( const IngestResult& ing, std::string_view qu
     else if( nWords >= 3 )
     {
         rc.which  = LexMode::SubtokenBody;
-        rc.reason = "subtoken+body BM25 (--for's default) — no strong name hit, multi-word conceptual query";
+        rc.reason = "subtoken+body";   // row 6: the conceptual ranker, as a code — see the route= legend reading
     }
     else
     {
         rc.which  = LexMode::SubtokenBody;
-        rc.reason = "subtoken+body BM25 (--for's default) — no strong name hit; broad query, plain rg may also win";
+        rc.reason = "subtoken+body:broad";   // row 6: 1-2 plain words — the legend says plain rg may also win
     }
     return rc;
 }
@@ -2041,7 +2392,6 @@ inline AdaptiveCut adaptiveCut( const std::vector<float>& scores, std::size_t fl
     // cut, only the honesty flag (A4-F4: previously the single global-max drop was used for BOTH roles, so a
     // routine 90%+ tail drop beyond hardCeil silently starved the in-cap material cliff of ever being chosen —
     // the mode was inert on exactly the sharp queries it exists for).
-    std::size_t bestCutKept    = 0;
     double      bestDrop       = 0.0;
     std::size_t bestCapCutKept = 0;
     double      bestCapDrop    = 0.0;
@@ -2050,7 +2400,7 @@ inline AdaptiveCut adaptiveCut( const std::vector<float>& scores, std::size_t fl
         const double prev = double( pos[ i - 1 ] );
         const double here = double( pos[ i ] );
         const double drop = prev > 0.0 ? ( prev - here ) / prev : 0.0;
-        if( drop > bestDrop ) { bestDrop = drop; bestCutKept = i; }               // cut BEFORE rank i+1 ⇒ keep i
+        if( drop > bestDrop ) { bestDrop = drop; }                                // the GLOBAL cliff: only its magnitude is read
         if( i < hardCeil && drop > bestCapDrop ) { bestCapDrop = drop; bestCapCutKept = i; }
     }
 
@@ -2082,6 +2432,51 @@ inline AdaptiveCut adaptiveCut( const std::vector<float>& scores, std::size_t fl
     return cut;
 }
 
+// The legend clause that defines confidence=/margin_pct= (below). Named (lane r2-LO) so the session dictionary
+// (legenddict.h) quotes the same bytes the --for headers append.
+inline constexpr std::string_view kForConfidenceNote =
+    " [confidence= derives from the ranked head's largest relative score drop (margin_pct=, whole "
+    "percent, 0 = none; the same gap the adaptive flag cuts at). low = flat ranking: treat the set "
+    "as a starting point, not an answer]";
+
+// ── Homonym-pool decline gate (T14; docs/research/adaptive-short-query.md on lane/research-adaptive-
+// shortquery, c04affc2 — investigation only, not merged) ───────────────────────────────────────────────
+// A name-exact route against a large pool of identically-named, UNRELATED symbols (every class's own
+// `update()`) can still clear kMinCliffDrop above: the drop is real, but it is a drop in the SECONDARY
+// (tie-break) key that orders symbols already tied on lexical score, not a drop in relevance — nothing in
+// a bare word like "update" picks rank 6 over rank 7 of 231 identical name matches. Left alone, --adaptive
+// narrows to a handful of an undifferentiated pool while confidence="high" claims the cut is relevance-
+// driven: a confident wrong answer. Measured on two corpora (the doc's word sweep, both routed name-exact):
+// every positiveHits>=50 row clears this gate (`update` 231->6, `run` 148->10, `init` 56->7, all kept<=10);
+// every harmless name-exact cut measured (pools of 13-37, kept 11-35) does not — leaving a 37..56 margin for
+// the threshold below. Reuses AdaptiveCut::positiveHits, already computed for the cut itself — no new
+// scorer, no second pass over the score vector (the doc's own rejection criterion for the two alternatives
+// it measured and dropped: a query-length/content threshold cannot separate `update` from `adaptiveCut`,
+// both one token, one working correctly and one not).
+constexpr std::size_t kAdaptiveHomonymPoolFloor = 50;   // positiveHits must clear this; measured gap is 37 (harmless) .. 56 (failing)
+
+inline bool isAdaptiveHomonymDecline( bool nameExactRoute, const AdaptiveCut& cut, std::size_t floorK )
+{
+    return nameExactRoute && cut.positiveHits > kAdaptiveHomonymPoolFloor && cut.kept <= 2 * floorK;
+}
+
+// ── ONE predicate for "is this ranking's route the raw name-exact BM25 lane" (T14 finding 1, review
+// rv-t14a.md 2026-09-20) ───────────────────────────────────────────────────────────────────────────────
+// The route tag is a three-state string every producer already writes verbatim — "name-exact" |
+// "subtoken+body" | "no-route" (packtask.h LensRanking::routeTag's own comment; --no-route leaves the
+// field at that struct default rather than routing at all). Three call sites need "is this name-exact"
+// for the homonym-decline gate above; ONE of them (runForLens) answered it as `!isConceptualRoute(tag)`
+// — a DIFFERENT question ("is this NOT subtoken+body") whose negation is true on "no-route" too, so
+// --no-route --adaptive silently mislabeled the un-routed subtoken+body ranking as name-exact and
+// declined + fabricated a same-name count on a genuine, unrelated cliff. The other two call sites
+// (emitCandidates, MCP `for`) already asked the right question, each with its own string/enum
+// comparison — so CLI and MCP disagreed under --no-route. Fixing the negation in place would still
+// leave three independent implementations to keep in sync; this is the one all three now call.
+inline bool isNameExactRouteTag( const char* routeTag ) noexcept
+{
+    return routeTag != nullptr && std::strcmp( routeTag, "name-exact" ) == 0;
+}
+
 struct ForConfidence
 {
     std::string attrs;      // ` confidence="high|low" margin_pct="N"` — root facts, every ladder rung
@@ -2090,21 +2485,36 @@ struct ForConfidence
     int         marginPct = 0;
 };
 
-inline ForConfidence deriveForConfidence( const rw::AdaptiveCut& cut, int servedTopN )
+// homonymDecline: true when isAdaptiveHomonymDecline fired on this same cut — confidence must not claim
+// "high" on a cliff driven by tie-break order rather than relevance (a decline plus a high-confidence
+// stamp is the same defect wearing a different hat). marginPct is left as the TRUE measured drop even
+// when declined — 0 means "no cliff found" (non-negotiable #3: a zero must mean none found, never none
+// exists), and a real 25% tie-break drop is not that; the note's extra clause is what says not to trust it.
+inline ForConfidence deriveForConfidence( const rw::AdaptiveCut& cut, int servedTopN, bool homonymDecline )
 {
     ForConfidence out;
     const bool servedComplete = cut.positiveHits > 0 && cut.positiveHits <= std::size_t( servedTopN );
-    out.level     = ( !cut.hitCeiling || servedComplete ) ? "high" : "low";
+    out.level     = homonymDecline ? "low" : ( !cut.hitCeiling || servedComplete ) ? "high" : "low";
     out.marginPct = cut.hitCeiling ? 0 : cut.dropPct;
     char attrBuf[ 48 ];
-    std::snprintf( attrBuf, sizeof( attrBuf ), " confidence=\"%s\" margin_pct=\"%d\"", out.level, out.marginPct );
+    rw::formatTo( attrBuf, sizeof( attrBuf ), " confidence=\"{}\" margin_pct=\"{}\"", out.level, out.marginPct );
     out.attrs = attrBuf;
     // no "--" anywhere (rides inside an XML comment, where "--" is ill-formed — G4). TERSE on purpose:
     // this rides EVERY --for header and its bytes are charged under an explicit budget, so each word
     // competes with a sig row (the W3-S short-spelling precedent). The full mapping: the --for help text.
-    out.note = " [confidence= derives from the ranked head's largest relative score drop (margin_pct=, whole "
-               "percent, 0 = none; the same gap the adaptive flag cuts at). low = flat ranking: treat the set "
-               "as a starting point, not an answer]";
+    out.note = kForConfidenceNote;
+    if( homonymDecline )
+    {
+        // present-only (fires only on the decline itself — byte-identical elsewhere): margin_pct above is
+        // real and nonzero here, which "low = flat ranking" alone does not cover — this clause is what makes
+        // the two consistent (T14 requirement 2).
+        char db[ 200 ];
+        rw::formatTo( db, sizeof( db ),
+                       " [{} symbols share this exact name; the drop above is tie-break order among them, not "
+                       "relevance, so confidence stays low even though margin_pct is nonzero]",
+                       cut.positiveHits );
+        out.note += db;
+    }
     return out;
 }
 

@@ -13,10 +13,10 @@
 # re-applies the `Graph::localityKey` tie-break (an unscoped def is compared as `path::name`, not its bare
 # name) so a module-level function is no longer auto-lost to a same-file class method.
 #
-# THE FIXTURE (test/lpinfix/, 3 files):
-#   pinned.py   — `Alpha.run` -> `helper()`; `Alpha.helper` beats `Beta.helper` by scope: ONE edge, `lpin="1"`, no `amb=`.
-#   tied.py     — `Eps.go` -> `other()`; sibling classes tie: split, `amb="1"`, no `lpin=`.
-#   modlevel.py — `Caller.go` -> `compute()`; `Helper.compute` vs module-level `compute`: a full tie under
+# THE FIXTURE (test/lpinfix/, 3 Kotlin files — Python until FE-A, whose bare call reaches no method: test/falseedgecheck.sh):
+#   pinned.kt   — `Alpha.run` -> `helper()`; `Alpha.helper` beats `Beta.helper` by scope: ONE edge, `lpin="1"`, no `amb=`.
+#   tied.kt     — `Eps.go` -> `other()`; sibling classes tie: split, `amb="1"`, no `lpin=`.
+#   modlevel.kt — `Caller.go` -> `compute()`; `Helper.compute` vs top-level `compute`: a full tie under
 #                 localityKey ⇒ split, `amb="1"`, no `lpin=` (was a silent pin on Helper::compute).
 #
 # Exits non-zero on any failure.
@@ -29,7 +29,7 @@ CORPUS="$ROOT/test/lpinfix"
 FIXTURE="$ROOT/test/fixture"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -37,39 +37,42 @@ no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 echo "lpincheck: BIN=$BIN  CORPUS=$CORPUS"
 
-"$BIN" "$CORPUS" --pin-census="$TMP/c.tsv" --no-cache >"$TMP/map.xml" 2>"$TMP/err" || { no "the map run exited non-zero"; sed 's/^/          /' "$TMP/err"; }
+# L1 (2026-09-19): the CLI default legend is compact; (F) reads the FULL legend's lpin=/locality_pinned= clauses, so the
+# census run asks for it (--pin-census writes beside the map and takes a posture since L1).
+"$BIN" "$CORPUS" --pin-census="$TMP/c.tsv" --no-cache --legend=full >"$TMP/map.xml" 2>"$TMP/err" || { no "the map run exited non-zero"; sed 's/^/          /' "$TMP/err"; }
 MAP="$( cat "$TMP/map.xml" )"
-row(){ printf '%s' "$MAP" | tr '<' '\n' | grep "id=\"$1\"" | head -1; }
+# row 6 (2026-09-12): a scoped row prints n= then sc= (the short id); the canonical id composes as <f p=>::sc::n
+row(){ _n="${1##*::}"; _r="${1#*::}"; _s="${_r%::*}"; printf '%s' "$MAP" | tr '<' '\n' | grep "n=\"$_n\" sc=\"$_s\"" | head -1; }
 
 # ── (A) the pin is DISCLOSED on its row, and it is still not an amb ──────────────────────────────
-RUN_ROW="$( row 'pinned.py::Alpha::run' )"
-printf '%s' "$RUN_ROW" | grep -q 'lpin="1"' && ok "(A) pinned.py::Alpha::run carries lpin=\"1\" — the locality pin is disclosed" \
-    || no "(A) pinned.py::Alpha::run has no lpin=\"1\": $RUN_ROW"
-printf '%s' "$RUN_ROW" | grep -q 'amb=' && no "(A) pinned.py::Alpha::run carries amb= — the marker inflated amb=: $RUN_ROW" \
+RUN_ROW="$( row 'pinned.kt::Alpha::run' )"
+printf '%s' "$RUN_ROW" | grep -q 'lpin="1"' && ok "(A) pinned.kt::Alpha::run carries lpin=\"1\" — the locality pin is disclosed" \
+    || no "(A) pinned.kt::Alpha::run has no lpin=\"1\": $RUN_ROW"
+printf '%s' "$RUN_ROW" | grep -q 'amb=' && no "(A) pinned.kt::Alpha::run carries amb= — the marker inflated amb=: $RUN_ROW" \
     || ok "(A) the pin still contributes nothing to amb="
-N_HELPER="$( printf '%s' "$MAP" | tr '>' '\n' | awk '/id="pinned.py::Alpha::run"/{f=1} f{print} /\/s/{if(f)exit}' | grep -c 'n="helper"' )"
-[ "$N_HELPER" = 1 ] && ok "(A) the pin still emits ONE confident edge" || no "(A) $N_HELPER helper edges on Alpha::run, want 1"
+N_HELPER="$( printf '%s' "$MAP" | tr '>' '\n' | awk '/n="run" sc="Alpha"/{f=1} f{print} /\/s/{if(f)exit}' | grep -c 'n="helper"' )"
+if [ "$N_HELPER" = 1 ]; then ok "(A) the pin still emits ONE confident edge"; else no "(A) $N_HELPER helper edges on Alpha::run, want 1"; fi
 
 # ── (B) the tied control — a split is not a pin ───────────────────────────────────────────────────
-GO_ROW="$( row 'tied.py::Eps::go' )"
-printf '%s' "$GO_ROW" | grep -q 'amb="1"' && ok "(B) tied.py::Eps::go carries amb=\"1\" (the honest split)" \
-    || no "(B) tied.py::Eps::go lacks amb=\"1\": $GO_ROW"
-printf '%s' "$GO_ROW" | grep -q 'lpin=' && no "(B) tied.py::Eps::go carries lpin= — a split labelled as a pin: $GO_ROW" \
+GO_ROW="$( row 'tied.kt::Eps::go' )"
+printf '%s' "$GO_ROW" | grep -q 'amb="1"' && ok "(B) tied.kt::Eps::go carries amb=\"1\" (the honest split)" \
+    || no "(B) tied.kt::Eps::go lacks amb=\"1\": $GO_ROW"
+printf '%s' "$GO_ROW" | grep -q 'lpin=' && no "(B) tied.kt::Eps::go carries lpin= — a split labelled as a pin: $GO_ROW" \
     || ok "(B) no lpin= on the split"
 
 # ── (C) the module-level shape — a full tie under localityKey, not a silent pin ──────────────────
-CALLER_ROW="$( row 'modlevel.py::Caller::go' )"
-printf '%s' "$CALLER_ROW" | grep -q 'amb="1"' && ok "(C) modlevel.py::Caller::go is an honest split (amb=\"1\") — the module-level def is no longer auto-lost" \
-    || no "(C) modlevel.py::Caller::go is not amb=\"1\" — Helper::compute still silently wins: $CALLER_ROW"
-printf '%s' "$CALLER_ROW" | grep -q 'lpin=' && no "(C) modlevel.py::Caller::go carries lpin= — still pinned: $CALLER_ROW" \
+CALLER_ROW="$( row 'modlevel.kt::Caller::go' )"
+printf '%s' "$CALLER_ROW" | grep -q 'amb="1"' && ok "(C) modlevel.kt::Caller::go is an honest split (amb=\"1\") — the module-level def is no longer auto-lost" \
+    || no "(C) modlevel.kt::Caller::go is not amb=\"1\" — Helper::compute still silently wins: $CALLER_ROW"
+printf '%s' "$CALLER_ROW" | grep -q 'lpin=' && no "(C) modlevel.kt::Caller::go carries lpin= — still pinned: $CALLER_ROW" \
     || ok "(C) no lpin= on the module-level site"
-grep -E '^C	locality	' "$TMP/c.tsv" | grep -q 'modlevel.py::Caller::go' \
-    && no "(C) the census still labels modlevel.py::Caller::go locality-pinned" \
-    || ok "(C) the census agrees: no locality row for modlevel.py::Caller::go"
+grep -E '^C	locality	' "$TMP/c.tsv" | grep -q 'modlevel.kt::Caller::go' \
+    && no "(C) the census still labels modlevel.kt::Caller::go locality-pinned" \
+    || ok "(C) the census agrees: no locality row for modlevel.kt::Caller::go"
 
 # ── (D) the header counter, and its equality with the census ──────────────────────────────────────
 HDR="$( printf '%s' "$MAP" | grep -o '<!-- files=[^>]*-->' | head -1 )"
-printf '%s' "$HDR" | grep -q ' locality_pinned=1 ' && ok "(D) header locality_pinned=1" || no "(D) header lacks locality_pinned=1: $HDR"
+if printf '%s' "$HDR" | grep -q ' locality_pinned=1 '; then ok "(D) header locality_pinned=1"; else no "(D) header lacks locality_pinned=1: $HDR"; fi
 printf '%s' "$HDR" | grep -q ' ambiguous=2 ' && ok "(D) header ambiguous=2 — the marker added nothing, the tie-break added exactly the module-level split" \
     || no "(D) header ambiguous= is not 2: $HDR"
 N_LOC="$( grep -cE '^C	locality	' "$TMP/c.tsv" )"
@@ -78,7 +81,8 @@ HDR_LP="$( printf '%s' "$HDR" | grep -o 'locality_pinned=[0-9]*' | cut -d= -f2 )
     || no "(D) locality_pinned='$HDR_LP' but the census holds $N_LOC locality rows"
 
 # ── (E) zero bytes where nothing fires (the dropped_positive= rule) ───────────────────────────────
-( cd "$ROOT" && "$BIN" test/fixture --no-cache >"$TMP/fix.xml" 2>/dev/null )   # repo-relative, exactly how the golden is derived
+# L1 (2026-09-19): the CLI default legend is compact; test/golden.xml was recorded from the full default, so this run asks for it.
+( cd "$ROOT" && "$BIN" test/fixture --no-cache --legend=full >"$TMP/fix.xml" 2>/dev/null )   # repo-relative, exactly how the golden is derived
 grep -q 'lpin=' <( grep -v '^<!-- ripwire v1' "$TMP/fix.xml" ) && no "(E) test/fixture emits lpin= — it has no locality pin" \
     || ok "(E) test/fixture: no lpin= outside the legend"
 grep -q 'locality_pinned=[0-9]' "$TMP/fix.xml" && no "(E) test/fixture header carries locality_pinned= — want absent when 0" \
@@ -88,14 +92,14 @@ cmp -s "$TMP/fix.xml" "$ROOT/test/golden.xml" && ok "(E) test/golden.xml byte-id
 
 # ── (F) the legend defines both names (legendcoveragecheck's definitional predicate) ─────────────
 LEGEND="$( printf '%s' "$MAP" | grep -o '<!-- ripwire v1[^>]*-->' | head -1 )"
-printf '%s' "$LEGEND" | grep -q ' lpin=' && ok "(F) legend defines lpin=" || no "(F) legend lacks lpin=: $LEGEND"
-printf '%s' "$LEGEND" | grep -q 'locality_pinned=' && ok "(F) legend defines locality_pinned=" || no "(F) legend lacks locality_pinned="
+if printf '%s' "$LEGEND" | grep -q ' lpin='; then ok "(F) legend defines lpin="; else no "(F) legend lacks lpin=: $LEGEND"; fi
+if printf '%s' "$LEGEND" | grep -q 'locality_pinned='; then ok "(F) legend defines locality_pinned="; else no "(F) legend lacks locality_pinned="; fi
 
 # ── (G) the --json dialect carries the same two facts ─────────────────────────────────────────────
 "$BIN" "$CORPUS" --json --no-cache >"$TMP/map.json" 2>/dev/null
-python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/map.json" 2>/dev/null && ok "(G) --json parses" || no "(G) --json output does not parse"
-grep -q '"lpin":1' "$TMP/map.json" && ok "(G) --json carries \"lpin\":1" || no "(G) --json lacks \"lpin\":1"
-grep -q '"locality_pinned":1' "$TMP/map.json" && ok "(G) --json header carries \"locality_pinned\":1" || no "(G) --json header lacks \"locality_pinned\":1"
+if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/map.json" 2>/dev/null; then ok "(G) --json parses"; else no "(G) --json output does not parse"; fi
+if grep -q '"lpin":1' "$TMP/map.json"; then ok "(G) --json carries \"lpin\":1"; else no "(G) --json lacks \"lpin\":1"; fi
+if grep -q '"locality_pinned":1' "$TMP/map.json"; then ok "(G) --json header carries \"locality_pinned\":1"; else no "(G) --json header lacks \"locality_pinned\":1"; fi
 "$BIN" "$FIXTURE" --json --no-cache 2>/dev/null | grep -q '"lpin"\|"locality_pinned"' && no "(G) --json on test/fixture emits the keys with nothing to disclose" \
     || ok "(G) --json on test/fixture: both keys absent"
 
@@ -129,7 +133,7 @@ class Subscriber:
         return 2
 PYEOF
 "$BIN" "$SELFD" --no-cache >"$TMP/selfwin.xml" 2>/dev/null
-SW="$( sed 's/></>\n</g' "$TMP/selfwin.xml" | awk '/id="facade.py::Facade::publish_event"/{f=1;print;next} /^<s /{f=0} f' )"
+SW="$( sed 's/></>\n</g' "$TMP/selfwin.xml" | awk '/n="publish_event" sc="Facade"/{f=1;print;next} /^<s /{f=0} f' )"
 [ "$( printf '%s' "$SW" | grep -c '<c n="publish_event"' )" = 2 ] \
     && ok "(I) the facade keeps BOTH real targets (2 edges) — the caller no longer wins its own tie-break" \
     || no "(I) facade.py::Facade::publish_event has $( printf '%s' "$SW" | grep -c '<c n="publish_event"' ) publish_event edges, want 2: $SW"
@@ -157,10 +161,11 @@ printf '%s' "$RESH" | grep -q ' edges=0 ' \
     || no "(I) the tier-1 residual moved — update this arm AND src/graph.h's stated floor: $RESH"
 
 # ── (H) determinism + well-formedness ─────────────────────────────────────────────────────────────
-"$BIN" "$CORPUS" --no-cache >"$TMP/map2.xml" 2>/dev/null
-cmp -s "$TMP/map.xml" "$TMP/map2.xml" && ok "(H) two runs byte-identical" || no "(H) the map is not deterministic"
+# L1 (2026-09-19): the --pin-census run above asks for the full legend; the rerun it is compared to asks for the same.
+"$BIN" "$CORPUS" --no-cache --legend=full >"$TMP/map2.xml" 2>/dev/null
+if cmp -s "$TMP/map.xml" "$TMP/map2.xml"; then ok "(H) two runs byte-identical"; else no "(H) the map is not deterministic"; fi
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/map.xml" 2>/dev/null && ok "(H) well-formed XML" || no "(H) xmllint rejects the map"
+    if xmllint --noout "$TMP/map.xml" 2>/dev/null; then ok "(H) well-formed XML"; else no "(H) xmllint rejects the map"; fi
 fi
 
 [ "$fail" = 0 ] && { echo "lpincheck: OK"; exit 0; }

@@ -46,7 +46,7 @@ inline constexpr std::size_t kReductionBlockSize = 1024;
 // It is NOT a flag: G5 says every flag is purely additive and appears in the hand-rolled parser and in
 // --help, and this must appear in neither — it is a gate's arming mechanism, not a user surface. Unlike
 // serialize.h's RIPWIRE_FAULT_CHARGE_BUFFER it is honoured in EVERY build flavour, deliberately: the fact
-// the gate exists to prove is that a NDEBUG build discloses non-convergence after DEGRADED_PATH_ALERT has
+// the gate exists to prove is that a NDEBUG build discloses non-convergence after DISCLOSE has
 // been compiled out of it, and a hook that also vanished under NDEBUG could not ask that question.
 // Read once per process, so the answer cannot change mid-run and determinism holds.
 //
@@ -92,33 +92,40 @@ double probabilityMass( std::span<const double> values ) noexcept
 
 }
 
+// The PageRank power iteration itself — the numeric kernel every ranked document's order comes from.
+// Each round: gather rank along in-edges (rank / weighted out-degree), spread dangling mass back through
+// the teleport vector, damp by alpha, and measure the L1 residual; stop when it drops below tolerance or
+// at the iteration ceiling, and return which of the two ended the loop (PageRankRun, pagerank.h).
 PageRankRun pageRankDouble( const sparseCsr<float>& inEdges, std::span<const double> weightedOutDegree,
                             std::span<const double> teleport, std::span<double> rank, PageRankConfig config )
 {
     const std::size_t nodeCount = inEdges.rows();
-    VERIFY( verifyCsr( inEdges, nodeCount ) );
-    VERIFY( weightedOutDegree.size() == nodeCount );
-    VERIFY( teleport.size() == nodeCount );
-    VERIFY( rank.size() == nodeCount );
-    VERIFY( config.alpha >= 0.0 && config.alpha < 1.0 );
-    VERIFY( config.tolerance > 0.0 );
-    VERIFY( config.maxIterationCount > 0 );
+    DASSERT( verifyCsr( inEdges, nodeCount ) ); // a corrupt CSR is not impossible; do not let the promise delete the bounds reasoning
+    ASSUME( weightedOutDegree.size() == nodeCount );
+    ASSUME( teleport.size() == nodeCount );
+    ASSUME( rank.size() == nodeCount );
+    ASSUME( config.alpha >= 0.0 && config.alpha < 1.0 );
+    ASSUME( config.tolerance > 0.0 );
+    ASSUME( config.maxIterationCount > 0 );
     // The test-only ceiling can only LOWER the configured one, so the shipped ceiling is still an upper
-    // bound on every run and the VERIFY above still describes the loop that runs.
+    // bound on every run and the ASSUME above still describes the loop that runs.
     const std::uint32_t testCeiling = testIterationCeiling();
     const std::uint32_t maxIterationCount = testCeiling > 0 ? std::min( config.maxIterationCount, testCeiling ) : config.maxIterationCount;
     if( nodeCount == 0 )
     {
         return { 0, true }; // no residual to leave above tolerance — vacuously converged, see PageRankRun
     }
-    VERIFY( rank.data() != teleport.data() );
+    ASSUME( rank.data() != teleport.data() );
 
     for( std::size_t nodeIndex = 0; nodeIndex < nodeCount; ++nodeIndex )
     {
-        VERIFY( std::isfinite( weightedOutDegree[nodeIndex] ) && weightedOutDegree[nodeIndex] >= 0.0 );
-        VERIFY( std::isfinite( teleport[nodeIndex] ) && teleport[nodeIndex] >= 0.0 );
+        ASSUME( std::isfinite( weightedOutDegree[nodeIndex] ) && weightedOutDegree[nodeIndex] >= 0.0 );
+        ASSUME( std::isfinite( teleport[nodeIndex] ) && teleport[nodeIndex] >= 0.0 );
     }
-    VERIFY( std::fabs( probabilityMass( teleport ) - 1.0 ) <= 1e-9 );
+    // Checked, never assumed: handing the optimizer a floating-point identity in the translation unit whose
+    // whole point is reproducible arithmetic (docs/ARCHITECTURE.md's determinism contract) buys nothing worth
+    // the licence it grants.
+    DASSERT( std::fabs( probabilityMass( teleport ) - 1.0 ) <= 1e-9 );
 
     // Allocate all scratch once. The power-iteration loop performs no dynamic allocation.
     std::vector<double> currentRank( teleport.begin(), teleport.end() );
@@ -185,16 +192,17 @@ PageRankRun pageRankDouble( const sparseCsr<float>& inEdges, std::span<const dou
         }
     }
 
-    // The alert STAYS (non-negotiable #4 — a degrade path never becomes VERIFY( false )), and it is still
+    // The alert STAYS (non-negotiable #4 — a degrade path never becomes ASSUME( false )), and it is still
     // the only thing that says WHICH site degraded on a dev build. It is no longer the only thing that says
     // the ranking is unfinished: that fact now leaves the function with the ranking it describes, so an
     // NDEBUG build — where this macro is nothing at all — still discloses it in the document it emits.
+    PageRankRun run { iterationCount, true };
     if( !hasConverged )
     {
-        DEGRADED_PATH_ALERT( "PageRank reached max iterations before L1 convergence" );
+        DISCLOSE( run, PageRankRun::DisclosureWhy::MaxIterationsReached, "PageRank reached max iterations before L1 convergence" );
     }
     std::copy( currentRank.begin(), currentRank.end(), rank.begin() );
-    return { iterationCount, hasConverged };
+    return run;
 }
 
 } // namespace rw

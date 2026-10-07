@@ -23,9 +23,16 @@
 // the same seven faults a second time.
 
 #include "model.h"
+#include "graph.h"   // filePathContainsRootRel / resolveAllByName — A1 (found-items 2026-09-17): this file's
+                      // own diagnosis must match the file half the SAME way resolveAllByNameQualified does
 #include "graph.h"          // splitQualifiedSpec / resolveAllByName — the SAME grammar the callers resolve with
 #include "didyoumean.h"     // §P12.1: the near-miss suggester, for the "the name is wrong too" fallback
 #include "degradedscan.h"   // degradedTextHit — the ONE degraded-parse text scan (mcprefusal.h words the same facts for MCP)
+#include "crossref.h"       // worktreeRenameOf — the not-found answer offers the working tree's rename first
+#include "serialize.h"      // escapeXml / jsonStr — the not-found answer document
+
+#include <cstdio>
+#include <utility>
 
 #include <algorithm>
 #include <cstddef>
@@ -41,13 +48,19 @@ namespace rw
 // many were left unsaid, and the first one is all a retry needs.
 inline constexpr std::size_t kSelectorFilesShown = 6;
 
-// The distinct files defining `name`, in index order (first occurrence wins), so the message is deterministic.
+// The distinct files defining `name`, in index order (first occurrence wins), so the message is
+// deterministic. A1 (review round, found-items 2026-09-17): root-relative (rootRelPath), never
+// ing.files[fileId] raw — this list feeds selectorFaultClause's "e.g. --verb=FILE:name" retry text below,
+// and a retry must actually RUN: under an absolute root spelling the raw stored path is LONGER than the
+// root-relative haystack every matcher now compares against (filePathContainsRootRel), so a raw absolute
+// echo can no longer even substring-match its own file — the retry regressed to unrunnable, not merely
+// differently spelled. selectorrefusecheck.sh's §B4.2/§B11.1 arms execute the offered retry, not just print it.
 inline std::vector<std::string> definingFilesOf( const IngestResult& ing, std::string_view name )
 {
     std::vector<std::string> files;
     for( NodeId n : resolveAllByName( ing, name ) )
     {
-        const std::string& path = ing.files[ ing.symbols[n].fileId ];
+        const std::string path( rootRelPath( ing, ing.symbols[n].fileId ) );
         if( std::find( files.begin(), files.end(), path ) == files.end() )
         {
             files.push_back( path );
@@ -56,15 +69,21 @@ inline std::vector<std::string> definingFilesOf( const IngestResult& ing, std::s
     return files;
 }
 
-// Does the FILE half of a `file:name` selector name anything in the index at all? Asked with filePathContains
-// — the identical predicate resolveFocus/resolveAllByNameQualified match the file half with — so this answers
-// exactly the question the resolver asked, never an approximation of it. Written as any_of rather than a
-// hand-rolled loop: the loop form is a 31-token for/if/return-true/return-false stream that --clones pairs
-// with every other tiny predicate in the tree (docdrift's declKeywordOnLine, for one), which is noise.
+// Does the FILE half of a `file:name` selector name anything in the index at all? Asked with
+// filePathContainsRootRel — the identical predicate resolveFocus/resolveAllByNameQualified match the file
+// half with (graph.h) — so this answers exactly the question the resolver asked, never an approximation of
+// it. A fileId loop rather than any_of-over-paths (the shape this used before A1, found-items 2026-09-17):
+// the root-relative view is keyed by fileId, so any_of's by-path lambda can no longer express it.
 inline bool indexHasFileMatching( const IngestResult& ing, std::string_view file )
 {
-    return std::any_of( ing.files.begin(), ing.files.end(),
-                        [ file ]( const std::string& path ) { return filePathContains( path, file ); } );
+    for( std::uint32_t fileId = 0; fileId < std::uint32_t( ing.files.size() ); ++fileId )
+    {
+        if( filePathContainsRootRel( ing, fileId, file ) )
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 // DEGRADED-PARSE routing (degradedhintcheck, 2026-08-30). A symbol sitting in a shredded file (the
@@ -205,6 +224,112 @@ inline std::string selectorNotFoundMessage( const IngestResult& ing, std::string
                                             std::string_view retryForm )
 {
     return std::move( prefix ) + std::string( spec ) + selectorFaultClause( ing, spec, retryForm );
+}
+
+// ── the NOT-FOUND ANSWER (2026-10-01, the comparison table's fix list #2) ─────────────────────────────────────
+//
+// A selector that matches no indexed definition is a REFUSAL, exit 1 (README §6.2; docs/COMMANDS.md --callers), and
+// that contract stays. But a refusal used to print NOTHING on stdout, so an agent that reads stdout got no answer at
+// all: on the comparison table a correct "that name is gone" (a rename in the working tree) scored as an ERROR. The
+// refusal now ALSO prints a one-element answer document — the verb's own root, the selector echoed in the verb's own
+// attribute names, found="0", and the name to retry with — under its own legend. stderr is unchanged except that a
+// working-tree rename, when there is one, is offered FIRST: spelling-distance ranks a token swap (line_trim →
+// trim_line) far below an unrelated near-spelling, and the working tree holds better evidence than spelling.
+
+// The name to offer: the working tree's rename of the selector's NAME half first, else the spelling near-miss.
+struct NotFoundNear
+{
+    std::string name;
+    bool        renamed = false;   // a changed file's HEAD copy holds the selector's name and not this one
+};
+
+inline NotFoundNear notFoundNear( const IngestResult& ing, std::string_view spec, const std::string& gitRoot )
+{
+    if( spec.empty() || spec.front() == '@' )
+    {
+        return {};   // a line seed is diagnosed by its own fault sentences; it has no name to rename
+    }
+    std::string_view file, name;
+    splitQualifiedSpec( spec, file, name );
+    if( !gitRoot.empty() )
+    {
+        std::string renamed = crossref::worktreeRenameOf( ing, name, gitRoot );
+        if( !renamed.empty() )
+        {
+            return { std::move( renamed ), true };
+        }
+    }
+    std::string near = didYouMean( ing, name );
+    return near == name ? NotFoundNear{} : NotFoundNear{ std::move( near ), false };
+}
+
+// The clause that puts a working-tree rename ahead of the shared fault clause on stderr ("" when there is none).
+inline std::string notFoundRenameClause( const NotFoundNear& near )
+{
+    return near.renamed ? " (renamed in the working tree: did you mean '" + near.name + "'?)" : std::string();
+}
+
+// The same clause inside an MCP refusal sentence, right after the quoted echo of the spelling that missed. Those
+// sentences echo as `'X'` (mcprefuse::notFound) or as `from='A'` / `to='B'` (path_between), so `endpoint` ("from",
+// "to", "both" or "") picks which echo it follows. One insertion rule for the live arm and the batch arm.
+inline std::string withRenameClause( std::string msg, const NotFoundNear& near, std::string_view endpoint = {} )
+{
+    if( !near.renamed )
+    {
+        return msg;
+    }
+    const std::string anchor = ( endpoint == "from" || endpoint == "to" ) ? std::string( endpoint ) + "='" : std::string( "'" );
+    const std::size_t at     = msg.find( anchor );
+    const std::size_t open   = at == std::string::npos ? std::string::npos : at + anchor.size() - 1;
+    const std::size_t close  = open == std::string::npos ? std::string::npos : msg.find( '\'', open + 1 );
+    msg.insert( close == std::string::npos ? msg.size() : close + 1, notFoundRenameClause( near ) );
+    return msg;
+}
+
+// The answer document a not-found refusal prints on stdout beside its exit 1. `echo` is the selector in the verb's
+// own attribute names (of=, or from=/to= for path), `missing` names the endpoint that matched nothing — "from", "to" or
+// "both" ("" for a one-selector verb); near= then retries the first endpoint it names. XML under the verb's root tag with its legend comment, or one JSON object under --json.
+struct NotFoundAnswer
+{
+    std::string_view                                       tag;
+    std::vector<std::pair<std::string_view, std::string>> echo;
+    std::string_view                                       missing;
+    NotFoundNear                                           near;
+};
+
+inline void writeNotFoundAnswer( std::FILE* out, const NotFoundAnswer& a, bool json )
+{
+    if( json )
+    {
+        std::string body = "{";
+        for( const auto& [ key, value ] : a.echo )
+        {
+            body += "\"" + std::string( key ) + "\":\"" + jsonStr( value ) + "\",";
+        }
+        body += "\"found\":0";
+        if( !a.missing.empty() ) { body += ",\"missing\":\"" + std::string( a.missing ) + "\""; }
+        if( !a.near.name.empty() ) { body += ",\"near\":\"" + jsonStr( a.near.name ) + "\""; }
+        if( a.near.renamed ) { body += ",\"near_renamed\":true"; }
+        rw::emitTo( out, "{}}}\n", body );
+        return;
+    }
+    std::vector<char> esc;
+    std::string       root = "<" + std::string( a.tag );
+    for( const auto& [ key, value ] : a.echo )
+    {
+        root += " " + std::string( key ) + "=\"" + std::string( escapeXml( value, esc ) ) + "\"";
+    }
+    root += " found=\"0\"";
+    if( !a.missing.empty() ) { root += " missing=\"" + std::string( a.missing ) + "\""; }
+    if( !a.near.name.empty() ) { root += " near=\"" + std::string( escapeXml( a.near.name, esc ) ) + "\""; }
+    if( a.near.renamed ) { root += " near_renamed=\"1\""; }
+    rw::emitTo( out, "<!-- ripwire {}: NOT FOUND, an answer and a refusal at once. found=0: no indexed definition matched the "
+                     "selector echoed on this element, so nothing was listed or counted. Zero means none found, not none exists: "
+                     "an unindexed file, a typo or an uncommitted rename can each hide the definition.{} near=: the indexed name "
+                     "to retry with; near_renamed=1: the working tree renamed the selector to it (a DEFINITION of the selector left "
+                     "a changed file that now defines near=; a mere mention is not a rename). On the CLI the exit status stays 1, a "
+                     "refusal, and stderr carries the same diagnosis; over MCP this document rides the refusal's error data. -->{}/>",
+                 a.tag, a.missing.empty() ? "" : " missing=from|to|both: the endpoint(s) that matched nothing; near= retries the first.", root );
 }
 
 }   // namespace rw

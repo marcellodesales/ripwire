@@ -37,10 +37,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -77,8 +78,21 @@ EOF
   && git add -A && git commit -qm init >/dev/null 2>&1 )
 runw(){ ( cd "$WORK" && "$BIN" . --no-cache "$@" 2>/dev/null ); }
 
-PID="$( runw | grep -oE 'id="[^"]*BudgetPlanner::parseBudget"' | head -1 | sed -E 's/id="([^"]*)"/\1/' )"
-[ -n "$PID" ] && ok "discovered scoped canonical id: $PID" || no "could not discover BudgetPlanner::parseBudget id"
+# row 6 (2026-09-12): the <d> row prints the short id sc= beside its own p=; the canonical id composes as p::sc::n
+PID="$( runw | python3 -c '
+import re, sys
+doc, name, scope = sys.stdin.read(), sys.argv[1], ( sys.argv[2] if len( sys.argv ) > 2 else None )
+for f in re.finditer( r"<f p=\"([^\"]*)\"[^>]*>(.*?)</f>", doc, re.S ):
+    for row in re.finditer( r"<[sd]\b([^>]*)>", f.group( 2 ) ):
+        a = dict( re.findall( r"\s([\w:.-]+)=\"([^\"]*)\"", row.group( 1 ) ) )
+        if a.get( "n" ) == name and "sc" in a and ( scope is None or a[ "sc" ] == scope ):
+            print( f.group( 1 ) + "::" + a[ "sc" ] + "::" + a[ "n" ] ); sys.exit( 0 )
+for row in re.finditer( r"<d\b([^>]*)>", doc ):
+    a = dict( re.findall( r"\s([\w:.-]+)=\"([^\"]*)\"", row.group( 1 ) ) )
+    if a.get( "n" ) == name and "sc" in a and "p" in a and ( scope is None or a[ "sc" ] == scope ):
+        print( a[ "p" ] + "::" + a[ "sc" ] + "::" + a[ "n" ] ); sys.exit( 0 )
+' parseBudget BudgetPlanner )"
+if [ -n "$PID" ]; then ok "discovered scoped canonical id: $PID"; else no "could not discover BudgetPlanner::parseBudget id"; fi
 runw --note-add="$PID: watch integer overflow when raw is INT_MAX" >/dev/null
 # D5 (see packtaskcheck.sh): --note-add normalizes the target's path segment to ROOT-RELATIVE on write
 # (strips the crawl's leading "./"), and --pack-task's <notes> keys on that same normalized form.
@@ -94,7 +108,7 @@ B900="$TMP/b900.xml"
 runw --pack-task="$TASK" --token-budget=900 > "$B900"
 L900="$( section_line "$B900" )"
 echo "  900-token report: $L900"
-xmllint --noout "$B900" 2>/dev/null && ok "900-token bundle is xmllint-clean" || no "900-token bundle is not well-formed"
+if xmllint --noout "$B900" 2>/dev/null; then ok "900-token bundle is xmllint-clean"; else no "900-token bundle is not well-formed"; fi
 
 # ── 2) the fix's floor: <bodies> is no longer a hard zero at 900 tokens (pre-fix: "omitted (budget)" on this
 #    exact fixture at this exact budget — the quota reservation buys section 2 SOME room even this low). ─────
@@ -110,7 +124,7 @@ B2000="$TMP/b2000.xml"
 runw --pack-task="$TASK" --token-budget=2000 > "$B2000"
 L2000="$( section_line "$B2000" )"
 echo "  2000-token report: $L2000"
-xmllint --noout "$B2000" 2>/dev/null && ok "2000-token bundle is xmllint-clean" || no "2000-token bundle is not well-formed"
+if xmllint --noout "$B2000" 2>/dev/null; then ok "2000-token bundle is xmllint-clean"; else no "2000-token bundle is not well-formed"; fi
 
 if printf '%s' "$L2000" | grep -qE 'notes: (none|omitted \(budget\))'; then
     no "2000-token: <notes> is EMPTY ($( printf '%s' "$L2000" | grep -oE 'notes: [^|]*' )) — the finding's symptom persists"
@@ -131,13 +145,16 @@ grep -oE '<tests[^>]*>.*</tests>' "$B2000" | grep -qF 'test/test_budget.cpp' \
 
 # ── 4) the disclosure reflects the NEW policy: the header legend names fixed per-section quotas and the
 #    roll-forward rule, not just the old "sections in FIXED order" cascade description on its own. ────────────
-if grep -qE 'quotas per section are FIXED' "$B2000" && grep -qE 'ROLLS FORWARD' "$B2000"; then
+# L1 (2026-09-19): the CLI default legend is compact; arms 4/4b read the FULL legend's policy prose, so they read a full-legend run of the same bundle.
+B2000F="$TMP/b2000full.xml"
+runw --pack-task="$TASK" --token-budget=2000 --legend=full > "$B2000F"
+if grep -qE 'quotas per section are FIXED' "$B2000F" && grep -qE 'ROLLS FORWARD' "$B2000F"; then
     ok "header legend states the fixed-quota + roll-forward policy"
 else
     no "header legend does not name the new quota policy — a reader can't tell WHY a starved section still got something"
 fi
 # the percentages named in the legend must match src/packtask.h's own constants (a hand-edited legend can drift)
-grep -qE 'rank40/body30/caller15/note5/test10' "$B2000" \
+grep -qE 'rank40/body30/caller15/note5/test10' "$B2000F" \
     && ok "header legend's stated percentages match the source constants (40/30/15/5/10)" \
     || no "header legend's percentages don't match — the disclosure has drifted from the code"
 
@@ -145,7 +162,7 @@ grep -qE 'rank40/body30/caller15/note5/test10' "$B2000" \
 D1="$( runw --pack-task="$TASK" --token-budget=2000 )"
 D2="$( runw --pack-task="$TASK" --token-budget=2000 )"
 D3="$( runw --pack-task="$TASK" --token-budget=2000 )"
-{ [ "$D1" = "$D2" ] && [ "$D2" = "$D3" ]; } && ok "quota-budgeted bundle is deterministic (byte-identical x3)" || no "quota-budgeted bundle is non-deterministic"
+if { [ "$D1" = "$D2" ] && [ "$D2" = "$D3" ]; }; then ok "quota-budgeted bundle is deterministic (byte-identical x3)"; else no "quota-budgeted bundle is non-deterministic"; fi
 
 # ── 6) --token-budget=1 sanity: the quota split must not invert at the degenerate end (mirrors packtaskcheck's
 #    F4 arm for the OLD cap() — the new sectionBudget()/quotaOf() must hold the same no-inversion property). ──

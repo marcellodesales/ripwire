@@ -39,12 +39,13 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/cloneidiomfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -59,7 +60,9 @@ cp -R "$FIX/." "$CORPUS/"
 echo "cloneidiomcheck: BIN=$BIN"
 
 # One <group ...> row per line, for grep-per-row assertions.
-rows(){ "$BIN" "$CORPUS/$1" --clones --no-cache 2>/dev/null | sed 's|<group |\n<group |g' | grep '^<group'; }
+# L1 (2026-09-19): the CLI default legend is compact and spells <group ...> row shapes inside its comment; rows()
+# counts real rows and (M) reads the FULL legend's definitions, so both ask for --legend=full.
+rows(){ "$BIN" "$CORPUS/$1" --clones --no-cache --legend=full 2>/dev/null | sed 's|<group |\n<group |g' | grep '^<group'; }
 
 # ── (A)-(F) the conjunction, one fixture per condition ────────────────────────────────────────────────
 # expect_row <dir> <memberA> <memberB> <idiom-or-NONE> <demoted:yes|no>
@@ -133,7 +136,7 @@ check_counter()
 {
     local dir="$1" attr="$2" want="$3" got
     got="$( root "$dir" | sed -n "s/.* $attr=\"\([0-9]*\)\".*/\1/p" )"
-    [ "$got" = "$want" ] && ok "$dir: $attr=$want" || no "$dir: $attr=$got, expected $want"
+    if [ "$got" = "$want" ]; then ok "$dir: $attr=$want"; else no "$dir: $attr=$got, expected $want"; fi
 }
 check_counter ladder_demote idiom_groups   1
 check_counter ladder_demote demoted_groups 1
@@ -143,7 +146,7 @@ check_counter nonidiom      demoted_groups 0
 # ── (M) the legend defines both new attributes ────────────────────────────────────────────────────────
 # The DEFINITIONAL predicate legendcoveragecheck uses for a closure: the attribute name followed by `=`.
 # The legend is everything ahead of the root element, which is where a reader meets it.
-LEG="$( "$BIN" "$CORPUS/ladder_demote" --clones --no-cache 2>/dev/null | sed 's/<clones .*//' )"
+LEG="$( "$BIN" "$CORPUS/ladder_demote" --clones --no-cache --legend=full 2>/dev/null | sed 's/<clones .*//' )"
 for a in idiom demoted idiom_groups demoted_groups; do
     case "$LEG" in
         *"$a="*) ok "legend defines $a=";;
@@ -219,7 +222,7 @@ esac
 # ── (J) determinism ───────────────────────────────────────────────────────────────────────────────────
 "$BIN" "$CORPUS" --clones --no-cache >"$TMP/a" 2>/dev/null
 "$BIN" "$CORPUS" --clones --no-cache >"$TMP/b" 2>/dev/null
-cmp -s "$TMP/a" "$TMP/b" && ok "two --clones runs byte-identical" || no "--clones is not deterministic"
+if cmp -s "$TMP/a" "$TMP/b"; then ok "two --clones runs byte-identical"; else no "--clones is not deterministic"; fi
 
 # ── (K) mutation control ──────────────────────────────────────────────────────────────────────────────
 # Every arm above is a grep for a string. If the emitter stopped emitting entirely, the NONE/no arms would

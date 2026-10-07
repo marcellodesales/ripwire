@@ -38,7 +38,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -118,10 +118,10 @@ for q in "${CONCEPTUAL[@]}"; do
         no "(1) '$q': candidate pool CLI=$cpool MCP=$mpool, both must equal the shared cap $CAP (CLI $cserved+$cdrop, MCP $mserved+$mdrop)"
         pool_fail=1
     fi
-    only_cli=$( comm -23 "$TMP/c.rows" "$TMP/m.rows" | grep -c . )
+    only_cli=$( LC_ALL=C comm -23 "$TMP/c.rows" "$TMP/m.rows" | grep -c . )
     if [ "$only_cli" != 0 ]; then
         no "(2) '$q': $only_cli row(s) served by the CLI are absent from the MCP set — the two ladders started from different heads"
-        comm -23 "$TMP/c.rows" "$TMP/m.rows" | head -5
+        LC_ALL=C comm -23 "$TMP/c.rows" "$TMP/m.rows" | head -5
         subset_fail=1
     fi
 done
@@ -218,6 +218,88 @@ for tb in 900 1200 1600 2000 6000; do
     fi
 done
 
+# ── (6) no_route: the CLI's own recovery from a route MIS-FIRE, reachable from MCP (audit F-R1-07) ────────
+# `for`'s header names WHICH ranker answered and why. Until 2026-09-10 an agent that read route= and
+# disagreed had no way to ask for the other one: the server refused `no_route` by name, so the CLI's own
+# answer to a mis-fire was unreachable from the MCP surface. These arms are RED against a pre-change binary
+# (the first returns -32602 "unknown field: 'no_route'").
+mcp_for_nr(){ printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"for","arguments":{"path":"%s","task":"%s","no_route":%s}}}\n' \
+                     "$CORPUS" "$1" "$2" | "$BIN" --mcp 2>/dev/null | python3 "$TMP/mcptext.py"; }
+# RE-AUTHORED 2026-09-12 (row 6, route= as a code): "parse tree" routes subtoken+body:broad on this corpus — the SAME
+# ranker no_route forces — so the served sets could only ever differ by what the 97 B route note displaced from the
+# byte-shaped <sigs>; with the note down to 23 B they were identical, and the arm went red on an artefact. An
+# identifier query routes name-exact, so no_route:true really changes the ranker (and the served set) here.
+NR_Q="escapeXml"
+mcp_for     "$NR_Q"        >"$TMP/nr.routed.xml"
+mcp_for_nr  "$NR_Q" true   >"$TMP/nr.off.xml"
+cli_for     "$NR_Q"        >"$TMP/nr.cli.routed.xml"
+cli_for     "$NR_Q" --no-route >"$TMP/nr.cli.off.xml"
+grep -q 'route="' "$TMP/nr.routed.xml" \
+    && ok "(6) MCP for still discloses route= by default" \
+    || no "(6) MCP for lost its route= disclosure"
+# FIRST, that the call ANSWERED. A refused call returns no content, and an empty document trivially
+# satisfies "no route=" and "not the routed row set" — the two arms below would then pass against a binary
+# that does not know the argument at all. Measured while writing this gate: against the pre-change binary
+# those two arms went green on emptiness, which is exactly the false-green this arm exists to prevent.
+if ! grep -q '<sigs' "$TMP/nr.off.xml"; then
+    no "(6) no_route:true returned no bundle at all (refused?) — every arm below would measure emptiness"
+fi
+# The CLI emits NO route= under --no-route (there is no route to disclose), and the MCP twin must not
+# invent one. Asserted against the CLI's own behavior, not against a remembered rule.
+if grep -q 'route="' "$TMP/nr.cli.off.xml"; then
+    no "(6) the CLI --no-route now emits a route= — this arm's premise moved, re-derive it"
+else
+    grep -q 'route="' "$TMP/nr.off.xml" \
+        && no "(6) MCP no_route:true still emitted a route= the CLI --no-route does not" \
+        || ok "(6) MCP no_route:true emits no route=, exactly as the CLI --no-route"
+fi
+# The point of the escape hatch: it must actually change the answer the way the CLI's does. Same served
+# set as the CLI's --no-route on this repo's own measured mis-fire ("parse tree" routes name-exact and
+# misses parseTree, which --no-route finds at rank 1) — subset, for the same payload reason arm (2) gives.
+python3 "$TMP/rows.py" <"$TMP/nr.off.xml"     >"$TMP/nr.off.rows"
+python3 "$TMP/rows.py" <"$TMP/nr.cli.off.xml" >"$TMP/nr.cli.off.rows"
+python3 "$TMP/rows.py" <"$TMP/nr.routed.xml"  >"$TMP/nr.routed.rows"
+if [ ! -s "$TMP/nr.off.rows" ] || [ ! -s "$TMP/nr.cli.off.rows" ]; then
+    no "(6) one of the two no-route dialects served no rows — this arm measured nothing"
+else
+    cmp -s "$TMP/nr.off.rows" "$TMP/nr.routed.rows" \
+        && no "(6) no_route:true served the SAME rows as the routed call — the argument is inert" \
+        || ok "(6) no_route:true changes the served set, as --no-route does on the CLI"
+    missing="$( LC_ALL=C comm -23 "$TMP/nr.cli.off.rows" "$TMP/nr.off.rows" | head -3 )"
+    [ -z "$missing" ] \
+        && ok "(6) every CLI --no-route row is present in the MCP no_route set" \
+        || no "(6) MCP no_route dropped CLI --no-route rows: $( printf '%s' "$missing" | tr '\n' ' ' )"
+fi
+# Typed, like every other MCP argument: a quoted "true" is a STRING and refuses rather than being guessed.
+QT="$( printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"for","arguments":{"path":"%s","task":"x","no_route":"true"}}}\n' "$CORPUS" | "$BIN" --mcp 2>/dev/null )"
+case "$QT" in *'invalid value for field: no_route'*) ok "(6) a quoted \"true\" refuses by name, never read as absent";; *) no "(6) no_route:\"true\" did not refuse: $( printf '%s' "$QT" | head -c 160 )";; esac
+# explore (and its pack_task alias) route too, and declare the same argument.
+EX="$( printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pack_task","arguments":{"path":"%s","task":"%s","no_route":true}}}\n' "$CORPUS" "$NR_Q" | "$BIN" --mcp 2>/dev/null | python3 "$TMP/mcptext.py" )"
+{ [ -n "$EX" ] && ! printf '%s' "$EX" | grep -q 'route="'; } \
+    && ok "(6) explore/pack_task honors no_route too (bundle served, no route=)" \
+    || no "(6) explore/pack_task did not honor no_route"
+# A verb that does NOT route must still refuse the argument — the declaration is per-verb, not global.
+GR="$( printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grep","arguments":{"path":"%s","pattern":"x","no_route":true}}}\n' "$CORPUS" | "$BIN" --mcp 2>/dev/null )"
+case "$GR" in *"unknown field: 'no_route'"*) ok "(6) a non-routing verb still refuses no_route by name";; *) no "(6) grep accepted no_route: $( printf '%s' "$GR" | head -c 160 )";; esac
+
+# ── (6b) T14 REGRESSION (review rv-t14a.md finding 1): confidence=/margin_pct= must agree between the
+#    CLI and MCP dialects under no-route, on a query with a genuine sharp cliff and a LARGE positive-
+#    score population — exactly the shape runForLens's own homonym-decline gate used to mislabel (it
+#    read the route as `!isConceptualRoute(routeTag)`, true on BOTH "subtoken+body" and the un-routed
+#    default "no-route", so --no-route --adaptive declined a real cliff and reported a fabricated
+#    same-name count). MCP `for`'s confidence=/margin_pct= is disclosure-only (H14) and was already
+#    correct (it reads rc.which directly) — the CLI is what drifted, so this arm is CLI-vs-MCP, not
+#    just CLI-vs-itself. estimateExpandBodyTokens is the same query arm (e)/(i) of adaptivecheck.sh use
+#    for its large scored population (>50) and floor-clamped kept (5).
+SHARP_Q="estimateExpandBodyTokens"
+cli_for    "$SHARP_Q" --no-route >"$TMP/sharp.cli.xml"
+mcp_for_nr "$SHARP_Q" true       >"$TMP/sharp.mcp.xml"
+CLI_CONF="$( grep -oE 'confidence="[^"]*" margin_pct="[^"]*"' "$TMP/sharp.cli.xml" | head -1 )"
+MCP_CONF="$( grep -oE 'confidence="[^"]*" margin_pct="[^"]*"' "$TMP/sharp.mcp.xml" | head -1 )"
+{ [ -n "$CLI_CONF" ] && [ "$CLI_CONF" = "$MCP_CONF" ] && printf '%s' "$CLI_CONF" | grep -q 'confidence="high"'; } \
+    && ok "(6b) CLI/MCP agree under no-route on a sharp cliff: $CLI_CONF (never a homonym-decline low)" \
+    || no "(6b) CLI/MCP disagree or mislabeled under no-route: cli='$CLI_CONF' mcp='$MCP_CONF'"
+
 # ── determinism + well-formedness on the MCP dialect ─────────────────────────────────────────────────────
 mcp_for "$INERT_Q" >"$TMP/d1.xml"; mcp_for "$INERT_Q" >"$TMP/d2.xml"
 cmp -s "$TMP/d1.xml" "$TMP/d2.xml" \
@@ -228,6 +310,53 @@ if command -v xmllint >/dev/null 2>&1; then
         && ok "MCP for output is well-formed XML (G4)" || no "MCP for output is not well-formed"
 else
     printf '  SKIP  xmllint (not installed)\n'
+fi
+
+
+# ── (7) THE sc= READING IS PRESENT-ONLY ON BOTH DIALECTS (CodeRabbit, PR #215) ───────────────────────────
+# THE DEFECT. The CLI lens made both droppable readings present-only — the sc= clause rides only when a row
+# this bundle could serve actually carries a scope (verbs_for.h forScPresent), the route= code only when the
+# root carries route= — while this twin appended kForIdRouteLegend UNCONDITIONALLY. On a scope-free corpus the
+# MCP answer therefore DEFINED an attribute no row carried, and the signatures-budget exemption a few lines
+# below hand-built the same decision a second time, so the bytes emitted and the bytes exempted could disagree.
+# Both surfaces now ask rw::forIdRouteLegendParts once and use `.sc`/`.route` to append and `.bytes()` to
+# exempt: four sites, one rule.
+#
+# WHY BOTH DIRECTIONS. A one-sided pin (absent on a flat corpus) would pass on a binary that never emits the
+# clause at all, which is the opposite defect — a first-screen attribute with no definition anywhere in the
+# document. So the arm reads the same rule twice: the scope-free fixture must have it on NEITHER dialect, and
+# the scoped corpus must have it on BOTH. RED on the pre-fix binary: flat corpus, CLI 0, MCP 1.
+SC_CLAUSE='sc=scope (full id p::sc::n)'
+FLAT="$TMP/flatcorpus"
+mkdir -p "$FLAT"
+cat > "$FLAT/flat.c" <<'FLATSRC'
+int widgetPingRouteAlpha( int a ) { return a + 1; }
+int widgetPingRouteBeta( int a ) { return widgetPingRouteAlpha( a ) + 2; }
+int widgetPingRouteGamma( int a ) { return widgetPingRouteBeta( a ) + 3; }
+FLATSRC
+mcp_for_at(){ printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"for","arguments":{"path":"%s","task":"%s"}}}\n' \
+                     "$1" "$2" | "$BIN" --mcp 2>/dev/null | python3 "$TMP/mcptext.py"; }
+FLAT_Q="widget ping route"
+# L1 (2026-09-19): the CLI default legend is compact and words the scope reading differently; this arm reads the
+# FULL legend's sc= clause (the MCP twin serves that wording), so both CLI runs ask for --legend=full.
+"$BIN" "$FLAT" --for="$FLAT_Q" --no-cache --legend=full >"$TMP/sc_flat_cli.xml" 2>/dev/null
+mcp_for_at "$FLAT" "$FLAT_Q"                >"$TMP/sc_flat_mcp.xml"
+cli_for "$INERT_Q" --legend=full >"$TMP/sc_scoped_cli.xml"
+mcp_for "$INERT_Q" >"$TMP/sc_scoped_mcp.xml"
+sc_has(){ grep -qF "$SC_CLAUSE" "$1" && echo 1 || echo 0; }
+# the premise: both fixtures must have produced a bundle with a header at all
+if ! grep -q '<sigs' "$TMP/sc_flat_cli.xml" || ! grep -q '<sigs' "$TMP/sc_flat_mcp.xml" \
+   || ! grep -q '<sigs' "$TMP/sc_scoped_cli.xml" || ! grep -q '<sigs' "$TMP/sc_scoped_mcp.xml"; then
+    no "(7) one of the four runs served no <sigs> bundle — the sc= presence arm measured nothing"
+else
+    flatC="$( sc_has "$TMP/sc_flat_cli.xml" )"; flatM="$( sc_has "$TMP/sc_flat_mcp.xml" )"
+    scopC="$( sc_has "$TMP/sc_scoped_cli.xml" )"; scopM="$( sc_has "$TMP/sc_scoped_mcp.xml" )"
+    { [ "$flatC" = 0 ] && [ "$flatM" = 0 ]; } \
+        && ok "(7) scope-free corpus: NEITHER dialect defines sc= (CLI=$flatC MCP=$flatM) — no reading for an attribute no row carries" \
+        || no "(7) scope-free corpus: the sc= reading is present-only on one dialect and unconditional on the other (CLI=$flatC MCP=$flatM) — the parity gap"
+    { [ "$scopC" = 1 ] && [ "$scopM" = 1 ]; } \
+        && ok "(7) scoped corpus ($CORPUS): BOTH dialects define sc= (CLI=$scopC MCP=$scopM) — the attribute a reader meets has a definition" \
+        || no "(7) scoped corpus ($CORPUS): sc= rides the rows but only $((scopC + scopM)) of 2 dialects define it (CLI=$scopC MCP=$scopM)"
 fi
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"

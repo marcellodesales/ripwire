@@ -48,13 +48,27 @@
 #include "model.h"
 #include "arch.h"        // §B1.3: relForHash — the root-relative path segment canonicalIdRelTo keys on
 #include "smallvec.h"
+#include "infra/namesplit.h"   // stripTemplateArgs — a C++ template-id scope's family (appendTemplateFamilyKey), a `using Base<T>::m;` qualifier (buildUsingReexports)
+#include "infra/sortutil.h"      // radixSortIdsAscending — the id-set sort buildGraph/2b below runs F times
+#include "infra/profileScope.h"  // PROFILE_SCOPE self-profiling — gated by PROFILE_ENABLED (off unless -DRIPWIRE_PROFILE=ON)
+#include "infra/os.h"           // os::realpath / os::stat — the ancestor-config walk (#220: configs above the crawl root)
+#include "infra/Diagnostics.h"   // ASSUME — buildScopedRecvDecls' index-range precondition
+#include "extentsuspect.h"       // extent::inSet with kHeadRuleLangs / kExtentClassKinds — class identity's C-family and class-kind tables
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>       // fopen/fread — workspace-only config-file evidence (go.mod / tsconfig.json), §3.2
+#include <climits>      // PATH_MAX — the ancestor-config walk's realpath buffer
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace rw
@@ -83,9 +97,23 @@ inline constexpr std::uint32_t kNoFile = 0xFFFFFFFFu;   // "no repo file" sentin
 // a trailing '/' is dropped. Empty segments (from `//` or a leading '/') and `.` segments are elided.
 inline std::string lexicalNormalize( std::string_view path )
 {
-    const bool                     isAbsolute = ( !path.empty() && path.front() == '/' );
-    std::vector<std::string_view>  segs;                 // the surviving path components, in order
-    segs.reserve( 8 );
+    // ONE allocation, the returned string, and it is reserved: the segment list this used to build
+    // (`std::vector<std::string_view> segs; segs.reserve( 8 );`) was a second heap block on a function
+    // probeUpward calls ~25 times PER INCLUDE — 714,000 times on a 4,923-file Ruby tree, where the include
+    // adjacency was 87 ms of a 330 ms warm run (bench/PROFILE.md). Segments are appended to `out` directly
+    // and a `..` truncates it back to the previous '/', which is the same pop the vector did: `segs` could
+    // only ever hold real segments (`.`, `..` and empties take the other branches), so its
+    // `segs.back() != ".."` guard was invariant-true and is gone with it. `rootLen` is the prefix a `..`
+    // may never eat — 1 for an absolute path, 0 for a relative one — which is what makes the two degrade
+    // rules ("no-op at the filesystem root" vs "escaping above the base is unsound") one comparison.
+    const bool  isAbsolute = ( !path.empty() && path.front() == '/' );
+    std::string out;
+    out.reserve( path.size() );
+    if( isAbsolute )
+    {
+        out.push_back( '/' );
+    }
+    const std::size_t rootLen = out.size();
 
     std::size_t i = 0;
     while( i < path.size() )
@@ -104,9 +132,10 @@ inline std::string lexicalNormalize( std::string_view path )
         }
         else if( seg == ".." )
         {
-            if( !segs.empty() && segs.back() != ".." )
+            if( out.size() > rootLen )
             {
-                segs.pop_back(); // pop the previous real segment
+                const std::size_t cut = out.rfind( '/' );                       // pop the previous real segment
+                out.resize( ( cut == std::string::npos || cut < rootLen ) ? rootLen : cut );
             }
             else if( isAbsolute )                       { /* `..` at the filesystem root is a no-op */ }
             else
@@ -116,25 +145,14 @@ inline std::string lexicalNormalize( std::string_view path )
         }
         else
         {
-            segs.push_back( seg );
+            if( out.size() > rootLen )
+            {
+                out.push_back( '/' );
+            }
+            out.append( seg );
         }
 
         i = ( j < path.size() ) ? j + 1 : j;             // skip the '/'
-    }
-
-    // reassemble
-    std::string out;
-    if( isAbsolute )
-    {
-        out.push_back( '/' );
-    }
-    for( std::size_t k = 0; k < segs.size(); ++k )
-    {
-        if( k )
-        {
-            out.push_back( '/' );
-        }
-        out.append( segs[k] );
     }
     return out;
 }
@@ -154,7 +172,7 @@ inline std::string lexicalNormalize( std::string_view path )
 // The import dialect a file's imports resolve in, keyed off its extension. C-family covers the quote
 // `#include`; Other (Swift/Java/C#/PHP/Markdown/…) never precise-resolves (deferred / no path in import).
 // Bash/Ruby/Lua/Elixir joined at kParserVer 81 — see their Step-As below.
-enum class IncludeLang : std::uint8_t { CFamily, Python, Ts, Rust, Go, Bash, Ruby, Lua, Elixir, Dart, Other };
+enum class IncludeLang : std::uint8_t { CFamily, Python, Ts, Rust, Go, Bash, Ruby, Lua, Elixir, Other };
 
 // extension → dialect, a declarative constexpr table (NOT a scattered if-chain). Extension includes the
 // leading dot; the classifier lowercases nothing (source extensions are lowercase by convention here).
@@ -167,10 +185,23 @@ inline IncludeLang includeLangOf( std::string_view path ) noexcept
         { ".cxx", IncludeLang::CFamily }, { ".h",   IncludeLang::CFamily }, { ".hpp", IncludeLang::CFamily },
         { ".hh",  IncludeLang::CFamily }, { ".hxx", IncludeLang::CFamily }, { ".m",   IncludeLang::CFamily },
         { ".mm",  IncludeLang::CFamily },
-        { ".py",  IncludeLang::Python },
+        // The shader/CUDA trio the crawl indexes as C++ and the Python typing stub. Their files entered the
+        // dependency denominator when langOfPath learned their extensions (lintrules.h), so their includer
+        // dialect joins in the same change: a quote `#include "x.cuh"` is the C tier's exact relative-path
+        // hit, and a stub's `import` is Python's Step-A. Without these rows they would be counted and never
+        // resolve, which test/deplangscheck.sh arm (G) refuses. `.hxx` left this table with langOfPath's row while
+        // the crawl admitted no `.hxx` file, and came back with it when the crawl did (A4, lane/small-fixes-0917).
+        { ".metal", IncludeLang::CFamily }, { ".cu", IncludeLang::CFamily }, { ".cuh", IncludeLang::CFamily },
+        { ".py",  IncludeLang::Python },    { ".pyi", IncludeLang::Python },
         { ".ts",  IncludeLang::Ts },      { ".tsx", IncludeLang::Ts },      { ".mts", IncludeLang::Ts },
         { ".cts", IncludeLang::Ts },      { ".js",  IncludeLang::Ts },      { ".jsx", IncludeLang::Ts },
         { ".mjs", IncludeLang::Ts },      { ".cjs", IncludeLang::Ts },
+        // `.astro` joins for the SAME reason the shader/CUDA trio above did, in the same change that gave it a
+        // langOfPath row (issue #67): it is Lang::TypeScript, so it is dependency-CAPABLE and enters the
+        // dep_files= denominator — without this row it would be counted and never resolve, which
+        // test/deplangscheck.sh arm (G) refuses. Its imports are ordinary relative TypeScript specifiers and
+        // live in the `---` frontmatter, which is the only part of the file this build parses at all.
+        { ".astro", IncludeLang::Ts },
         { ".rs",  IncludeLang::Rust },
         { ".go",  IncludeLang::Go },       // Go: single-root DEFERRED (kNoFile); cross-root via go.mod `replace` (§3.2)
         // kParserVer 81 — the four-language import round. Each has a SOUND Step-A below (unique-or-degrade,
@@ -180,7 +211,6 @@ inline IncludeLang includeLangOf( std::string_view path ) noexcept
         { ".rb",  IncludeLang::Ruby },
         { ".lua", IncludeLang::Lua },
         { ".ex",  IncludeLang::Elixir },  { ".exs", IncludeLang::Elixir },
-        { ".dart", IncludeLang::Dart },
         // B6.2: `.cs` has NO entry here — it falls through to IncludeLang::Other below, DEFERRED like
         // Java (also absent) and Swift/Go-single-root: a C# namespace does not map 1:1 onto a file (one
         // namespace spans many files, one file can hold several namespaces), so there is no sound
@@ -409,6 +439,170 @@ inline std::uint32_t resolvePythonImport( std::string_view includerPath, std::st
     return ( hit == kNoFile || hit == kNoFile - 1 ) ? kNoFile : hit;   // unique-or-degrade
 }
 
+// A relative JS/TS specifier may spell the RUNTIME file its source compiles to: TypeScript's node16/nodenext
+// resolution requires `import './api.js'` for `api.ts`, and a `.mjs`/`.cjs` specifier names its `.mts`/`.cts`
+// source. ONE table, read by the precise include tier (resolveTsImport below) and by graph.h's named-import binder
+// (resolveJsNamedImportFile), so --deps and the call binder cannot disagree about which file a runtime spelling
+// names. No directory-index row: TypeScript never maps `./lib.js` onto `lib/index.ts` (verified live, tsc 7.0.2
+// --traceResolution, node16/nodenext/bundler identical: "was not resolved").
+//
+// Two tiers, source before declaration (same trace): a stray `.d.ts`/`.d.mts`/`.d.cts` is tried ONLY when
+// `sources` answers NOTHING — `./d.js` with only `d.d.ts` on disk resolves to it, but `./both.js` with BOTH
+// `both.ts` and `both.d.ts` resolves to `both.ts` and never even probes the declaration (source wins outright,
+// not "first written"). `sources` itself keeps the existing unique-or-degrade discipline unchanged: if two
+// SOURCE alternates both exist (e.g. a tree with both `tj.ts` and `tj.tsx` for one `./tj.js` specifier), tsc's
+// real resolver breaks the tie by fixed order (`tj.ts` wins, not ambiguous) — this table does not implement
+// that tie-break (matches the pre-existing `.js`->{ts,tsx} row's shipped behaviour, a deliberate conservative
+// choice already documented above: two real candidates degrade to unresolved rather than guess). `decl` is
+// UNAMBIGUOUS by construction — TypeScript declaration files never fork on tsx/jsx, so there is exactly one
+// declaration spelling per runtime extension, never a pair to degrade between.
+struct JsRuntimeSourceExt
+{
+    std::string_view runtime;        // the emitted spelling the specifier carries
+    std::string_view sources[ 2 ];   // the source spellings it may name; an empty slot is unused
+    std::string_view decl;           // declaration-only fallback, tried iff `sources` found nothing at all; empty = none
+};
+
+inline constexpr JsRuntimeSourceExt kJsRuntimeSourceExts[] = {
+    { ".js",  { ".ts", ".tsx" }, ".d.ts"  },
+    // .jsx before .js in iteration order doesn't matter here (`ends_with(".js")` is false on a ".jsx" specifier —
+    // the two runtime spellings share no suffix), but jsRuntimeSourceExtOf takes the FIRST row whose runtime
+    // suffix matches, so this row still owns every ".jsx" specifier outright. Source order .tsx-then-.ts matches
+    // tsc live: `./jx.jsx`->jx.tsx (only .tsx present), `./jts.jsx`->jts.ts (only .ts present). The `.d.ts`
+    // fallback for a bare `.jsx` specifier is not in the archived tsc trace (its probe list only carried .js/.jsx
+    // rows that already had a source hit) — it is the same single declaration-file rule as `.js` because
+    // TypeScript never emits a `.d.jsx`/`.d.tsx`; kept here for that reason, not because it was traced directly.
+    { ".jsx", { ".tsx", ".ts" }, ".d.ts"  },
+    { ".mjs", { ".mts", {} },    ".d.mts" },
+    { ".cjs", { ".cts", {} },    ".d.cts" },
+};
+
+// The row a specifier's suffix selects, or nullptr when it carries no runtime extension.
+inline const JsRuntimeSourceExt* jsRuntimeSourceExtOf( std::string_view specifier ) noexcept
+{
+    for( const JsRuntimeSourceExt& row : kJsRuntimeSourceExts )
+    {
+        if( specifier.size() > row.runtime.size() && specifier.ends_with( row.runtime ) )
+        {
+            return &row;
+        }
+    }
+    return nullptr;
+}
+
+// The two-tier probe `kJsRuntimeSourceExts` exists for: `runtimeExt`'s SOURCE alternates first
+// (unique-or-degrade among `sources`), then — ONLY when the source tier found NOTHING at all, never when
+// it is ambiguous — its single DECLARATION fallback. `seedHit` folds in a caller's own already-resolved
+// candidate (an exact/literal probe of the specifier itself) under the SAME unique-or-degrade rule, so a
+// caller needs no separate merge step: the returned `fileId` already accounts for it. Shared by
+// resolveTsImport (below) and graph.h's resolveJsNamedImportFile, so the two-tier precedence — source
+// before declaration, tsc live-verified (see kJsRuntimeSourceExts above) — and the underlying lookup
+// (joinNormalizeLookup) cannot drift between the include tier and the named-import binder.
+//
+// Returns { fileId, ambiguous }: fileId is kNoFile on EITHER "nothing answered" or "ambiguous" — ambiguous
+// says which, the same two-outcome contract resolveJsNamedImportFile already promised its own callers.
+inline std::pair<std::uint32_t, bool> probeJsRuntimeSourceExt( std::string_view dir, std::string_view target,
+                                                                const JsRuntimeSourceExt& runtimeExt,
+                                                                const HashMap<std::string, std::uint32_t>& fileIndex,
+                                                                const WsIncludeCtx* ws, std::uint32_t includerFileId,
+                                                                std::uint32_t seedHit = kNoFile )
+{
+    // `runtimeExt` must be the row `jsRuntimeSourceExtOf( target )` itself returned — its own size guard
+    // (`specifier.size() > row.runtime.size()`, just above) is what makes forming `stem` safe below; this
+    // function does not re-derive `runtimeExt` from `target`, so that contract is the CALLER's to keep.
+    // `seedHit` must not already be the `kNoFile - 1` ambiguous marker: it is folded in as an ordinary
+    // candidate, not as a pre-existing ambiguity, and no caller has a reason to pass that sentinel in.
+    EXPECTS( target.size() > runtimeExt.runtime.size(), "caller must pass runtimeExt from jsRuntimeSourceExtOf( target )" );
+    EXPECTS( seedHit != kNoFile - 1, "seedHit is an ordinary candidate, never the ambiguous marker" );
+    const std::string stem( target.substr( 0, target.size() - runtimeExt.runtime.size() ) );
+    std::uint32_t hit = seedHit;
+    bool ambiguous = false;
+    const auto probe = [ & ]( std::string_view extension )
+    {
+        const std::uint32_t candidate = joinNormalizeLookup( dir, stem + std::string( extension ), fileIndex, ws, includerFileId );
+        if( candidate == kNoFile ) { return; }
+        if( hit != kNoFile && hit != candidate ) { ambiguous = true; }
+        hit = candidate;
+    };
+    for( const std::string_view source : runtimeExt.sources )
+    {
+        if( !source.empty() )
+        {
+            probe( source );
+        }
+    }
+    if( !ambiguous && hit == kNoFile && !runtimeExt.decl.empty() )
+    {
+        probe( runtimeExt.decl );
+    }
+    return { ambiguous ? kNoFile : hit, ambiguous };
+}
+
+// ── Python Step-A, SUFFIX fallback (issue #287) — for an ABSOLUTE (non-relative) spec Step-A's two bases
+// (relative-to-file, relative-to-crawl-root) both miss: `import target_mod` naming an indexed
+// `pkg/target_mod.py` that lives under a package directory neither base probes (no sys.path modelling —
+// same limit Step-A already has). Reuses `samePathTail` (arch.h) — the SAME whole-path-COMPONENT-boundary
+// suffix test already used to match a canonical id's root-relative spelling (graph.h::canonicalIdMatches)
+// and a git tree path against an ingest path (crossref.h::sameTreePath) — rather than a new, looser
+// matcher: `target_mod.py` hits `pkg/target_mod.py` on a real path-component boundary, never
+// `xtarget_mod.py` or a bare `.py`. `fileIndex` is the same ingest-root-relative universe Step-A probes;
+// unique-or-degrade exactly like Step-A's own probe (0 or ≥2 distinct fileIds hit ⇒ kNoFile).
+//
+// NEVER applied to a relative spec — a leading `.` fixes the base to the includer's own file, so
+// suffix-scanning it would be a real loosening (matching some unrelated same-named file elsewhere in the
+// tree), not a mirror of Step-A. Guarded here too (kNoFile on a relative/empty target) so a future call
+// site can't skip the gate silently.
+//
+// CodeRabbit PR #292 finding 4052087919: this scans the WHOLE `fileIndex`, which in a MERGED multi-root
+// workspace (`ripwire dir1 dir2 …`) spans every labeled root, not just the importer's own. Without a
+// same-root restriction, `import target_mod` in root A could bind to the only `target_mod.py` in an
+// unrelated root B — a cross-root edge with no import path or workspace configuration connecting the two
+// roots, the exact kind of evidence-free cross-root hit `sameRoot()` exists elsewhere in graph.h to
+// refuse. `fileRoot`/`importerFileId` are optional (both default to "no restriction") so a single-root
+// caller — `fileRoot` is empty there, same convention as graph.h's own `sameRoot` — pays nothing and
+// changes nothing; a multi-root caller passes both and every candidate outside the importer's root is
+// filtered OUT before the unique-or-degrade count, exactly as if it were never indexed (never counted as
+// the ambiguity that makes a genuinely unique same-root hit degrade to kNoFile).
+inline std::uint32_t resolvePythonModuleSuffix( std::string_view target, const HashMap<std::string, std::uint32_t>& fileIndex,
+                                                 const std::vector<std::uint32_t>* fileRoot = nullptr, std::uint32_t importerFileId = kNoFile )
+{
+    if( target.empty() || target.front() == '.' )
+    {
+        return kNoFile;
+    }
+    const bool         rootScoped = fileRoot != nullptr && !fileRoot->empty() && importerFileId < fileRoot->size();
+    const std::uint32_t importerRoot = rootScoped ? ( *fileRoot )[ importerFileId ] : 0u;
+    std::string modPath;
+    modPath.reserve( target.size() );
+    for( const char c : target )
+    {
+        modPath.push_back( c == '.' ? '/' : c );
+    }
+    const std::string tailPy   = modPath + ".py";
+    const std::string tailInit = modPath + "/__init__.py";
+
+    std::uint32_t hit = kNoFile;
+    for( const auto& kv : fileIndex )
+    {
+        if( samePathTail( kv.first, tailPy ) || samePathTail( kv.first, tailInit ) )
+        {
+            if( rootScoped && ( kv.second >= fileRoot->size() || ( *fileRoot )[ kv.second ] != importerRoot ) )
+            {
+                continue;   // a real path-tail hit, but in an unrelated labeled root — no import evidence connects them
+            }
+            if( hit == kNoFile )
+            {
+                hit = kv.second; // first distinct hit
+            }
+            else if( kv.second != hit )
+            {
+                return kNoFile; // a SECOND distinct file → ambiguous, never guess
+            }
+        }
+    }
+    return hit;
+}
+
 // ── TS/JS Step-A — SOUND (closest to C quote-includes). Relative specifier `./x` / `../a/b` → probe a
 // FIXED extension list then index files, relative-to-includer; a BARE specifier (`react`, `lodash` — no
 // leading dot) is node_modules/external → kNoFile (unresolved, never matched). Resolve IFF exactly ONE
@@ -519,8 +713,17 @@ inline std::uint32_t resolveTsImport( std::string_view includerPath, std::string
             hit = kNoFile - 1; // second distinct file → ambiguous
         }
     };
-    // FIRST an exact hit (specifier already has an extension, e.g. `./x.js`), then extension-appended, then index.
+    // FIRST an exact hit (specifier already has an extension, e.g. `./x.js`), then the source file a runtime spelling
+    // names (kJsRuntimeSourceExts, both tiers — probeJsRuntimeSourceExt above), then extension-appended, then
+    // index. One accumulator for all of them (probeJsRuntimeSourceExt is SEEDED with it and folds its own
+    // result back in), so a tree holding BOTH api.js and api.ts leaves `./api.js` unresolved rather than
+    // guessing which module was meant.
     probe( std::string( target ) );
+    if( const JsRuntimeSourceExt* const runtimeExt = jsRuntimeSourceExtOf( target ) )
+    {
+        const auto [ extHit, extAmbiguous ] = probeJsRuntimeSourceExt( dir, target, *runtimeExt, fileIndex, ws, includerFileId, hit );
+        hit = extAmbiguous ? ( kNoFile - 1 ) : extHit;
+    }
     for( std::string_view e : kFileExt )
     {
         probe( std::string( target ) + std::string( e ) );
@@ -1266,13 +1469,12 @@ inline std::uint32_t resolveElixirModule( std::string_view target, const HashMap
 // `.ex`/`.exs` includer this is one pass over `ing.includes` that finds nothing and allocates nothing, so
 // every other language's cost is unchanged. An empty result is the caller's signal to pass nullptr.
 //
-// ROUND FLOOR, stated once. This layer resolves the FILE edge for all four languages added at parser
-// version 81. It does NOT feed the name-level resolver: an Elixir `alias A.B.C` also binds the local name
-// `C`, a Ruby `require` makes a constant autoloadable, and neither narrows a later call the way a Python
-// import now does through Phase 5's binding table. `--deps`/`--arch`/`--impact`/`--cochange` see these
-// edges; `--callers`/`--callees` still resolve those languages' calls by the global name ladder alone.
+// Resolve Elixir file dependencies from declared module identities, independent of the file layout.
+// Lexical aliases are already expanded at ingest. Function calls use ElixirResolver's separate
+// module/name/arity index; this unique-module index serves --deps/--arch/--impact/--cochange.
 inline HashMap<std::string, std::uint32_t> buildElixirModuleIndex( const IngestResult& ing )
 {
+    PROFILE_SCOPE_DESCRIBE( "resolve/elixir: module index" );
     HashMap<std::string, std::uint32_t> modules;
     const std::uint32_t F = std::uint32_t( ing.files.size() );
     bool anyElixirDirective = false;
@@ -1288,11 +1490,13 @@ inline HashMap<std::string, std::uint32_t> buildElixirModuleIndex( const IngestR
     {
         return modules;
     }
+    modules.reserve( ing.files.size() );
     for( const Symbol& s : ing.symbols )
     {
-        if( s.lang != Lang::Elixir || s.kind != SymKind::Other || s.name.empty() || s.fileId >= F )
+        if( s.lang != Lang::Elixir || !s.scope.empty() || s.name.empty() || s.fileId >= F
+            || ( s.kind != SymKind::Other && s.kind != SymKind::Class && s.kind != SymKind::Struct && s.kind != SymKind::Interface ) )
         {
-            continue;   // queries/elixir/tags.scm's @definition.module is the ONLY Elixir SymKind::Other
+            continue;   // only module/protocol/struct containers, never attributes or type declarations
         }
         const auto [ it, inserted ] = modules.try_emplace( s.name, s.fileId );
         if( !inserted && it->second != s.fileId )
@@ -1301,550 +1505,6 @@ inline HashMap<std::string, std::uint32_t> buildElixirModuleIndex( const IngestR
         }
     }
     return modules;
-}
-
-struct DartPackageRoot
-{
-    std::string name;
-    std::string libBase;   // root-relative, or labeled root-relative in a workspace
-};
-
-inline void dartSkipJsonWs( const std::string& bytes, std::size_t& i ) noexcept
-{
-    while( i < bytes.size() && ( bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\r' || bytes[i] == '\n' ) )
-    {
-        ++i;
-    }
-}
-
-inline bool dartParseJsonString( const std::string& bytes, std::size_t& i, std::string& out )
-{
-    if( i >= bytes.size() || bytes[i] != '"' )
-    {
-        return false;
-    }
-    out.clear();
-    ++i;
-    while( i < bytes.size() )
-    {
-        const char c = bytes[i++];
-        if( c == '"' )
-        {
-            return true;
-        }
-        if( c != '\\' )
-        {
-            out.push_back( c );
-            continue;
-        }
-        if( i >= bytes.size() )
-        {
-            return false;
-        }
-        const char esc = bytes[i++];
-        switch( esc )
-        {
-            case '"': case '\\': case '/': out.push_back( esc ); break;
-            case 'b': out.push_back( '\b' ); break;
-            case 'f': out.push_back( '\f' ); break;
-            case 'n': out.push_back( '\n' ); break;
-            case 'r': out.push_back( '\r' ); break;
-            case 't': out.push_back( '\t' ); break;
-            case 'u':
-                if( i + 4 > bytes.size() )
-                {
-                    return false;
-                }
-                i += 4;
-                out.push_back( '?' );
-                break;
-            default: return false;
-        }
-    }
-    return false;
-}
-
-inline bool dartSkipJsonValue( const std::string& bytes, std::size_t& i )
-{
-    dartSkipJsonWs( bytes, i );
-    if( i >= bytes.size() )
-    {
-        return false;
-    }
-    if( bytes[i] == '"' )
-    {
-        std::string scratch;
-        return dartParseJsonString( bytes, i, scratch );
-    }
-    if( bytes[i] == '{' )
-    {
-        ++i;
-        dartSkipJsonWs( bytes, i );
-        if( i < bytes.size() && bytes[i] == '}' )
-        {
-            ++i;
-            return true;
-        }
-        while( i < bytes.size() )
-        {
-            std::string key;
-            if( !dartParseJsonString( bytes, i, key ) )
-            {
-                return false;
-            }
-            dartSkipJsonWs( bytes, i );
-            if( i >= bytes.size() || bytes[i] != ':' )
-            {
-                return false;
-            }
-            ++i;
-            if( !dartSkipJsonValue( bytes, i ) )
-            {
-                return false;
-            }
-            dartSkipJsonWs( bytes, i );
-            if( i < bytes.size() && bytes[i] == ',' )
-            {
-                ++i;
-                dartSkipJsonWs( bytes, i );
-                continue;
-            }
-            if( i < bytes.size() && bytes[i] == '}' )
-            {
-                ++i;
-                return true;
-            }
-            return false;
-        }
-        return false;
-    }
-    if( bytes[i] == '[' )
-    {
-        ++i;
-        dartSkipJsonWs( bytes, i );
-        if( i < bytes.size() && bytes[i] == ']' )
-        {
-            ++i;
-            return true;
-        }
-        while( i < bytes.size() )
-        {
-            if( !dartSkipJsonValue( bytes, i ) )
-            {
-                return false;
-            }
-            dartSkipJsonWs( bytes, i );
-            if( i < bytes.size() && bytes[i] == ',' )
-            {
-                ++i;
-                dartSkipJsonWs( bytes, i );
-                continue;
-            }
-            if( i < bytes.size() && bytes[i] == ']' )
-            {
-                ++i;
-                return true;
-            }
-            return false;
-        }
-        return false;
-    }
-    const std::size_t start = i;
-    while( i < bytes.size() && bytes[i] != ',' && bytes[i] != '}' && bytes[i] != ']' && bytes[i] != ' '
-           && bytes[i] != '\t' && bytes[i] != '\r' && bytes[i] != '\n' )
-    {
-        ++i;
-    }
-    return i > start;
-}
-
-inline std::string dartConfigUriToPath( std::string_view uri )
-{
-    if( uri.empty() )
-    {
-        return {};
-    }
-    if( uri.starts_with( "file://" ) )
-    {
-        return std::string( uri.substr( 7 ) );
-    }
-    if( uri.starts_with( "file:" ) )
-    {
-        return std::string( uri.substr( 5 ) );
-    }
-    if( uri.find( ':' ) != std::string_view::npos )
-    {
-        return {};
-    }
-    return std::string( uri );
-}
-
-inline void appendDartPackageRoot( std::vector<DartPackageRoot>& packages, std::string_view configDirRel,
-                                   const std::string& name, std::string_view rootUri, std::string_view packageUri,
-                                   std::string_view packageUriRoot )
-{
-    if( name.empty() )
-    {
-        return;
-    }
-    const std::string baseRoot = dartConfigUriToPath( rootUri );
-    std::string       relBase  = dartConfigUriToPath( packageUriRoot );
-    if( relBase.empty() )
-    {
-        const std::string pkg = dartConfigUriToPath( packageUri );
-        if( pkg.empty() )
-        {
-            return;
-        }
-        relBase = baseRoot.empty() ? pkg : lexicalNormalize( baseRoot + "/" + pkg );
-    }
-    std::string joined;
-    if( !configDirRel.empty() )
-    {
-        joined.append( configDirRel );
-        joined.push_back( '/' );
-    }
-    joined.append( relBase );
-    const std::string libBase = lexicalNormalize( joined );
-    if( libBase.empty() )
-    {
-        return;
-    }
-    packages.push_back( { name, libBase } );
-}
-
-inline void parseDartPackageConfig( const std::string& bytes, std::string_view configDirRel, std::vector<DartPackageRoot>& packages )
-{
-    std::size_t i = 0;
-    dartSkipJsonWs( bytes, i );
-    if( i >= bytes.size() || bytes[i] != '{' )
-    {
-        return;
-    }
-    ++i;
-    while( i < bytes.size() )
-    {
-        dartSkipJsonWs( bytes, i );
-        if( i < bytes.size() && bytes[i] == '}' )
-        {
-            return;
-        }
-        std::string key;
-        if( !dartParseJsonString( bytes, i, key ) )
-        {
-            return;
-        }
-        dartSkipJsonWs( bytes, i );
-        if( i >= bytes.size() || bytes[i] != ':' )
-        {
-            return;
-        }
-        ++i;
-        dartSkipJsonWs( bytes, i );
-        if( key != "packages" )
-        {
-            if( !dartSkipJsonValue( bytes, i ) )
-            {
-                return;
-            }
-        }
-        else
-        {
-            if( i >= bytes.size() || bytes[i] != '[' )
-            {
-                return;
-            }
-            ++i;
-            while( i < bytes.size() )
-            {
-                dartSkipJsonWs( bytes, i );
-                if( i < bytes.size() && bytes[i] == ']' )
-                {
-                    ++i;
-                    break;
-                }
-                if( i >= bytes.size() || bytes[i] != '{' )
-                {
-                    return;
-                }
-                ++i;
-                std::string name, rootUri, packageUri, packageUriRoot;
-                while( i < bytes.size() )
-                {
-                    dartSkipJsonWs( bytes, i );
-                    if( i < bytes.size() && bytes[i] == '}' )
-                    {
-                        ++i;
-                        appendDartPackageRoot( packages, configDirRel, name, rootUri, packageUri, packageUriRoot );
-                        break;
-                    }
-                    std::string pkgKey, value;
-                    if( !dartParseJsonString( bytes, i, pkgKey ) )
-                    {
-                        return;
-                    }
-                    dartSkipJsonWs( bytes, i );
-                    if( i >= bytes.size() || bytes[i] != ':' )
-                    {
-                        return;
-                    }
-                    ++i;
-                    dartSkipJsonWs( bytes, i );
-                    if( i < bytes.size() && bytes[i] == '"' && dartParseJsonString( bytes, i, value ) )
-                    {
-                        if( pkgKey == "name" )               { name = std::move( value ); }
-                        else if( pkgKey == "rootUri" )       { rootUri = std::move( value ); }
-                        else if( pkgKey == "packageUri" )    { packageUri = std::move( value ); }
-                        else if( pkgKey == "packageUriRoot" ){ packageUriRoot = std::move( value ); }
-                    }
-                    else if( !dartSkipJsonValue( bytes, i ) )
-                    {
-                        return;
-                    }
-                    dartSkipJsonWs( bytes, i );
-                    if( i < bytes.size() && bytes[i] == ',' )
-                    {
-                        ++i;
-                        continue;
-                    }
-                    if( i < bytes.size() && bytes[i] == '}' )
-                    {
-                        ++i;
-                        appendDartPackageRoot( packages, configDirRel, name, rootUri, packageUri, packageUriRoot );
-                        break;
-                    }
-                    return;
-                }
-                dartSkipJsonWs( bytes, i );
-                if( i < bytes.size() && bytes[i] == ',' )
-                {
-                    ++i;
-                    continue;
-                }
-                if( i < bytes.size() && bytes[i] == ']' )
-                {
-                    ++i;
-                    break;
-                }
-                return;
-            }
-        }
-        dartSkipJsonWs( bytes, i );
-        if( i < bytes.size() && bytes[i] == ',' )
-        {
-            ++i;
-            continue;
-        }
-        if( i < bytes.size() && bytes[i] == '}' )
-        {
-            return;
-        }
-    }
-}
-
-inline std::string dartRelWithinRoot( const IngestResult& ing, std::uint32_t fileId )
-{
-    if( fileId >= ing.files.size() )
-    {
-        return {};
-    }
-    if( ing.fileRoot.empty() || ing.rootLabels.empty() )
-    {
-        return ing.files[ fileId ];
-    }
-    const std::uint32_t rootId = ing.fileRoot[ fileId ];
-    if( rootId >= ing.rootLabels.size() )
-    {
-        return {};
-    }
-    const std::string_view label = ing.rootLabels[ rootId ];
-    std::string_view       rel   = ing.files[ fileId ];
-    if( rel.size() >= label.size() && rel.compare( 0, label.size(), label ) == 0 )
-    {
-        rel.remove_prefix( label.size() );
-        if( !rel.empty() && rel.front() == '/' )
-        {
-            rel.remove_prefix( 1 );
-        }
-    }
-    return std::string( rel );
-}
-
-inline std::string parsePubspecName( const std::string& bytes )
-{
-    std::size_t i = 0;
-    while( i < bytes.size() )
-    {
-        std::size_t e = bytes.find( '\n', i );
-        if( e == std::string::npos )
-        {
-            e = bytes.size();
-        }
-        std::string_view line( bytes.data() + i, e - i );
-        i = e + 1;
-        std::string_view t = trimWs( line );
-        const bool       indented = !line.empty() && ( line.front() == ' ' || line.front() == '\t' );
-        if( t.empty() || t.front() == '#' || indented )
-        {
-            continue;
-        }
-        if( t.substr( 0, 5 ) != "name:" )
-        {
-            continue;
-        }
-        t = trimWs( t.substr( 5 ) );
-        if( t.empty() )
-        {
-            return {};
-        }
-        if( ( t.front() == '\'' || t.front() == '"' ) && t.size() >= 2 && t.back() == t.front() )
-        {
-            t = t.substr( 1, t.size() - 2 );
-        }
-        std::size_t end = 0;
-        while( end < t.size() && ( ( t[end] >= 'a' && t[end] <= 'z' ) || ( t[end] >= '0' && t[end] <= '9' ) || t[end] == '_' ) )
-        {
-            ++end;
-        }
-        if( end == 0 )
-        {
-            return {};
-        }
-        const std::string_view tail = trimWs( t.substr( end ) );
-        if( !tail.empty() && tail.front() != '#' )
-        {
-            return {};
-        }
-        return std::string( t.substr( 0, end ) );
-    }
-    return {};
-}
-
-inline std::vector<DartPackageRoot> buildDartPackageRoots( const IngestResult& ing )
-{
-    std::vector<DartPackageRoot> packages;
-    const std::uint32_t          F = std::uint32_t( ing.files.size() );
-    bool                         anyDartDirective = false;
-    for( const Include& inc : ing.includes )
-    {
-        if( inc.fileId < F && includeLangOf( ing.files[ inc.fileId ] ) == IncludeLang::Dart )
-        {
-            anyDartDirective = true;
-            break;
-        }
-    }
-    if( !anyDartDirective || ing.rootReals.empty() )
-    {
-        return packages;
-    }
-
-    const bool isWorkspace = !ing.fileRoot.empty() && !ing.rootLabels.empty();
-    for( std::uint32_t rootId = 0; rootId < ing.rootReals.size(); ++rootId )
-    {
-        const std::string config = readConfigBytes( ing.rootReals[ rootId ] + "/.dart_tool/package_config.json" );
-        if( config.empty() )
-        {
-            continue;
-        }
-        std::string configDirRel;
-        if( isWorkspace )
-        {
-            configDirRel = ing.rootLabels[ rootId ] + "/.dart_tool";
-        }
-        else
-        {
-            configDirRel = ".dart_tool";
-        }
-        parseDartPackageConfig( config, configDirRel, packages );
-    }
-    for( std::uint32_t f = 0; f < F; ++f )
-    {
-        const std::string_view path = ing.files[ f ];
-        if( path != "pubspec.yaml" && ( path.size() < 13 || path.substr( path.size() - 13 ) != "/pubspec.yaml" ) )
-        {
-            continue;
-        }
-        const std::uint32_t rootId = ( isWorkspace && f < ing.fileRoot.size() ) ? ing.fileRoot[ f ] : 0u;
-        if( rootId >= ing.rootReals.size() )
-        {
-            continue;
-        }
-        const std::string rel = dartRelWithinRoot( ing, f );
-        if( rel.empty() )
-        {
-            continue;
-        }
-        const std::string bytes = readConfigBytes( ing.rootReals[ rootId ] + "/" + rel );
-        const std::string name  = parsePubspecName( bytes );
-        if( name.empty() )
-        {
-            continue;
-        }
-        const std::string pkgDir = rel == "pubspec.yaml" ? std::string{} : rel.substr( 0, rel.size() - 13 );
-        std::string       libBase;
-        if( isWorkspace )
-        {
-            libBase = ing.rootLabels[ rootId ];
-            libBase.push_back( '/' );
-        }
-        if( !pkgDir.empty() )
-        {
-            libBase += pkgDir;
-            libBase.push_back( '/' );
-        }
-        libBase += "lib";
-        packages.push_back( { name, lexicalNormalize( libBase ) } );
-    }
-    std::sort( packages.begin(), packages.end(), []( const DartPackageRoot& a, const DartPackageRoot& b )
-               { return a.name != b.name ? a.name < b.name : a.libBase < b.libBase; } );
-    packages.erase( std::unique( packages.begin(), packages.end(), []( const DartPackageRoot& a, const DartPackageRoot& b )
-                                 { return a.name == b.name && a.libBase == b.libBase; } ),
-                    packages.end() );
-    return packages;
-}
-
-inline std::uint32_t resolveDartImport( std::string_view includerPath, std::string_view target,
-                                        const HashMap<std::string, std::uint32_t>& fileIndex,
-                                        const std::vector<DartPackageRoot>* packages,
-                                        const WsIncludeCtx* ws = nullptr, std::uint32_t includerFileId = kNoFile )
-{
-    if( target.empty() || target.front() == '/' || target.starts_with( "dart:" ) )
-    {
-        return kNoFile;
-    }
-    if( target.starts_with( "package:" ) )
-    {
-        if( packages == nullptr )
-        {
-            return kNoFile;
-        }
-        std::string_view spec = target.substr( 8 );
-        const std::size_t sl  = spec.find( '/' );
-        if( sl == std::string_view::npos || sl == 0 || sl + 1 >= spec.size() )
-        {
-            return kNoFile;
-        }
-        const std::string_view pkg  = spec.substr( 0, sl );
-        const std::string_view rest = spec.substr( sl + 1 );
-        UniqueProbe            probe;
-        for( const DartPackageRoot& root : *packages )
-        {
-            if( root.name != pkg )
-            {
-                continue;
-            }
-            const std::string base = lexicalNormalize( root.libBase );
-            const std::string cand = lexicalNormalize( base + "/" + std::string( rest ) );
-            if( cand.empty() || cand.size() <= base.size() || cand.compare( 0, base.size(), base ) != 0 || cand[ base.size() ] != '/' )
-            {
-                continue;
-            }
-            const auto it = fileIndex.find( cand );
-            probe.consider( it == fileIndex.end() ? kNoFile : it->second );
-        }
-        return probe.result();
-    }
-    return joinNormalizeLookup( includerDir( includerPath ), target, fileIndex, ws, includerFileId );
 }
 
 // ─── Ruby constant index (parser version 82) ─────────────────────────────────────────────────────────────
@@ -1918,6 +1578,7 @@ inline std::uint32_t rubyInnermostOpen( const std::vector<RubyOpenRec>& opens, s
 
 inline RubyConstantIndex buildRubyConstantIndex( const IngestResult& ing )
 {
+    PROFILE_SCOPE_DESCRIBE( "resolve/ruby: constant index" );
     RubyConstantIndex ix;
     bool anySymbolic = false;
     for( const Include& inc : ing.includes )
@@ -2109,6 +1770,218 @@ inline std::pair<std::uint32_t, std::uint32_t> resolveRubyConstant( const RubyCo
     return result;
 }
 
+// ─── Ruby base SCOPING (test/rubyinheritcheck.sh floor (c)) ────────────────────────────────────────────────
+// A Ruby inherit reference is found by NAME — its final segment, the byName key every language's bases use —
+// and that name alone cannot tell `class Rec < ActiveRecord::Base` from the tree's own `Space::Base`: before
+// this, the out-of-tree base landed on every in-tree `Base` as an implementor AND fed the resolver's base walk.
+// This table scopes each one with Ruby's own lookup. The superclass AS WRITTEN is already on record — the
+// symbolic Include every `class X < Y` emits (ingest_relations.h, parser version 82), at the class's own start
+// byte — so no new extraction is needed: the inherit ref is joined to it through the derived class's open
+// (the innermost open containing the ref), and the written name is looked up innermost-first along the
+// ENCLOSING nesting, then at the top level, `::X` absolute — resolveRubyConstant's order. Against what: every
+// open the tree holds, WRAPPERS INCLUDED — `class Outer; class Nested; end; end` defines nothing of Outer and
+// is no definer in the #57 index, but it is a class a base can name, so the definer table is the wrong oracle
+// here. The bases are then the class symbols whose OWN open carries the resolved constant — read from
+// `classesByFqn`, NOT from buildGraph's byName: byName has been through the C-family decl/def collapse, which
+// takes a body-less `class Base < StandardError; end` for a forward declaration and drops it whenever a
+// same-named class with a body exists (activerecord's Encryption::Errors::Base lost all six of its subclasses
+// to rails/generators' Base that way). Ruby has no forward declarations; every open is the class. A written
+// base the tree never opens resolves to nothing, and the reference then mints no implementor row and no CHA edge.
+// Any reference the join cannot place (no open around it, no superclass directive at that open) stays on the
+// byName rule — the pre-scoping answer, never a guess in either direction — and is COUNTED by `disclosure` below
+// (RubyBaseScopeDisclosure), which buildGraph copies to Graph::rubyBasesUnscoped: the gauge attribute
+// ruby_bases_unscoped=N, absent at zero (graphlegend.h graphGaugeAttrXml/Json, test/rubyinheritcheck.sh).
+// Built only when the corpus holds a Ruby inherit reference; empty otherwise.
+//
+// The sink models Diagnostics::DisclosureSink: one reason, one count, read by the emitter as the gauge attribute.
+struct RubyBaseScopeDisclosure
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        NoSuperclassDirective   // an inherit reference with no superclass directive at its class open
+    };
+    std::uint32_t unscoped = 0;   // ruby_bases_unscoped=
+    void disclose( DisclosureWhy ) noexcept { ++unscoped; }
+};
+
+struct RubyBaseScope
+{
+    RubyBaseScopeDisclosure                       disclosure;    // the references left on the byName rule
+    RubyConstantIndex                             ix;
+    HashMap<std::string, char>                    opened;        // the constant of EVERY open, wrapper or not
+    HashMap<std::uint32_t, std::string>           baseFqn;       // reference index → resolved base constant (EMPTY
+                                                                 // when the tree opens no such constant); find-only
+    HashMap<std::string, rw::SmallVec<NodeId, 2>> classesByFqn;  // constant → the Ruby symbols whose own open it is
+
+    // nullptr: not a scoped Ruby base — the byName rule stands. Otherwise the resolved constant (empty = none).
+    const std::string* resolvedBase( std::size_t refIdx ) const noexcept
+    {
+        const auto it = baseFqn.find( std::uint32_t( refIdx ) );
+        return it != baseFqn.end() ? &it->second : nullptr;
+    }
+
+    // The constant of a Ruby class symbol's own open; nullptr when no open of that name starts the symbol.
+    const std::string* fqnOfSymbol( const Symbol& s ) const noexcept
+    {
+        if( s.fileId >= ix.opensByFile.size() )
+        {
+            return nullptr;
+        }
+        const std::vector<RubyOpenRec>& opens = ix.opensByFile[ s.fileId ];
+        const std::uint32_t             o     = rubyInnermostOpen( opens, s.sigStartByte + 1u );   // strict at the start
+        if( o == kNoFile )
+        {
+            return nullptr;
+        }
+        const std::string_view w   = opens[ o ].written;
+        const std::size_t      cut = w.rfind( "::" );
+        if( ( cut == std::string_view::npos ? w : w.substr( cut + 2 ) ) != s.name )
+        {
+            return nullptr;
+        }
+        return &opens[ o ].fqn;
+    }
+
+    // The implementor a Ruby class stands as: the lowest-id symbol of its constant with its own kind. A class REOPENED
+    // with its superclass repeated (`class Reop < Parent … end`, twice) is two symbols and one constant, so both opens
+    // collapse onto one row instead of listing the class twice. `id` itself when its open is not indexed.
+    NodeId canonicalClass( const IngestResult& ing, NodeId id ) const noexcept
+    {
+        const std::string* fqn = fqnOfSymbol( ing.symbols[ id ] );
+        if( fqn == nullptr )
+        {
+            return id;
+        }
+        const auto it = classesByFqn.find( *fqn );
+        if( it == classesByFqn.end() )
+        {
+            return id;
+        }
+        for( NodeId cand : it->second )   // id order → the first match is the lowest id
+        {
+            if( ing.symbols[ cand ].kind == ing.symbols[ id ].kind )
+            {
+                return cand;
+            }
+        }
+        return id;
+    }
+};
+
+// Every `class X < Y`'s written superclass, keyed by (fileId, the class's own start byte) — the symbolic directive
+// #57 records at that byte. Find-only, so its bucket order never reaches output.
+inline HashMap<std::uint64_t, const std::string*> rubySuperclassSites( const IngestResult& ing, const RubyConstantIndex& ix )
+{
+    HashMap<std::uint64_t, const std::string*> sites;
+    for( const Include& inc : ing.includes )
+    {
+        if( inc.isSymbolic && inc.fileId < ix.opensByFile.size() && !ix.opensByFile[ inc.fileId ].empty() )
+        {
+            sites.try_emplace( ( std::uint64_t( inc.fileId ) << 32 ) | inc.byte, &inc.target );   // first directive at a byte wins
+        }
+    }
+    return sites;
+}
+
+// Ruby's lookup of a written base from the derived class open `derived`: `::X` absolute, else innermost-first
+// along the ENCLOSING nesting (the superclass is evaluated before the class opens), then the top level. Returns
+// the constant the tree opens, or empty when it opens none.
+// Stated floor — a QUALIFIED name is looked up whole: `class X < Mod::B` tries `<nesting>::Mod::B` innermost-first,
+// then `Mod::B`. Ruby resolves only the FIRST segment lexically and the rest strictly inside it, so where an
+// enclosing `Outer::Mod` exists without a `B`, Ruby raises NameError while this falls through to a top-level
+// `Mod::B`. That code cannot load, so the difference only shows in a tree that is already broken.
+inline std::string rubyResolveBaseConstant( const HashMap<std::string, char>& opened, const std::vector<RubyOpenRec>& opens,
+                                            std::uint32_t derived, std::string_view written )
+{
+    const auto isOpened = [ &opened ]( const std::string& c ) { return opened.find( c ) != opened.end(); };
+    if( rubyConstIsAbsolute( written ) )
+    {
+        std::string abs( written.substr( 2 ) );
+        return isOpened( abs ) ? abs : std::string{};
+    }
+    for( std::uint32_t k = opens[ derived ].parent; k != kNoFile; k = opens[ k ].parent )
+    {
+        std::string cand = opens[ k ].fqn;
+        cand += "::";
+        cand += written;
+        if( isOpened( cand ) )
+        {
+            return cand;
+        }
+    }
+    std::string top( written );
+    return isOpened( top ) ? top : std::string{};
+}
+
+// THE TEST SEAM (#325). RIPWIRE_TEST_RUBY_BASE_UNSCOPED=1 makes the join below find NO superclass directive for any
+// Ruby inherit reference, so every one takes the byName fallback and is counted. No well-formed input is known to
+// reach that fallback (a class open with a superclass records its directive at that open), so this is the one way
+// test/rubyinheritcheck.sh can pin the count and the ruby_bases_unscoped= attribute it feeds. Any other value, or
+// unset, is no seam; test/lib/clean-env.sh clears it. Read once.
+inline bool rubyBaseUnscopedTestSeam() noexcept
+{
+    static const bool on = []() noexcept
+    {
+        const char* const env = std::getenv( "RIPWIRE_TEST_RUBY_BASE_UNSCOPED" );
+        return env != nullptr && std::string_view( env ) == "1";
+    }();
+    return on;
+}
+
+// Joins each Ruby inherit reference to the superclass directive at its derived class's open and records the
+// resolved base constant in `sc.baseFqn`. A reference the join cannot place is left out — the byName rule stands.
+inline void rubyScopeBaseReferences( RubyBaseScope& sc, const IngestResult& ing )
+{
+    const HashMap<std::uint64_t, const std::string*> sites = rubySuperclassSites( ing, sc.ix );
+    for( std::size_t i = 0; i < ing.references.size(); ++i )
+    {
+        const Reference& r = ing.references[ i ];
+        if( !r.isInherit || r.lang != Lang::Ruby || r.fileId >= sc.ix.opensByFile.size() )
+        {
+            continue;
+        }
+        const std::vector<RubyOpenRec>& opens   = sc.ix.opensByFile[ r.fileId ];
+        const std::uint32_t             derived = rubyInnermostOpen( opens, r.startByte );
+        const auto                      site    = ( derived == kNoFile || rubyBaseUnscopedTestSeam() ) ? sites.end() : sites.find( ( std::uint64_t( r.fileId ) << 32 ) | opens[ derived ].startByte );
+        if( site == sites.end() )
+        {
+            DISCLOSE( sc.disclosure, RubyBaseScopeDisclosure::DisclosureWhy::NoSuperclassDirective,
+                      "Ruby inherit reference with no superclass directive at its class open: base left on the byName rule" );
+            continue;
+        }
+        sc.baseFqn.emplace( std::uint32_t( i ), rubyResolveBaseConstant( sc.opened, opens, derived, *site->second ) );
+    }
+}
+
+inline RubyBaseScope buildRubyBaseScope( const IngestResult& ing )
+{
+    RubyBaseScope sc;
+    const auto isRubyBase = []( const Reference& r ) noexcept { return r.isInherit && r.lang == Lang::Ruby; };
+    if( std::none_of( ing.references.begin(), ing.references.end(), isRubyBase ) )
+    {
+        return sc;
+    }
+    PROFILE_SCOPE_DESCRIBE( "buildGraph/ruby: base scoping" );
+    sc.ix = buildRubyConstantIndex( ing );
+    for( const std::vector<RubyOpenRec>& opens : sc.ix.opensByFile )
+    {
+        for( const RubyOpenRec& o : opens )
+        {
+            sc.opened.try_emplace( o.fqn, 1 );
+        }
+    }
+    for( const Symbol& s : ing.symbols )
+    {
+        const std::string* fqn = ( s.lang == Lang::Ruby ) ? sc.fqnOfSymbol( s ) : nullptr;
+        if( fqn != nullptr )
+        {
+            sc.classesByFqn[ *fqn ].push_back( s.id );   // ids ascending → each list is in id order
+        }
+    }
+    rubyScopeBaseReferences( sc, ing );
+    return sc;
+}
+
 // Resolve ONE #include / import target to a concrete repo fileId by LEXICAL path semantics, dispatched on
 // the INCLUDER's language (its file extension). `fileIndex` maps each canonical `ing.files` path → its
 // fileId. `crateRootDir`/`hasCrateRoot` carry the Rust crate root (empty/false for non-Rust);
@@ -2118,14 +1991,13 @@ inline std::pair<std::uint32_t, std::uint32_t> resolveRubyConstant( const RubyCo
 // fallback, NEVER a guess).
 //   * C-family quote `"x.h"` (isAngle==false): resolve relative-to-includer, collapse `.`/`..`, exact hit.
 //   * C-family angle `<x.h>` (isAngle==true): external without a build system ⇒ kNoFile (never matched).
-//   * Python / TS / Rust / Bash / Ruby / Lua / Elixir / Dart: their per-language Step-A above (unique-or-degrade).
+//   * Python / TS / Rust / Bash / Ruby / Lua / Elixir: their per-language Step-A above (unique-or-degrade).
 //   * Go / Swift / Other: DEFERRED / no path ⇒ kNoFile (contributes nothing — honest).
 inline std::uint32_t resolvePreciseInclude( std::string_view includerPath, std::string_view target, bool isAngle,
                                             const HashMap<std::string, std::uint32_t>& fileIndex,
                                             std::string_view crateRootDir = {}, bool hasCrateRoot = false,
                                             const WsIncludeCtx* ws = nullptr, std::uint32_t includerFileId = kNoFile,
-                                            const HashMap<std::string, std::uint32_t>* moduleIndex = nullptr,
-                                            const std::vector<DartPackageRoot>* dartPackages = nullptr )
+                                            const HashMap<std::string, std::uint32_t>* moduleIndex = nullptr )
 {
     if( target.empty() )
     {
@@ -2194,7 +2066,6 @@ inline std::uint32_t resolvePreciseInclude( std::string_view includerPath, std::
         case IncludeLang::Ruby:   return resolveRubyRequire( includerPath, target, fileIndex, ws, includerFileId );
         case IncludeLang::Lua:    return resolveLuaRequire(  includerPath, target, fileIndex, ws, includerFileId );
         case IncludeLang::Elixir: return resolveElixirModule( target, moduleIndex );
-        case IncludeLang::Dart:   return resolveDartImport( includerPath, target, fileIndex, dartPackages, ws, includerFileId );
         case IncludeLang::Other:  return kNoFile;        // Swift (no path in import) → deferred
     }
     return kNoFile;
@@ -2229,32 +2100,2136 @@ inline void recordLazyPair( HashMap<std::uint64_t, char>& lazyPairs, std::uint32
     }
 }
 
+// ── #220: TS/JS IMPORTS THROUGH A PROJECT'S OWN CONFIG — resolved when the config says where, counted when not ────────
+// resolveTsImport leaves every bare (non-relative) specifier unresolved on a single root, and that is the sound
+// answer for `react`. It is NOT a sound answer for a specifier the project's own config places in the tree: a
+// tsconfig/jsconfig `compilerOptions.paths` alias (`@app/b`), a `baseUrl`-relative path (`lib/util` under
+// `"baseUrl": "src"`), or a workspace member's package name (`@acme/lib`). Part 1 counted them so every answer built
+// on the file graph could say it was a floor; part 2 (ImportResolver below) RESOLVES them the way TypeScript does, so
+// they become real edges, and only what still cannot be resolved is counted.
+//
+// The order is tsc's (moduleResolution node10/node16/bundler agree on it for these three sources):
+//   1. `paths` of the config that owns the importer — the nearest tsconfig.json (else jsconfig.json) walking up from
+//      its directory; when that config does not hold the file (`files`/`include`/`exclude`, inherited through
+//      `extends`) and names `references` (a solution-style config: create-vite's `files: []`), the referenced projects
+//      that hold it, through nested references — two that answer differently are ambiguous. A file no project holds
+//      is in a program only by import: every reached project is asked, and those that place it must agree. tsc's matchPatternOrExact picks ONE key: an exact key first, else the wildcard key with the
+//      longest prefix. Its targets are tried IN ORDER from `baseUrl` when set, else from the directory of the config
+//      that declared `paths`; the first target that names a file wins. A key with two `*` is not a pattern.
+//   2. `<baseUrl>/<specifier>`, when no `paths` key matched (a matched key that answers nothing stops here, as in tsc).
+//   2b. a `#x` specifier: the `imports` map of the nearest package.json at or above the importer (Node's
+//      PACKAGE_IMPORTS_RESOLVE, same key and condition rules as `exports` below); one nothing answers is counted.
+//   3. a workspace package: members are the package.json files whose directory a `workspaces` glob (root
+//      package.json: an array, or `{ "packages": [...] }`) or a pnpm-workspace.yaml `packages:` glob (block or flow list) admits, relative to
+//      the declaring file (`*`, `**`, `!` negation). Only an importer UNDER the declaring directory sees them (it is
+//      that directory's node_modules the package manager links them into). The specifier's package name (`@s/n` or
+//      `n`) picks the member; two members declaring one name are ambiguous and resolve to neither. Inside the member:
+//      `exports` (the `.` entry or a subpath, exact key before the longest-prefix `*` pattern; conditions in the
+//      object's own order, `import`/`require` each with and without `node`, plus `default`, all evaluated — two
+//      different files is ambiguous; `types` never selected), else `module` then `main`, else the package's `index`. A target spelling
+//      the package's EMITTED output (`./dist/index.js`) is mapped back to its source through that package's own
+//      tsconfig `outDir` → `rootDir` first (without `rootDir`: its `src/`, then its own directory), then tried as
+//      written. That goes beyond tsc, whose tryLoadInputFileForPath maps only the importing program's own output: it is
+//      the source-of-truth edge a monorepo means, stated here as a heuristic.
+// Each candidate path is probed in tsc's order with the house's unique-or-degrade discipline per tier: the exact
+// spelling when it carries an extension, the source a runtime spelling names (`.js` → `.ts`/`.tsx`, kJsRuntimeSource
+// Exts), `+.ts`/`+.tsx`; then the declaration (`+.d.ts`) ONLY when no source answered; then `/index.ts`/`/index.tsx`,
+// then `/index.d.ts`; across every candidate of a `paths` entry the TypeScript tiers run before the JavaScript one
+// (`.js .jsx .mjs .cjs /index.js /index.jsx`), tsc's priority/secondary split. Two files in one tier are ambiguous:
+// no edge, counted — never a guess (tsc would prefer `.ts` over `.tsx`; the relative branch refuses, and so does this).
+// An edge that lands only on a declaration file is a real dependency but not source; it is counted separately
+// (imports_dts=) so the answer says so.
+//
+// What is COUNTED (imports_unresolved=): a specifier that matched a `paths` key with a NON-EMPTY literal prefix whose
+// target stays in the tree, a visible workspace member's name, or any ambiguity above — and still has no edge. A
+// catch-all key (`*`) or a baseUrl path that answers nothing is someone else's package and is never counted. A
+// bare package that matches none of these (react, lodash/fp, node:fs) is External: no edge, no count, ever. Nor is an
+// asset (a stylesheet, an image, a font: isAssetSpecifier) that no indexed file answers — the graph has no node for it;
+// a bundler `?query` suffix is dropped before any probe.
+//
+// `extends` is followed (cycle-safe, depth 16): a RELATIVE base must be a file the crawl indexed; a PACKAGE-form base
+// (`@tsconfig/node20/tsconfig.json`, or a package whose package.json `tsconfig` field or tsconfig.json is meant) is
+// read from the nearest `node_modules` at or above the config, inside the tree only. A child's key replaces the
+// inherited one (tsc's rule). A base that is named but absent is DISCLOSED (tsconfig_unread=) when it could have
+// changed an answer: a relative one could supply `paths` or `baseUrl`; a package-form one lives in node_modules, so
+// its own `paths`/`baseUrl` could only point back into node_modules — except inherited `paths` under the child's
+// own `baseUrl`. A `references` entry the crawl did not index is disclosed the same way when the owning lookup
+// needed it (the unread project could hold the importer).
+// Only bytes the crawl admitted are read for the project's own configs (ing.files, so --exclude, gitignore and the
+// 256 KB .json ceiling apply), through a JSONC reader: a commented-out `// "paths": …` is a comment, never a key (the
+// multi-root text scan above reads it as live; this reader must not); a leading UTF-8 BOM is stripped. A config or
+// manifest that does not parse, and a tsconfig/jsconfig or workspace root ABOVE the crawl root (looked for up to the git
+// top-level, never read), is disclosed in tsconfig_unread=. All of it happens at GRAPH time, from the config bytes on
+// disk: no ingested record changes.
+namespace tsimport
+{
+// The JSON subset these three files use: strings, arrays, objects; every other scalar is Kind::Other. Keys keep
+// source order; a later duplicate wins at lookup, as in JSON.parse.
+struct JsonNode
+{
+    enum class Kind : std::uint8_t { Other, Str, Arr, Obj };
+    Kind                     kind = Kind::Other;
+    std::string              str;
+    std::vector<std::string> keys;    // Obj
+    std::vector<JsonNode>    vals;    // Obj (parallel to keys) or Arr
+
+    const JsonNode* get( std::string_view key ) const noexcept
+    {
+        // Cursor counts down to 1, index = cursor - 1: the `i-- > 0` idiom wraps the unsigned to SIZE_MAX on EVERY
+        // miss, which G1's `-fsanitize=integer` aborts on (train 21's asan editcheckcheck arm (g): a package.json
+        // with no `workspaces` key, read by collectWorkspaceMembers, exit 134).
+        for( std::size_t cursor = keys.size(); cursor > 0; --cursor )
+        {
+            if( keys[cursor - 1] == key )
+            {
+                return &vals[cursor - 1];
+            }
+        }
+        return nullptr;
+    }
+};
+
+// JSONC (tsc's dialect): `//` and `/* */` comments and trailing commas are accepted. Depth-bounded, so a hostile
+// file cannot recurse the stack (the crawl's jsonNestsTooDeep is the ingest-side guard; this is its own).
+class JsoncReader
+{
+public:
+    explicit JsoncReader( std::string_view s ) noexcept : s_( s ) {}
+
+    bool parse( JsonNode& out )
+    {
+        skip();
+        return value( out, 0 );
+    }
+
+private:
+    static constexpr int kMaxDepth = 64;
+    std::string_view     s_;
+    std::size_t          p_ = 0;
+
+    void skip() noexcept
+    {
+        while( p_ < s_.size() )
+        {
+            const char c = s_[p_];
+            if( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' )
+            {
+                ++p_;
+            }
+            else if( c == '/' && p_ + 1 < s_.size() && s_[p_ + 1] == '/' )
+            {
+                const std::size_t e = s_.find( '\n', p_ );
+                p_ = ( e == std::string_view::npos ) ? s_.size() : e + 1;
+            }
+            else if( c == '/' && p_ + 1 < s_.size() && s_[p_ + 1] == '*' )
+            {
+                const std::size_t e = s_.find( "*/", p_ + 2 );
+                p_ = ( e == std::string_view::npos ) ? s_.size() : e + 2;
+            }
+            else
+            {
+                return;
+            }
+        }
+    }
+
+    // A JSON escape's character. \uXXXX reads as '?': no key or path this reader matches spells one.
+    static char unescape( char e ) noexcept
+    {
+        constexpr std::string_view kEscaped = "ntrbfu", kMeant = "\n\t\r\b\f?";   // any other (\" \\ \/) is itself
+        const std::size_t          k        = kEscaped.find( e );
+        return k == std::string_view::npos ? e : kMeant[k];
+    }
+
+    bool string( std::string& out )
+    {
+        ++p_;   // the opening quote
+        while( p_ < s_.size() && s_[p_] != '"' )
+        {
+            if( s_[p_] != '\\' || p_ + 1 >= s_.size() )
+            {
+                out.push_back( s_[p_++] );
+                continue;
+            }
+            out.push_back( unescape( s_[p_ + 1] ) );
+            p_ += s_[p_ + 1] == 'u' ? 6 : 2;   // an overshoot past the end is the unterminated case below
+        }
+        if( p_ >= s_.size() )
+        {
+            return false;
+        }
+        ++p_;   // the closing quote
+        return true;
+    }
+
+    // An object member's `"key":`, leaving the reader at its value.
+    bool key( JsonNode& n )
+    {
+        n.keys.emplace_back();
+        if( s_[p_] != '"' || !string( n.keys.back() ) )
+        {
+            return false;
+        }
+        skip();
+        if( p_ >= s_.size() || s_[p_] != ':' )
+        {
+            return false;
+        }
+        ++p_;
+        skip();
+        return true;
+    }
+
+    bool members( JsonNode& n, int depth, char close )
+    {
+        ++p_;   // '{' or '['
+        for( ;; )
+        {
+            skip();
+            if( p_ >= s_.size() )
+            {
+                return false;
+            }
+            if( s_[p_] == close )
+            {
+                ++p_;
+                return true;   // also the trailing-comma case: `,` then the closer
+            }
+            if( close == '}' && !key( n ) )
+            {
+                return false;
+            }
+            n.vals.emplace_back();
+            if( !value( n.vals.back(), depth + 1 ) )
+            {
+                return false;
+            }
+            skip();
+            if( p_ < s_.size() && s_[p_] == ',' )
+            {
+                ++p_;
+            }
+            else if( p_ >= s_.size() || s_[p_] != close )
+            {
+                return false;
+            }
+        }
+    }
+
+    bool value( JsonNode& n, int depth )
+    {
+        if( depth > kMaxDepth || p_ >= s_.size() )
+        {
+            return false;
+        }
+        const char c = s_[p_];
+        if( c == '{' || c == '[' )
+        {
+            n.kind = ( c == '{' ) ? JsonNode::Kind::Obj : JsonNode::Kind::Arr;
+            return members( n, depth, c == '{' ? '}' : ']' );
+        }
+        if( c == '"' )
+        {
+            n.kind = JsonNode::Kind::Str;
+            return string( n.str );
+        }
+        const std::size_t b = p_;   // a number, true/false/null: consumed, never read
+        while( p_ < s_.size() && s_[p_] != ',' && s_[p_] != '}' && s_[p_] != ']' && s_[p_] != '/'
+               && s_[p_] != ' ' && s_[p_] != '\t' && s_[p_] != '\n' && s_[p_] != '\r' )
+        {
+            ++p_;
+        }
+        return p_ > b;
+    }
+};
+
+// `dir` + "/" + `rel`, lexically normalized; a root-level `dir` is the empty string. Empty on an escape.
+inline std::string joinRel( std::string_view dir, std::string_view rel )
+{
+    std::string s( dir );
+    if( !s.empty() )
+    {
+        s.push_back( '/' );
+    }
+    s.append( rel );
+    return lexicalNormalize( s );
+}
+
+// Does root-relative `rel` name a file called `name` (at the root or in any directory)?
+inline bool fileNamed( std::string_view rel, std::string_view name ) noexcept
+{
+    return rel.ends_with( name ) && ( rel.size() == name.size() || rel[ rel.size() - name.size() - 1 ] == '/' );
+}
+
+// One `paths` key: `prefix*suffix` when wild, else the exact `prefix`. Targets keep their order.
+struct PathPattern
+{
+    std::string              prefix, suffix;
+    bool                     wild = false;
+    std::vector<std::string> targets;
+
+    bool matches( std::string_view spec ) const noexcept
+    {
+        if( !wild )
+        {
+            return spec == prefix;
+        }
+        return spec.size() >= prefix.size() + suffix.size() && spec.starts_with( prefix ) && spec.ends_with( suffix );
+    }
+};
+
+// Which files a project holds: tsc's `files`/`include`/`exclude`, each entry joined root-relative against the config
+// that declared it; a base's key replaces the one inherited so far, and a child's own key replaces the base's.
+struct ProjectFileSet
+{
+    std::vector<std::string> files, include, exclude;
+    bool                     hasFiles = false, hasInclude = false, hasExclude = false;
+
+    void inherit( ProjectFileSet&& base )
+    {
+        take( base.hasFiles, base.files, hasFiles, files );
+        take( base.hasInclude, base.include, hasInclude, include );
+        take( base.hasExclude, base.exclude, hasExclude, exclude );
+    }
+
+    static void take( bool baseHas, std::vector<std::string>& baseSet, bool& has, std::vector<std::string>& set )
+    {
+        if( baseHas )
+        {
+            set = std::move( baseSet );
+            has = true;
+        }
+    }
+
+    // Does the project hold root-relative `file`? tsc's rule: a `files` entry names it, or an `include` pattern matches
+    // it (the default `**/*` under `projectDir` only when neither key is declared) and no `exclude` pattern does.
+    bool holds( std::string_view file, std::string_view projectDir ) const;
+};
+
+// The effective alias view of one config after its `extends` chain.
+struct AliasScope
+{
+    std::shared_ptr<const std::vector<PathPattern>> paths;   // shared: every config extending one base holds its table
+    std::string              pathsDir;   // the directory of the config that declared `paths`
+    std::string              baseDir;    // `baseUrl`, resolved against the config that declared it
+    std::string              outDir;     // part 2: `outDir`/`rootDir`, each resolved against its declaring config — a
+    std::string              rootDir;    //   workspace package's emitted entry maps back to its source through them
+    bool                     hasPaths   = false;
+    bool                     hasBaseUrl = false;
+    bool                     hasOutDir  = false;
+    bool                     hasRootDir = false;
+    bool                     unreadRelativeBase = false;   // a relative `extends` the crawl did not index
+    bool                     unreadPackageBase  = false;   // a package-form `extends` not installed in the tree
+    ProjectFileSet           fileSet;                      // which files the project holds (inherited through extends)
+    // `references` belongs to the config itself and is never inherited: the root-relative paths of the configs it
+    // names that the crawl indexed.
+    std::string              projectDir;                   // the owning config's own directory (the default `include`)
+    std::vector<std::string> references;
+    bool                     unreadReference = false;      // a `references` entry the crawl did not index
+
+    // What a base in the `extends` chain contributes: each key the base declared replaces the one inherited so far.
+    void inherit( AliasScope&& base )
+    {
+        if( base.hasPaths )
+        {
+            paths    = std::move( base.paths );
+            pathsDir = std::move( base.pathsDir );
+            hasPaths = true;
+        }
+        if( base.hasBaseUrl )
+        {
+            baseDir    = std::move( base.baseDir );
+            hasBaseUrl = true;
+        }
+        if( base.hasOutDir )
+        {
+            outDir    = std::move( base.outDir );
+            hasOutDir = true;
+        }
+        if( base.hasRootDir )
+        {
+            rootDir    = std::move( base.rootDir );
+            hasRootDir = true;
+        }
+        unreadRelativeBase = unreadRelativeBase || base.unreadRelativeBase;
+        unreadPackageBase  = unreadPackageBase || base.unreadPackageBase;
+        fileSet.inherit( std::move( base.fileSet ) );
+    }
+
+    bool holds( std::string_view file ) const { return fileSet.holds( file, projectDir ); }
+
+    // Could a base that was named but not read have changed what this scope resolves? A relative one could have
+    // supplied `paths` or `baseUrl`. A package-form one sits in node_modules, so its own `paths`/`baseUrl` resolve
+    // there; only its `paths` read under THIS chain's `baseUrl` could reach the tree.
+    bool unreadMatters() const noexcept
+    {
+        return ( unreadRelativeBase && !( hasPaths && hasBaseUrl ) ) || ( unreadPackageBase && !hasPaths && hasBaseUrl );
+    }
+};
+
+// A `paths` object's entries, in source order.
+inline std::vector<PathPattern> readPathPatterns( const JsonNode& ps )
+{
+    std::vector<PathPattern> out;
+    for( std::size_t i = 0; i < ps.keys.size(); ++i )
+    {
+        PathPattern       pp;
+        const std::string& key  = ps.keys[i];
+        const std::size_t  star = key.find( '*' );
+        pp.wild   = star != std::string::npos;
+        pp.prefix = pp.wild ? key.substr( 0, star ) : key;
+        pp.suffix = pp.wild ? key.substr( star + 1 ) : std::string();
+        for( const JsonNode& t : ps.vals[i].vals )   // an Arr's items; any other kind has none
+        {
+            if( t.kind == JsonNode::Kind::Str )
+            {
+                pp.targets.push_back( t.str );
+            }
+        }
+        // a repeated key keeps its first position and its LAST value, as JSON.parse does
+        const auto same = std::find_if( out.begin(), out.end(), [ & ]( const PathPattern& q )
+                                        { return q.wild == pp.wild && q.prefix == pp.prefix && q.suffix == pp.suffix; } );
+        if( same != out.end() )
+        {
+            same->targets = std::move( pp.targets );
+            continue;
+        }
+        out.push_back( std::move( pp ) );
+    }
+    return out;
+}
+
+// A config's own `compilerOptions.baseUrl` / `.paths` / `.outDir` / `.rootDir`, over what it inherited (`dir` = the
+// config's directory).
+inline void applyCompilerOptions( const JsonNode& root, const std::string& dir, AliasScope& out )
+{
+    const JsonNode* co = root.get( "compilerOptions" );
+    if( co == nullptr || co->kind != JsonNode::Kind::Obj )
+    {
+        return;
+    }
+    if( const JsonNode* bu = co->get( "baseUrl" ); bu != nullptr && bu->kind == JsonNode::Kind::Str )
+    {
+        out.baseDir    = joinRel( dir, bu->str );
+        out.hasBaseUrl = true;
+    }
+    if( const JsonNode* ps = co->get( "paths" ); ps != nullptr && ps->kind == JsonNode::Kind::Obj )
+    {
+        out.paths    = std::make_shared<const std::vector<PathPattern>>( readPathPatterns( *ps ) );   // a child's paths REPLACES the inherited one (tsc)
+        out.pathsDir = dir;
+        out.hasPaths = true;
+    }
+    if( const JsonNode* od = co->get( "outDir" ); od != nullptr && od->kind == JsonNode::Kind::Str )
+    {
+        out.outDir    = joinRel( dir, od->str );
+        out.hasOutDir = true;
+    }
+    if( const JsonNode* rd = co->get( "rootDir" ); rd != nullptr && rd->kind == JsonNode::Kind::Str )
+    {
+        out.rootDir    = joinRel( dir, rd->str );
+        out.hasRootDir = true;
+    }
+}
+
+// A whole glob (`packages/*`, `apps/**`, `libs/*-core`) against a directory's segments; `**` spans zero or more
+// segments, and within one segment arch.h's wildcardMatch applies (a segment holds no '/').
+inline bool globPath( std::span<const std::string_view> patIn, std::span<const std::string_view> path )
+{
+    // A run of `**` means what one does, and matching is a table over (pattern index, path index), filled from the
+    // ends: O(|pattern| x |path|), where trying every split per `**` was C(n + k, k) — a config or workspace glob of
+    // a dozen `**` over a deep directory hung every graph build (test/fuzz/readers/seeds/resolvecfg/*bomb).
+    std::vector<std::string_view> pat;
+    pat.reserve( patIn.size() );
+    for( const std::string_view seg : patIn )
+    {
+        if( !( seg == "**" && !pat.empty() && pat.back() == "**" ) )
+        {
+            pat.push_back( seg );
+        }
+    }
+    const std::size_t P = pat.size(), S = path.size(), W = S + 1;
+    std::vector<char> m( ( P + 1 ) * W, 0 );   // m[i*W + j]: pattern suffix i matches path suffix j
+    m[ P * W + S ] = 1;
+    for( std::size_t ic = P; ic > 0; --ic )   // cursors, not `i-- > 0` (see JsonNode::get): no unsigned wrap at exit
+    {
+        const std::size_t i = ic - 1;
+        for( std::size_t jc = W; jc > 0; --jc )
+        {
+            const std::size_t j = jc - 1;
+            const bool more = j < S;
+            m[ i * W + j ] = pat[i] == "**" ? char( m[ ( i + 1 ) * W + j ] || ( more && m[ i * W + j + 1 ] ) )
+                                           : char( more && m[ ( i + 1 ) * W + j + 1 ] && wildcardMatch( path[j], pat[i] ) );
+        }
+    }
+    return m[0] != 0;
+}
+
+// One `include`/`exclude` pattern against a root-relative file. A pattern whose last segment holds neither `*` nor
+// `.` names a directory, so it matches every file below it (tsc); otherwise `**` spans segments and `*` stays in one.
+inline bool projectPatternMatches( std::string_view pattern, std::string_view file, bool isDir = false )
+{
+    std::vector<std::string_view>       pat  = splitSegments( pattern );
+    const std::vector<std::string_view> segs = splitSegments( file );
+    if( isDir || pat.empty() || pat.back().find_first_of( "*." ) == std::string_view::npos )
+    {
+        pat.emplace_back( "**" );   // a directory (the empty pattern is the crawl root)
+    }
+    return globPath( pat, segs );
+}
+
+inline bool ProjectFileSet::holds( std::string_view file, std::string_view projectDir ) const
+{
+    if( hasFiles && std::find( files.begin(), files.end(), file ) != files.end() )
+    {
+        return true;
+    }
+    const auto any = [ & ]( const std::vector<std::string>& ps )
+    { return std::any_of( ps.begin(), ps.end(), [ & ]( const std::string& p ) { return projectPatternMatches( p, file ); } ); };
+    const bool included = hasInclude ? any( include ) : ( !hasFiles && projectPatternMatches( projectDir, file, /*isDir=*/true ) );
+    return included && !( hasExclude && any( exclude ) );
+}
+
+// One `files`/`include`/`exclude` array, each entry joined root-relative against `dir`; an entry that climbs above the
+// crawl root is dropped. A key that is not an array leaves the inherited set alone.
+inline void readProjectPatterns( const JsonNode* n, const std::string& dir, std::vector<std::string>& set, bool& has )
+{
+    if( n == nullptr || n->kind != JsonNode::Kind::Arr )
+    {
+        return;
+    }
+    set.clear();
+    has = true;
+    for( const JsonNode& e : n->vals )
+    {
+        // joined with a trailing `/x` so that `.` at the crawl root (the empty path) stays apart from an escape
+        const std::string at = e.kind == JsonNode::Kind::Str && !e.str.empty() ? joinRel( dir, e.str + "/x" ) : std::string();
+        if( !at.empty() )
+        {
+            set.push_back( at.substr( 0, at.size() > 1 ? at.size() - 2 : 0 ) );
+        }
+    }
+}
+
+// A config's own `files`/`include`/`exclude` (each a string array; an entry that climbs above the root is dropped).
+inline void applyProjectFiles( const JsonNode& root, const std::string& dir, AliasScope& out )
+{
+    readProjectPatterns( root.get( "files" ), dir, out.fileSet.files, out.fileSet.hasFiles );
+    readProjectPatterns( root.get( "include" ), dir, out.fileSet.include, out.fileSet.hasInclude );
+    readProjectPatterns( root.get( "exclude" ), dir, out.fileSet.exclude, out.fileSet.hasExclude );
+}
+
+// A config's `extends` specifiers, in order (a string, or an array of them), relative and package-form alike.
+inline std::vector<std::string_view> extendsSpecs( const JsonNode& root )
+{
+    std::vector<std::string_view> out;
+    const JsonNode* ext = root.get( "extends" );
+    if( ext == nullptr )
+    {
+        return out;
+    }
+    const auto take = [ & ]( const JsonNode& e )
+    {
+        if( e.kind == JsonNode::Kind::Str && !e.str.empty() )
+        {
+            out.push_back( e.str );
+        }
+    };
+    if( ext->kind == JsonNode::Kind::Arr )
+    {
+        for( const JsonNode& e : ext->vals )
+        {
+            take( e );
+        }
+    }
+    else
+    {
+        take( *ext );
+    }
+    return out;
+}
+
+// One workspace declaration: the declaring file's directory and its globs, in order (a later `!glob` excludes).
+struct WorkspaceDecl
+{
+    std::string              dir;
+    std::vector<std::string> globs;
+    bool                     pnpm = false;   // pnpm-workspace.yaml: pnpm links a member only through `workspace:`
+
+    bool admits( std::string_view memberDir ) const
+    {
+        if( !dir.empty() && !( memberDir.size() > dir.size() && memberDir.starts_with( dir ) && memberDir[ dir.size() ] == '/' ) )
+        {
+            return false;   // not under the declaring file's directory
+        }
+        const std::vector<std::string_view> segs = splitSegments( dir.empty() ? memberDir : memberDir.substr( dir.size() + 1 ) );
+        bool                                in   = false;
+        for( const std::string& g : globs )   // a later `!glob` excludes; a later positive glob re-admits
+        {
+            if( g.empty() )
+            {
+                continue;   // both producers drop empties today; an empty glob admits nothing and has no front()
+            }
+            const bool        neg  = g.front() == '!';
+            const std::string norm = lexicalNormalize( std::string_view( g ).substr( neg ? 1 : 0 ) );   // `./packages/*`
+            if( globPath( splitSegments( norm ), segs ) )
+            {
+                in = !neg;
+            }
+        }
+        return in;
+    }
+};
+
+// A UTF-8 byte-order mark: editors on Windows write one; every JSON/YAML reader of these files strips it.
+inline constexpr std::string_view kUtf8Bom = "\xEF\xBB\xBF";
+
+// One YAML list item as a glob — trimmed, surrounding quotes (either style) dropped — appended unless empty.
+inline void appendYamlGlob( std::string_view item, std::vector<std::string>& out )
+{
+    if( const std::string_view g = namesplit::stripQuotePair( trimWs( item ) ); !g.empty() )
+    {
+        out.emplace_back( g );
+    }
+}
+
+// pnpm-workspace.yaml's `packages:` key — the one key read — as a block list (`- 'glob'` items under it) or a flow
+// list (`packages: ['a/*', "b/*"]`, which may span lines up to its `]`). An item holding a `,` or `]` inside quotes
+// is not a glob pnpm documents and is split at it (an under-count, never a false member). One line at a time.
+class PnpmGlobReader
+{
+public:
+    std::vector<std::string> globs;
+
+    void step( std::string_view line )   // a trimmed, non-empty, comment-free line
+    {
+        EXPECTS( !line.empty() );
+        if( at_ == At::Flow )
+        {
+            flow_.append( "," ).append( line );
+        }
+        else if( line.starts_with( "packages:" ) || ( at_ == At::Block && line.front() == '[' ) )   // the flow list on its key's line, or the next
+        {
+            openKey( line.front() == '[' ? line : trimWs( line.substr( 9 ) ) );
+        }
+        else if( at_ == At::Block && line.front() == '-' )
+        {
+            appendYamlGlob( line.substr( 1 ), globs );
+        }
+        else
+        {
+            at_ = At::Other;   // any other key ends the block
+        }
+        closeFlow();
+    }
+
+private:
+    enum class At : std::uint8_t { Other, Block, Flow };
+    At          at_ = At::Other;
+    std::string flow_;   // a flow list's text so far, after its `[`
+
+    void openKey( std::string_view rest )
+    {
+        at_ = rest.empty() ? At::Block : ( rest.front() == '[' ? At::Flow : At::Other );
+        flow_.assign( at_ == At::Flow ? rest.substr( 1 ) : std::string_view() );
+    }
+
+    void closeFlow()
+    {
+        if( at_ != At::Flow || flow_.find( ']' ) == std::string::npos )
+        {
+            return;
+        }
+        for( const std::string_view item : splitSegments( std::string_view( flow_ ).substr( 0, flow_.find( ']' ) ), ',' ) )
+        {
+            appendYamlGlob( item, globs );
+        }
+        at_ = At::Other;
+    }
+};
+
+inline std::vector<std::string> pnpmWorkspaceGlobs( std::string_view y )
+{
+    if( y.starts_with( kUtf8Bom ) )
+    {
+        y.remove_prefix( kUtf8Bom.size() );
+    }
+    PnpmGlobReader reader;
+    for( std::string_view line : splitSegments( y, '\n' ) )
+    {
+        line = trimWs( line.substr( 0, line.find( " #" ) ) );
+        if( !line.empty() && line.front() != '#' )
+        {
+            reader.step( line );
+        }
+    }
+    return std::move( reader.globs );
+}
+
+inline std::vector<std::string> globList( const JsonNode* ws );
+
+// The package.json `workspaces` globs (an array, or yarn's `{ "packages": [...] }`); empty when it declares none.
+inline std::vector<std::string> packageJsonWorkspaceGlobs( const JsonNode& pj )
+{
+    return globList( pj.get( "workspaces" ) );
+}
+
+// A glob list: an array of strings, or an object's `packages` array (yarn's `{ "packages": [...] }`). Empty items drop.
+inline std::vector<std::string> globList( const JsonNode* ws )
+{
+    std::vector<std::string> out;
+    if( ws != nullptr && ws->kind == JsonNode::Kind::Obj )
+    {
+        ws = ws->get( "packages" );
+    }
+    if( ws != nullptr && ws->kind == JsonNode::Kind::Arr )
+    {
+        for( const JsonNode& g : ws->vals )
+        {
+            if( g.kind == JsonNode::Kind::Str && !g.str.empty() )
+            {
+                out.push_back( g.str );
+            }
+        }
+    }
+    return out;
+}
+
+// Inside the crawl root (joinRel refuses an escape) and not under node_modules, which the crawl never enters.
+inline bool inTreeTarget( const std::string& at )
+{
+    const std::vector<std::string_view> segs = splitSegments( at );
+    return !segs.empty() && std::find( segs.begin(), segs.end(), std::string_view( "node_modules" ) ) == segs.end();
+}
+
+// A path whose last segment carries a '.' (`x.ts`, `Foo.vue`, `api.client`): the one shape whose exact spelling is
+// probed before an extension is appended.
+inline bool lastSegmentHasDot( std::string_view p ) noexcept
+{
+    const std::size_t slash = p.rfind( '/' );
+    return p.substr( slash == std::string_view::npos ? 0 : slash + 1 ).find( '.' ) != std::string_view::npos;
+}
+
+// A declaration file: an edge to it is an edge to types, not to source.
+inline bool isDeclarationFile( std::string_view p ) noexcept
+{
+    return p.ends_with( ".d.ts" ) || p.ends_with( ".d.mts" ) || p.ends_with( ".d.cts" );
+}
+
+// A specifier whose last segment names a non-code asset by its extension (a stylesheet, an image, a font, media, a
+// data or markup file, wasm), matched case-insensitively. Such an import names no module of the import graph: when
+// the crawl indexed the file, the exact-spelling probe draws its edge like a relative import's; when no indexed file
+// answers, the graph has no node it could have reached, so it is never counted as an in-repo import that drew no
+// edge (ImportResolver::resolve). `.vue`/`.svelte` components are code, so they are not on the list.
+inline bool isAssetSpecifier( std::string_view spec ) noexcept
+{
+    static constexpr std::string_view kAssetExts[] = {
+        "css", "scss", "sass", "less", "styl", "pcss",                                           // stylesheets
+        "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp",                        // images
+        "woff", "woff2", "ttf", "otf", "eot",                                                    // fonts
+        "mp4", "webm", "mp3", "wav", "ogg",                                                      // media
+        "json", "yaml", "yml", "toml", "csv", "txt", "md", "html", "xml", "graphql", "gql", "wasm" };
+    const std::size_t      slash = spec.rfind( '/' );
+    const std::string_view last  = spec.substr( slash == std::string_view::npos ? 0 : slash + 1 );
+    const std::size_t      dot   = last.rfind( '.' );
+    if( dot == std::string_view::npos || last.size() - dot - 1 > 8 )
+    {
+        return false;
+    }
+    char              lower[8] = {};
+    const std::size_t n        = last.size() - dot - 1;
+    for( std::size_t i = 0; i < n; ++i )
+    {
+        const char c = last[ dot + 1 + i ];
+        lower[i]     = ( c >= 'A' && c <= 'Z' ) ? char( c - 'A' + 'a' ) : c;
+    }
+    const std::string_view ext( lower, n );
+    return std::find( std::begin( kAssetExts ), std::end( kAssetExts ), ext ) != std::end( kAssetExts );
+}
+
+// npm's split of a bare specifier: the package name (`@scope/name`, else the first segment) and the rest as an
+// `exports` key (`.` or `./sub`). The name is empty for a scope alone (`@scope`).
+inline std::pair<std::string_view, std::string> splitPackageSpecifier( std::string_view spec )
+{
+    std::size_t cut = spec.find( '/' );
+    if( spec.starts_with( '@' ) )
+    {
+        if( cut == std::string_view::npos )
+        {
+            return { {}, {} };
+        }
+        cut = spec.find( '/', cut + 1 );
+    }
+    if( cut == std::string_view::npos )
+    {
+        return { spec, "." };
+    }
+    return { spec.substr( 0, cut ), "." + std::string( spec.substr( cut ) ) };
+}
+
+// What one specifier came to. External: not this tree's (no edge, no count). Resolved / Declaration: an edge, to
+// source / to a declaration file only. InRepoUnresolved: the config places it in the tree, yet no unique file answers.
+enum class Verdict : std::uint8_t { External, Resolved, Declaration, InRepoUnresolved };
+struct Outcome
+{
+    std::uint32_t file      = kNoFile;
+    Verdict       verdict   = Verdict::External;
+    bool          ambiguous = false;   // two indexed files answered one probe tier (never downgraded as an asset)
+
+    bool decided() const noexcept { return verdict != Verdict::External; }
+};
+
+// Node's resolvePackageTarget over one `exports` value: Found fills `out`; Null is an explicit null (the subpath is
+// not exported, stop); Missing lets the enclosing array or object try its next entry. An object's keys are read in
+// its own order and only the active `conds` are entered, so `types` (never active here) is skipped.
+enum class ExportsHit : std::uint8_t { Missing, Null, Found };
+inline ExportsHit exportsTarget( const JsonNode& n, std::span<const std::string_view> conds, std::string& out, int depth = 0 )
+{
+    if( depth > 16 || n.kind == JsonNode::Kind::Other )
+    {
+        return depth > 16 ? ExportsHit::Missing : ExportsHit::Null;
+    }
+    if( n.kind == JsonNode::Kind::Str )
+    {
+        out = n.str;
+        return ExportsHit::Found;
+    }
+    for( std::size_t i = 0; i < n.vals.size(); ++i )   // an array's items in order, or an object's active conditions
+    {
+        if( n.kind == JsonNode::Kind::Obj && std::find( conds.begin(), conds.end(), n.keys[i] ) == conds.end() )
+        {
+            continue;
+        }
+        const ExportsHit h = exportsTarget( n.vals[i], conds, out, depth + 1 );
+        if( h == ExportsHit::Null || ( h == ExportsHit::Found && ( n.kind == JsonNode::Kind::Obj || out.starts_with( "./" ) ) ) )
+        {
+            return h;   // an array skips an invalid (non-`./`) target and tries the next one
+        }
+    }
+    return ExportsHit::Missing;
+}
+
+// The `exports` entry a subpath selects (Node's PACKAGE_EXPORTS_RESOLVE): the whole value when it is not a subpath map
+// (only `.` is exported then), else the exact key, else the one-`*` key with the longest prefix (the longer key on a
+// tie) whose capture is non-empty; `capture` receives what the `*` matched.
+inline const JsonNode* patternMapEntry( const JsonNode& ex, const std::string& sub, std::string& capture );
+inline const JsonNode* exportsEntry( const JsonNode& ex, const std::string& sub, std::string& capture )
+{
+    if( ex.kind != JsonNode::Kind::Obj || ex.keys.empty() || !ex.keys.front().starts_with( '.' ) )
+    {
+        return sub == "." ? &ex : nullptr;
+    }
+    return patternMapEntry( ex, sub, capture );
+}
+
+// Node's PATTERN_KEY_COMPARE over one subpath map (an `exports` subpath object, or `imports`): the exact key, else
+// the one-`*` key with the longest prefix whose capture is non-empty.
+inline const JsonNode* patternMapEntry( const JsonNode& ex, const std::string& sub, std::string& capture )
+{
+    if( ex.kind != JsonNode::Kind::Obj )
+    {
+        return nullptr;
+    }
+    if( const JsonNode* exact = ex.get( sub ) )
+    {
+        return exact;
+    }
+    const JsonNode*   best    = nullptr;
+    const std::string* bestKey = nullptr;
+    for( std::size_t i = 0; i < ex.keys.size(); ++i )
+    {
+        const std::string& key  = ex.keys[i];
+        const std::size_t  star = key.find( '*' );
+        if( star == std::string::npos || key.find( '*', star + 1 ) != std::string::npos || sub.size() < key.size()
+            || !sub.starts_with( std::string_view( key ).substr( 0, star ) ) || !sub.ends_with( std::string_view( key ).substr( star + 1 ) ) )
+        {
+            continue;
+        }
+        const std::size_t bestStar = bestKey != nullptr ? bestKey->find( '*' ) : 0;
+        if( best == nullptr || star > bestStar || ( star == bestStar && key.size() > bestKey->size() ) )
+        {
+            best    = &ex.vals[i];
+            bestKey = &key;
+            capture = sub.substr( star, sub.size() - key.size() + 1 );
+        }
+    }
+    return best;
+}
+
+// A config or manifest's bytes as a JSON object; false for an empty read, a parse failure or a non-object root.
+inline bool parseJsonObject( const std::string& bytes, JsonNode& out )
+{
+    std::string_view text( bytes );
+    if( text.starts_with( kUtf8Bom ) )
+    {
+        text.remove_prefix( kUtf8Bom.size() );   // tsc, node, npm and pnpm all strip it
+    }
+    if( text.empty() )
+    {
+        return false;
+    }
+    JsoncReader reader( text );
+    return reader.parse( out ) && out.kind == JsonNode::Kind::Obj;
+}
+
+
+// Which project configs own one importer (ConfigScopes::ownersFor): scope indices, sorted; `byImport` when no
+// referenced project holds the file by `files`/`include`, so each reached project is only a candidate.
+struct ConfigOwners
+{
+    std::vector<int> scopes;
+    bool             byImport = false;
+};
+
+// The project configs that own importers: one AliasScope per tsconfig/jsconfig read (its `extends` chain folded in),
+// the directory → nearest-config memo, `references` ownership, and the configs whose unread base or reference could
+// have changed an answer (tsconfig_unread=). ImportResolver asks it; it never resolves a specifier itself.
+class ConfigScopes
+{
+public:
+    ConfigScopes( const IngestResult& ing, const HashMap<std::string, std::uint32_t>& fileIndex ) : ing_( ing ), fileIndex_( fileIndex ) {}
+
+    const AliasScope& scope( int si ) const
+    {
+        EXPECTS( si >= 0 && std::size_t( si ) < scopes_.size() );
+        return scopes_[ std::size_t( si ) ];
+    }
+
+    // Record scope `si`'s config when an unread base could have changed what it resolves.
+    void noteUnreadIfMatters( int si )
+    {
+        if( scope( si ).unreadMatters() )
+        {
+            unreadConfigs_.emplace( scopeConfig_[ std::size_t( si ) ], 1 );
+        }
+    }
+
+    std::uint64_t unreadCount() const noexcept { return unreadConfigs_.size(); }
+
+    // A config or manifest that could declare aliases or packages and was not read (unparseable, above the root).
+    void noteUnread( const std::string& path ) { unreadConfigs_.emplace( path, 1 ); }
+
+    // Configs ABOVE the crawl root (`ripwire pkg/src` inside a monorepo) are not read: tsc would find a tsconfig.json
+    // or jsconfig.json there, and a package manager a workspace root. Walked once, from the crawl root's realpath up
+    // to the enclosing git top-level (never past it; no walk outside a git work tree, where no bound exists). Each
+    // found file is disclosed (tsconfig_unread=) the first time an answer could depend on it: a tsconfig when an
+    // importer has no in-tree config, a workspace root when a bare specifier finds no member here.
+    void noteAncestorTsconfigs() { noteAll( ancestors().tsconfigs ); }
+    void noteAncestorWorkspaces() { noteAll( ancestors().workspaces ); }
+
+    // The workspace members by name (ImportResolver's table), so a member can serve as a package-form `extends` base.
+    void setMemberDirs( const HashMap<std::string, std::string>* memberDirs ) noexcept { memberDirs_ = memberDirs; }
+
+    // The configs that own `importer`: the nearest one (scopeForDir), unless it does not hold the file and names
+    // `references` (a solution-style tsconfig.json such as create-vite's `files: []` beside tsconfig.app.json and
+    // tsconfig.node.json). Then every referenced project that holds it, searched through nested references. When none
+    // holds it by `files`/`include`, the file is in a program only because a held file imports it (tsc compiles it
+    // there with that program's aliases), so `byImport` asks every referenced project and the solution config, and
+    // ImportResolver::resolveOwned keeps the answer the projects that resolve it agree on. -1 alone = no config above
+    // it. Sorted, so the answer is order-free.
+    ConfigOwners ownersFor( std::string_view importer, const std::string& dir )
+    {
+        std::string key( importer );
+        if( const auto it = owners_.find( key ); it != owners_.end() )
+        {
+            return it->second;
+        }
+        ConfigOwners out;
+        const int    c = scopeForDir( dir );
+        if( c >= 0 && ( !scopes_[ std::size_t( c ) ].references.empty() || scopes_[ std::size_t( c ) ].unreadReference ) && !scopes_[ std::size_t( c ) ].holds( importer ) )
+        {
+            std::vector<int> seen{ c };
+            collectOwners( c, importer, out.scopes, seen );
+            if( scopes_[ std::size_t( c ) ].unreadReference )
+            {
+                unreadConfigs_.emplace( scopeConfig_[ std::size_t( c ) ], 1 );   // an unread project could hold it too
+            }
+            out.byImport = out.scopes.empty();
+            if( out.byImport )
+            {
+                out.scopes = std::move( seen );   // every project the search reached, the solution config included
+            }
+        }
+        if( out.scopes.empty() )
+        {
+            out.scopes.push_back( c );
+        }
+        std::sort( out.scopes.begin(), out.scopes.end() );
+        out.scopes.erase( std::unique( out.scopes.begin(), out.scopes.end() ), out.scopes.end() );
+        ENSURES( !out.scopes.empty() );
+        owners_.emplace( std::move( key ), out );
+        return out;
+    }
+
+    // The config that owns `dir`: the nearest tsconfig.json, else jsconfig.json, walking up to the crawl root.
+    int scopeForDir( const std::string& dir )
+    {
+        if( const auto it = dirScope_.find( dir ); it != dirScope_.end() )
+        {
+            return it->second;
+        }
+        int r = -1;
+        for( const std::string_view name : { std::string_view( "tsconfig.json" ), std::string_view( "jsconfig.json" ) } )
+        {
+            if( const std::uint32_t cfg = joinNormalizeLookup( dir, name, fileIndex_ ); cfg != kNoFile )
+            {
+                r = scopeForConfig( joinRel( dir, name ), diskPath( ing_, cfg ) );
+                break;
+            }
+        }
+        if( r < 0 && !dir.empty() )
+        {
+            r = scopeForDir( std::string( includerDir( dir ) ) );
+        }
+        dirScope_.emplace( dir, r );
+        return r;
+    }
+
+private:
+    void collectOwners( int c, std::string_view importer, std::vector<int>& owners, std::vector<int>& seen )
+    {
+        const std::vector<std::string> refs = scopes_[ std::size_t( c ) ].references;   // a copy: scopeForConfig grows scopes_
+        for( const std::string& ref : refs )
+        {
+            const auto it = fileIndex_.find( ref );
+            if( it == fileIndex_.end() )
+            {
+                continue;
+            }
+            const int r = scopeForConfig( ref, diskPath( ing_, it->second ) );
+            if( std::find( seen.begin(), seen.end(), r ) != seen.end() || seen.size() >= 32 )
+            {
+                continue;   // a reference cycle, or a chain past any real layout
+            }
+            seen.push_back( r );
+            if( scopes_[ std::size_t( r ) ].unreadReference )
+            {
+                unreadConfigs_.emplace( scopeConfig_[ std::size_t( r ) ], 1 );   // a nested unread project could hold it
+            }
+            if( scopes_[ std::size_t( r ) ].holds( importer ) )
+            {
+                owners.push_back( r );
+            }
+            else if( !scopes_[ std::size_t( r ) ].references.empty() )
+            {
+                collectOwners( r, importer, owners, seen );
+            }
+        }
+    }
+
+    int scopeForConfig( const std::string& rel, const std::string& disk )
+    {
+        if( const auto it = cfgScope_.find( rel ); it != cfgScope_.end() )
+        {
+            return it->second;
+        }
+        std::vector<std::string> chain;
+        AliasScope               s = loadChain( rel, disk, chain );
+        scopes_.push_back( std::move( s ) );
+        scopeConfig_.push_back( rel );
+        const int idx = int( scopes_.size() - 1 );
+        cfgScope_.emplace( rel, idx );
+        return idx;
+    }
+
+    // One config and what it extends, bases first so the child's own keys win; with an `extends` array the LAST base
+    // that declares a key wins. `chain` is the path taken so far: a revisit stops there, and the depth is bounded.
+    AliasScope loadChain( const std::string& rel, const std::string& disk, std::vector<std::string>& chain )
+    {
+        AliasScope out;
+        JsonNode   root;
+        if( chain.size() >= 16 || std::find( chain.begin(), chain.end(), rel ) != chain.end() )
+        {
+            return out;
+        }
+        const bool asBase = !chain.empty();   // a base's folded scope is the same for every config that extends it
+        if( const auto it = asBase ? baseScopes_.find( rel ) : baseScopes_.end(); it != baseScopes_.end() )
+        {
+            return it->second;
+        }
+        if( !parseJsonObject( readConfigBytes( disk ), root ) )
+        {
+            // A config that does not parse (not tsc's JSONC, or empty) was not read: whatever aliases it declares are
+            // unknown, so it is disclosed like an unread base (tsconfig_unread=), never read as "declares none".
+            ( inTreeTarget( rel ) ? out.unreadRelativeBase : out.unreadPackageBase ) = true;
+            return out;
+        }
+        chain.push_back( rel );
+        for( const std::string_view b : extendsSpecs( root ) )
+        {
+            if( const std::optional<BaseLoc> at = locateBase( rel, disk, b, out ) )
+            {
+                out.inherit( loadChain( at->rel, at->disk, chain ) );
+            }
+        }
+        const std::string dir( includerDir( rel ) );
+        applyCompilerOptions( root, dir, out );
+        applyProjectFiles( root, dir, out );
+        if( chain.size() == 1 )   // the owning config itself: its directory and its `references` (never inherited)
+        {
+            out.projectDir = dir;
+            readReferences( root, dir, out );
+        }
+        chain.pop_back();
+        if( asBase )
+        {
+            baseScopes_.emplace( rel, out );   // one parse per base, not one per child (an Nx base holds every lib's key)
+        }
+        return out;
+    }
+
+    // `references: [{ "path": … }]`: a config file, or a directory holding tsconfig.json, relative to the config.
+    // Only an indexed config is read (the crawl's rules apply, as to `extends`); any other is flagged, never guessed.
+    void readReferences( const JsonNode& root, const std::string& dir, AliasScope& out ) const
+    {
+        const JsonNode* refs = root.get( "references" );
+        if( refs == nullptr || refs->kind != JsonNode::Kind::Arr )
+        {
+            return;
+        }
+        for( const JsonNode& r : refs->vals )
+        {
+            const JsonNode* path = r.kind == JsonNode::Kind::Obj ? r.get( "path" ) : nullptr;
+            if( path == nullptr || path->kind != JsonNode::Kind::Str || path->str.empty() )
+            {
+                continue;
+            }
+            const std::string at  = joinRel( dir, path->str );
+            const std::string cfg = at.ends_with( ".json" ) ? at : joinRel( at, "tsconfig.json" );
+            if( !cfg.empty() && fileIndex_.contains( cfg ) )
+            {
+                out.references.push_back( cfg );
+            }
+            else
+            {
+                out.unreadReference = true;
+            }
+        }
+    }
+
+    // Where a base config lives: its root-relative spelling and the path its bytes are read from.
+    struct BaseLoc
+    {
+        std::string rel, disk;
+    };
+
+    // Where an `extends` names its base: (relative) the indexed file, with or without `.json` — or, for a config that
+    // was itself read from node_modules, the file beside it on disk; (package form) the nearest `node_modules` at or
+    // above the config, inside the tree: `<pkg>/<subpath>[.json]`, else the package.json `tsconfig` field, else
+    // `tsconfig.json`. A base that is not there is flagged on `out`, never guessed at.
+    std::optional<BaseLoc> locateBase( const std::string& rel, const std::string& disk, std::string_view b, AliasScope& out ) const
+    {
+        const bool inPackage = !inTreeTarget( rel );
+        const bool relative  = b.starts_with( "./" ) || b.starts_with( "../" );
+        std::optional<BaseLoc> at = relative ? locateRelativeBase( rel, disk, b, inPackage ) : locatePackageBase( rel, disk, b );
+        if( !at )
+        {
+            ( relative && !inPackage ? out.unreadRelativeBase : out.unreadPackageBase ) = true;
+        }
+        return at;
+    }
+
+    // An in-tree member package as an `extends` base: the subpath (with or without `.json`), else its package.json
+    // `tsconfig` field, else `tsconfig.json` — the first the crawl indexed.
+    std::optional<BaseLoc> probeMemberDir( const std::string& memberDir, const std::string& sub ) const
+    {
+        const std::vector<std::string> tries = configTries( sub, [ & ]
+        {
+            const auto pjIt = fileIndex_.find( joinRel( memberDir, "package.json" ) );
+            return pjIt != fileIndex_.end() ? readConfigBytes( diskPath( ing_, pjIt->second ) ) : std::string();
+        } );
+        for( const std::string& t : tries )
+        {
+            const std::string r = joinRel( memberDir, t );
+            if( const auto it = r.empty() ? fileIndex_.end() : fileIndex_.find( r ); it != fileIndex_.end() )
+            {
+                return BaseLoc{ r, diskPath( ing_, it->second ) };
+            }
+        }
+        return std::nullopt;
+    }
+
+    // What a package-form `extends` names inside the package, in order: the subpath (with or without `.json`), else the
+    // package.json `tsconfig` field (`manifest` reads its bytes, only then), else `tsconfig.json`.
+    template <class ReadManifest>
+    static std::vector<std::string> configTries( const std::string& sub, ReadManifest&& manifest )
+    {
+        if( sub != "." )
+        {
+            return { sub.substr( 2 ), sub.substr( 2 ) + ".json" };
+        }
+        std::vector<std::string> tries;
+        JsonNode                 pj;
+        if( const JsonNode* t = parseJsonObject( manifest(), pj ) ? pj.get( "tsconfig" ) : nullptr; t != nullptr && t->kind == JsonNode::Kind::Str && !t->str.empty() )
+        {
+            tries.push_back( t->str );
+        }
+        tries.push_back( "tsconfig.json" );
+        return tries;
+    }
+
+    static std::string diskDirOf( const std::string& disk )
+    {
+        return includerDir( disk ).empty() ? std::string( "." ) : std::string( includerDir( disk ) );
+    }
+
+    std::optional<BaseLoc> locateRelativeBase( const std::string& rel, const std::string& disk, std::string_view b, bool inPackage ) const
+    {
+        const std::string dir( includerDir( rel ) );
+        for( const std::string& cand : { std::string( b ), std::string( b ) + ".json" } )
+        {
+            const std::string r = joinRel( dir, cand );
+            if( r.empty() )
+            {
+                continue;
+            }
+            if( const auto it = inPackage ? fileIndex_.end() : fileIndex_.find( r ); it != fileIndex_.end() )
+            {
+                return BaseLoc{ r, diskPath( ing_, it->second ) };
+            }
+            if( std::string d = diskDirOf( disk ) + "/" + cand; inPackage && !readConfigBytes( d ).empty() )
+            {
+                return BaseLoc{ r, std::move( d ) };
+            }
+        }
+        return std::nullopt;
+    }
+
+    // The package-form base: `node_modules/<name>` in the config's directory, then each directory above it.
+    std::optional<BaseLoc> locatePackageBase( const std::string& rel, const std::string& disk, std::string_view b ) const
+    {
+        const auto [ name, sub ] = splitPackageSpecifier( b );
+        if( name.empty() || b.starts_with( '/' ) )
+        {
+            return std::nullopt;
+        }
+        // A workspace member IS the package the link in node_modules points at (tsc reads it through the realpath),
+        // installed or not: read it in the tree, where its own `paths` resolve.
+        if( const auto m = memberDirs_ != nullptr ? memberDirs_->find( std::string( name ) ) : HashMap<std::string, std::string>::const_iterator{};
+            memberDirs_ != nullptr && m != memberDirs_->end() && m->second != "\x1f" )
+        {
+            return probeMemberDir( m->second, sub );
+        }
+        const std::string diskDir = diskDirOf( disk );
+        std::string       relDir( includerDir( rel ) ), up;
+        for( ;; )
+        {
+            const std::string nmRel = joinRel( relDir, "node_modules/" + std::string( name ) );
+            if( std::optional<BaseLoc> at = probePackageDir( nmRel, diskDir + up + "/node_modules/" + std::string( name ), sub ) )
+            {
+                return at;
+            }
+            if( relDir.empty() )
+            {
+                return std::nullopt;
+            }
+            relDir = std::string( includerDir( relDir ) );
+            up += "/..";
+        }
+    }
+
+    // One installed package directory: the subpath (with or without `.json`), else its package.json `tsconfig` field,
+    // else `tsconfig.json`; the first that has bytes on disk.
+    static std::optional<BaseLoc> probePackageDir( const std::string& nmRel, const std::string& nmDisk, const std::string& sub )
+    {
+        const std::vector<std::string> tries = configTries( sub, [ & ] { return readConfigBytes( nmDisk + "/package.json" ); } );
+        for( const std::string& t : tries )
+        {
+            std::string d = nmDisk + "/" + t;
+            if( std::string r = joinRel( nmRel, t ); !nmRel.empty() && !r.empty() && !readConfigBytes( d ).empty() )
+            {
+                return BaseLoc{ std::move( r ), std::move( d ) };
+            }
+        }
+        return std::nullopt;
+    }
+
+    struct AncestorConfigs
+    {
+        std::vector<std::string> tsconfigs, workspaces;
+    };
+
+    void noteAll( const std::vector<std::string>& paths )
+    {
+        for( const std::string& p : paths )
+        {
+            unreadConfigs_.emplace( p, 1 );
+        }
+    }
+
+    const AncestorConfigs& ancestors()
+    {
+        if( !ancestors_ )
+        {
+            ancestors_ = findAncestorConfigs( ing_.crawlRoot );
+        }
+        return *ancestors_;
+    }
+
+    static bool hasEntry( const std::string& dir, std::string_view name )
+    {
+        const std::string at = dir + std::string( name );
+        os::stat_t        st;
+        return os::stat( at.c_str(), &st ) == 0;
+    }
+
+    // The directories strictly above `crawlRoot`, nearest first, up to and including the git top-level; empty when the
+    // root IS the top-level or no git work tree bounds the walk.
+    static std::vector<std::string> dirsAboveToGitTop( const std::string& crawlRoot )
+    {
+        char buf[ PATH_MAX ];
+        if( crawlRoot.empty() || os::realpath( crawlRoot.c_str(), buf ) == nullptr )
+        {
+            return {};   // a multi-root merge reads each root's config itself (§3.2); an unresolvable root has no parent
+        }
+        std::vector<std::string> above;
+        std::string              d = buf;
+        while( !hasEntry( d, "/.git" ) && d.size() > 1 )
+        {
+            const std::size_t cut = d.rfind( '/' );
+            if( cut == std::string::npos )
+            {
+                return {};
+            }
+            d = cut == 0 ? std::string( "/" ) : d.substr( 0, cut );
+            above.push_back( d );
+        }
+        return !above.empty() && hasEntry( above.back(), "/.git" ) ? above : std::vector<std::string>{};
+    }
+
+    static AncestorConfigs findAncestorConfigs( const std::string& crawlRoot )
+    {
+        AncestorConfigs out;
+        for( const std::string& d : dirsAboveToGitTop( crawlRoot ) )
+        {
+            for( const std::string_view name : { std::string_view( "/tsconfig.json" ), std::string_view( "/jsconfig.json" ) } )
+            {
+                if( hasEntry( d, name ) )
+                {
+                    out.tsconfigs.push_back( d + std::string( name ) );
+                }
+            }
+            JsonNode pj;
+            if( hasEntry( d, "/pnpm-workspace.yaml" ) || hasEntry( d, "/lerna.json" ) || hasEntry( d, "/rush.json" )
+                || ( parseJsonObject( readConfigBytes( d + "/package.json" ), pj ) && !packageJsonWorkspaceGlobs( pj ).empty() ) )
+            {
+                out.workspaces.push_back( d );
+            }
+        }
+        return out;
+    }
+
+    const IngestResult&                        ing_;
+    const HashMap<std::string, std::uint32_t>& fileIndex_;
+    std::optional<AncestorConfigs>             ancestors_;
+    HashMap<std::string, int>                  dirScope_;       // directory → index into scopes_, -1 = no config above it
+    HashMap<std::string, int>                  cfgScope_;       // config path → index into scopes_
+    std::vector<AliasScope>                    scopes_;
+    std::vector<std::string>                   scopeConfig_;    // scopes_[i]'s config path
+    HashMap<std::string, char>                 unreadConfigs_;
+    HashMap<std::string, ConfigOwners>         owners_;         // importer path → its owning scopes (ownersFor)
+    HashMap<std::string, AliasScope>           baseScopes_;     // base config path → its folded scope (loadChain)
+    const HashMap<std::string, std::string>*   memberDirs_ = nullptr;   // workspace member name → its dir ("\x1f" = two)
+};
+
+// The resolver. One per adjacency build that met a bare TS/JS specifier its relative branch could not place; every
+// memo lives here, and nothing in it depends on the order specifiers are asked in.
+class ImportResolver
+{
+public:
+    ImportResolver( const IngestResult& ing, const HashMap<std::string, std::uint32_t>& fileIndex )
+        : ing_( ing ), fileIndex_( fileIndex ), configs_( ing, fileIndex )
+    {
+        collectWorkspaceMembers();
+    }
+
+    // `importer` is the importing file's normalized root-relative path, `spec` a bare specifier it wrote. A bundler's
+    // `?query` suffix (`logo.svg?react`, `a.css?inline`) is not part of the path: the file it names is probed.
+    Outcome resolve( std::string_view importer, std::string_view spec )
+    {
+        if( spec.find( ':' ) != std::string_view::npos )
+        {
+            return {};   // node:fs, https://…, data:… — a scheme, never a path in this tree
+        }
+        spec = spec.substr( 0, spec.find( '?' ) );
+        const std::string      dir( includerDir( importer ) );
+        const ConfigOwners owners = configs_.ownersFor( importer, dir );
+        std::string        key    = dir + '\x1f' + std::string( spec ) + ( owners.byImport ? "\x1fi" : "" );
+        for( const int si : owners.scopes )   // the owning configs are part of the question when `references` chose them
+        {
+            key += '\x1f';
+            key += std::to_string( si );
+        }
+        if( const auto it = memo_.find( key ); it != memo_.end() )
+        {
+            return it->second;
+        }
+        Outcome o = spec.empty() ? Outcome{} : resolveOwned( dir, owners, spec );
+        if( o.verdict == Verdict::InRepoUnresolved && !o.ambiguous && isAssetSpecifier( spec ) )
+        {
+            o = {};   // an asset no indexed file answers: the graph has no node for it (isAssetSpecifier)
+        }
+        ENSURES( ( o.file != kNoFile ) == ( o.verdict == Verdict::Resolved || o.verdict == Verdict::Declaration ),
+                 "an edge exactly when the verdict names a file" );
+        memo_.emplace( std::move( key ), o );
+        return o;
+    }
+
+    // How many configs that own an importer name an `extends` base or a `references` entry that was not read and could
+    // have changed an answer.
+    std::uint64_t extendsUnread() const noexcept { return configs_.unreadCount(); }
+
+private:
+    struct Member
+    {
+        std::string              dir;
+        std::size_t              manifest = 0;   // index into manifests_
+        std::vector<std::string> declDirs;       // the directories of the workspace declarations that admit it
+        bool                     pnpmOnly = false;   // admitted only by pnpm-workspace.yaml globs
+    };
+    struct Hit
+    {
+        std::uint32_t file      = kNoFile;
+        bool          ambiguous = false;
+    };
+
+    const IngestResult&                             ing_;
+    const HashMap<std::string, std::uint32_t>&      fileIndex_;
+    std::vector<JsonNode>                           manifests_;
+    std::vector<Member>                             members_;
+    HashMap<std::string, std::vector<std::size_t>>  membersByName_;
+    HashMap<std::string, std::string>               memberDirByName_;   // name → its member's dir, "\x1f" when two share it
+    ConfigScopes                                    configs_;
+    HashMap<std::string, Outcome>                   memo_;
+    std::vector<std::pair<std::string, JsonNode>>   scopePackages_;  // (directory, package.json) — `imports` scopes
+    HashMap<std::string, int>                       dirPackage_;     // directory → index into scopePackages_, -1 = none
+
+    // Several owning projects (a file two `references` include) answer as one only when they agree: the edit a user
+    // makes compiles under each, and the record cannot say which build the reader means. By import only, the file
+    // compiles in whichever program imports it, and only a program that RESOLVES the specifier can be that program:
+    // the files those programs name must agree (else ambiguous); none resolving is counted if any placed it here.
+    Outcome resolveOwned( const std::string& dir, const ConfigOwners& owners, std::string_view spec )
+    {
+        EXPECTS( !owners.scopes.empty() );
+        Outcome agreed;
+        bool    first = true, placed = false;
+        for( const int si : owners.scopes )
+        {
+            const Outcome o = resolveUncached( dir, si, spec );
+            if( owners.byImport && o.file == kNoFile )
+            {
+                placed = placed || o.decided();
+                continue;
+            }
+            if( !first && ( o.verdict != agreed.verdict || o.file != agreed.file ) )
+            {
+                return { kNoFile, Verdict::InRepoUnresolved };
+            }
+            agreed = o;
+            first  = false;
+        }
+        return first && placed ? Outcome{ kNoFile, Verdict::InRepoUnresolved } : agreed;
+    }
+
+    Outcome resolveUncached( const std::string& dir, const int si, std::string_view spec )
+    {
+        bool inRepo = false;   // a literal `paths` key placed it in the tree, whatever answers below
+        if( si < 0 )
+        {
+            configs_.noteAncestorTsconfigs();   // no config in the tree owns it: one above the crawl root could
+        }
+        if( si >= 0 )
+        {
+            configs_.noteUnreadIfMatters( si );
+            bool matched = false;
+            if( const Outcome o = throughPaths( configs_.scope( si ), spec, inRepo, matched ); o.decided() )
+            {
+                return o;
+            }
+            if( const AliasScope& sc = configs_.scope( si ); sc.hasBaseUrl && !matched )
+            {
+                if( const Outcome o = probeInOrder( candidateAt( sc.baseDir, spec ) ); o.decided() )
+                {
+                    return o;
+                }
+            }
+        }
+        if( spec.starts_with( '#' ) )
+        {
+            return throughImports( dir, spec );   // a package-internal import: never another package's name
+        }
+        if( const Outcome o = throughSelfName( dir, spec ); o.decided() )
+        {
+            return o;
+        }
+        if( const Outcome o = throughWorkspace( dir, spec ); o.decided() )
+        {
+            return o;
+        }
+        if( !inRepo && !cannotBeRegistryName( spec ) )
+        {
+            configs_.noteAncestorWorkspaces();   // a workspace declared above the crawl root could own this name
+            return {};
+        }
+        return { kNoFile, Verdict::InRepoUnresolved };
+    }
+
+    // `@/x` (an empty npm scope) and `~…` are not names a registry can publish: only a bundler or tsconfig alias
+    // gives them meaning, so one nothing here answers names this tree and is counted.
+    static bool cannotBeRegistryName( std::string_view spec ) noexcept { return spec.starts_with( "@/" ) || spec.starts_with( '~' ); }
+
+    // Node's self-reference: a package imports itself by its own name through its own `exports` (the nearest
+    // package.json at or above the importer). Without `exports` the name goes to node_modules like any other.
+    Outcome throughSelfName( const std::string& dir, std::string_view spec )
+    {
+        const int pi = nearestPackage( dir );
+        if( pi < 0 )
+        {
+            return {};
+        }
+        const auto& [ pkgDir, pj ] = scopePackages_[ std::size_t( pi ) ];
+        const auto [ name, sub ]   = splitPackageSpecifier( spec );
+        const JsonNode* own        = pj.get( "name" );
+        const JsonNode* ex         = pj.get( "exports" );
+        if( name.empty() || own == nullptr || own->kind != JsonNode::Kind::Str || own->str != name || ex == nullptr || ex->kind == JsonNode::Kind::Other )
+        {
+            return {};
+        }
+        const Outcome o = throughExports( pkgDir, *ex, sub );
+        return o.decided() ? o : Outcome{ kNoFile, Verdict::InRepoUnresolved };
+    }
+
+    // Node's PACKAGE_IMPORTS_RESOLVE: `#x` through the `imports` map of the nearest package.json at or above the
+    // importer (its package scope). A `#` specifier names nothing outside that package, so one that no in-tree file
+    // answers — no package.json, no `imports`, no key, or a target that is not here — is counted, never external.
+    Outcome throughImports( const std::string& dir, std::string_view spec )
+    {
+        const int pi = nearestPackage( dir );
+        if( pi >= 0 )
+        {
+            const auto& [ pkgDir, pj ] = scopePackages_[ std::size_t( pi ) ];
+            std::string     capture;
+            const JsonNode* imports = pj.get( "imports" );
+            const JsonNode* entry   = imports != nullptr ? patternMapEntry( *imports, std::string( spec ), capture ) : nullptr;
+            if( const Outcome o = entry != nullptr ? resolveConditional( pkgDir, *entry, capture, /*bareIsPackage=*/true ) : Outcome{}; o.decided() )
+            {
+                return o;
+            }
+        }
+        return { kNoFile, Verdict::InRepoUnresolved };
+    }
+
+    // The package scope of `dir`: the nearest indexed package.json at or above it that parses (-1 = none), memoized.
+    int nearestPackage( const std::string& dir )
+    {
+        if( const auto it = dirPackage_.find( dir ); it != dirPackage_.end() )
+        {
+            return it->second;
+        }
+        int      r = -1;
+        JsonNode pj;
+        if( const std::uint32_t f = joinNormalizeLookup( dir, "package.json", fileIndex_ ); f != kNoFile && parseJsonObject( readConfigBytes( diskPath( ing_, f ) ), pj ) )
+        {
+            scopePackages_.emplace_back( dir, std::move( pj ) );
+            r = int( scopePackages_.size() - 1 );
+        }
+        else if( !dir.empty() )
+        {
+            r = nearestPackage( std::string( includerDir( dir ) ) );
+        }
+        dirPackage_.emplace( dir, r );
+        return r;
+    }
+
+    static std::vector<std::string> candidateAt( std::string_view base, std::string_view rel )
+    {
+        std::string at = joinRel( base, rel );
+        return inTreeTarget( at ) ? std::vector<std::string>{ std::move( at ) } : std::vector<std::string>{};
+    }
+
+    // tsc's matchPatternOrExact: an exact key, else the wildcard key with the longest prefix (the first on a tie).
+    static const PathPattern* bestPathsKey( const std::vector<PathPattern>& paths, std::string_view spec )
+    {
+        const PathPattern* best = nullptr;
+        for( const PathPattern& pp : paths )
+        {
+            if( !pp.wild && pp.prefix == spec )
+            {
+                return &pp;
+            }
+            if( pp.wild && pp.suffix.find( '*' ) == std::string::npos && pp.matches( spec ) && ( best == nullptr || pp.prefix.size() > best->prefix.size() ) )
+            {
+                best = &pp;
+            }
+        }
+        return best;
+    }
+
+    // Rule 1: the one `paths` key tsc would pick, its targets in order. A literal key (non-empty prefix, or exact)
+    // with a target that stays in the tree places the specifier here even when no target answers (`inRepo`); a
+    // catch-all matches every package there is, so only an answer from it means anything.
+    // tsc stops at a matched key even when no target answers (`matched`): `baseUrl` is never tried after it, only the
+    // package steps (tryLoadModuleUsingOptionalResolutionSettings returns the failed match).
+    Outcome throughPaths( const AliasScope& sc, std::string_view spec, bool& inRepo, bool& matched ) const
+    {
+        const PathPattern* pp = sc.hasPaths && sc.paths ? bestPathsKey( *sc.paths, spec ) : nullptr;
+        matched               = pp != nullptr;
+        if( pp == nullptr )
+        {
+            return {};
+        }
+        const std::string_view base    = sc.hasBaseUrl ? std::string_view( sc.baseDir ) : std::string_view( sc.pathsDir );
+        const std::string_view capture = pp->wild ? spec.substr( pp->prefix.size(), spec.size() - pp->prefix.size() - pp->suffix.size() ) : std::string_view();
+        std::vector<std::string> cands;
+        for( const std::string& t : pp->targets )
+        {
+            const std::size_t star = t.find( '*' );
+            // tsc substitutes only a non-empty capture of a wildcard key; an exact key's `*`, or an empty capture
+            // (`@/` against `@/*`), leaves the target verbatim, so its literal `*` names no file
+            const bool        subst = star != std::string::npos && pp->wild && !capture.empty();
+            const std::string sub   = subst ? t.substr( 0, star ) + std::string( capture ) + t.substr( star + 1 ) : t;
+            for( std::string& at : candidateAt( base, sub ) )
+            {
+                cands.push_back( std::move( at ) );
+            }
+        }
+        inRepo = inRepo || ( ( !pp->prefix.empty() || !pp->wild ) && !cands.empty() );
+        return probeInOrder( cands );
+    }
+
+    // One probe tier, unique-or-degrade: the one indexed file among `cands`, or ambiguous when two answer.
+    Hit tier( const std::vector<std::string>& cands ) const
+    {
+        Hit h;
+        for( const std::string& c : cands )
+        {
+            const auto it = fileIndex_.find( c );
+            if( it == fileIndex_.end() )
+            {
+                continue;
+            }
+            h.ambiguous = h.ambiguous || ( h.file != kNoFile && h.file != it->second );
+            h.file      = it->second;
+        }
+        return h;
+    }
+
+    Outcome decide( const Hit& h ) const
+    {
+        if( h.ambiguous )
+        {
+            return { kNoFile, Verdict::InRepoUnresolved, true };
+        }
+        if( h.file == kNoFile )
+        {
+            return {};
+        }
+        return { h.file, isDeclarationFile( rootRelPath( ing_, h.file ) ) ? Verdict::Declaration : Verdict::Resolved };
+    }
+
+    // The first tier that answers decides — a source beats its declaration outright, and an ambiguous tier stops.
+    Outcome firstTier( std::initializer_list<std::vector<std::string>> tiers ) const
+    {
+        for( const std::vector<std::string>& t : tiers )
+        {
+            if( const Outcome o = decide( tier( t ) ); o.decided() )
+            {
+                return o;
+            }
+        }
+        return {};
+    }
+
+    // The source a runtime spelling names (`x.js` → `x.ts`/`x.tsx`) and its declaration, appended to the two tiers.
+    static void runtimeAlternates( const std::string& c, std::vector<std::string>& sources, std::vector<std::string>& decls )
+    {
+        if( const JsRuntimeSourceExt* rt = jsRuntimeSourceExtOf( c ) )
+        {
+            const std::string stem = c.substr( 0, c.size() - rt->runtime.size() );
+            for( const std::string_view s : rt->sources )
+            {
+                if( !s.empty() )
+                {
+                    sources.push_back( stem + std::string( s ) );
+                }
+            }
+            decls.push_back( stem + std::string( rt->decl ) );
+        }
+    }
+
+    // One module path `c`, tsc's order: the file (the exact spelling when it has an extension, a runtime spelling's
+    // source, `+.ts`/`+.tsx`), its declaration, the directory's index, the index's declaration. `js` asks the
+    // JavaScript tier instead, which tsc tries only after every candidate's TypeScript tiers came up empty.
+    Outcome probeModule( const std::string& c, bool js ) const
+    {
+        if( js )
+        {
+            return decide( tier( { c + ".js", c + ".jsx", c + ".mjs", c + ".cjs", c + "/index.js", c + "/index.jsx" } ) );
+        }
+        std::vector<std::string> sources, decls;
+        if( lastSegmentHasDot( c ) )
+        {
+            sources.push_back( c );
+        }
+        runtimeAlternates( c, sources, decls );
+        sources.push_back( c + ".ts" );
+        sources.push_back( c + ".tsx" );
+        decls.push_back( c + ".d.ts" );
+        return firstTier( { sources, decls, { c + "/index.ts", c + "/index.tsx" }, { c + "/index.d.ts" } } );
+    }
+
+    // Several candidates in order (a `paths` entry's targets): every candidate's TypeScript tiers, then every
+    // candidate's JavaScript tier; the first candidate that answers wins.
+    Outcome probeInOrder( const std::vector<std::string>& cands ) const
+    {
+        for( const bool js : { false, true } )
+        {
+            for( const std::string& c : cands )
+            {
+                if( const Outcome o = probeModule( c, js ); o.decided() )
+                {
+                    return o;
+                }
+            }
+        }
+        return {};
+    }
+
+    // An `exports` target names a FILE: its exact spelling or the source a runtime spelling names, then that
+    // spelling's declaration. No extension is appended and no index is read (Node's rule for exports).
+    Outcome probeTarget( const std::string& c ) const
+    {
+        std::vector<std::string> sources{ c }, decls;
+        runtimeAlternates( c, sources, decls );
+        return firstTier( { sources, decls } );
+    }
+
+    // After tsc's tryLoadInputFileForPath (see the header: applied to the target package's own config): an entry
+    // inside the package's `outDir` names the file its `rootDir` compiles there. Both come from the config that owns
+    // the package directory.
+    // Without `rootDir`, tsc infers the common directory of the program's sources; the two it lands on in practice
+    // are the config's `src/` and the config's own directory, tried in that order (each probe is unique-or-degrade).
+    std::vector<std::string> sourcesOfEmitted( const std::string& pkgDir, const std::string& at )
+    {
+        const int si = configs_.scopeForDir( pkgDir );
+        if( si < 0 )
+        {
+            return {};
+        }
+        const AliasScope& sc = configs_.scope( si );
+        if( !sc.hasOutDir || sc.outDir.empty() || at.size() <= sc.outDir.size() || !at.starts_with( sc.outDir ) || at[ sc.outDir.size() ] != '/' )
+        {
+            return {};
+        }
+        const std::string_view   frag = std::string_view( at ).substr( sc.outDir.size() + 1 );
+        std::vector<std::string> out;
+        for( const std::string& root : sc.hasRootDir ? std::vector<std::string>{ sc.rootDir } : std::vector<std::string>{ joinRel( sc.projectDir, "src" ), sc.projectDir } )
+        {
+            if( root != sc.outDir )
+            {
+                out.push_back( joinRel( root, frag ) );
+            }
+        }
+        return out;
+    }
+
+    // A path the package names (an `exports` target, `module`/`main`, a subpath): inside the package only. Its source
+    // through outDir → rootDir first, then as written; `exact` for an `exports` target, module probing otherwise.
+    Outcome resolveEntry( const std::string& pkgDir, std::string_view rel, bool exact )
+    {
+        const std::string at = joinRel( pkgDir, rel );
+        if( !inTreeTarget( at ) || !( pkgDir.empty() || at == pkgDir || ( at.starts_with( pkgDir ) && at[ pkgDir.size() ] == '/' ) ) )
+        {
+            return {};
+        }
+        std::vector<std::string> cands;
+        for( std::string& src : sourcesOfEmitted( pkgDir, at ) )
+        {
+            if( !src.empty() )
+            {
+                cands.push_back( std::move( src ) );
+            }
+        }
+        cands.push_back( at );
+        if( !exact )
+        {
+            return probeInOrder( cands );
+        }
+        for( const std::string& c : cands )
+        {
+            if( const Outcome o = probeTarget( c ); o.decided() )
+            {
+                return o;
+            }
+        }
+        return {};
+    }
+
+    // `exports`: the entry the subpath selects, resolved under every condition set (resolveConditional).
+    Outcome throughExports( const std::string& pkgDir, const JsonNode& ex, const std::string& sub )
+    {
+        std::string     capture;
+        const JsonNode* entry = exportsEntry( ex, sub, capture );
+        return entry == nullptr ? Outcome{} : resolveConditional( pkgDir, *entry, capture, /*bareIsPackage=*/false );
+    }
+
+    // One `exports`/`imports` entry under each condition set a consumer of this tree could run: ESM and CJS, each
+    // with and without Node's `node` condition (node16/nodenext enter it; a bundler does not). `types` is never
+    // entered. Two sets naming different files is ambiguous — the directive's syntax and the consumer's resolution
+    // mode would choose, and the record keeps neither — so it is counted; a set that names nothing here defers.
+    // `bareIsPackage` (`imports` only): a target that is not `./…` names a package, resolved as a workspace import.
+    // Node substitutes every `*` of a pattern target with what the key's `*` matched.
+    static void substituteCapture( std::string& t, const std::string& capture )
+    {
+        for( std::size_t star = t.find( '*' ); !capture.empty() && star != std::string::npos; star = t.find( '*', star + capture.size() ) )
+        {
+            t.replace( star, 1, capture );
+        }
+    }
+
+    Outcome resolveConditional( const std::string& pkgDir, const JsonNode& entry, const std::string& capture, bool bareIsPackage )
+    {
+        static constexpr std::string_view kImportConds[]      = { "import", "default" };
+        static constexpr std::string_view kRequireConds[]     = { "require", "default" };
+        static constexpr std::string_view kNodeImportConds[]  = { "node", "import", "default" };
+        static constexpr std::string_view kNodeRequireConds[] = { "node", "require", "default" };
+        Outcome                           agreed;
+        for( const std::span<const std::string_view> conds : { std::span<const std::string_view>( kImportConds ), std::span<const std::string_view>( kRequireConds ),
+                                                               std::span<const std::string_view>( kNodeImportConds ), std::span<const std::string_view>( kNodeRequireConds ) } )
+        {
+            std::string t;
+            if( exportsTarget( entry, conds, t ) != ExportsHit::Found || ( !bareIsPackage && !t.starts_with( "./" ) ) )
+            {
+                continue;
+            }
+            substituteCapture( t, capture );
+            const Outcome o = t.starts_with( "./" ) ? resolveEntry( pkgDir, std::string_view( t ).substr( 2 ), /*exact=*/true ) : throughWorkspace( pkgDir, t );
+            if( o.verdict == Verdict::InRepoUnresolved || ( o.decided() && agreed.decided() && o.file != agreed.file ) )
+            {
+                return { kNoFile, Verdict::InRepoUnresolved };
+            }
+            agreed = o.decided() ? o : agreed;
+        }
+        return agreed;
+    }
+
+    // Inside a member: `exports` when it declares one, else `module` then `main` (or the subpath under the package),
+    // else its `index`.
+    Outcome resolvePackage( const Member& m, const std::string& sub )
+    {
+        const JsonNode& pj = manifests_[ m.manifest ];
+        if( const JsonNode* ex = pj.get( "exports" ); ex != nullptr && ex->kind != JsonNode::Kind::Other )
+        {
+            return throughExports( m.dir, *ex, sub );
+        }
+        if( sub != "." )
+        {
+            return resolveEntry( m.dir, std::string_view( sub ).substr( 2 ), /*exact=*/false );
+        }
+        for( const std::string_view field : { std::string_view( "module" ), std::string_view( "main" ) } )
+        {
+            const JsonNode* v = pj.get( field );
+            if( v != nullptr && v->kind == JsonNode::Kind::Str && !v->str.empty() )
+            {
+                if( const Outcome o = resolveEntry( m.dir, v->str, /*exact=*/false ); o.decided() )
+                {
+                    return o;
+                }
+            }
+        }
+        return resolveEntry( m.dir, "index", /*exact=*/false );
+    }
+
+    static bool visibleFrom( const Member& m, const std::string& dir )
+    {
+        return std::any_of( m.declDirs.begin(), m.declDirs.end(), [ & ]( const std::string& d )
+                            { return d.empty() || dir == d || ( dir.starts_with( d ) && dir[ d.size() ] == '/' ); } );
+    }
+
+    // Rule 3: the member the package name picks, among those the importer can see. Two members declaring one name
+    // resolve to neither; a member that answers nothing is still this tree's, so it is counted.
+    Outcome throughWorkspace( const std::string& dir, std::string_view spec )
+    {
+        const auto [ name, sub ] = splitPackageSpecifier( spec );
+        const auto it            = name.empty() ? membersByName_.end() : membersByName_.find( std::string( name ) );
+        if( it == membersByName_.end() )
+        {
+            return {};
+        }
+        const Member* only = nullptr;
+        for( const std::size_t m : it->second )
+        {
+            if( !visibleFrom( members_[ m ], dir ) )
+            {
+                continue;
+            }
+            if( only != nullptr && only->dir != members_[ m ].dir )
+            {
+                return { kNoFile, Verdict::InRepoUnresolved };
+            }
+            only = &members_[ m ];
+        }
+        if( only == nullptr )
+        {
+            return {};
+        }
+        if( only->pnpmOnly && declaresRegistrySpec( dir, name ) )
+        {
+            return { kNoFile, Verdict::InRepoUnresolved };   // pnpm links it only through `workspace:`; this may be the registry copy
+        }
+        const Outcome o = resolvePackage( *only, sub );
+        return o.decided() ? o : Outcome{ kNoFile, Verdict::InRepoUnresolved };
+    }
+
+    // Does the importer's own package.json depend on `name` with a spec other than `workspace:…` (a registry range)?
+    bool declaresRegistrySpec( const std::string& dir, std::string_view name )
+    {
+        const int pi = nearestPackage( dir );
+        if( pi < 0 )
+        {
+            return false;
+        }
+        const JsonNode& pj = scopePackages_[ std::size_t( pi ) ].second;
+        for( const std::string_view field : { "dependencies", "devDependencies", "peerDependencies", "optionalDependencies" } )
+        {
+            const JsonNode* deps = pj.get( field );
+            const JsonNode* spec = deps != nullptr ? deps->get( name ) : nullptr;
+            if( spec != nullptr && spec->kind == JsonNode::Kind::Str && !spec->str.starts_with( "workspace:" ) )
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Every indexed package.json whose directory a workspace glob admits, with its name and the declarations that
+    // admit it. Files are visited in ing.files order (sorted), so member order — and every answer — is deterministic.
+    void collectWorkspaceMembers()
+    {
+        std::vector<WorkspaceDecl>                    decls;
+        std::vector<std::pair<std::string, JsonNode>> manifests;   // (directory, parsed package.json)
+        std::vector<std::pair<std::string, bool>>     unparsed;    // (path, its bytes name "workspaces")
+        for( std::uint32_t f = 0; f < ing_.files.size(); ++f )
+        {
+            const std::string rel = lexicalNormalize( rootRelPath( ing_, f ) );
+            const std::string dir( includerDir( rel ) );
+            JsonNode          pj;
+            if( fileNamed( rel, "pnpm-workspace.yaml" ) )
+            {
+                decls.push_back( { dir, pnpmWorkspaceGlobs( readConfigBytes( diskPath( ing_, f ) ) ), /*pnpm=*/true } );
+            }
+            else if( fileNamed( rel, "lerna.json" ) || fileNamed( rel, "rush.json" ) )
+            {
+                addToolDecl( rel, dir, readConfigBytes( diskPath( ing_, f ) ), decls );
+            }
+            else if( fileNamed( rel, "package.json" ) )
+            {
+                const std::string bytes = readConfigBytes( diskPath( ing_, f ) );
+                if( !parseJsonObject( bytes, pj ) )
+                {
+                    unparsed.emplace_back( rel, bytes.find( "\"workspaces\"" ) != std::string::npos );
+                    continue;
+                }
+                if( std::vector<std::string> globs = packageJsonWorkspaceGlobs( pj ); !globs.empty() )
+                {
+                    decls.push_back( { dir, std::move( globs ) } );
+                }
+                manifests.emplace_back( dir, std::move( pj ) );
+            }
+        }
+        for( auto& [ dir, pj ] : manifests )
+        {
+            addMember( decls, dir, std::move( pj ) );
+        }
+        discloseUnparsedManifests( unparsed, decls );
+        configs_.setMemberDirs( &memberDirByName_ );
+    }
+
+    // lerna.json `packages` (lerna's default `packages/*` when absent) or rush.json `projects[].projectFolder`: the
+    // same member rule as package.json workspaces. One that does not parse is disclosed.
+    void addToolDecl( const std::string& rel, const std::string& dir, const std::string& bytes, std::vector<WorkspaceDecl>& decls )
+    {
+        JsonNode cfg;
+        if( !parseJsonObject( bytes, cfg ) )
+        {
+            configs_.noteUnread( rel );
+            return;
+        }
+        if( std::vector<std::string> globs = toolGlobs( fileNamed( rel, "lerna.json" ), cfg ); !globs.empty() )
+        {
+            decls.push_back( { dir, std::move( globs ) } );
+        }
+    }
+
+    static std::vector<std::string> toolGlobs( bool lerna, const JsonNode& cfg )
+    {
+        if( lerna )
+        {
+            const JsonNode* ps = cfg.get( "packages" );
+            return ps != nullptr ? globList( ps ) : std::vector<std::string>{ "packages/*" };
+        }
+        std::vector<std::string> out;
+        const JsonNode*          projects = cfg.get( "projects" );
+        for( const JsonNode& pr : projects != nullptr ? projects->vals : std::vector<JsonNode>{} )
+        {
+            if( const JsonNode* folder = pr.kind == JsonNode::Kind::Obj ? pr.get( "projectFolder" ) : nullptr; folder != nullptr && folder->kind == JsonNode::Kind::Str )
+            {
+                out.push_back( folder->str );
+            }
+        }
+        return out;
+    }
+
+    // A package.json that does not parse was not read: disclosed when it could declare workspaces or be a member.
+    void discloseUnparsedManifests( const std::vector<std::pair<std::string, bool>>& unparsed, const std::vector<WorkspaceDecl>& decls )
+    {
+        for( const auto& [ rel, mentionsWorkspaces ] : unparsed )
+        {
+            const std::string dir( includerDir( rel ) );
+            if( mentionsWorkspaces || std::any_of( decls.begin(), decls.end(), [ & ]( const WorkspaceDecl& d ) { return d.admits( dir ); } ) )
+            {
+                configs_.noteUnread( rel );
+            }
+        }
+    }
+
+    // One package.json: a member when a declaration admits its directory and it names itself.
+    void addMember( const std::vector<WorkspaceDecl>& decls, const std::string& dir, JsonNode&& pj )
+    {
+        Member m;
+        m.dir      = dir;
+        m.pnpmOnly = true;
+        for( const WorkspaceDecl& d : decls )
+        {
+            if( d.admits( dir ) )
+            {
+                m.declDirs.push_back( d.dir );
+                m.pnpmOnly = m.pnpmOnly && d.pnpm;
+            }
+        }
+        const JsonNode* name = pj.get( "name" );
+        if( m.declDirs.empty() || name == nullptr || name->kind != JsonNode::Kind::Str || name->str.empty() )
+        {
+            return;
+        }
+        m.manifest = manifests_.size();
+        membersByName_[ name->str ].push_back( members_.size() );
+        if( const auto [ it, fresh ] = memberDirByName_.emplace( name->str, dir ); !fresh && it->second != dir )
+        {
+            it->second = "\x1f";   // two members, one name: no single package to read as an `extends` base
+        }
+        manifests_.push_back( std::move( pj ) );
+        members_.push_back( std::move( m ) );
+        ENSURES( manifests_.size() == members_.size() );
+    }
+};
+
+// Could a TS/JS import land on this file at all? Not on a file of another import dialect (C-family, Python, Rust,
+// Go, shell, Ruby, Lua, Elixir): no module specifier resolves there. Everything else — TS/JS itself and the files
+// with no import dialect here (json, a .vue component, …) — could be, so a count that concerns it is disclosed.
+// --impact asks this of its def files, so a C++ symbol's import tier never pays for a TS alias elsewhere in the tree.
+inline bool couldBeTsImportTarget( std::string_view path ) noexcept
+{
+    const IncludeLang l = includeLangOf( path );
+    return l == IncludeLang::Ts || l == IncludeLang::Other;
+}
+
+// Is this include a counting candidate at all: a TS/JS importer's bare specifier (not `.`-relative, not absolute).
+inline bool isBareTsSpecifier( std::string_view includerPath, std::string_view target ) noexcept
+{
+    return !target.empty() && target.front() != '.' && target.front() != '/' && includeLangOf( includerPath ) == IncludeLang::Ts;
+}
+} // namespace tsimport
+
+// #220 part 2: the two disclosures the resolver adds beside imports_unresolved= (see buildPreciseIncludeAdjWithContext).
+struct TsImportExtras
+{
+    std::uint64_t declarationOnly = 0;   // directives whose edge is to a .d.ts (imports_dts=)
+    std::uint64_t extendsUnread   = 0;   // configs with an unread base that could have changed an answer (tsconfig_unread=)
+};
+
+// #220 part 2: one bare TS/JS specifier the relative branch left unresolved, through the project's own config
+// (tsimport::ImportResolver, built here on first use). Returns the edge's target or kNoFile, and tallies the verdict.
+// Multi-root: an answer in another root is not evidence (joinNormalizeLookup's rule 1), so it stays unresolved.
+inline std::uint32_t resolveBareTsImport( const IngestResult& ing, const HashMap<std::string, std::uint32_t>& fileIndex,
+                                          std::optional<tsimport::ImportResolver>& resolver, const WsIncludeCtx* ws,
+                                          const Include& inc, std::uint64_t* unresolvedOut, TsImportExtras* extrasOut )
+{
+    if( !resolver )
+    {
+        resolver.emplace( ing, fileIndex );
+    }
+    tsimport::Outcome o = resolver->resolve( lexicalNormalize( rootRelPath( ing, inc.fileId ) ), inc.target );
+    if( o.file != kNoFile && ws != nullptr && ( *ws->fileRoot )[ o.file ] != ( *ws->fileRoot )[ inc.fileId ] )
+    {
+        o = { kNoFile, tsimport::Verdict::InRepoUnresolved };
+    }
+    if( o.verdict == tsimport::Verdict::InRepoUnresolved && unresolvedOut != nullptr )
+    {
+        ++*unresolvedOut;
+    }
+    if( o.verdict == tsimport::Verdict::Declaration && extrasOut != nullptr )
+    {
+        ++extrasOut->declarationOnly;
+    }
+    return o.file;
+}
+
 // `lazyPairsOut` (kParserVer 72, fnbody-require lane): optional, default nullptr — purely additive, every
 // existing call site is unaffected. When non-null, keyed by (fromFileId<<32 | toFileId), value = "every
 // Include occurrence resolving to this edge so far was lazy" (Include::isLazy) — see recordLazyPair above.
 // Independent of `dedup`: keyed by file-id PAIR, not by adj's post-sort indices, so it stays correct
 // whichever adjacency shape the caller asked for.
+// `forCallNarrow` (parser version 93): true ⇒ Include records read off a VALUE position (Include::isValueUse — a
+// constant argument, a rescue class) are left out. Those are dependencies of the file and every dependency view
+// keeps them, but they are not import evidence for a bare call: `notify(Dev::Config)` beside `record.update!` says
+// nothing about `record`, and buildGraph's narrow bound 1,017 discourse call sites on that reading, 19 of 20
+// sampled wrong (PR #139 review). Only buildGraph's fileIncludes passes true; the default keeps every consumer
+// byte-identical.
+// `importsUnresolvedOut` (#220 part 1): optional, default nullptr — when non-null it receives how many TS/JS bare
+// import directives drew no edge although they name something in this tree (tsimport::ImportResolver's
+// InRepoUnresolved verdict). Counted in DIRECTIVES, lazy ones included, so the dedup=true and dedup=false builds
+// agree on it.
+// #220 part 2: every caller now gets the EDGES — a bare TS/JS specifier the relative branch left unresolved is handed
+// to tsimport::ImportResolver (built on the first such specifier, so a tree without one reads no config file), and
+// what it resolves is an edge exactly like a relative import's. `extrasOut` (optional) receives its two disclosures:
+// how many of those edges land only on a declaration file, and how many owning configs name an unread `extends` base.
 inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPreciseIncludeAdjWithContext( const IngestResult& ing, bool dedup = true,
-                                                                       HashMap<std::uint64_t, char>* lazyPairsOut = nullptr )
+                                                                       HashMap<std::uint64_t, char>* lazyPairsOut = nullptr,
+                                                                       bool forCallNarrow = false,
+                                                                       std::uint64_t* importsUnresolvedOut = nullptr,
+                                                                       TsImportExtras* extrasOut = nullptr )
 {
+    PROFILE_SCOPE_DESCRIBE( "buildGraph/2a: precise include adjacency (resolve.h)" );
     const std::uint32_t F = std::uint32_t( ing.files.size() );
     std::vector<std::vector<std::uint32_t>> adj( F );
+    if( importsUnresolvedOut != nullptr )
+    {
+        *importsUnresolvedOut = 0;
+    }
+    if( extrasOut != nullptr )
+    {
+        *extrasOut = {};
+    }
     if( ing.includes.empty() )
     {
         return { std::move( adj ), {} };
     }
 
-    // path → fileId over the canonical (sorted) file list. The KEY is the LEXICALLY-NORMALIZED file path,
-    // NOT the raw ing.files spelling: a crawl rooted at `.` stores paths with a leading `./` (`./test/main.cpp`),
-    // but a resolved include candidate is always `lexicalNormalize`d — which strips `.`/`./` segments — so the
-    // candidate `render/shader.h` would NOT byte-match a raw key `./render/shader.h` and the edge would be
-    // silently DROPPED (a false negative under a `.` root). Normalizing BOTH sides through the same lexical
-    // rule makes them agree with no re-rooting. Pure + deterministic (lexicalNormalize is I/O-free).
+    // path → fileId over the canonical (sorted) file list. The KEY is the LEXICALLY-NORMALIZED ROOT-RELATIVE
+    // path (rootRelPath, model.h), NOT the raw ing.files spelling, and every includer path handed to a Step-A
+    // below is the same view. Two defects this closes, both of the "answer moves with how the root was typed"
+    // kind (#228): a Python absolute import probes an EMPTY base, which named the crawl root only when the root
+    // was typed `.`, so "$PWD" (and every MCP session, and the --quality-delta HEAD side) lost the edge; and a
+    // root typed `../repo` stores `../repo/x.h`, which lexicalNormalize refuses as an escape — every key came
+    // out empty and every include in the tree went unresolved. Relative to the root, both spellings are the
+    // `.` spelling, and a `..` that climbs above the root is unresolved under all of them. Normalizing BOTH
+    // sides through the same lexical rule still makes `./render/shader.h` and a resolved `render/shader.h`
+    // agree. Pure + deterministic (no I/O). Multi-root keeps its labeled keys: rootRelPath is the identity there.
     HashMap<std::string, std::uint32_t> fileIndex;
     fileIndex.reserve( F );
     for( std::uint32_t f = 0; f < F; ++f )
     {
-        fileIndex.emplace( lexicalNormalize( ing.files[f] ), f );
+        fileIndex.emplace( lexicalNormalize( rootRelPath( ing, f ) ), f );
     }
 
     // ── Multi-root workspace context (§3.1): built ONLY for a merged workspace ingest — nullptr on every
@@ -2320,7 +4295,7 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
     }
     for( std::uint32_t f = 0; f < F; ++f )
     {
-        const std::string_view p = ing.files[f];
+        const std::string_view p = rootRelPath( ing, f );
         const bool isLib  = ( p == "lib.rs"  || ( p.size() >= 7 && p.substr( p.size() - 7 ) == "/lib.rs"  ) );
         const bool isMain = ( p == "main.rs" || ( p.size() >= 8 && p.substr( p.size() - 8 ) == "/main.rs" ) );
         if( !( isLib || isMain ) )
@@ -2337,8 +4312,6 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
 
     const HashMap<std::string, std::uint32_t> elixirModules = buildElixirModuleIndex( ing );
     const HashMap<std::string, std::uint32_t>* moduleIndex = elixirModules.empty() ? nullptr : &elixirModules;
-    const std::vector<DartPackageRoot>         dartPackages = buildDartPackageRoots( ing );
-    const std::vector<DartPackageRoot>*        packageRoots = dartPackages.empty() ? nullptr : &dartPackages;
     const RubyConstantIndex                   rubyConsts    = buildRubyConstantIndex( ing );   // parser version 82; empty unless a symbolic directive exists
     HashMap<std::string, std::pair<std::uint32_t, std::uint32_t>> rubyMemo;
 
@@ -2355,6 +4328,7 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
         adj[ f ].reserve( includeCountByFile[ f ] );
     }
 
+    std::optional<tsimport::ImportResolver> tsResolver;   // #220: built on the first bare TS/JS specifier that missed
     for( const Include& inc : ing.includes )
     {
         if( inc.fileId >= F )
@@ -2363,6 +4337,10 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
         }
         if( inc.isSymbolic )
         {
+            if( forCallNarrow && inc.isValueUse )
+            {
+                continue;   // a dependency, not import evidence — see the parameter note above
+            }
             // A Ruby constant: index + lexical rule, and an edge to EVERY definer (multiplicity — see the
             // RubyConstantIndex note). Self-includes are dropped exactly as on the path branch below.
             const auto [ off, cnt ] = resolveRubyConstant( rubyConsts, rubyMemo, inc.fileId, inc.byte, inc.target );
@@ -2389,8 +4367,12 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
             crd    = crateRootByRoot[ r ];
             hasCrd = hasCrateByRoot[ r ] != 0;
         }
-        const std::uint32_t to = resolvePreciseInclude( ing.files[ inc.fileId ], inc.target, inc.isAngle,
-                                                         fileIndex, crd, hasCrd, ws, inc.fileId, moduleIndex, packageRoots );
+        std::uint32_t to = resolvePreciseInclude( rootRelPath( ing, inc.fileId ), inc.target, inc.isAngle,
+                                                   fileIndex, crd, hasCrd, ws, inc.fileId, moduleIndex );
+        if( to == kNoFile && tsimport::isBareTsSpecifier( rootRelPath( ing, inc.fileId ), inc.target ) )
+        {
+            to = resolveBareTsImport( ing, fileIndex, tsResolver, ws, inc, importsUnresolvedOut, extrasOut );
+        }
         if( to == kNoFile || to == inc.fileId )
         {
             continue; // unresolved or self-include → contributes nothing
@@ -2400,6 +4382,10 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
         {
             recordLazyPair( *lazyPairsOut, inc.fileId, to, inc.isLazy );
         }
+    }
+    if( extrasOut != nullptr )
+    {
+        *extrasOut = TsImportExtras{ extrasOut->declarationOnly, tsResolver ? tsResolver->extendsUnread() : 0 };
     }
     if( dedup )
     {
@@ -2413,22 +4399,29 @@ inline std::pair<std::vector<std::vector<std::uint32_t>>, WsIncludeCtx> buildPre
 }
 
 inline std::vector<std::vector<std::uint32_t>> buildPreciseIncludeAdj( const IngestResult& ing, bool dedup = true,
-                                                                       HashMap<std::uint64_t, char>* lazyPairsOut = nullptr )
+                                                                       HashMap<std::uint64_t, char>* lazyPairsOut = nullptr,
+                                                                       std::uint64_t* importsUnresolvedOut = nullptr,
+                                                                       TsImportExtras* extrasOut = nullptr )
 {
-    return buildPreciseIncludeAdjWithContext( ing, dedup, lazyPairsOut ).first;
+    auto built = buildPreciseIncludeAdjWithContext( ing, dedup, lazyPairsOut, /*forCallNarrow=*/false, importsUnresolvedOut, extrasOut );
+    return std::move( built.first );   // the adjacency alone; the workspace context stays with the one caller that needs it
 }
 
-// Transitive include-set per file: for each file f, the sorted, deduped set of fileIds reachable from
-// f by ≥1 include hop (f itself EXCLUDED). Cycle-safe via a `seen` bitset (a file already visited is
+// Transitive include-set per file: for each file f, the sorted, duplicate-free set of fileIds reachable
+// from f by ≥1 include hop (f itself EXCLUDED). Cycle-safe via a `seen` bitset (a file already visited is
 // not re-pushed), so mutually-including headers (a↔b) simply each reach the other — the exact
-// reachability walk shape as graph.h::dependencyHealth. Deterministic: `adj` is sorted, each result
-// set is re-sorted+deduped, so it is a pure function of the adjacency regardless of visit order.
+// reachability walk shape as graph.h::dependencyHealth. Deterministic: `adj` is sorted and each result set
+// is re-sorted, so it is a pure function of the adjacency regardless of visit order. Duplicate-free is a
+// property of the epoch stamp, NOT of a dedup pass — there is no longer one to describe; see the NO DEDUP
+// PASS note at the sort below, which is where the removed std::unique used to sit.
 inline std::vector<std::vector<NodeId>> transitiveIncludeSet( const std::vector<std::vector<std::uint32_t>>& adj )
 {
+    PROFILE_SCOPE_DESCRIBE( "buildGraph/2b: transitive include closure (resolve.h)" );
     const std::uint32_t          F = std::uint32_t( adj.size() );
     std::vector<std::vector<NodeId>> trans( F );
     std::vector<std::uint32_t>   seenEpoch( F, 0 );
     std::vector<std::uint32_t>   stack;
+    std::vector<NodeId>          sortScratch;   // radix ping-pong buffer, reused across all F closures
     stack.reserve( F );
     std::uint32_t                epoch = 1;
     for( std::uint32_t s = 0; s < F; ++s )
@@ -2447,9 +4440,21 @@ inline std::vector<std::vector<NodeId>> transitiveIncludeSet( const std::vector<
                 }
             }
         }
-        // …trans[s] already excludes s (never pushed as a reachable target). Sort+dedup for binary search.
-        std::sort( trans[s].begin(), trans[s].end() );
-        trans[s].erase( std::unique( trans[s].begin(), trans[s].end() ), trans[s].end() );
+        // …trans[s] already excludes s (never pushed as a reachable target). Sorted for the binary_search
+        // in rule3IncludeFile, and for the determinism contract in this function's header comment — the
+        // walk's discovery order is deterministic but is NOT id order, so the sort is what makes the
+        // result a pure function of `adj`. It stays; only its implementation changes.
+        //
+        // NO DEDUP PASS. `w` is appended in the same branch that stamps `seenEpoch[w] = epoch`, and
+        // nothing clears that stamp before `++epoch` below, so a file can be appended to trans[s] at most
+        // once per source — the set is duplicate-free BY CONSTRUCTION. The `std::unique` that used to sit
+        // here removed 0 elements in 24,216 calls across six corpora (rails, go, django, rust-analyzer, a
+        // private C++ tree, this repo) at a measured 0.99 ms on rails. Its sibling `ancestorsReach` in
+        // graph.h has always relied on this same stamp without a dedup. The invariant is now asserted by
+        // test/includeprecisecheck.sh — a diamond fixture (two distinct paths to one file) plus a 400-node
+        // scrambled synthetic graph checked against an independent mark-sweep oracle — rather than paid
+        // for on every call.
+        rw::sortutil::radixSortIdsAscending( trans[s], sortScratch );
         ++epoch;
     }
     return trans;
@@ -2523,6 +4528,26 @@ inline std::string canonicalIdForEmit( const IngestResult& ing, const Symbol& s,
                         : canonicalIdRelTo( ing, s, root );
 }
 
+// The most shared-locality credit (sharedLocality below) the S6-C tie-break may give a candidate for this call: the whole
+// canonical id, except for a NamedVar receiver whose type no receiver rule (2, 2c, 2b) established — an untyped local, a
+// member Rule 2b cannot read, a typed variable whose type defines no such method. That receiver stops at the end of the
+// caller's FILE segment, `path::` (`callerPath` is the path localityKeyOf built the caller's key from), so same-file and
+// same-directory locality still count and the CLASS segment does not (2026-09-16, test/localitycheck.sh arms 5-9). The
+// receiver names SOME object and nothing says it is one of the caller's class, so the caller's own class winning the
+// scope credit is anti-evidence — the tie-break used to grant it on the premise "a typed var already narrowed above",
+// and a receiver no rule typed never narrowed. Measured in isolation with --pin-census (before vs after): rocksdb 121
+// call sites leave a locality decision for a split, a private C++ corpus 71, django 72, rails 145; this repo's src/,
+// vue-core and go/net 0. Read samples: 14 of 14 rocksdb pins and 14 of 16 private ones were wrong, mostly delegation
+// (`rep_->Name()` inside `Wrapper::Name`). Dropping the tie-break outright for these receivers moved no target on any of
+// those seven corpora; it only relabelled the tiers whose one competitor is the caller itself (scored zero there) from
+// `locality` to `unique`, losing their lpin= disclosure — so the file credit stays.
+// STATED FLOOR, not closed here: the ladder's tier 1 still admits same-file candidates alone, so a delegation whose true
+// target lives in another file lands on a same-file namesake before the tie-break runs.
+inline std::size_t receiverLocalityCap( const Reference& r, bool receiverTypeNarrowed, std::string_view callerPath ) noexcept
+{
+    return ( r.recv == RecvKind::NamedVar && !receiverTypeNarrowed ) ? callerPath.size() + 2 : std::numeric_limits<std::size_t>::max();
+}
+
 // Shared-locality score of two canonical ids — counted in characters, but ONLY over WHOLE matching SEGMENTS.
 // A canonical id is `path/to/file.ext::scope::name`, so its real structural boundaries are the `/` (directory)
 // and `::` (scope/name) delimiters. The resolution tie-break wants "nearer" = same file > same class/scope >
@@ -2568,6 +4593,1411 @@ inline std::size_t sharedLocality( std::string_view a, std::string_view b ) noex
     return cut;
 }
 
+// Rule 2's qualifier guard (test/narrowcheck.sh arms 17-24): whether a declaration's written QUALIFIED type text
+// (Binding::importedName, "" when unqualified) names namespace `std`. A recorded type is its final segment and class
+// names carry no namespace, so `std::map<K, V> m; m.find( k )` narrowed to any in-repo class named `map`. `std` is
+// reserved to the implementation ([namespace.std]: a program adds nothing to it but specializations), so no in-repo
+// class IS the `std::` type — refusing costs nothing but the rare standard-library source tree's own narrows.
+// EVERY OTHER QUALIFIER STILL NARROWS, measured: refusing them all refused 424 in-repo narrows on rocksdb
+// (`ROCKSDB_NAMESPACE::Status s; s.ok()`), 11 on a private C++ corpus and 9 on src/, every sampled one correct,
+// and fixed no wrong edge outside `std`. STATED FLOOR: a qualifier that is neither `std` nor the class's own
+// namespace (an external or alias-template type whose final segment an in-repo class shares) still narrows on the
+// name — closing it needs the namespace chain in Symbol::scope (arm 24 pins it). The text is ingest_binds.h
+// qualifiedNameText's, which already dropped a leading global `::` (`::std::map` arrives as `std::map`).
+// Readers: the lexical lookup (Narrower::recvVarTypeName) answers "" for such a declaration; buildGraph's flat varType
+// table TOMBSTONES the variable rather than skipping the record, because it cannot tell which of a function's
+// declarations of the name is in scope at a call site (six `std::map` locals narrowed wrong on a private C++ corpus).
+inline bool namesStdType( std::string_view qualified ) noexcept
+{
+    return qualified.starts_with( "std::" );
+}
+
+// The same fact for a member FIELD (test/fieldnarrowcheck.sh arm q): a compose reference for `std::string name_;` carries the
+// type's final segment as its name and the namespace the type was written in as its qualifier (ingest_relations.h
+// writtenTypeNamespace). The capture reads only the two-segment spelling, so that qualifier is one written namespace — never
+// a nested one, and never an inline ABI namespace, which no conforming program spells. graph.h's two readers of the capture
+// refuse it: buildFieldNarrowTables records no type for it (a tombstone when a same-named class's same-named field has a real
+// type — a skip would hand that type to this field's calls), and the HAS-A edges draw none.
+inline bool fieldTypeWrittenInStd( const Reference& r ) noexcept
+{
+    return r.isCompose && r.qualifier == "std";
+}
+
+// A C/C++/ObjC TYPE ALIAS record (ingest_relations.h captureTypeAlias): `typedef llvm::IRBuilder<F, I> CGBuilderBaseTy;` rides the
+// compose shape as recvVar CGBuilderBaseTy, calleeName IRBuilder, qualifier llvm — with an EMPTY fieldName, so buildFieldNarrowTables
+// never reads it as a member, and composeRel "alias", which the HAS-A edges refuse. addTypeAliasBases is its one reader.
+inline bool isTypeAliasRecord( const Reference& r ) noexcept
+{
+    return r.isCompose && r.fieldName.empty() && r.composeRel == "alias";
+}
+
+// The inheritance NAME graph's alias edges (graph.h chaUp): an alias NAME gains its target as a direct base, so a base walk that
+// reaches the alias continues at the class it names — `class CGBuilderTy : public CGBuilderBaseTy` walks on to IRBuilder and
+// IRBuilderBase (test/fieldnarrowcheck.sh arm t). chaUp ONLY: an alias is not a subclass, so no cone, --lego implementor or
+// role="extends" use-site gains a member. Refused, as a written type is elsewhere: a target written in `std` (it names no in-repo
+// class). NOT followed: an alias NAME that is also a real class somewhere in the corpus — a class-like symbol of that name at a
+// line no alias record holds (a typedef is itself a Struct symbol at its name's line). The graph keys classes by bare name, so
+// `using Base = Foo;` in one class would otherwise hand Foo's methods to every class that derives from an unrelated `Base`.
+// Same-named aliases with different targets keep BOTH as bases: the walk's one-hit-per-level rule refuses a real tie.
+inline void addTypeAliasBases( const IngestResult& ing, HashMap<std::string, std::vector<std::string>>& chaUp )
+{
+    const auto followable = []( const Reference& r ) noexcept
+    {
+        return isTypeAliasRecord( r ) && !fieldTypeWrittenInStd( r ) && !r.recvVar.empty() && !r.calleeName.empty();
+    };
+    const auto siteKey = []( std::string& key, std::uint32_t fileId, std::uint32_t line, std::string_view name )
+    {
+        key.assign( std::to_string( fileId ) ).push_back( ':' );
+        key.append( std::to_string( line ) ).push_back( ':' );
+        key.append( name );
+    };
+    std::vector<std::uint32_t> aliasRefs;
+    HashMap<std::string, char> aliasSites;
+    HashMap<std::string, char> aliasNames;
+    std::string                key;
+    for( std::uint32_t refIndex = 0; refIndex < ing.references.size(); ++refIndex )
+    {
+        if( const Reference& r = ing.references[ refIndex ]; followable( r ) )
+        {
+            aliasRefs.push_back( refIndex );
+            siteKey( key, r.fileId, r.line, r.recvVar );
+            aliasSites.try_emplace( key, '\0' );
+            aliasNames.try_emplace( r.recvVar, '\0' );
+        }
+    }
+    HashMap<std::string, char> realClassNames;   // alias names some class-like symbol at a non-alias site also carries
+    for( const Symbol& s : ing.symbols )
+    {
+        const bool classLike = s.kind == SymKind::Class || s.kind == SymKind::Struct || s.kind == SymKind::Interface;
+        if( classLike && aliasNames.find( s.name ) != aliasNames.end() )
+        {
+            siteKey( key, s.fileId, s.line, s.name );
+            if( aliasSites.find( key ) == aliasSites.end() )
+            {
+                realClassNames.try_emplace( s.name, '\0' );
+            }
+        }
+    }
+    for( std::uint32_t refIndex : aliasRefs )
+    {
+        if( const Reference& r = ing.references[ refIndex ]; realClassNames.find( r.recvVar ) == realClassNames.end() )
+        {
+            chaUp[ r.recvVar ].push_back( r.calleeName );   // the caller sorts and dedups every adjacency list
+        }
+    }
+}
+
+// Every Class/Struct/Interface NAME in the corpus: Rule 2c's receiver-token test (Narrower::rule2cClassNameRecv) and the
+// assignment guard below. Names carry no namespace, so this answers "some class is called that", never which one.
+// A Ruby MODULE joins that set. It is a receiver of class methods exactly as a class is (`Util.format`, the service-object
+// idiom), and `@definition.module` maps to SymKind::Other (ingest_crawl.h::defKind) for every language rather than to a
+// kind of its own. Restricted to Ruby because there the implication runs both ways: queries/ruby/tags.scm emits class,
+// module, method and constant, and the other three have kinds of their own, so a Ruby SymKind::Other symbol IS a module.
+// test/rubyrecvnarrowcheck.sh.
+inline HashMap<std::string, char> classNameSet( const IngestResult& ing )
+{
+    HashMap<std::string, char> classNames;
+    classNames.reserve( ing.symbols.size() / 8 + 1 );
+    for( const Symbol& s : ing.symbols )
+    {
+        const bool rubyModule = ( s.lang == Lang::Ruby && s.kind == SymKind::Other );
+        if( s.kind == SymKind::Class || s.kind == SymKind::Struct || s.kind == SymKind::Interface || rubyModule )
+        {
+            classNames.try_emplace( s.name, '\0' );
+        }
+    }
+    return classNames;
+}
+
+// Rule 2's assignment guard (test/narrowcheck.sh arms 44-51): whether a Type record a C++ ASSIGNMENT emitted names no class.
+// `x = f( … )` records the callee's last name as x's type (ingest_binds.h assignedTypeOf), because a constructor call and
+// a function call are one grammar node: `t = llvm::cast<Target>( y )` recorded `cast`, `t = makeTarget( y )` recorded
+// `makeTarget`. An assignment declares nothing, so such a name is no fact about the variable, and every reader of the
+// record drops it — buildGraph's flat varType table and collectFieldUseSites' table, where it tombstoned the declaration's
+// written `Target* t` (a lost narrow, a lost field pin). The local-name set keeps it: localNameEvidence marks an assignment
+// bound but not declared, so Rule 2b no longer reads a MEMBER assigned from a call as a local, while Rule 2c still reads the
+// name as a variable (integration/train-5 joined the two). A DECLARATION's callee-read name is kept: that
+// declaration exists with a type nothing recorded, and its conflict with a sibling declaration of the name is the tombstone
+// that keeps one block's type off the other block's calls (arm 48). An assignment from a class keeps its record, conflict
+// included (arm 47). The lexical table (buildScopedRecvDecls) never attaches an assignment's record: no declaration shares
+// its byte.
+inline bool assignmentNamesNoClass( const Binding& b, const HashMap<std::string, char>& classNames )
+{
+    return b.isFromAssignment && classNames.find( b.typeName ) == classNames.end();
+}
+
+// The VALUE of buildFieldNarrowTables' localNameSet (graph.h): the evidence one "<fromSymbol>#<var>" key holds, OR-ed over its
+// binding records (test/fieldnarrowcheck.sh arm v). Its readers ask two different questions, and an assignment answers only
+// one. Rule 2c and the Phase 5 external veto ask whether the name is a VARIABLE in that definition, and any record says so:
+// `Widget = makePane();` proves `Widget` is no class. Rule 2b asks whether a LOCAL hides a member of the enclosing class, and
+// only a declaration introduces one: `OutputFile = std::make_unique<ToolOutputFile>( … );` inside a method assigns the member,
+// yet ingest records it — a Type record naming the callee (ingest_binds.h's assignment arm), an L3 FnAssign for `x = other`,
+// a clobber tombstone for `x = nullptr` — and counting those refused the member's declared type. Every local-declaring shape
+// emits VarDecl (a block or condition declaration, a parameter, a range-for variable, a structured binding, a catch parameter,
+// a lambda parameter or capture) or ParamType, and FnDecl is a declaration too: the misparsed `void (*fn)() = &f;` has no VarDecl.
+// One declaration still records none: a direct-initialised local whose arguments are plain names, `Foo x( a, b );`, which the
+// grammar reads as a function declarator — a call inside its scope takes the member's type (fieldnarrowcheck arm v4, a floor).
+inline constexpr char kLocalNameBound    = 1;   // some binding record names the variable
+inline constexpr char kLocalNameDeclared = 2;   // a declaration record does
+
+inline char localNameEvidence( LocalBindKind kind ) noexcept
+{
+    const bool declares = kind == LocalBindKind::VarDecl || kind == LocalBindKind::ParamType || kind == LocalBindKind::FnDecl;
+    return declares ? char( kLocalNameBound | kLocalNameDeclared ) : kLocalNameBound;
+}
+
+// One entry of Rule 2's FLAT per-function type table (buildGraph's varType) and of Rule 2b's "Class#field" table
+// (buildFieldNarrowTables): the declared type name — "" is a TOMBSTONE, an ambiguous or `std::`-typed name that never
+// narrows — whether a declaration wrote that type QUALIFIED, the fact prov="final-segment" discloses
+// (Narrower::finalSegmentTypeAt for a parameter or local, Narrower::fieldFinalSegmentAt for a field), and, for a field only,
+// whether the type is the POINTEE of a std smart pointer member, which a call reaches through `->` alone (test/fieldnarrowcheck.sh
+// arm p): `w_.reset()` on `std::unique_ptr<Widget> w_;` is the smart pointer's own member, never Widget::reset.
+struct FlatRecvType
+{
+    std::string type;
+    bool        writtenQualified = false;
+    bool        arrowOnly        = false;
+};
+
+// fold one declared type into a flat table: the first type wins, a different later type tombstones, and an agreeing
+// declaration that wrote it qualified marks the entry. `type` is "" for a refused (`std::`) type, which tombstones too. A type
+// reached through `->` alone (`arrowOnly`) and the same type reached as the member itself are different facts, and tombstone too.
+inline void recordFlatRecvTypeFact( HashMap<std::string, FlatRecvType>& table, const std::string& key, std::string_view type, bool writtenQualified,
+                                    bool arrowOnly = false )
+{
+    const auto [ it, inserted ] = table.try_emplace( key );
+    if( inserted )
+    {
+        it->second.type.assign( type );
+        it->second.writtenQualified = writtenQualified;
+        it->second.arrowOnly        = arrowOnly;
+    }
+    else if( !it->second.type.empty() && ( it->second.type != type || it->second.arrowOnly != arrowOnly ) )
+    {
+        it->second.type.clear();   // conflicting types for one name in one scope → tombstone (never narrow on it)
+    }
+    else
+    {
+        it->second.writtenQualified = it->second.writtenQualified || writtenQualified;
+    }
+}
+
+// fold one Type binding into a flat table (buildGraph's varType; also collectFieldUseSites' Type+ParamType table): the first type wins, a different later type or a `std::` one tombstones
+inline void recordFlatRecvType( HashMap<std::string, FlatRecvType>& table, const std::string& key, const Binding& b )
+{
+    recordFlatRecvTypeFact( table, key, namesStdType( b.importedName ) ? std::string_view{} : std::string_view( b.typeName ), !b.importedName.empty() );
+}
+
+// what Rule 2 and CHA-lite read for one named receiver at one site: its type name ("" = none), whether the declaration
+// that decided it wrote the type QUALIFIED — a match on the final segment alone, whose qualifier nothing checked — and, for
+// Rule 2's class identity, that declaration's typed record when the lexical table decided it (nullptr on the flat table)
+struct RecvVarType
+{
+    std::string_view name;
+    bool             writtenQualified = false;
+    const Binding*   declared         = nullptr;
+};
+
+// The provenance value of one resolved edge (Graph::outProv; graph.h provLabel spells it) from the edge sets the resolve loop
+// filled. The precedence is deliberate: scip PINS an edge (precise); binding and import NAME the mechanism that resolved it;
+// split says the resolver could not choose; final-segment says it chose by a qualified written type's last name alone
+// (test/narrowcheck.sh arm 25). prov= is single-valued and a symbol's amb= counts a split arm either way, so nothing is
+// lost by the ordering. 0 = a uniquely resolved name-based edge, which no emitter writes.
+struct EdgeProvenanceSets
+{
+    const HashMap<std::uint64_t, char>& binding;
+    const HashMap<std::uint64_t, char>& import;
+    const HashMap<std::uint64_t, char>& split;
+    const HashMap<std::uint64_t, char>& finalSegment;
+};
+inline std::uint8_t edgeProvenance( bool scipPrecise, const EdgeProvenanceSets& sets, std::uint64_t edgeKey ) noexcept
+{
+    const auto holds = [ edgeKey ]( const HashMap<std::uint64_t, char>& set ) { return set.find( edgeKey ) != set.end(); };
+    if( scipPrecise )
+    {
+        return 1u;
+    }
+    if( holds( sets.binding ) )
+    {
+        return 2u;
+    }
+    if( holds( sets.import ) )
+    {
+        return 4u;
+    }
+    if( holds( sets.split ) )
+    {
+        return 3u;
+    }
+    return holds( sets.finalSegment ) ? 5u : 0u;
+}
+
+// P2-D Rule 2, PARAMETER receivers (2026-09-16, test/narrowcheck.sh arms 7-18): one DECLARATION of a receiver
+// name inside one definition — the scope its VarDecl record covers and the written type its Type/ParamType
+// record carries, joined on the record position the two share (Binding::startByte).
+// buildScopedRecvDecls (below) builds the table; Narrower::recvVarTypeName reads it.
+struct ScopedRecvDecl
+{
+    std::uint32_t declByte;      // Binding::startByte of the declaration's records
+    std::uint32_t spanStart;     // the VarDecl span: where the name denotes THIS declaration
+    std::uint32_t spanEnd;
+    std::uint32_t typeBinding;   // index into ing.bindings of the typed record, or one of the two sentinels below
+};
+static_assert( std::is_trivially_copyable_v<ScopedRecvDecl> && sizeof( ScopedRecvDecl ) == 16, "four u32 — an rw::svector element" );
+inline constexpr std::uint32_t kRecvDeclUntyped    = 0xFFFFFFFFu;   // no typed record at this declaration (`auto`, a capture)
+inline constexpr std::uint32_t kRecvDeclConflicted = 0xFFFFFFFEu;   // two typed records disagree — never narrows
+
+// the lexical table and the bindings its typeBinding indices point into, held together so they cannot be paired wrong
+struct ScopedRecvDecls
+{
+    // "<fromSymbol>#<var>" → that name's declarations in the definition, in declaration-byte order. Holds ONLY names
+    // with at least one ParamType record; every other name keeps the flat varType table, byte-identical.
+    HashMap<std::string, rw::SmallVec<ScopedRecvDecl, 1>> byName;
+    const std::vector<Binding>*                           bindings = nullptr;
+};
+
+// ── P2-D Rule 2 PARAMETER receivers: building the lexical declaration table (2026-09-16, test/narrowcheck.sh arms 7-18) ──
+// A ParamType record — a definition or lambda parameter, a typed range-for variable, a reference local — was read
+// by the field use-site index alone, so `int Decoy::plainCaller( Target& other ) { return other.pick( 1 ); }` fell
+// through Rule 2 and the S6-C locality tie-break handed the site to Decoy::pick: one precise wrong edge, no amb=.
+// It cannot simply join the flat per-definition varType table: every one of those shapes is scoped narrower than
+// the definition or can be hidden by a nested redeclaration, and the naive fold was MEASURED to mint three precise
+// wrong edges on the gate fixture (arms 12-14: a range-for variable's type reaching a later `auto` loop of the same
+// name, a same-named field read after the loop, and a parameter hidden by an untyped loop variable). So for every
+// name with a ParamType record, this lists ALL its declarations in the definition — each VarDecl with its scope
+// span — and attaches each Type/ParamType record to the declaration whose VarDecl shares its record position;
+// Narrower::recvVarTypeName asks which one is innermost at the call site, and narrows on its type unless the type was
+// written in namespace `std` — a written type is its final segment alone, and a parameter's is often a library container
+// (`const std::map<K, V>&`) whose name an unrelated in-repo class shares (namesStdType above, arm 17; the qualified
+// text rides Binding::importedName). A typed record with no VarDecl at its
+// position (a shape the shadow capture refuses) types nothing: a lost narrow, never a wrong one. Names with no
+// ParamType record are absent and keep the flat varType answer, byte-identically. Deterministic: ing.bindings is
+// totally ordered, lists are appended in that order, and nothing iterates the map into output.
+inline void attachRecvDeclType( ScopedRecvDecl& decl, std::uint32_t bindIndex, const std::vector<Binding>& bindings ) noexcept
+{
+    if( decl.typeBinding == kRecvDeclUntyped )
+    {
+        decl.typeBinding = bindIndex;
+    }
+    else if( decl.typeBinding != kRecvDeclConflicted && bindings[ decl.typeBinding ].typeName != bindings[ bindIndex ].typeName )
+    {
+        decl.typeBinding = kRecvDeclConflicted;   // one declaration, two written types — trust neither
+    }
+}
+
+// a binding record the lexical table can key: attributed to a definition, naming a variable
+inline bool isScopedBindRecord( const Binding& b ) noexcept
+{
+    return b.fromSymbol != kNoNode && !b.var.empty();
+}
+
+// the names the table covers: every "<fromSymbol>#<var>" with a ParamType record
+inline void addParamTypedNames( const IngestResult& ing, ScopedRecvDecls& table, std::string& key )
+{
+    const auto isParamType = []( const Binding& b ) noexcept { return b.kind == LocalBindKind::ParamType && isScopedBindRecord( b ); };
+    table.byName.reserve( std::size_t( std::ranges::count_if( ing.bindings, isParamType ) ) );
+    for( const Binding& b : ing.bindings )
+    {
+        if( isParamType( b ) )
+        {
+            buildShadowKey( key, b.fromSymbol, b.var );
+            table.byName.try_emplace( key );
+        }
+    }
+}
+
+// every declaration of those names: the VarDecl records, in (file, byte) order — an exact repeat of the previous one
+// (the same declaration captured twice) is dropped, or it would tie with itself and refuse the site
+inline void addRecvDeclScopes( const IngestResult& ing, ScopedRecvDecls& table, std::string& key )
+{
+    for( const Binding& b : ing.bindings )
+    {
+        if( b.kind != LocalBindKind::VarDecl || !isScopedBindRecord( b ) )
+        {
+            continue;
+        }
+        buildShadowKey( key, b.fromSymbol, b.var );
+        const auto it = table.byName.find( key );
+        if( it == table.byName.end() )
+        {
+            continue;
+        }
+        const ScopedRecvDecl decl{ b.startByte, b.spanStart, b.spanEnd, kRecvDeclUntyped };
+        const bool repeat = !it->second.empty() && it->second.back().declByte == decl.declByte && it->second.back().spanStart == decl.spanStart
+                         && it->second.back().spanEnd == decl.spanEnd;
+        if( !repeat )
+        {
+            it->second.push_back( decl );
+        }
+    }
+}
+
+// each written type onto the declaration that shares its record position
+inline void attachRecvDeclTypes( const IngestResult& ing, ScopedRecvDecls& table, std::string& key )
+{
+    for( std::uint32_t bindIndex = 0; bindIndex < std::uint32_t( ing.bindings.size() ); ++bindIndex )
+    {
+        const Binding& b = ing.bindings[ bindIndex ];
+        if( ( b.kind != LocalBindKind::Type && b.kind != LocalBindKind::ParamType ) || !isScopedBindRecord( b ) || b.typeName.empty() )
+        {
+            continue;
+        }
+        buildShadowKey( key, b.fromSymbol, b.var );
+        const auto it = table.byName.find( key );
+        if( it == table.byName.end() )
+        {
+            continue;
+        }
+        for( ScopedRecvDecl& decl : it->second )
+        {
+            if( decl.declByte == b.startByte ) { attachRecvDeclType( decl, bindIndex, ing.bindings ); }
+        }
+    }
+}
+
+inline ScopedRecvDecls buildScopedRecvDecls( const IngestResult& ing )
+{
+    PROFILE_SCOPE_DESCRIBE( "buildGraph/2j: Rule-2 lexical receiver declarations" );
+    ASSUME( ing.bindings.size() < kRecvDeclConflicted );   // typeBinding indices stay clear of the two sentinels
+    ScopedRecvDecls table;
+    table.bindings = &ing.bindings;
+    std::string key;
+    addParamTypedNames( ing, table, key );
+    if( !table.byName.empty() )
+    {
+        addRecvDeclScopes( ing, table, key );
+        attachRecvDeclTypes( ing, table, key );
+    }
+    return table;
+}
+
+// ── using-declaration re-exports — built once per buildGraph, consumed via Narrower::ownMethodSet (the type-side
+// probe Rules 2b/2c and Rule 1's base walk share). "Class::m" → the sorted, deduped names of the classes a class-scope
+// `using Base::m;` names for `m`. In C++ a class's own `m` HIDES every base `m`; the using-declaration puts the named
+// base's members into the class's own scope (clang's CGNonTrivialStruct.cpp: `using StructVisitor<Derived>::asDerived;`
+// in a class whose two bases both define asDerived). ownMethodSet reads it only for a class with no `m` of its own.
+// The facts are the import refs the tags pass already mints (queries/cpp/tags.scm using_declaration → RefRole::Import): one whose enclosing symbol is a Class/Struct sits
+// at class scope. The key is that class's NAME — the scope string its methods carry — so it is byte-identical to the
+// canonByName key of the class's own `m`. The qualifier is the IMMEDIATE scope (ingest's re-split) and loses its
+// template arguments here, where the 2-segment spelling `using Base<T>::m;` still carries them. An inheriting
+// constructor `using Base::Base;` records nothing: no member call names it. RESOLVE-stage only — every input is a
+// field the cache already stores. Deterministic: pure function of ing.references; each list sorted and deduped.
+inline HashMap<std::string, std::vector<std::string>> buildUsingReexports( const IngestResult& ing )
+{
+    PROFILE_SCOPE_DESCRIBE( "buildGraph/2k: using-declaration re-exports" );
+    HashMap<std::string, std::vector<std::string>> reexports;
+    std::string                                    key;   // reused "Class::m" buffer
+    for( const Reference& ur : ing.references )
+    {
+        if( ur.role != RefRole::Import || ur.fromSymbol == kNoNode || ur.qualifier.empty() || ( ur.lang != Lang::Cpp && ur.lang != Lang::ObjC ) )
+        {
+            continue;
+        }
+        const Symbol& cls = ing.symbols[ ur.fromSymbol ];
+        const std::string_view base = namesplit::stripTemplateArgs( ur.qualifier );
+        if( ( cls.kind != SymKind::Class && cls.kind != SymKind::Struct ) || base.empty() || base == ur.calleeName || base == cls.name )
+        {
+            continue;   // not at class scope, an inheriting constructor, or a class naming itself
+        }
+        key.clear();
+        key.append( cls.name ).append( "::" ).append( ur.calleeName );
+        reexports[ key ].emplace_back( base );
+    }
+    for( auto& [ k, bases ] : reexports )
+    {
+        std::sort( bases.begin(), bases.end() );
+        bases.erase( std::unique( bases.begin(), bases.end() ), bases.end() );
+    }
+    return reexports;
+}
+
+// S6-C's ranking key for one candidate: sharedLocality doubled, plus one when a BARE or `this->` call's candidate is
+// declared in the caller's OWN scope rather than in a scope nested inside it. Both share the caller's whole
+// `path::Scope::` prefix, so counting segments ties `Outer::start` with `Outer::Inner::start` for a `start()` written in
+// `Outer::operator=`; but a nested class's non-static member needs an object, so the bare call names Outer's. The
+// bonus never separates candidates the segment count already ranks, never applies to an explicit receiver (whose
+// type, not the enclosing scope, decides), and never fires when either id's NAME holds `::` (a conversion operator's
+// type) — that case keeps the plain tie. test/cpptmplscopecheck.sh §6. `shareCap` is receiverLocalityCap's limit on the
+// shared credit (an untyped NamedVar receiver stops at the caller's file segment); it binds only a receiver the bonus
+// never applies to, so the two rules cannot meet on one call.
+inline std::size_t localityRank( std::string_view caller, std::string_view cand, bool lexicalCall, std::size_t shareCap ) noexcept
+{
+    const std::size_t shared   = std::min( sharedLocality( caller, cand ), shareCap );
+    const std::size_t scopeEnd = caller.rfind( "::" );
+    const bool        ownScope = lexicalCall && scopeEnd != std::string_view::npos && shared == scopeEnd + 2
+                              && cand.find( "::", shared ) == std::string_view::npos;
+    return 2 * shared + ( ownScope ? 1u : 0u );
+}
+
+// The FAMILY key of a C++ template-id scope: `Traits<int>` + `encode` → "Traits::encode" written into `key`, true;
+// false with `key` untouched for a scope that is not a template-id. Ingest keys a primary template's out-of-line
+// member by the bare template name and a specialization by its canonical template-id (ingest_names.h), so the family
+// of `Traits::encode` is the defs keyed by it plus every specialization def whose own family key it is.
+inline bool appendTemplateFamilyKey( std::string& key, std::string_view scope, std::string_view name )
+{
+    if( scope.empty() || scope.back() != '>' )
+    {
+        return false;
+    }
+    const std::string_view family = namesplit::stripTemplateArgs( scope );
+    if( family.empty() || family.size() == scope.size() )
+    {
+        return false;
+    }
+    key.clear();
+    key.append( family ).append( "::" ).append( name );
+    return true;
+}
+
+// ── P2-D Rule 2 CLASS IDENTITY (2026-09-16, test/narrowcheck.sh arms 25-34) ──────────────────────────────────────────
+// Rule 2 keys a receiver's type by its final class-name segment, and a NESTED class keeps only that segment in its
+// scope: `SkipList<Key, Comparator>::Iterator::key` and a namespace-level `Iterator`'s methods share the key
+// `Iterator::key`. Measured on rocksdb @ 0e2801ac3: a call through `Iterator* it` — an abstract interface whose methods
+// are pure-virtual DECLARATIONS, never in the definitions-only canonByName — narrowed onto the five unrelated nested
+// `Iterator` classes in memtable/ that define `key`, and none was right. This index restores the class identity the key
+// dropped, from facts ingest already has: byte spans (a class inside another class's span is nested in it), the scope a
+// member names, the inherit references, the include targets and the namespace scopes of non-members. IdentityNarrower
+// below reads it for Rule 2. C-family only (C, C++, ObjC): every other language keeps unknown owners and an unchanged answer.
+// FLOORS, stated: namespaces are evidence, not a model (a same-named class in another namespace the caller also includes
+// stays a candidate); a nested class's out-of-line member defined in a different FILE than the class has no known owner;
+// a base the inherit reference records only by its final segment (`public Outer::Iterator`) is judged by nesting alone;
+// a type alias is kept rather than read through.
+using ChaUpNames = HashMap<std::string, std::vector<std::string>>;
+
+struct ClassIdentity
+{
+    struct FlatQualifier
+    {
+        std::string text;             // the written type WHOLE when qualified, "" when written bare
+        bool        conflicting = false;
+    };
+    const std::vector<Symbol>*                            symbols = nullptr;
+    const std::vector<std::string>*                       files   = nullptr;
+    std::vector<NodeId>                                   enclosingClass;   // class id → innermost enclosing class, kNoNode at namespace scope
+    std::vector<NodeId>                                   ownerClass;       // member id → the class that owns it, kNoNode when unknown
+    std::vector<std::uint8_t>                             ownerAmbiguous;   // 1: an out-of-line member whose file holds SEVERAL classes of its scope's name
+    HashMap<std::string, rw::SmallVec<NodeId, 2>>         classesByName;    // C-family class DEFINITIONS by name, in id order
+    HashMap<std::string, rw::SmallVec<NodeId, 2>>         nestedByName;     // the NESTED ones among them, by name
+    HashMap<std::string, rw::SmallVec<NodeId, 4>>         realDown;         // base NAME → derived class ids, namesake edges excluded
+    HashMap<NodeId, std::vector<std::string_view>>        realUp;           // derived class id → base names (views into ing.references)
+    HashMap<std::string, char>                            declared;         // "Scope::name" of a C-family member DECLARATION (no body)
+    HashMap<std::string, rw::SmallVec<NodeId, 2>>         specializationDefs; // "Template::name" → definitions scoped to a template-id of that class
+    HashMap<std::string, char>                            fileNamespaces;   // "<fileId>#<ns>": the file defines a non-member under namespace scope ns
+    std::vector<std::vector<std::string_view>>            namespacesOfFile; // the same evidence per file id (views into Symbol::scope)
+    struct IncludeTarget
+    {
+        std::uint32_t    fileId;
+        std::string_view target;   // as written (a view into ing.includes)
+    };
+    std::vector<IncludeTarget>                            includeTargets;   // every direct #include, ordered by including file
+    HashMap<std::string, FlatQualifier>                   flatQualifier;    // "<fromSymbol>#var" → the flat-table records' written qualifier
+};
+
+// the positions of the last two top-level `::` separators of a qualified name; template arguments are skipped by bracket
+// depth, so a `::` inside them (`Map<std::string>::Iterator`) is never a boundary. npos where there is none.
+inline std::pair<std::size_t, std::size_t> lastTwoTopLevelSeparators( std::string_view qualified ) noexcept
+{
+    std::size_t prevSep = std::string_view::npos;
+    std::size_t lastSep = std::string_view::npos;
+    int         depth   = 0;
+    for( std::size_t i = 0; i + 1 < qualified.size(); ++i )
+    {
+        const char c = qualified[ i ];
+        depth += ( c == '<' ) ? 1 : ( ( c == '>' && depth > 0 ) ? -1 : 0 );
+        if( depth == 0 && c == ':' && qualified[ i + 1 ] == ':' )
+        {
+            prevSep = lastSep;
+            lastSep = i++;
+        }
+    }
+    return { prevSep, lastSep };
+}
+
+// the class a written qualifier's LAST segment names: `Skip::Iterator` → `Skip`, `SkipList<Key, Comparator>::Iterator` →
+// `SkipList`, `ns::Outer::Iterator` → `Outer`; "" for a bare name
+inline std::string_view qualifierOuterName( std::string_view qualified ) noexcept
+{
+    const auto [ prevSep, lastSep ] = lastTwoTopLevelSeparators( qualified );
+    if( lastSep == std::string_view::npos )
+    {
+        return {};
+    }
+    const std::size_t start = ( prevSep == std::string_view::npos ) ? 0 : prevSep + 2;
+    const std::string_view outer = qualified.substr( start, lastSep - start );
+    return trimWs( outer.substr( 0, std::min( outer.size(), outer.find( '<' ) ) ) );
+}
+
+// does class NAME `derived` reach class NAME `base` up the name-keyed chaUp graph? Bounded. A same-name collision only ever
+// ENLARGES the answer, which on both callers is the conservative side (a class stays nameable, an edge stays a namesake).
+inline bool derivesFromName( std::string_view derived, std::string_view base, const ChaUpNames& chaUp )
+{
+    std::vector<std::string_view> frontier{ derived };
+    std::vector<std::string_view> next;
+    for( int depth = 0; depth < 12 && !frontier.empty(); ++depth )
+    {
+        next.clear();
+        for( std::string_view name : frontier )
+        {
+            const auto it = chaUp.find( std::string( name ) );
+            if( it == chaUp.end() )
+            {
+                continue;
+            }
+            if( std::ranges::find( it->second, base ) != it->second.end() )
+            {
+                return true;
+            }
+            next.insert( next.end(), it->second.begin(), it->second.end() );
+        }
+        frontier.swap( next );
+    }
+    return false;
+}
+
+// a class DEFINITION only: a forward declaration (`class Iterator;`, five at rocksdb's namespace scope) names no class body,
+// and counted as one it made every bare `Iterator` look like several namesakes
+inline void addClassDefinitions( const IngestResult& ing, ClassIdentity& ids )
+{
+    for( const Symbol& s : ing.symbols )
+    {
+        if( extent::inSet( extent::kHeadRuleLangs, s.lang ) && extent::inSet( extent::kExtentClassKinds, s.kind ) && isDefinitionNotDeclaration( s ) )
+        {
+            ids.classesByName[ s.name ].push_back( s.id );
+        }
+    }
+}
+
+// the member DECLARATIONS ("Scope::name", bodiless) and each file's namespace evidence: a scope no class carries is a namespace
+inline void addDeclarationsAndNamespaces( const IngestResult& ing, ClassIdentity& ids )
+{
+    std::string key;
+    for( const Symbol& s : ing.symbols )
+    {
+        if( !extent::inSet( extent::kHeadRuleLangs, s.lang ) || extent::inSet( extent::kExtentClassKinds, s.kind ) || s.scope.empty() )
+        {
+            continue;
+        }
+        if( !isDefinitionNotDeclaration( s ) )
+        {
+            key.assign( s.scope ).append( "::" ).append( s.name );
+            ids.declared.try_emplace( key, '\0' );
+        }
+        if( ids.classesByName.find( s.scope ) != ids.classesByName.end() )
+        {
+            continue;
+        }
+        buildShadowKey( key, s.fileId, s.scope );
+        if( ids.fileNamespaces.try_emplace( key, '\0' ).second && s.fileId < ids.namespacesOfFile.size() )
+        {
+            ids.namespacesOfFile[ s.fileId ].push_back( s.scope );
+        }
+    }
+}
+
+// per file, the C-family symbols in (start, end descending, id) order — the order a containment sweep needs
+inline SymbolsByFile cFamilySymbolsBySpan( const IngestResult& ing )
+{
+    SymbolsByFile perFile = symbolsByFileInIdOrder( ing, []( const Symbol& s ) { return extent::inSet( extent::kHeadRuleLangs, s.lang ); } );
+    const auto spanOrder = [ & ]( NodeId a, NodeId b )
+    {
+        const Symbol& x = ing.symbols[ a ];
+        const Symbol& y = ing.symbols[ b ];
+        if( x.sigStartByte != y.sigStartByte ) { return x.sigStartByte < y.sigStartByte; }
+        if( x.endByte != y.endByte )           { return x.endByte > y.endByte; }
+        return a < b;
+    };
+    for( FileSymbols& list : perFile )
+    {
+        std::sort( list.begin(), list.end(), spanOrder );
+    }
+    return perFile;
+}
+
+// one file's containment sweep with a stack of open classes: every class gets its innermost enclosing class, every member
+// the innermost enclosing class of its scope's name
+inline void sweepFileNesting( const IngestResult& ing, const FileSymbols& list, ClassIdentity& ids )
+{
+    std::vector<NodeId> open;
+    for( NodeId id : list )
+    {
+        const Symbol& s = ing.symbols[ id ];
+        while( !open.empty() && ing.symbols[ open.back() ].endByte < s.endByte )
+        {
+            open.pop_back();   // the innermost open class ends before this symbol does: it cannot contain it
+        }
+        if( extent::inSet( extent::kExtentClassKinds, s.kind ) )
+        {
+            ids.enclosingClass[ id ] = open.empty() ? kNoNode : open.back();
+            open.push_back( id );
+        }
+        else if( !s.scope.empty() )
+        {
+            const auto owner = std::find_if( open.rbegin(), open.rend(), [ & ]( NodeId c ) { return ing.symbols[ c ].name == s.scope; } );
+            ids.ownerClass[ id ] = ( owner == open.rend() ) ? kNoNode : *owner;
+        }
+    }
+}
+
+// "<classId>#<member name>" for every bodiless member inside that class's span
+inline HashMap<std::string, char> bodilessMembersByClass( const IngestResult& ing, const ClassIdentity& ids )
+{
+    HashMap<std::string, char> declaresMember;
+    std::string                key;
+    for( const Symbol& s : ing.symbols )
+    {
+        if( extent::inSet( extent::kHeadRuleLangs, s.lang ) && !extent::inSet( extent::kExtentClassKinds, s.kind ) && ids.ownerClass[ s.id ] != kNoNode && !isDefinitionNotDeclaration( s ) )
+        {
+            buildShadowKey( key, ids.ownerClass[ s.id ], s.name );
+            declaresMember.try_emplace( key, '\0' );
+        }
+    }
+    return declaresMember;
+}
+
+// one out-of-line member among the classes of its scope's name: the one in its file when there is one; among several there,
+// the nearest PRECEDING one whose body DECLARES it (C++ defines a member out of line only after the class that declares it:
+// `ListRep::Iterator` defines `key` inline, so the out-of-line `key` after `Skip::Iterator` is Skip's); still ambiguous when
+// none decides
+inline void assignOutOfLineOwner( const IngestResult& ing, const Symbol& s, const rw::SmallVec<NodeId, 2>& candidates,
+                                  const HashMap<std::string, char>& declaresMember, ClassIdentity& ids )
+{
+    std::string   key;
+    std::uint32_t sameFile = 0;
+    NodeId        declarer = kNoNode;
+    for( NodeId c : candidates )
+    {
+        const Symbol& cls = ing.symbols[ c ];
+        if( cls.fileId != s.fileId )
+        {
+            continue;
+        }
+        ids.ownerClass[ s.id ] = ( sameFile++ == 0 ) ? c : ids.ownerClass[ s.id ];
+        buildShadowKey( key, c, s.name );
+        const bool precedesAndDeclares = cls.sigStartByte < s.sigStartByte && declaresMember.find( key ) != declaresMember.end();
+        declarer = ( precedesAndDeclares && ( declarer == kNoNode || ing.symbols[ declarer ].sigStartByte < cls.sigStartByte ) ) ? c : declarer;
+    }
+    if( sameFile > 1 && declarer != kNoNode )
+    {
+        ids.ownerClass[ s.id ] = declarer;
+        sameFile               = 1;
+    }
+    ids.ownerAmbiguous[ s.id ] = std::uint8_t( sameFile > 1 ? 1 : 0 );
+}
+
+// an out-of-line member (`inline int Skip::Iterator::key() const { … }`) sits in no class span; unknown when its file
+// defines no class of its scope's name
+inline void assignOutOfLineOwners( const IngestResult& ing, ClassIdentity& ids )
+{
+    const HashMap<std::string, char> declaresMember = bodilessMembersByClass( ing, ids );
+    for( const Symbol& s : ing.symbols )
+    {
+        if( !extent::inSet( extent::kHeadRuleLangs, s.lang ) || s.scope.empty() || extent::inSet( extent::kExtentClassKinds, s.kind ) || ids.ownerClass[ s.id ] != kNoNode )
+        {
+            continue;
+        }
+        if( const auto it = ids.classesByName.find( s.scope ); it != ids.classesByName.end() )
+        {
+            assignOutOfLineOwner( ing, s, it->second, declaresMember, ids );
+        }
+    }
+}
+
+// a class template's SPECIALIZATION has no class symbol (`template <typename T> class TBase<T, true>`), so its members' scope
+// `TBase<T, true>` names no class and a walk reaching TBase by name never sees them — llvm's SmallVectorTemplateBase<T, true>
+// defines the push_back a pointer element type instantiates. Indexed by the template's name; a primary template's own
+// out-of-line members spelled `TBase<T, B>::m` land here too, which is where their bodies are
+inline void addSpecializationDefinitions( const IngestResult& ing, ClassIdentity& ids )
+{
+    std::string key;
+    for( const Symbol& s : ing.symbols )
+    {
+        const std::size_t open = s.scope.find( '<' );
+        if( open == std::string::npos || !extent::inSet( extent::kHeadRuleLangs, s.lang ) || extent::inSet( extent::kExtentClassKinds, s.kind ) || !isDefinitionNotDeclaration( s ) )
+        {
+            continue;
+        }
+        key.assign( trimWs( std::string_view( s.scope ).substr( 0, open ) ) );
+        if( ids.classesByName.find( key ) != ids.classesByName.end() )
+        {
+            ids.specializationDefs[ key.append( "::" ).append( s.name ) ].push_back( s.id );
+        }
+    }
+}
+
+inline void addNestedByName( ClassIdentity& ids )
+{
+    for( const auto& [ name, classIds ] : ids.classesByName )
+    {
+        for( NodeId c : classIds )
+        {
+            if( ids.enclosingClass[ c ] != kNoNode )
+            {
+                ids.nestedByName[ name ].push_back( c );
+            }
+        }
+    }
+    for( auto& [ name, nestedIds ] : ids.nestedByName )
+    {
+        std::sort( nestedIds.begin(), nestedIds.end() );   // hash-map iteration filled it: restore id order for determinism
+    }
+}
+
+// an include written against an include ROOT (`"LinearMath/btVector3.h"`) resolves to no file path-precisely; as a PATH
+// SUFFIX it still says which file it names — a preference between namesakes, never a narrow on its own
+inline void addIncludeTargets( const IngestResult& ing, ClassIdentity& ids )
+{
+    ids.includeTargets.resize( ing.includes.size() );
+    std::ranges::transform( ing.includes, ids.includeTargets.begin(), []( const Include& inc ) { return ClassIdentity::IncludeTarget{ inc.fileId, inc.target }; } );
+    std::ranges::stable_sort( ids.includeTargets, {}, &ClassIdentity::IncludeTarget::fileId );
+}
+
+// is `baseName`, written in derived class `derived`'s base clause, a NESTED class by C++ lookup — nested in a class that
+// encloses `derived`, or inherited into one? `class Iterator : public MemTableRep::Iterator` inside SkipListRep (which
+// derives from MemTableRep) is; `class DBIter : public Iterator` at namespace scope is not. `derived` itself never counts:
+// a class cannot be its own base, so a bare self-name must mean some other class.
+inline bool isNamesakeBaseEdge( const IngestResult& ing, const ClassIdentity& ids, NodeId derived, std::string_view baseName, const ChaUpNames& chaUp )
+{
+    const auto nested = ids.nestedByName.find( std::string( baseName ) );
+    if( nested == ids.nestedByName.end() )
+    {
+        return false;
+    }
+    for( NodeId outer = ids.enclosingClass[ derived ]; outer != kNoNode; outer = ids.enclosingClass[ outer ] )
+    {
+        const std::string& outerName = ing.symbols[ outer ].name;
+        const auto         inScope   = [ & ]( NodeId n )
+        {
+            const std::string& nOuter = ing.symbols[ ids.enclosingClass[ n ] ].name;
+            return n != derived && ( nOuter == outerName || derivesFromName( outerName, nOuter, chaUp ) );
+        };
+        if( std::ranges::any_of( nested->second, inScope ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the inheritance graph with namesake edges removed: `realDown` by base NAME (the walk to subclasses), `realUp` by derived
+// class id (the walk to ancestors)
+inline void addRealInheritance( const IngestResult& ing, ClassIdentity& ids, const ChaUpNames& chaUp )
+{
+    for( const Reference& ir : ing.references )
+    {
+        if( !ir.isInherit || ir.fromSymbol == kNoNode || ir.calleeName.empty() || !ir.qualifier.empty() )
+        {
+            continue;
+        }
+        const Symbol& d = ing.symbols[ ir.fromSymbol ];
+        if( !extent::inSet( extent::kHeadRuleLangs, d.lang ) || !extent::inSet( extent::kExtentClassKinds, d.kind ) || isNamesakeBaseEdge( ing, ids, d.id, ir.calleeName, chaUp ) )
+        {
+            continue;
+        }
+        rw::SmallVec<NodeId, 4>& down = ids.realDown[ ir.calleeName ];
+        if( down.empty() || down.back() != d.id )
+        {
+            down.push_back( d.id );
+        }
+        std::vector<std::string_view>& up = ids.realUp[ d.id ];
+        if( std::ranges::find( up, std::string_view( ir.calleeName ) ) == up.end() )
+        {
+            up.push_back( ir.calleeName );
+        }
+    }
+}
+
+// Rule 2's flat table (typed LOCALS) keeps only the final segment; the qualifier its records wrote is kept here, keyed like
+// it, so class identity reads `Skip::Iterator it;` the way the lexical table reads a parameter. Two records of one variable
+// writing different qualifiers are conflicting: identity then stays out and Rule 2 answers as before.
+inline void addFlatQualifiers( const IngestResult& ing, ClassIdentity& ids )
+{
+    std::string key;
+    for( const Binding& b : ing.bindings )
+    {
+        if( b.kind != LocalBindKind::Type || b.fromSymbol == kNoNode || b.var.empty() || b.typeName.empty() || !extent::inSet( extent::kHeadRuleLangs, ing.symbols[ b.fromSymbol ].lang ) )
+        {
+            continue;
+        }
+        buildShadowKey( key, b.fromSymbol, b.var );
+        const auto [ it, inserted ] = ids.flatQualifier.try_emplace( key, ClassIdentity::FlatQualifier{ b.importedName, false } );
+        if( !inserted && it->second.text != b.importedName )
+        {
+            it->second.conflicting = true;
+        }
+    }
+}
+
+inline ClassIdentity buildClassIdentity( const IngestResult& ing, const ChaUpNames& chaUp )
+{
+    PROFILE_SCOPE_DESCRIBE( "buildGraph/2k: Rule-2 class identity" );
+    ClassIdentity ids;
+    ids.symbols = &ing.symbols;
+    ids.files   = &ing.files;
+    addClassDefinitions( ing, ids );
+    if( ids.classesByName.empty() )
+    {
+        return ids;   // no C-family class: Rule 2 reads nothing from the index and answers exactly as before
+    }
+    ids.enclosingClass.assign( ing.symbols.size(), kNoNode );
+    ids.namespacesOfFile.assign( ing.files.size(), {} );
+    ids.ownerClass.assign( ing.symbols.size(), kNoNode );
+    ids.ownerAmbiguous.assign( ing.symbols.size(), std::uint8_t( 0 ) );
+    addDeclarationsAndNamespaces( ing, ids );
+    for( const FileSymbols& list : cFamilySymbolsBySpan( ing ) )
+    {
+        sweepFileNesting( ing, list, ids );
+    }
+    assignOutOfLineOwners( ing, ids );
+    addSpecializationDefinitions( ing, ids );
+    addNestedByName( ids );
+    addIncludeTargets( ing, ids );
+    addRealInheritance( ing, ids, chaUp );
+    addFlatQualifiers( ing, ids );
+    return ids;
+}
+
+// the receiver's WRITTEN type as Rule 2 recorded it: the final class-name segment it matches, and the declaration's
+// qualifier text ("" when written bare)
+struct WrittenType
+{
+    std::string_view name;
+    std::string_view qualifier;
+};
+
+// Rule 2 through class identity — the narrowing half, owned by the Narrower and called from rule2RecvVarType. References
+// buildGraph's tables plus reused scratch; one instance drives the single-threaded resolve loop.
+//   (1) keep the final-segment hits whose owning class the written type NAMES (C++ lookup outward from the caller; a
+//       qualifier naming the enclosing class) — every one kept returns `own` itself, byte-identical;
+//   (2) with none left and one claimable class, the shallowest REAL ancestor level that defines the callee;
+//   (3) with no body along the ancestry but a DECLARATION on it, the callee's definitions in the class's real subclasses:
+//       the dispatch split a virtual call through an interface is.
+// Steps 2-3 are CLAIMS, marked for claimFor so the ladder keeps them whole. Namesakes are told apart by evidence: a class
+// visible from the file (the same file, a path-resolved include, a direct include read as a path suffix), else a shared
+// namespace. EXPLAIN OR KEEP: identity replaces `own` only with an answer it can explain; a nested class visible through the
+// caller's includes is never dropped (a type ALIAS the index does not see may name it: `using NodeSet =
+// MachineGadgetGraph::NodeSet;`, measured on llvm); several claimable namesakes, or two same-named classes defining the
+// callee at one ancestor level, leave `own` standing.
+struct IdentityNarrower
+{
+    const HashMap<std::string, rw::SmallVec<NodeId, 2>>& canonByName;
+    const std::vector<std::vector<NodeId>>&              fileIncludes;
+    const std::vector<std::uint32_t>&                    symFileId;
+
+    mutable std::string                                   keyScope;        // "Class::callee"
+    mutable rw::SmallVec<NodeId, 2>                       hits;            // the answer, copied out by the caller at once
+    mutable std::vector<NodeId>                           classWalk;       // nameable classes, then a walk frontier
+    mutable std::vector<NodeId>                           classNext;
+    mutable std::vector<NodeId>                           plausible;       // plausibleClasses' answer
+    mutable std::vector<std::uint32_t>                    seenStamp;       // generation-stamped visited set, one u32 per symbol
+    mutable std::uint32_t                                 seenGeneration = 0;
+    mutable HashMap<std::string, rw::SmallVec<NodeId, 2>> subclassMemo;    // step 3 per (receiver class, callee)
+    mutable const Reference*                              claimRef       = nullptr;
+    mutable bool                                          lookupLexical  = false;   // classWalk came from an enclosing class or a class qualifier
+
+    IdentityNarrower( const HashMap<std::string, rw::SmallVec<NodeId, 2>>& canon, const std::vector<std::vector<NodeId>>& incl,
+                      const std::vector<std::uint32_t>& symFile ) noexcept
+        : canonByName( canon ), fileIncludes( incl ), symFileId( symFile ) {}
+
+    bool claimFor( const Reference& r ) const noexcept
+    {
+        return claimRef == &r;
+    }
+
+    bool forgetClaim() const noexcept
+    {
+        claimRef = nullptr;
+        return false;
+    }
+
+    const rw::SmallVec<NodeId, 2>* narrow( const Reference& r, WrittenType type, const rw::SmallVec<NodeId, 2>* own, const ClassIdentity& ids,
+                                           const ChaUpNames& chaUp ) const
+    {
+        claimRef = nullptr;
+        nameableClasses( type, r, ids, chaUp, /*verifiedNamespace=*/ false );
+        if( own != nullptr )
+        {
+            if( const rw::SmallVec<NodeId, 2>* const kept = keepNameableHits( r, *own, ids ); kept != nullptr )
+            {
+                return kept;
+            }
+        }
+        return claimFromAncestry( r, type, own, ids, chaUp );
+    }
+
+    // step (1): `own` itself when every hit's owner is nameable — or when a nested namesake is in the caller's sight, which
+    // a type alias may name — the nameable subset otherwise, nullptr when none is
+    const rw::SmallVec<NodeId, 2>* keepNameableHits( const Reference& r, const rw::SmallVec<NodeId, 2>& own, const ClassIdentity& ids ) const
+    {
+        const std::uint32_t callerFile = symFileId[ r.fromSymbol ];
+        if( !lookupLexical && std::ranges::any_of( own, [ & ]( NodeId h ) { return nestedNamesakeInSight( h, callerFile, ids ); } ) )
+        {
+            return &own;
+        }
+        hits.clear();
+        for( NodeId h : own )
+        {
+            if( memberNameable( h, ids ) ) { hits.push_back( h ); }
+        }
+        if( hits.size() == own.size() )
+        {
+            return &own;
+        }
+        return hits.empty() ? nullptr : &hits;
+    }
+
+    // steps (2)-(3), from the one class a claim can stand on; `own` when there is none or the ancestry explains nothing
+    const rw::SmallVec<NodeId, 2>* claimFromAncestry( const Reference& r, WrittenType type, const rw::SmallVec<NodeId, 2>* own,
+                                                      const ClassIdentity& ids, const ChaUpNames& chaUp ) const
+    {
+        if( !type.qualifier.empty() )
+        {
+            nameableClasses( type, r, ids, chaUp, /*verifiedNamespace=*/ true );   // a claim needs evidence
+        }
+        const NodeId receiverClass = claimableClass( type.name, r, ids );
+        if( receiverClass == kNoNode )
+        {
+            return own;
+        }
+        bool declaredAlong = false;
+        bool ambiguous     = false;
+        if( inheritedDefinitions( r, receiverClass, ids, declaredAlong, ambiguous )
+         || ( !ambiguous && declaredAlong && subclassDefinitions( r, receiverClass, ids ) ) )
+        {
+            claimRef = &r;
+            return &hits;
+        }
+        return own;
+    }
+
+    // the one class a claim stands on: the single plausible nameable class, unless another class of that name is in the
+    // caller's sight and this one shows no sign of being meant; kNoNode otherwise
+    NodeId claimableClass( std::string_view typeName, const Reference& r, const ClassIdentity& ids ) const
+    {
+        const std::uint32_t callerFile = symFileId[ r.fromSymbol ];
+        plausibleClasses( classWalk, callerFile, ids );
+        const auto sameName = ids.classesByName.find( std::string( typeName ) );
+        if( plausible.size() != 1 || sameName == ids.classesByName.end() )
+        {
+            return kNoNode;
+        }
+        const NodeId claimed         = plausible.front();
+        const bool   namesakeInSight = std::ranges::any_of( sameName->second, [ & ]( NodeId c )
+        {
+            return c != claimed && fileVisibleFrom( callerFile, fileOf( c, ids ), ids );
+        } );
+        return ( lookupLexical || !namesakeInSight || classEvidenced( claimed, callerFile, ids ) ) ? claimed : kNoNode;
+    }
+
+    static std::uint32_t fileOf( NodeId symbol, const ClassIdentity& ids ) noexcept
+    {
+        return ( *ids.symbols )[ symbol ].fileId;
+    }
+
+    static std::string_view outerNameOf( NodeId cls, const ClassIdentity& ids ) noexcept
+    {
+        const NodeId outer = ids.enclosingClass[ cls ];
+        return ( outer == kNoNode ) ? std::string_view{} : std::string_view( ( *ids.symbols )[ outer ].name );
+    }
+
+    // the caller's own class: itself when it is a class, its owner otherwise (kNoNode when unknown or ambiguous)
+    static NodeId callerClassOf( NodeId from, const ClassIdentity& ids ) noexcept
+    {
+        if( extent::inSet( extent::kExtentClassKinds, ( *ids.symbols )[ from ].kind ) )
+        {
+            return from;
+        }
+        return ( ids.ownerAmbiguous[ from ] != 0 ) ? kNoNode : ids.ownerClass[ from ];
+    }
+
+    static bool nestedInAncestorOf( NodeId cls, std::string_view className, const ClassIdentity& ids, const ChaUpNames& chaUp )
+    {
+        const std::string_view outer = outerNameOf( cls, ids );
+        return !outer.empty() && derivesFromName( className, outer, chaUp );
+    }
+
+    bool collectIf( const rw::SmallVec<NodeId, 2>& named, const auto& pick ) const
+    {
+        for( NodeId c : named )
+        {
+            if( pick( c ) ) { classWalk.push_back( c ); }
+        }
+        return !classWalk.empty();
+    }
+
+    // the classes the written type NAMES at this call, into classWalk in id order: through a qualifier; bare, outward from the
+    // caller's class — a class nested directly in an enclosing class wins, then one nested in that class's ancestors — then
+    // from an unknown caller's written scope; past all of those the namespace-level classes of that name. `verifiedNamespace`
+    // separates an EXCLUSION from a CLAIM: to drop a hit, a namespace qualifier names every namespace-level class of its name
+    // (none is provably excluded); to claim, only those whose file shows it defines something in that namespace.
+    void nameableClasses( WrittenType type, const Reference& r, const ClassIdentity& ids, const ChaUpNames& chaUp, bool verifiedNamespace ) const
+    {
+        classWalk.clear();
+        lookupLexical    = false;
+        const auto named = ids.classesByName.find( std::string( type.name ) );
+        if( named == ids.classesByName.end() )
+        {
+            return;
+        }
+        if( !type.qualifier.empty() )
+        {
+            nameableThroughQualifier( named->second, type.qualifier, ids, verifiedNamespace );
+            return;
+        }
+        if( nameableFromCallerClass( named->second, r, ids, chaUp ) )
+        {
+            lookupLexical = true;
+            return;
+        }
+        if( !nameableFromCallerScope( named->second, type.name, r, ids, chaUp ) )
+        {
+            collectIf( named->second, [ & ]( NodeId c ) { return ids.enclosingClass[ c ] == kNoNode; } );
+        }
+    }
+
+    void nameableThroughQualifier( const rw::SmallVec<NodeId, 2>& named, std::string_view qualifier, const ClassIdentity& ids, bool verifiedNamespace ) const
+    {
+        const std::string_view q = qualifierOuterName( qualifier );
+        if( ids.classesByName.find( std::string( q ) ) != ids.classesByName.end() )
+        {
+            lookupLexical = collectIf( named, [ & ]( NodeId c ) { return outerNameOf( c, ids ) == q; } );
+            return;
+        }
+        // `ns::T` names a namespace-level T; claimed only from a file showing it defines things in `ns` — an
+        // `ankerl::unordered_dense::map` must not become amc's `map` (measured on a private corpus)
+        std::string nsKey;
+        collectIf( named, [ & ]( NodeId c )
+        {
+            buildShadowKey( nsKey, fileOf( c, ids ), q );
+            return ids.enclosingClass[ c ] == kNoNode && ( !verifiedNamespace || ids.fileNamespaces.find( nsKey ) != ids.fileNamespaces.end() );
+        } );
+    }
+
+    bool nameableFromCallerClass( const rw::SmallVec<NodeId, 2>& named, const Reference& r, const ClassIdentity& ids, const ChaUpNames& chaUp ) const
+    {
+        for( NodeId sc = callerClassOf( r.fromSymbol, ids ); sc != kNoNode; sc = ids.enclosingClass[ sc ] )
+        {
+            const std::string& scName = ( *ids.symbols )[ sc ].name;
+            if( collectIf( named, [ & ]( NodeId c ) { return ids.enclosingClass[ c ] == sc; } )
+             || collectIf( named, [ & ]( NodeId c ) { return nestedInAncestorOf( c, scName, ids, chaUp ); } ) )
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // an out-of-line caller of unknown class: its written scope's name is the only evidence of where it sits
+    bool nameableFromCallerScope( const rw::SmallVec<NodeId, 2>& named, std::string_view typeName, const Reference& r, const ClassIdentity& ids,
+                                  const ChaUpNames& chaUp ) const
+    {
+        const std::string& scope = ( *ids.symbols )[ r.fromSymbol ].scope;
+        if( callerClassOf( r.fromSymbol, ids ) != kNoNode || scope.empty() || ids.classesByName.find( scope ) == ids.classesByName.end() )
+        {
+            return false;
+        }
+        if( scope == typeName )
+        {
+            return collectIf( named, []( NodeId ) { return true; } );   // a member of a class of that very name: any of them, as before
+        }
+        return collectIf( named, [ & ]( NodeId c ) { return outerNameOf( c, ids ) == scope; } )
+            || collectIf( named, [ & ]( NodeId c ) { return nestedInAncestorOf( c, scope, ids, chaUp ); } );
+    }
+
+    // a hit owned by a NESTED class outside the nameable set whose file is visible from the caller
+    bool nestedNamesakeInSight( NodeId hit, std::uint32_t callerFile, const ClassIdentity& ids ) const
+    {
+        const NodeId owner = ids.ownerClass[ hit ];
+        return ids.ownerAmbiguous[ hit ] == 0 && owner != kNoNode && ids.enclosingClass[ owner ] != kNoNode
+            && !std::binary_search( classWalk.begin(), classWalk.end(), owner ) && fileVisibleFrom( callerFile, fileOf( owner, ids ), ids );
+    }
+
+    // a hit's owning class among the nameable ones? An unknown owner keeps the hit; an ambiguous out-of-line owner is
+    // nameable when any same-file class of its scope's name is
+    bool memberNameable( NodeId member, const ClassIdentity& ids ) const
+    {
+        const NodeId owner = ids.ownerClass[ member ];
+        if( owner == kNoNode )
+        {
+            return true;
+        }
+        if( ids.ownerAmbiguous[ member ] == 0 )
+        {
+            return std::binary_search( classWalk.begin(), classWalk.end(), owner );
+        }
+        const Symbol& m      = ( *ids.symbols )[ member ];
+        const auto    scoped = ids.classesByName.find( m.scope );
+        return scoped != ids.classesByName.end() && std::ranges::any_of( scoped->second, [ & ]( NodeId c )
+        {
+            return fileOf( c, ids ) == m.fileId && std::binary_search( classWalk.begin(), classWalk.end(), c );
+        } );
+    }
+
+    // is `defFile` visible from `fromFile` — the same file, one it path-resolvably includes, or one a DIRECT include of it
+    // names as a path suffix (an include-root spelling, `"clang/Interpreter/Value.h"`; a suffix, not a basename: three
+    // `Value.h` headers hold three `Value` classes in llvm)?
+    bool fileVisibleFrom( std::uint32_t fromFile, std::uint32_t defFile, const ClassIdentity& ids ) const
+    {
+        if( fromFile == defFile || ( fromFile < fileIncludes.size() && std::binary_search( fileIncludes[ fromFile ].begin(), fileIncludes[ fromFile ].end(), defFile ) ) )
+        {
+            return true;
+        }
+        if( ids.files == nullptr || defFile >= ids.files->size() )
+        {
+            return false;
+        }
+        const std::string_view path             = ( *ids.files )[ defFile ];
+        const auto [ firstInclude, endInclude ] = std::ranges::equal_range( ids.includeTargets, fromFile, {}, &ClassIdentity::IncludeTarget::fileId );
+        return std::any_of( firstInclude, endInclude, [ & ]( const ClassIdentity::IncludeTarget& include )
+        {
+            std::string_view target = include.target;
+            while( target.starts_with( "./" ) )
+            {
+                target.remove_prefix( 2 );
+            }
+            return !target.empty() && path.ends_with( target ) && ( path.size() == target.size() || path[ path.size() - target.size() - 1 ] == '/' );
+        } );
+    }
+
+    static bool filesShareNamespace( std::uint32_t a, std::uint32_t b, const ClassIdentity& ids ) noexcept
+    {
+        if( a >= ids.namespacesOfFile.size() || b >= ids.namespacesOfFile.size() )
+        {
+            return false;
+        }
+        return std::ranges::any_of( ids.namespacesOfFile[ a ], [ & ]( std::string_view x )
+        {
+            return std::ranges::find( ids.namespacesOfFile[ b ], x ) != ids.namespacesOfFile[ b ].end();
+        } );
+    }
+
+    // does a use in file `fromFile` have EVIDENCE it means class `cls` — visible from it, or a namespace in common?
+    bool classEvidenced( NodeId cls, std::uint32_t fromFile, const ClassIdentity& ids ) const
+    {
+        return fileVisibleFrom( fromFile, fileOf( cls, ids ), ids ) || filesShareNamespace( fromFile, fileOf( cls, ids ), ids );
+    }
+
+    // among same-named classes, the ones a use in file `fromFile` most plausibly means: those visible from it, else those
+    // sharing a namespace with it, else all — a preference that orders namesakes, never one that removes the last candidate
+    void plausibleClasses( std::span<const NodeId> named, std::uint32_t fromFile, const ClassIdentity& ids ) const
+    {
+        plausible.clear();
+        for( NodeId c : named )
+        {
+            if( named.size() == 1 || fileVisibleFrom( fromFile, fileOf( c, ids ), ids ) ) { plausible.push_back( c ); }
+        }
+        for( NodeId c : ( plausible.empty() ? named : std::span<const NodeId>{} ) )
+        {
+            if( filesShareNamespace( fromFile, fileOf( c, ids ), ids ) ) { plausible.push_back( c ); }
+        }
+        if( plausible.empty() )
+        {
+            plausible.assign( named.begin(), named.end() );
+        }
+    }
+
+    // the definitions under keyScope ("Class::callee") owned by class `cls` — or, when their owner is ambiguous or unknown,
+    // plausibly it — appended to hits
+    void appendOwnedDefinitions( NodeId cls, const ClassIdentity& ids ) const
+    {
+        const auto it    = canonByName.find( keyScope );
+        const auto named = ids.classesByName.find( ( *ids.symbols )[ cls ].name );
+        if( it == canonByName.end() )
+        {
+            return;
+        }
+        for( NodeId d : it->second )
+        {
+            if( ownedBy( d, cls, named == ids.classesByName.end() ? nullptr : &named->second, ids ) && markSeen( d ) )
+            {
+                hits.push_back( d );   // a definition plausible for two same-named classes of one walk is appended once
+            }
+        }
+    }
+
+    bool ownedBy( NodeId def, NodeId cls, const rw::SmallVec<NodeId, 2>* sameNamed, const ClassIdentity& ids ) const
+    {
+        const NodeId owner = ids.ownerClass[ def ];
+        if( owner == cls )
+        {
+            return true;
+        }
+        if( ids.ownerAmbiguous[ def ] != 0 )
+        {
+            return fileOf( def, ids ) == fileOf( cls, ids );   // one of several same-file classes of the name
+        }
+        if( owner != kNoNode || sameNamed == nullptr )
+        {
+            return false;
+        }
+        plausibleClasses( std::span<const NodeId>( sameNamed->data(), sameNamed->size() ), fileOf( def, ids ), ids );   // defined out of line in another file
+        return std::ranges::find( plausible, cls ) != plausible.end();
+    }
+
+    // a fresh visited generation over the symbol ids (the stamp vector is sized once, never cleared)
+    void nextSeenGeneration( const ClassIdentity& ids ) const
+    {
+        if( seenStamp.size() != ids.symbols->size() || seenGeneration == 0xFFFFFFFFu )
+        {
+            seenStamp.assign( ids.symbols->size(), 0u );
+            seenGeneration = 0;
+        }
+        ++seenGeneration;
+    }
+
+    bool markSeen( NodeId id ) const noexcept
+    {
+        const bool fresh = seenStamp[ id ] != seenGeneration;
+        seenStamp[ id ] = seenGeneration;
+        return fresh;
+    }
+
+    // two KNOWN, distinct owning classes that share a name among the definitions — a union of namesakes, not one type's answer
+    // (an unknown owner was admitted only as plausibly the walked class, so it never counts against it)
+    static bool definedBySameNamedClasses( const rw::SmallVec<NodeId, 2>& defs, const ClassIdentity& ids ) noexcept
+    {
+        for( std::size_t a = 0; a < defs.size(); ++a )
+        {
+            const NodeId oa         = ids.ownerClass[ defs[ a ] ];
+            const auto   namesakeOf = [ & ]( NodeId d )
+            {
+                const NodeId ob = ids.ownerClass[ d ];
+                return ob != kNoNode && ob != oa && ( *ids.symbols )[ oa ].name == ( *ids.symbols )[ ob ].name;
+            };
+            if( oa != kNoNode && std::any_of( defs.begin() + a + 1, defs.end(), namesakeOf ) )
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // step (2): from the receiver class up the REAL inheritance level by level; the shallowest level whose classes define the
+    // callee answers into hits (several defining classes at one level: their union, an honest split — unless two of them are
+    // namesakes, then `ambiguous`). `declaredAlong` reports a bodiless declaration of the callee on any class visited.
+    bool inheritedDefinitions( const Reference& r, NodeId receiverClass, const ClassIdentity& ids, bool& declaredAlong, bool& ambiguous ) const
+    {
+        nextSeenGeneration( ids );
+        markSeen( receiverClass );
+        classWalk.assign( 1, receiverClass );
+        for( int depth = 0; depth < 16 && !classWalk.empty(); ++depth )
+        {
+            hits.clear();
+            classNext.clear();
+            for( NodeId c : classWalk )
+            {
+                declaredAlong = visitAncestor( r, c, depth > 0, ids ) || declaredAlong;
+            }
+            if( !hits.empty() )
+            {
+                std::sort( hits.begin(), hits.end() );   // each definition appended once (markSeen): the id order own's hits have
+                ambiguous = definedBySameNamedClasses( hits, ids );
+                return !ambiguous;
+            }
+            classWalk.swap( classNext );
+        }
+        return false;
+    }
+
+    // the definitions under keyScope that the template's specializations hold (ClassIdentity::specializationDefs), when the
+    // specialization's file sees the class's: the family split one instantiation picks from
+    void appendSpecializationDefinitions( NodeId cls, const ClassIdentity& ids ) const
+    {
+        const auto it = ids.specializationDefs.find( keyScope );
+        if( it == ids.specializationDefs.end() )
+        {
+            return;
+        }
+        const std::uint32_t classFile = fileOf( cls, ids );
+        for( NodeId d : it->second )
+        {
+            const std::uint32_t defFile = fileOf( d, ids );
+            if( ( defFile == classFile || fileVisibleFrom( defFile, classFile, ids ) ) && markSeen( d ) )
+            {
+                hits.push_back( d );
+            }
+        }
+    }
+
+    // one class of the ancestor walk: whether it DECLARES the callee; its definitions appended (not at the receiver's own
+    // level, which step 1 judged); its plausible direct bases queued
+    bool visitAncestor( const Reference& r, NodeId c, bool appendDefinitions, const ClassIdentity& ids ) const
+    {
+        keyScope.assign( ( *ids.symbols )[ c ].name ).append( "::" ).append( r.calleeName );
+        const bool declares = ids.declared.find( keyScope ) != ids.declared.end();
+        if( appendDefinitions )
+        {
+            appendOwnedDefinitions( c, ids );
+            appendSpecializationDefinitions( c, ids );
+        }
+        const auto up = ids.realUp.find( c );
+        for( std::string_view base : ( up == ids.realUp.end() ) ? std::span<const std::string_view>{} : std::span<const std::string_view>( up->second ) )
+        {
+            const auto bases = ids.classesByName.find( std::string( base ) );
+            if( bases == ids.classesByName.end() )
+            {
+                continue;
+            }
+            plausibleClasses( std::span<const NodeId>( bases->second.data(), bases->second.size() ), fileOf( c, ids ), ids );
+            for( NodeId b : plausible )
+            {
+                if( markSeen( b ) ) { classNext.push_back( b ); }
+            }
+        }
+        return declares;
+    }
+
+    // step (3): the callee's definitions in the REAL subclasses of the receiver class, transitively — every runtime target of a
+    // virtual call on a type whose ancestry declares the callee but defines it nowhere. Memoised per (class, callee).
+    bool subclassDefinitions( const Reference& r, NodeId receiverClass, const ClassIdentity& ids ) const
+    {
+        std::string memoKey = std::to_string( receiverClass ).append( "#" ).append( r.calleeName );
+        if( const auto hit = subclassMemo.find( memoKey ); hit != subclassMemo.end() )
+        {
+            hits = hit->second;
+            return !hits.empty();
+        }
+        hits.clear();
+        nextSeenGeneration( ids );
+        classWalk.assign( 1, receiverClass );
+        for( int depth = 0; depth < 32 && !classWalk.empty(); ++depth )
+        {
+            classNext.clear();
+            for( NodeId c : classWalk )
+            {
+                visitSubclassesOf( r, c, ids );
+            }
+            classWalk.swap( classNext );
+        }
+        std::sort( hits.begin(), hits.end() );   // each definition appended once (markSeen)
+        subclassMemo.emplace( std::move( memoKey ), hits );
+        return !hits.empty();
+    }
+
+    // the real subclasses of `c` whose base clause, read from their own file, plausibly means `c`: their definitions of the
+    // callee appended, each queued once
+    void visitSubclassesOf( const Reference& r, NodeId c, const ClassIdentity& ids ) const
+    {
+        const std::string& cname = ( *ids.symbols )[ c ].name;
+        const auto         down  = ids.realDown.find( cname );
+        const auto         named = ids.classesByName.find( cname );
+        if( down == ids.realDown.end() || named == ids.classesByName.end() )
+        {
+            return;
+        }
+        for( NodeId d : down->second )
+        {
+            plausibleClasses( std::span<const NodeId>( named->second.data(), named->second.size() ), fileOf( d, ids ), ids );
+            if( std::ranges::find( plausible, c ) == plausible.end() || !markSeen( d ) )
+            {
+                continue;   // d derives from another class of that name, or was reached already
+            }
+            keyScope.assign( ( *ids.symbols )[ d ].name ).append( "::" ).append( r.calleeName );
+            appendOwnedDefinitions( d, ids );
+            classNext.push_back( d );
+        }
+    }
+};
+
 // One-hop receiver narrowing over the canonical scope::name → definition-ids map (built once by buildGraph).
 // Holds only const references to maps buildGraph owns — no state, no allocation, no copy of the symbol table.
 struct Narrower
@@ -2577,7 +6007,10 @@ struct Narrower
     // canonByName), or the empty string as a TOMBSTONE marking an AMBIGUOUS var (bound to ≥2 distinct types in
     // one scope) — looked up but never narrowed. buildGraph builds it from IngestResult::bindings. Empty when
     // there are no bindings, so Rule 2 simply never fires (degrades to the unchanged ladder).
-    const HashMap<std::string, std::string>&             varType;
+    const HashMap<std::string, FlatRecvType>&            varType;
+    // Rule 2's LEXICAL table for names with a ParamType declaration (see ScopedRecvDecl above). A name found here is
+    // answered here ONLY — varType is not consulted.
+    const ScopedRecvDecls&                               scopedDecls;
     // P2-D Rule 3 include table: caller fileId → the sorted, deduped set of fileIds it #includes / imports
     // (resolved file→file by basename, exactly like graph.h::resolveIncludeAdj; the caller's own file is NEVER
     // in its own set). buildGraph builds it once from IngestResult::includes. Empty when the repo has no
@@ -2587,6 +6020,9 @@ struct Narrower
     // per-symbol fileId (view into ing.symbols' fileIds), so Rule 3 can group candidate defs by their file
     // without a reference to the whole IngestResult. buildGraph owns the backing vector.
     const std::vector<std::uint32_t>&                    symFileId;
+    // "Class::m" → the classes a class-scope `using Base::m;` re-exports `m` from (buildUsingReexports above). Read by
+    // ownMethodSet only; empty on a corpus without one, where every probe is the plain canonByName hit it always was.
+    const HashMap<std::string, std::vector<std::string>>& usingReexports;
 
     // reused key-assembly buffers — one `Narrower` drives the whole (single-threaded) resolve loop, so the
     // `scope::name` / `<fromSymbol>#var` lookup keys are built IN PLACE (clear()+append(), capacity kept) into
@@ -2596,12 +6032,17 @@ struct Narrower
     mutable std::string keyBind;    // "<fromSymbolId>#var" for the varType binding lookup (Rule 2 + L3)
     mutable std::vector<std::string_view> fieldWalk;   // Rule 2b reused base-walk frontier (views into chaUp's stored strings)
     mutable rw::SmallVec<NodeId, 2>       walkUnion;   // Phase 5: the union of a multi-base hit level (super() only) — an honest split
+    IdentityNarrower identity;   // Rule 2 through class identity: its scratch, memo and claim flag live there
+    mutable rw::SmallVec<NodeId, 2>       reexportUnion;   // what a type's `using Base::m;` declarations reach when it defines no `m` itself
 
     explicit Narrower( const HashMap<std::string, rw::SmallVec<NodeId, 2>>& canon,
-                       const HashMap<std::string, std::string>&             vt,
+                       const HashMap<std::string, FlatRecvType>&            vt,
+                       const ScopedRecvDecls&                               scoped,
                        const std::vector<std::vector<NodeId>>&              incl,
-                       const std::vector<std::uint32_t>&                    symFile ) noexcept
-        : canonByName( canon ), varType( vt ), fileIncludes( incl ), symFileId( symFile ) {}
+                       const std::vector<std::uint32_t>&                    symFile,
+                       const HashMap<std::string, std::vector<std::string>>& reexports ) noexcept
+        : canonByName( canon ), varType( vt ), scopedDecls( scoped ), fileIncludes( incl ), symFileId( symFile ), usingReexports( reexports ),
+          identity( canon, incl, symFile ) {}
 
     // append base-10 `n` to `dst` without an intermediate std::to_string allocation (matches to_string bytes).
     static void appendUint( std::string& dst, std::uint32_t n )
@@ -2667,12 +6108,14 @@ struct Narrower
     //
     // Airtight "no wrong narrow" (the contract): it narrows ONLY when ALL hold — (1) the call has a named
     // receiver variable; (2) that var has EXACTLY ONE type binding in this scope (an ambiguous var is tombstoned
-    // by buildGraph → empty type → no narrow); (3) the bound type defines `m` (canonByName, DEFS only). So the
+    // by buildGraph → empty type → no narrow) — or, for a name with a PARAMETER-typed declaration, the declaration
+    // in scope AT THE SITE has a written type (recvVarTypeName); (3) the bound type defines `m` (canonByName, DEFS only). So the
     // returned ids are always real `Foo::m` definitions the bare ladder could also reach — Rule 2 just picks the
     // type-correct one earlier. Any uncertainty (no binding, conflicting bindings, type has no such method) →
     // honest ambiguity via §2a, never a guess. Deterministic: canonByName insertion order = symbol-id order.
-    const rw::SmallVec<NodeId, 2>* rule2RecvVarType( const Reference& r ) const
+    const rw::SmallVec<NodeId, 2>* rule2RecvVarType( const Reference& r, const ClassIdentity& ids, const ChaUpNames& chaUp ) const
     {
+        identity.forgetClaim();
         if( r.recv != RecvKind::NamedVar || r.recvVar.empty() )
         {
             return nullptr; // not a named-receiver call
@@ -2686,29 +6129,49 @@ struct Narrower
             return nullptr; // file-scope call: no per-def binding scope
         }
 
-        // the var's resolved type in THIS scope. Empty value = tombstone (ambiguous var) → no narrow. Key built
-        // in the reused buffer (identical bytes to `std::to_string( r.fromSymbol ) + "#" + r.recvVar`).
-        keyBind.clear();
-        appendUint( keyBind, r.fromSymbol );
-        keyBind.push_back( '#' );
-        keyBind.append( r.recvVar );
-        const auto vit = varType.find( keyBind );
-        if( vit == varType.end() || vit->second.empty() )
+        // the var's type at THIS site. Empty = unbound, tombstoned, or an untyped declaration in scope → no narrow.
+        const RecvVarType bound = recvVarType( r );
+        if( bound.name.empty() )
         {
             return nullptr;
         }
+        const auto [ qualifierKnown, qualifier ] = writtenQualifier( bound, ids );
 
-        // resolve `m` against the bound type's own methods (defs only). Miss ⇒ degrade to §2a. Reused buffer,
-        // identical bytes to `vit->second + "::" + r.calleeName`.
+        // resolve `m` against the bound type's own methods (defs only). Reused buffer, identical bytes to
+        // `bound.name + "::" + r.calleeName`.
         keyScope.clear();
-        keyScope.append( vit->second ).append( "::" ).append( r.calleeName );
+        keyScope.append( bound.name ).append( "::" ).append( r.calleeName );
         const auto it = canonByName.find( keyScope );
-        if( it == canonByName.end() || it->second.size() == 0 )
+        const rw::SmallVec<NodeId, 2>* const own = ( it == canonByName.end() || it->second.size() == 0 ) ? nullptr : &it->second;
+        if( ids.classesByName.empty() || !extent::inSet( extent::kHeadRuleLangs, r.lang ) || !qualifierKnown )
         {
-            return nullptr;
+            return own;   // no class identity to consult: the final-segment answer — overloads split 1/k within the type
         }
-        return &it->second;   // real `Foo::m` definition(s) — overloads stay split 1/k, but only within the type
+        return identity.narrow( r, WrittenType{ bound.name, qualifier }, own, ids, chaUp );
     }
+
+    // true iff THIS reference's Rule 2 answer was a class-identity CLAIM (an inherited body or an interface dispatch split)
+    // that survived the caller's language/root filter — a type fact, which the ladder keeps whole instead of trimming it by
+    // file locality. forgetClaim: the caller's filter emptied Rule 2's answer; false, to close `narrowed = narrowTo( … ) || …`.
+    bool identityClaimFor( const Reference& r ) const noexcept
+    {
+        return identity.claimFor( r );
+    }
+
+    bool forgetClaim() const noexcept
+    {
+        return identity.forgetClaim();
+    }
+
+    // Rule 2b's member evidence, bundled so its signatures read as its conditions: `types` = "<Class>#<field>" → the declared type
+    // (graph.h buildFieldNarrowTables, from the HAS-A compose captures), `declared` = every C/C++ member "<Owner>#<field>"
+    // (memberFieldNames), typed or not, and `chaUp` = class name → its direct base names, the graph both walks read. No copy.
+    struct FieldRecvTables
+    {
+        const HashMap<std::string, FlatRecvType>&             types;
+        const HashMap<std::string, char>&                     declared;
+        const HashMap<std::string, std::vector<std::string>>& chaUp;
+    };
 
     // Rule 2b — receiver-FIELD type narrow (W1-P1-12). For a member call `f.m()` / `f->m()` (recv==NamedVar,
     // recvVar="f") inside a METHOD whose enclosing class declares a FIELD named `f` with a known type
@@ -2720,10 +6183,12 @@ struct Narrower
     //   (1) named-receiver call, no explicit qualifier, from a known def in a known class scope, C-family
     //       (the field table is built from C++ field captures; Python/TS field receivers are chained
     //       accesses ingest classifies RecvKind::None, so they never even reach this rule — disclosed limit);
-    //   (2) NO local binding of ANY kind exists for (fromSymbol, recvVar) — a parameter or declared local
-    //       SHADOWS a same-named field in real C++ lookup, so any local evidence vetoes the narrow
-    //       (`localNames`, built from every binding kind incl. the r9 VarDecl shadow records);
-    //   (3) the enclosing class declares that field with EXACTLY ONE type corpus-wide — same-NAMED classes
+    //   (2) NO local DECLARATION exists for (fromSymbol, recvVar) — a parameter or declared local SHADOWS a
+    //       same-named field in real C++ lookup, so declaration evidence vetoes the narrow; an assignment
+    //       names the field itself and does not (`localNames`' kLocalNameDeclared bit, localNameEvidence);
+    //   (3) the enclosing class declares that field with EXACTLY ONE type corpus-wide — or, when the class declares
+    //       no member of that name, the ONE base declaring it at the shallowest level of a bounded breadth-first
+    //       walk over chaUp does (fieldEntryAt, arm w). Same-NAMED classes
     //       collapse to one scope string here (namespaces are dropped from Symbol::scope), so a same-named
     //       field bound to two DIFFERENT types is TOMBSTONED at build ("" value) and never narrows;
     //   (4) the field's type — or exactly ONE base name at the shallowest hit level of a bounded, breadth-
@@ -2733,10 +6198,8 @@ struct Narrower
     //       type-correct one earlier; any uncertainty degrades to §2a and the honest amb= split.
     // Deterministic: chaUp lists are sorted+deduped, the frontier is expanded in stored order with a fixed
     // visit cap, and canonByName insertion order = symbol-id order.
-    const rw::SmallVec<NodeId, 2>* rule2bFieldRecvType( const Reference& r, const std::string& callerScope,
-                                                        const HashMap<std::string, std::string>&              fieldTypes,
-                                                        const HashMap<std::string, char>&                     localNames,
-                                                        const HashMap<std::string, std::vector<std::string>>& chaUp ) const
+    const rw::SmallVec<NodeId, 2>* rule2bFieldRecvType( const Reference& r, const std::string& callerScope, const FieldRecvTables& fields,
+                                                        const HashMap<std::string, char>& localNames ) const
     {
         if( r.recv != RecvKind::NamedVar || r.recvVar.empty() || !r.qualifier.empty() || r.fromSymbol == kNoNode )
         {
@@ -2746,48 +6209,42 @@ struct Narrower
         {
             return nullptr; // (1) the field-type table is C++-evidence only — other languages stay on their unchanged ladder
         }
-        if( callerScope.empty() || fieldTypes.empty() )
+        if( callerScope.empty() || fields.types.empty() )
         {
             return nullptr; // free function (no enclosing class), or a field-capture-free corpus
         }
 
-        // (2) local-shadow veto: ANY binding evidence for (fromSymbol, recvVar) means the name is a LOCAL.
+        // (2) local-shadow veto: a DECLARATION of (fromSymbol, recvVar) makes the name a LOCAL; assigning it does not.
         keyBind.clear();
         appendUint( keyBind, r.fromSymbol );
         keyBind.push_back( '#' );
         keyBind.append( r.recvVar );
-        if( localNames.find( keyBind ) != localNames.end() )
+        if( const auto lit = localNames.find( keyBind ); lit != localNames.end() && ( lit->second & kLocalNameDeclared ) != 0 )
         {
             return nullptr;
         }
 
-        // (3) the enclosing class's field entry — keyed by the scope's FINAL segment (Symbol::scope is the
-        // bare class name for methods; a nested scope's last segment is the innermost class), "" = tombstone.
-        std::string_view scopeFinal( callerScope );
-        if( const std::size_t cut = scopeFinal.rfind( "::" ); cut != std::string_view::npos )
-        {
-            scopeFinal.remove_prefix( cut + 2 );
-        }
-        keyBind.clear();
-        keyBind.append( scopeFinal );
-        keyBind.push_back( '#' );
-        keyBind.append( r.recvVar );
-        const auto fit = fieldTypes.find( keyBind );
-        if( fit == fieldTypes.end() || fit->second.empty() )
+        // (3) the field entry of the enclosing class or the one base declaring it (fieldEntryAt), "" = tombstone.
+        const FlatRecvType* field = fieldEntryAt( r, callerScope, fields );
+        if( field == nullptr || field->type.empty() )
         {
             return nullptr;
+        }
+        if( field->arrowOnly && !r.viaArrow )
+        {
+            return nullptr; // a std smart pointer's pointee: `.` names the smart pointer's own member (arm p)
         }
 
         // (4) the declared type's own method set, then its bases — shared with Rule 2c below.
-        return methodOnTypeOrBases( fit->second, r, chaUp );
+        return methodOnTypeOrBases( field->type, r, fields.chaUp );
     }
 
-    // The type-side probe Rules 2b and 2c share: `type::callee` in the type's OWN method set first (canonByName,
-    // DEFS only), then a bounded breadth-first DIRECT-base walk (frontier levels over chaUp). The SHALLOWEST
-    // level with a hit decides: exactly one hitting base name → those definitions; two or more at one level →
-    // nullptr (honest ambiguity, the caller's ladder stays unchanged). Deterministic: chaUp lists are
-    // sorted+deduped, the frontier is expanded in stored order with a fixed visit cap, and canonByName
-    // insertion order = symbol-id order.
+    // The type-side probe Rules 2b and 2c share: `type::callee` in the type's OWN method set first (ownMethodSet: its
+    // definitions plus what its using-declarations re-export), then a bounded breadth-first DIRECT-base walk (frontier
+    // levels over chaUp). The SHALLOWEST level with a hit decides: exactly one hitting base name → those
+    // definitions; two or more at one level → nullptr (honest ambiguity, the caller's ladder stays unchanged).
+    // Deterministic: chaUp lists are sorted+deduped, the frontier is expanded in stored order with a fixed visit cap,
+    // and canonByName insertion order = symbol-id order.
     // One level of the base walk: probe `name::callee` for every frontier name from `lvlEnd` on. Returns the
     // single hitting definition list and whether a SECOND base hit at this level (`multi`); every hit's
     // definitions are also appended to `walkUnion`, which the caller returns when it asked for the union.
@@ -2815,53 +6272,119 @@ struct Narrower
         return { found, multi };
     }
 
-    // `skipSelf` (Phase 5): start at the BASES — the type's own method set is not probed. The `super()`
-    // receiver needs exactly that: `super().m()` inside class C names the first `m` in C's MRO AFTER C.
-    // `unionOnMulti` (Phase 5): when two or more bases at the shallowest hit level define the callee, return the
-    // UNION of their definitions instead of refusing — the `super()` walk needs it: a multi-base tie is an in-repo
-    // ambiguity (Python's C3 order is not modelled), NOT a sign the MRO left the tree, and the caller's veto
-    // must not fire on it. The union reaches the ladder as a narrowed multi-candidate set → an honest split.
-    const rw::SmallVec<NodeId, 2>* methodOnTypeOrBases( std::string_view typeName, const Reference& r,
-                                                         const HashMap<std::string, std::vector<std::string>>& chaUp,
-                                                         bool skipSelf = false, bool unionOnMulti = false ) const
+    // TRUE when `base` is in `typeName`'s base closure over chaUp: a direct base, a base's base, and so on. The walk is
+    // expandWalkLevel's, so a closure the name cap truncates answers false — the caller treats that as "not a base".
+    bool inBaseClosure( std::string_view typeName, std::string_view base, const HashMap<std::string, std::vector<std::string>>& chaUp ) const
     {
-        if( !skipSelf )
-        {
-            keyScope.clear();
-            keyScope.append( typeName ).append( "::" ).append( r.calleeName );
-            if( const auto it = canonByName.find( keyScope ); it != canonByName.end() && it->second.size() != 0 )
-            {
-                return &it->second;
-            }
-        }
-
-        constexpr std::size_t kFieldWalkCap = 16;   // total visited names — bounds depth and width together
         fieldWalk.clear();
         fieldWalk.push_back( typeName );
         std::size_t lvlBegin = 0;
         while( lvlBegin < fieldWalk.size() )
         {
             const std::size_t lvlEnd = fieldWalk.size();
-            // expand this level's bases into the next level (dedup against every visited name — cycles too)
-            for( std::size_t i = lvlBegin; i < lvlEnd; ++i )
+            expandWalkLevel( lvlBegin, lvlEnd, chaUp );
+            if( std::find( fieldWalk.begin() + std::ptrdiff_t( lvlEnd ), fieldWalk.end(), base ) != fieldWalk.end() )
             {
-                const auto uit = chaUp.find( std::string( fieldWalk[ i ] ) );
-                if( uit == chaUp.end() )
-                {
-                    continue;
-                }
-                for( const std::string& base : uit->second )
-                {
-                    if( fieldWalk.size() >= kFieldWalkCap )
-                    {
-                        break;
-                    }
-                    if( std::find( fieldWalk.begin(), fieldWalk.end(), std::string_view( base ) ) == fieldWalk.end() )
-                    {
-                        fieldWalk.push_back( base );
-                    }
-                }
+                return true;
             }
+            lvlBegin = lvlEnd;
+        }
+        return false;
+    }
+
+    // `name::callee`'s definitions (canonByName, DEFS only), or nullptr when the scope defines none.
+    const rw::SmallVec<NodeId, 2>* definitionsIn( std::string_view scope, std::string_view callee ) const
+    {
+        keyScope.clear();
+        keyScope.append( scope ).append( "::" ).append( callee );
+        const auto it = canonByName.find( keyScope );
+        return ( it != canonByName.end() && it->second.size() != 0 ) ? &it->second : nullptr;
+    }
+
+    // The type's OWN method set for the callee: its own definitions — or, when it defines none, the base members a
+    // class-scope `using Base::callee;` names (usingReexports). C++ lookup stops at the first class that declares the
+    // name, and a using-declaration declares it in the class itself, so `using B1::m;` in `D : B1, B2` answers B1::m
+    // where the base walk refuses the two-base tie, and reaches a base the walk cannot name. A re-exported base is
+    // probed by name, its own definitions else its base walk, ONE level deep: that base's own using-declarations are
+    // not followed. Several using-declarations for one name answer the union of what they reach (an honest split); one
+    // naming nothing the index reaches (a base outside the tree, an alias the resolver cannot follow) adds nothing, and
+    // the unchanged walk runs. So does one naming a class OUTSIDE the class's base closure (inBaseClosure): C++ requires a
+    // base there, so `using NotABase::m;` is mid-refactor or partial input, and trusting it pinned NotABase::m alone over
+    // the real bases' tie (fieldnarrowcheck (u8); a grand-base is honoured, (u9)).
+    // STATED FLOOR, decided by measurement: a class that DEFINES the callee answers its own definitions alone, even
+    // when it also re-exports base overloads — which C++ puts in the same overload set. The union was built and graded
+    // net-WORSE (2026-09-17, --pin-census rocksdb 0e2801ac3 + llvm-project 4d5358b1d, the 17 sites it moved, blinded
+    // against source: 5 better, 4 same, 8 worse). With no parameter types the ladder cannot drop a re-exported base
+    // overload the class OVERRIDES (rocksdb WriteBatch::Put's WriteBatchBase overloads) or one the arguments rule out
+    // by count (the arity filter drops only too-many-arguments), and a split whose base half shares the caller's file
+    // is cut to that half by the ladder's same-file tier. A call that selects the re-exported overload stays on the
+    // class's own — fieldnarrowcheck (u1) pins that floor.
+    // Returns canonByName storage for the class's own definitions, else `reexportUnion` (sorted by id, deduped).
+    const rw::SmallVec<NodeId, 2>* ownMethodSet( std::string_view typeName, const Reference& r,
+                                                  const HashMap<std::string, std::vector<std::string>>& chaUp ) const
+    {
+        const rw::SmallVec<NodeId, 2>* own = definitionsIn( typeName, r.calleeName );
+        if( own != nullptr || usingReexports.empty() || ( r.lang != Lang::Cpp && r.lang != Lang::ObjC ) )
+        {
+            return own;   // the facts are C-family: a same-named Python/Ruby class keeps its own walk
+        }
+        const auto rit = usingReexports.find( keyScope );   // definitionsIn left `typeName::callee` in keyScope
+        if( rit == usingReexports.end() )
+        {
+            return nullptr;
+        }
+        reexportUnion.clear();
+        for( const std::string& base : rit->second )
+        {
+            if( !inBaseClosure( typeName, base, chaUp ) )
+            {
+                continue;   // not a base of the class: ill-formed or partial input, and the walk below decides as it always did
+            }
+            const rw::SmallVec<NodeId, 2>* baseDefs = definitionsIn( base, r.calleeName );
+            if( baseDefs == nullptr )
+            {
+                baseDefs = methodOnTypeOrBases( base, r, chaUp, /*skipSelf=*/ true );   // the walk alone: canonByName storage or nullptr, never a buffer
+            }
+            if( baseDefs != nullptr )
+            {
+                reexportUnion.insert( reexportUnion.end(), baseDefs->begin(), baseDefs->end() );
+            }
+        }
+        std::sort( reexportUnion.begin(), reexportUnion.end() );
+        reexportUnion.erase( std::unique( reexportUnion.begin(), reexportUnion.end() ), reexportUnion.end() );
+        return reexportUnion.empty() ? nullptr : &reexportUnion;
+    }
+
+    // `skipSelf` (Phase 5): start at the BASES — the type's own method set is not probed. The `super()`
+    // receiver needs exactly that: `super().m()` inside class C names the first `m` in C's MRO AFTER C.
+    // `unionOnMulti` (Phase 5): when two or more bases at the shallowest hit level define the callee, return the
+    // UNION of their definitions instead of refusing — the `super()` walk needs it: a multi-base tie is an in-repo
+    // ambiguity (Python's C3 order is not modelled), NOT a sign the MRO left the tree, and the caller's veto
+    // must not fire on it. The union reaches the ladder as a narrowed multi-candidate set → an honest split.
+    // A class that defines no `m` answers what its `using Base::m;` names (ownMethodSet), so `using B1::m;` in
+    // `D : B1, B2` settles the two-base tie a walk would refuse. Only the type itself is read that way: a base the
+    // walk reaches is probed for its own definitions, and that base's using-declarations are not read.
+    const rw::SmallVec<NodeId, 2>* methodOnTypeOrBases( std::string_view typeName, const Reference& r,
+                                                         const HashMap<std::string, std::vector<std::string>>& chaUp,
+                                                         bool skipSelf = false, bool unionOnMulti = false ) const
+    {
+        if( !skipSelf )
+        {
+            if( const rw::SmallVec<NodeId, 2>* own = ownMethodSet( typeName, r, chaUp ) )
+            {
+                return own;
+            }
+        }
+
+        fieldWalk.clear();
+        fieldWalk.push_back( typeName );
+        std::size_t lvlBegin = 0;
+        while( lvlBegin < fieldWalk.size() )
+        {
+            const std::size_t lvlEnd = fieldWalk.size();
+            // expand this level's bases into the next level (dedup against every visited name — cycles too). A walk the cap
+            // stopped still probes the names it visited: this probe's policy, unlike fieldEntryAt's.
+            expandWalkLevel( lvlBegin, lvlEnd, chaUp );
             // probe the NEW level's names; the shallowest level with any hit decides
             const auto [ found, multi ] = probeWalkLevel( lvlEnd, r.calleeName );
             if( multi )
@@ -2924,26 +6447,110 @@ struct Narrower
         return methodOnTypeOrBases( callerScope, r, chaUp, /*skipSelf=*/ isSuper, /*unionOnMulti=*/ isSuper );
     }
 
+    static constexpr std::size_t kFieldWalkCap = 16;   // total visited names — bounds depth and width together (methodOnTypeOrBases, memberFieldHides and fieldEntryAt)
+
+    // Rule 2c's member-field veto set: "<Owner>#<field>" for every C/C++ member in the field side table (IngestResult::fields). That
+    // table, not Rule 2b's fieldTypeByClass, because it holds EVERY declarator shape: the S5-E compose capture records no type for
+    // `std::unique_ptr<Widget> Reader;`, the llvm shape this veto exists for. Owner is the scope's final segment — the keying of
+    // Symbol::scope and chaUp — so same-named classes pool their members: a collision can only add a refusal, never a narrow. Python
+    // attributes stay out: a Python method reaches one only through `self.`, so a bare `Interval.validate()` always names the class.
+    static HashMap<std::string, char> memberFieldNames( const IngestResult& ing )
+    {
+        HashMap<std::string, char> names;
+        names.reserve( ing.fields.size() );
+        std::string key;
+        for( const Symbol& f : ing.fields )
+        {
+            if( ( f.lang != Lang::Cpp && f.lang != Lang::C ) || f.scope.empty() || f.name.empty() )
+            {
+                continue;
+            }
+            std::string_view owner( f.scope );
+            if( const std::size_t cut = owner.rfind( "::" ); cut != std::string_view::npos )
+            {
+                owner.remove_prefix( cut + 2 );
+            }
+            key.assign( owner ).push_back( '#' );
+            key.append( f.name );
+            names.try_emplace( key, '\0' );
+        }
+        return names;
+    }
+
+    // True ⇒ `name` is a member field of `callerScope`'s class or of a class up its chaUp bases, breadth-first. C++ lookup inside a
+    // member function finds a member of the class or a base before any namespace-scope class, so such a token is the member and
+    // never the class it is spelled like. A walk stopped by the cap with a base unvisited answers true as well: a narrow that cannot
+    // prove the name unshadowed is withheld, never guessed. Reuses fieldWalk / keyScope / keyBind — it returns before the caller's
+    // methodOnTypeOrBases clears them.
+    bool memberFieldHides( std::string_view callerScope, std::string_view name, const HashMap<std::string, char>& memberFields,
+                           const HashMap<std::string, std::vector<std::string>>& chaUp ) const
+    {
+        if( const std::size_t cut = callerScope.rfind( "::" ); cut != std::string_view::npos )
+        {
+            callerScope.remove_prefix( cut + 2 );
+        }
+        fieldWalk.clear();
+        fieldWalk.push_back( callerScope );
+        for( std::size_t walkIndex = 0; walkIndex < fieldWalk.size(); ++walkIndex )
+        {
+            keyBind.assign( fieldWalk[ walkIndex ] ).push_back( '#' );
+            keyBind.append( name );
+            if( memberFields.find( keyBind ) != memberFields.end() )
+            {
+                return true;
+            }
+            keyScope.assign( fieldWalk[ walkIndex ] );
+            const auto uit = chaUp.find( keyScope );
+            if( uit == chaUp.end() )
+            {
+                continue;
+            }
+            for( const std::string& base : uit->second )
+            {
+                if( std::find( fieldWalk.begin(), fieldWalk.end(), std::string_view( base ) ) != fieldWalk.end() )
+                {
+                    continue;
+                }
+                if( fieldWalk.size() >= kFieldWalkCap )
+                {
+                    return true;   // an unvisited base could declare the member — refuse rather than guess
+                }
+                fieldWalk.push_back( base );
+            }
+        }
+        return false;
+    }
+
     // Rule 2c — CLASS-NAME receiver (docs/EVALS.md "Phase 4b"). `Cls.m(…)`, a static / classmethod call THROUGH
     // THE CLASS NAME, reaches the ladder as a named-receiver call with no local binding, so Rule 2 cannot fire
     // and the S6-C prior then hands the win to the CALLER's own class by the scope segment (astropy:
     // `_Interval.validate(v)` pinned to `ModelBoundingBox::validate`). The receiver token IS the type: resolve
     // the callee against it, then its direct bases (`IERS_B.open()` → `IERS::open`). Narrows ONLY when ALL hold:
     // (1) bare named-receiver call from a known def; (2) NO local binding of any kind for (fromSymbol, recvVar)
-    // — a parameter/local named like the class shadows it (Rule 2b's veto set); (3) recvVar names an in-repo
-    // class-like definition (`classNames`: SymKind Class/Struct/Interface); (4) the class — or exactly one base
-    // at the shallowest hit level — DEFINES the callee. Two same-named classes both defining it keep BOTH
-    // candidates (an honest split). Any miss ⇒ nullptr. C++'s `Cls::m()` never arrives here (a qualifier).
-    const rw::SmallVec<NodeId, 2>* rule2cClassNameRecv( const Reference& r,
-                                                        const HashMap<std::string, char>&                     classNames,
-                                                        const HashMap<std::string, char>&                     localNames,
+    // — a parameter/local named like the class shadows it, and an assignment to the name proves a variable just as
+    // well (every record in Rule 2b's veto set, not only the declarations Rule 2b reads); (2m) for a C++/ObjC caller, NO
+    // member field of that name in the caller's class or its bases (memberFieldHides: `Reader->read()` beside
+    // `std::unique_ptr<SampleProfileReader> Reader;` is the member — test/clsrecvcheck.sh arms H-N); (3) recvVar
+    // names an in-repo class-like definition (`classNames`: SymKind Class/Struct/Interface); (4) the class — or
+    // exactly one base at the shallowest hit level — DEFINES the callee. Two same-named classes both defining it
+    // keep BOTH candidates (an honest split). Any miss ⇒ nullptr. C++'s `Cls::m()` never arrives here (a qualifier).
+    // Rule 2c's name evidence, bundled so the rule's signature reads as its conditions: every class-like definition NAME (3), every
+    // local binding "<fromSymbol>#var" (2), every C/C++ member "<Owner>#field" (2m, memberFieldNames). Built per call from graph.h's
+    // tables — three references, no copy.
+    struct ClassNameRecvNames
+    {
+        const HashMap<std::string, char>& classNames;
+        const HashMap<std::string, char>& localNames;
+        const HashMap<std::string, char>& memberFields;
+    };
+    const rw::SmallVec<NodeId, 2>* rule2cClassNameRecv( const Reference& r, const std::string& callerScope, const ClassNameRecvNames& names,
                                                         const HashMap<std::string, std::vector<std::string>>& chaUp ) const
     {
         if( r.recv != RecvKind::NamedVar || r.recvVar.empty() || !r.qualifier.empty() || r.fromSymbol == kNoNode )
         {
             return nullptr; // (1) not a bare named-receiver call from a known def
         }
-        if( classNames.find( r.recvVar ) == classNames.end() )
+        if( names.classNames.find( r.recvVar ) == names.classNames.end() )
         {
             return nullptr; // (3) the receiver token names no class-like definition anywhere in the corpus
         }
@@ -2951,9 +6558,13 @@ struct Narrower
         appendUint( keyBind, r.fromSymbol );
         keyBind.push_back( '#' );
         keyBind.append( r.recvVar );
-        if( localNames.find( keyBind ) != localNames.end() )
+        if( names.localNames.find( keyBind ) != names.localNames.end() )
         {
             return nullptr; // (2) a local / parameter of that name shadows the class
+        }
+        if( ( r.lang == Lang::Cpp || r.lang == Lang::ObjC ) && !callerScope.empty() && memberFieldHides( callerScope, r.recvVar, names.memberFields, chaUp ) )
+        {
+            return nullptr; // (2m) a member field of the caller's class or a base hides the class
         }
         return methodOnTypeOrBases( r.recvVar, r, chaUp );   // (4)
     }
@@ -3023,18 +6634,205 @@ struct Narrower
         }
         if( r.recv == RecvKind::NamedVar && !r.recvVar.empty() && r.fromSymbol != kNoNode )
         {
-            keyBind.clear();
-            appendUint( keyBind, r.fromSymbol );
-            keyBind.push_back( '#' );
-            keyBind.append( r.recvVar );
-            const auto vit = varType.find( keyBind );
-            if( vit == varType.end() || vit->second.empty() )
-            {
-                return {}; // unbound or tombstoned (ambiguous) → no type
-            }
-            return std::string_view( vit->second );
+            return recvVarTypeName( r );   // unbound, tombstoned or untyped-in-scope → "" → no CHA-lite
         }
         return {};
+    }
+
+    // Rule 2's receiver-VARIABLE type at one call site — the ONE lookup Rule 2 and CHA-lite share, so they can never
+    // disagree about a receiver. A name with a ParamType declaration in this definition is answered LEXICALLY: the
+    // innermost declaration whose scope covers the site decides, and only its own written type counts — a
+    // parameter shadowed by an `auto` loop variable, a range-for variable read after its loop, and two declarations
+    // with one scope all answer "" — and so does a type written in namespace `std` (`const std::map<K, V>&`, see
+    // namesStdType). Every other name reads the flat varType table, where buildGraph tombstones a `std::` type the
+    // same way ("" = tombstone).
+    // KNOWN FLOOR, the span model's own: a range-for variable's span is the whole loop statement, so a same-named
+    // outer variable used inside the loop's own range expression reads as the loop variable.
+    std::string_view recvVarTypeName( const Reference& r ) const
+    {
+        return recvVarType( r ).name;
+    }
+
+    // prov="final-segment" for a FIELD (test/fieldnarrowcheck.sh arm r): whether the field Rule 2b narrowed on was declared
+    // QUALIFIED. `store::Text body_; body_.size()` matched `Text` alone, exactly the guess finalSegmentTypeAt discloses for a
+    // parameter or a local, so the edge must not read as uniquely resolved. Asked only for a site Rule 2b decided.
+    bool fieldFinalSegmentAt( const Reference& r, const std::string& callerScope, const FieldRecvTables& fields ) const
+    {
+        const FlatRecvType* field = fieldEntryAt( r, callerScope, fields );
+        return field != nullptr && field->writtenQualified && !field->type.empty();
+    }
+
+    // Rule 2b's "Class#field" entry for a named receiver, or nullptr: keyed by the caller scope's FINAL segment (Symbol::scope
+    // is the bare class name for methods; a nested scope's last segment is the innermost class). Shared by the narrow and its
+    // prov="final-segment" question, so the two cannot read different entries.
+    // A class that declares no member of that name reads it from its bases (test/fieldnarrowcheck.sh arm w): C++ lookup of a bare
+    // name inside a member function finds the class's own member first, then the bases'. The walk is breadth-first over chaUp
+    // (final-segment names, like methodOnTypeOrBases), and the SHALLOWEST level with a base DECLARING the member decides: exactly
+    // one such base, whose entry is returned. A member counts as declared when it is typed OR only in the field side table, so a
+    // member whose type was not captured — in the class itself or at a level before the hit — hides the bases behind it and
+    // answers nullptr, never a deeper base's type. Two declaring bases at one level (an ambiguous lookup) and a walk the cap
+    // stopped with a base unvisited answer nullptr too: neither proves which member the name reaches.
+    const FlatRecvType* fieldEntryAt( const Reference& r, const std::string& callerScope, const FieldRecvTables& fields ) const
+    {
+        std::string_view className( callerScope );
+        if( const std::size_t cut = className.rfind( "::" ); cut != std::string_view::npos )
+        {
+            className.remove_prefix( cut + 2 );
+        }
+        if( const auto [ own, ownDeclared ] = declaredFieldAt( className, r.recvVar, fields ); ownDeclared )
+        {
+            return own;   // the class's own member hides every base's — nullptr when its type was not captured
+        }
+        fieldWalk.clear();
+        fieldWalk.push_back( className );
+        for( std::size_t lvlBegin = 0; lvlBegin < fieldWalk.size(); )
+        {
+            const std::size_t lvlEnd = fieldWalk.size();
+            if( !expandWalkLevel( lvlBegin, lvlEnd, fields.chaUp ) )
+            {
+                return nullptr;   // the cap left a base unvisited: this level may be incomplete, and deeper ones are unread
+            }
+            if( const auto [ hit, declaring ] = declaringBasesAt( lvlEnd, r.recvVar, fields ); declaring != 0 )
+            {
+                return declaring == 1 ? hit : nullptr;   // two bases declaring it at one level → an ambiguous lookup
+            }
+            lvlBegin = lvlEnd;
+        }
+        return nullptr;
+    }
+
+    // One level of fieldEntryAt's walk: how many of fieldWalk[ lvlEnd, end ) declare member `name`, and the last one's typed entry.
+    std::pair<const FlatRecvType*, std::size_t> declaringBasesAt( std::size_t lvlEnd, std::string_view name, const FieldRecvTables& fields ) const
+    {
+        const FlatRecvType* hit       = nullptr;
+        std::size_t         declaring = 0;
+        for( std::size_t i = lvlEnd; i < fieldWalk.size(); ++i )
+        {
+            if( const auto [ entry, declared ] = declaredFieldAt( fieldWalk[ i ], name, fields ); declared )
+            {
+                ++declaring;
+                hit = entry;
+            }
+        }
+        return { hit, declaring };
+    }
+
+    // Whether `className` declares a member `name`, and its typed "Class#field" entry when it has one (nullptr when the member's
+    // type was not captured). Reuses keyBind.
+    std::pair<const FlatRecvType*, bool> declaredFieldAt( std::string_view className, std::string_view name, const FieldRecvTables& fields ) const
+    {
+        keyBind.assign( className ).push_back( '#' );
+        keyBind.append( name );
+        if( const auto fit = fields.types.find( keyBind ); fit != fields.types.end() )
+        {
+            return { &fit->second, true };
+        }
+        return { nullptr, fields.declared.find( keyBind ) != fields.declared.end() };
+    }
+
+    // Append the direct bases of fieldWalk[ lvlBegin, lvlEnd ) that the walk has not visited. False when the kFieldWalkCap-name cap
+    // left one out. Reuses keyScope.
+    bool expandWalkLevel( std::size_t lvlBegin, std::size_t lvlEnd, const HashMap<std::string, std::vector<std::string>>& chaUp ) const
+    {
+        for( std::size_t i = lvlBegin; i < lvlEnd; ++i )
+        {
+            keyScope.assign( fieldWalk[ i ] );
+            const auto uit = chaUp.find( keyScope );
+            if( uit == chaUp.end() )
+            {
+                continue;
+            }
+            for( const std::string& base : uit->second )
+            {
+                if( std::find( fieldWalk.begin(), fieldWalk.end(), std::string_view( base ) ) != fieldWalk.end() )
+                {
+                    continue;
+                }
+                if( fieldWalk.size() >= kFieldWalkCap )
+                {
+                    return false;
+                }
+                fieldWalk.push_back( base );
+            }
+        }
+        return true;
+    }
+
+    // prov="final-segment" (test/narrowcheck.sh arm 25): whether a named receiver's type at this site — the one Rule 2 narrows
+    // on and CHA-lite prunes by — was written QUALIFIED. Such a narrow matched the type's final segment alone and never
+    // checked its qualifier against the class's namespace (arm 24's wrong edge is exactly that), so the edge must not read
+    // as uniquely resolved. `this`, a field, a bare call or an explicit `A::m()` answer false.
+    bool finalSegmentTypeAt( const Reference& r ) const
+    {
+        if( r.recv != RecvKind::NamedVar || r.recvVar.empty() || !r.qualifier.empty() || r.fromSymbol == kNoNode )
+        {
+            return false;
+        }
+        const RecvVarType t = recvVarType( r );
+        return t.writtenQualified && !t.name.empty();
+    }
+
+    RecvVarType recvVarType( const Reference& r ) const
+    {
+        // key built in the reused buffer (identical bytes to `std::to_string( r.fromSymbol ) + "#" + r.recvVar`)
+        keyBind.clear();
+        appendUint( keyBind, r.fromSymbol );
+        keyBind.push_back( '#' );
+        keyBind.append( r.recvVar );
+        if( const auto sit = scopedDecls.byName.find( keyBind ); sit != scopedDecls.byName.end() )
+        {
+            const ScopedRecvDecl* const innermost = innermostCoveringDecl( sit->second, r.startByte );
+            if( innermost == nullptr || innermost->typeBinding >= kRecvDeclConflicted )
+            {
+                return RecvVarType{};   // no declaration in scope (a field or global of the name), a tie, or untyped/conflicted
+            }
+            const Binding& declared = ( *scopedDecls.bindings )[ innermost->typeBinding ];
+            return namesStdType( declared.importedName ) ? RecvVarType{} : RecvVarType{ declared.typeName, !declared.importedName.empty(), &declared };
+        }
+        const auto vit = varType.find( keyBind );
+        return ( vit == varType.end() ) ? RecvVarType{} : RecvVarType{ vit->second.type, vit->second.writtenQualified, nullptr };
+    }
+
+    // the qualifier the receiver's declaration wrote — the lexical record's own, else the flat table's kept one (read while
+    // keyBind still holds this site's key) — and false when the flat table's records disagree: identity then stays out
+    std::pair<bool, std::string_view> writtenQualifier( const RecvVarType& bound, const ClassIdentity& ids ) const
+    {
+        if( bound.declared != nullptr )
+        {
+            return { true, bound.declared->importedName };
+        }
+        const auto flat = ids.flatQualifier.find( keyBind );
+        if( flat == ids.flatQualifier.end() )
+        {
+            return { true, std::string_view{} };
+        }
+        return { !flat->second.conflicting, flat->second.text };
+    }
+
+    // the innermost declaration whose span covers `siteByte`, or nullptr when none does or two declarations share
+    // the innermost span (one scope cannot declare a name twice, so a tie is evidence we mis-read — refuse). Spans
+    // inside one definition nest, so the innermost covering span is the one that starts LAST.
+    static const ScopedRecvDecl* innermostCoveringDecl( std::span<const ScopedRecvDecl> decls, std::uint32_t siteByte ) noexcept
+    {
+        const ScopedRecvDecl* best = nullptr;
+        bool                  tied = false;
+        for( const ScopedRecvDecl& d : decls )
+        {
+            if( siteByte < d.spanStart || siteByte >= d.spanEnd )
+            {
+                continue;
+            }
+            if( best == nullptr || d.spanStart > best->spanStart || ( d.spanStart == best->spanStart && d.spanEnd < best->spanEnd ) )
+            {
+                best = &d;
+                tied = false;
+            }
+            else if( d.spanStart == best->spanStart && d.spanEnd == best->spanEnd )
+            {
+                tied = true;
+            }
+        }
+        return tied ? nullptr : best;
     }
 
     // Rule 3 — import/include-based FILE narrow. Given the bare-name candidate defs `cands` for a call inside
@@ -3054,8 +6852,12 @@ struct Narrower
     //
     // Deterministic: `cands` is in symbol-id order (byName insertion order) and `fileIncludes[callerFileId]` is a
     // sorted id set, so the "which single file" decision and the emitted `out` are a pure function of the inputs.
+    //
+    // `minCands` (default 2): the smallest set this rule reads. graph.h passes 1 for the set a call can reach BY NAME
+    // after function-local defs were set aside (reachableByName) — there a lone survivor is not "already
+    // unambiguous": the name is shared with the set-aside defs, and only import evidence may pick it.
     bool rule3IncludeFile( const rw::SmallVec<NodeId, 2>& cands, std::uint32_t callerFileId,
-                           std::vector<NodeId>& out ) const
+                           std::vector<NodeId>& out, std::size_t minCands = 2 ) const
     {
         if( callerFileId >= fileIncludes.size() )
         {
@@ -3066,7 +6868,7 @@ struct Narrower
         {
             return false; // caller includes nothing → no narrow
         }
-        if( cands.size() < 2 )
+        if( cands.size() < minCands || cands.empty() )
         {
             return false; // already unambiguous → nothing for Rule 3 to do
         }
@@ -3128,5 +6930,175 @@ struct Narrower
         return !out.empty();
     }
 };
+
+// ── C++ template families: the canonical tier's fallback when a template-id qualifier keys no definition ──────────
+// Ingest keys a primary template's out-of-line member by the bare template name and a specialization by its canonical
+// template-id (ingest_names.h); a specialization header's base clause arrives as an inherit ref whose derived name is
+// that template-id, so buildGraph's chaUp holds `Info<char>` → its bases too. What a call through `F<args>::name`
+// can reach, when no definition is keyed `F<args>::name`, is decided here and nowhere else.
+
+// Index one symbol into buildGraph's two canonical maps: a DEFINITION under "scope::name" (byScope) and, when its
+// scope is a template-id, again under its template's family key (byFamily). Any symbol scoped by a template-id —
+// a declaration too — also marks that specialization as EXISTING, under the scope text prefixed with '\x01' (a byte
+// no scope or family key can hold): a call through an existing specialization that does not itself define the name
+// must never fall back to its siblings.
+inline void indexCanonicalScope( HashMap<std::string, rw::SmallVec<NodeId, 2>>& byScope, HashMap<std::string, rw::SmallVec<NodeId, 2>>& byFamily,
+                                 std::string& key, const Symbol& s )
+{
+    if( s.scope.empty() )
+    {
+        return;
+    }
+    if( s.scope.back() == '>' )
+    {
+        key.assign( 1, '\x01' ).append( s.scope );
+        byFamily[ key ];
+    }
+    if( !isDefinitionNotDeclaration( s ) )
+    {
+        return;
+    }
+    key.clear();
+    key.append( s.scope ).append( "::" ).append( s.name );
+    byScope[ key ].push_back( s.id );
+    if( appendTemplateFamilyKey( key, s.scope, s.name ) )
+    {
+        byFamily[ key ].push_back( s.id );
+    }
+}
+
+// The template-id class names chaUp holds — specializations with a base clause — byte-sorted, so the specializations
+// of one template are one contiguous range (specializationsOf).
+inline std::vector<std::string> sortedSpecializationNames( const HashMap<std::string, std::vector<std::string>>& chaUp )
+{
+    std::vector<std::string> names;
+    for( const auto& [ derived, bases ] : chaUp )
+    {
+        if( !derived.empty() && derived.back() == '>' )
+        {
+            names.push_back( derived );
+        }
+    }
+    std::sort( names.begin(), names.end() );
+    return names;
+}
+
+// Everything the family fallback reads, owned by buildGraph.
+struct CanonicalScopes
+{
+    const HashMap<std::string, rw::SmallVec<NodeId, 2>>&  byScope;
+    const HashMap<std::string, rw::SmallVec<NodeId, 2>>&  byFamily;
+    const std::vector<std::string>&                       specializationsWithBases;   // sortedSpecializationNames( chaUp )
+    const Narrower&                                       narrower;                   // methodOnTypeOrBases — the CHA base walk
+    const HashMap<std::string, std::vector<std::string>>& chaUp;
+    const std::vector<Symbol>&                            symbols;                    // a candidate's scope, to widen it to its family
+};
+
+// Appends candidate ids to `cand` once each, past `before`, when `admit` accepts them.
+template< class Admit >
+struct CandidateSink
+{
+    std::vector<NodeId>& cand;
+    std::size_t          before;
+    Admit&               admit;
+
+    void add( const rw::SmallVec<NodeId, 2>* ids )
+    {
+        for( std::size_t i = 0; ids != nullptr && i < ids->size(); ++i )
+        {
+            const NodeId c = ( *ids )[ i ];
+            if( admit( c ) && std::find( cand.begin() + std::ptrdiff_t( before ), cand.end(), c ) == cand.end() )
+            {
+                cand.push_back( c );
+            }
+        }
+    }
+};
+
+// The members of template `family` that supply `r.calleeName` beyond its primary: every specialization that defines it
+// (byFamily) and every specialization with a base clause, through its own member or its bases.
+template< class Admit >
+inline void appendSpecializationMembers( CandidateSink<Admit>& sink, std::string& key, std::string_view family, const Reference& r,
+                                         const CanonicalScopes& scopes )
+{
+    key.assign( family ).append( "::" ).append( r.calleeName );
+    if( const auto it = scopes.byFamily.find( key ); it != scopes.byFamily.end() )
+    {
+        sink.add( &it->second );
+    }
+    key.assign( family ).push_back( '<' );
+    const auto& specs = scopes.specializationsWithBases;
+    for( auto it = std::lower_bound( specs.begin(), specs.end(), key ); it != specs.end() && it->starts_with( key ); ++it )
+    {
+        sink.add( scopes.narrower.methodOnTypeOrBases( *it, r, scopes.chaUp, /*skipSelf=*/false, /*unionOnMulti=*/true ) );
+    }
+}
+
+// A member reached through a BASE may belong to a template family itself — `ImutContainerInfo<T>` inherits
+// `ImutProfileInfo<T>::Profile`, and `ImutProfileInfo` has specializations — so each candidate a primary contributed is
+// widened ONCE to its own template's specializations. The widening adds specialization members only, which a second
+// pass would not widen again, so one pass is the fixpoint.
+template< class Admit >
+inline void widenToTemplateFamilies( CandidateSink<Admit>& sink, std::string& key, const Reference& r, const CanonicalScopes& scopes )
+{
+    const std::size_t assembled = sink.cand.size();
+    for( std::size_t i = sink.before; i < assembled; ++i )
+    {
+        const std::string& scope = scopes.symbols[ sink.cand[ i ] ].scope;
+        if( !scope.empty() && scope.back() != '>' )
+        {
+            appendSpecializationMembers( sink, key, scope, r, scopes );
+        }
+    }
+}
+
+// E#4's canonical tier: the defs keyed `qualifier::name` that `admit` (the caller's language/root filter) accepts,
+// appended to `cand`. A C++ template-id qualifier that keys none is answered from its template's family, and only when
+// the answer cannot be missing a body the call may reach:
+//   * the written id names an EXISTING specialization (a member or a base clause says so) that does not define the
+//     name → what that specialization inherits; if it inherits nothing, no answer;
+//   * otherwise every specialization's own or inherited member joins what the PRIMARY supplies, itself or through its
+//     bases. When the primary supplies nothing visible, the specializations alone answer only as a SPLIT of two or
+//     more: a traits template whose primary defines no member (`DenseMapInfo<T>::getHashValue`) is answered by its
+//     specializations, but a lone specialization beside a primary whose members are not visible — declared only, or
+//     mis-scoped like llvm's `list_storage` — is no answer, because that primary may be the one the call reaches;
+//   * either way a member reached through a base is widened to that base template's specializations.
+// "No answer" leaves `cand` untouched, so the bare-name ladder decides exactly as it did before this fallback existed.
+// More than one candidate is a split the caller discloses with amb=; a call through a template-id never lands on a
+// same-named definition outside the template. `key` is the caller's reused buffer.
+template< class Admit >
+inline void appendCanonicalCandidates( std::vector<NodeId>& cand, std::string& key, const Reference& r, const CanonicalScopes& scopes, Admit&& admit )
+{
+    CandidateSink<Admit> sink { cand, cand.size(), admit };
+    key.clear();
+    key.append( r.qualifier ).append( "::" ).append( r.calleeName );
+    if( const auto it = scopes.byScope.find( key ); it != scopes.byScope.end() )
+    {
+        sink.add( &it->second );
+    }
+    if( cand.size() != sink.before || !appendTemplateFamilyKey( key, r.qualifier, r.calleeName ) )
+    {
+        return;
+    }
+    key.assign( 1, '\x01' ).append( r.qualifier );
+    const bool existingSpecialization = scopes.byFamily.find( key ) != scopes.byFamily.end() || scopes.chaUp.find( r.qualifier ) != scopes.chaUp.end();
+    const std::string_view family = existingSpecialization ? std::string_view( r.qualifier ) : namesplit::stripTemplateArgs( r.qualifier );
+    sink.add( scopes.narrower.methodOnTypeOrBases( family, r, scopes.chaUp, /*skipSelf=*/existingSpecialization, /*unionOnMulti=*/true ) );
+    const bool primarySupplies = cand.size() != sink.before;
+    if( existingSpecialization && !primarySupplies )
+    {
+        return;
+    }
+    if( !existingSpecialization )
+    {
+        appendSpecializationMembers( sink, key, family, r, scopes );
+    }
+    if( !primarySupplies && cand.size() < sink.before + 2 )
+    {
+        cand.resize( sink.before );   // a lone specialization with no visible primary member is no answer (see above)
+        return;
+    }
+    widenToTemplateFamilies( sink, key, r, scopes );
+}
 
 }   // namespace rw

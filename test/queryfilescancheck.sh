@@ -61,7 +61,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -152,7 +152,8 @@ else
 fi
 
 # ── (3) NO-REGRESSION — a corpus with zero unsupported-ext files stays silent about the new tier ──────────
-"$BIN" test/fixture --grep=perimeter >"$TMP/fix.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact and names `<unindexed>` inside its comment; (3b) looks for a real element, so it asks for the full legend.
+"$BIN" test/fixture --grep=perimeter --legend=full >"$TMP/fix.xml" 2>/dev/null
 grep -q 'unindexed_files_scanned="0"' "$TMP/fix.xml" \
     && ok "(3a) test/fixture (no unsupported-ext files) reports unindexed_files_scanned=\"0\"" \
     || { no "(3a) test/fixture did not report unindexed_files_scanned=\"0\""; grep -o '<grep[^>]*>' "$TMP/fix.xml"; }

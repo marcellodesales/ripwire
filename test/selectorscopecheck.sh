@@ -28,7 +28,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/selectorscopefix"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -57,7 +57,8 @@ else
 fi
 
 # ── (d) --edit-check accepts the spelling it itself prints as sym= ──────────────────────────────────
-OUTD="$( cd "$ROOT" && "$BIN" test/selectorscopefix --no-cache --edit-check=Box::lid 2>&1 )"
+# L1 (2026-09-19): the CLI default legend is compact, whose root leads with schema=; (d) reads sym= as the root's first attribute, so it asks for the full legend.
+OUTD="$( cd "$ROOT" && "$BIN" test/selectorscopefix --no-cache --edit-check=Box::lid --legend=full 2>&1 )"
 if printf '%s' "$OUTD" | grep -q '<edit-check sym="lid"' && printf '%s' "$OUTD" | grep -q 'box.h'; then
     ok "(d) --edit-check=Box::lid resolves to box.h's lid"
 else
@@ -92,6 +93,44 @@ if printf '%s' "$OUTH" | grep -qE 'not found|matched no|no symbol'; then
     ok "(h) --callees=Nope::lid refuses (a wrong scope is an error, not a fallback)"
 else
     no "(h) a wrong scope silently resolved — the tier leaks into bare-name matching"; printf '%s\n' "$OUTH" | tail -2
+fi
+
+# ── (i)-(m) THE DOTTED SPELLINGS: `Class.method` and `Class#method` are the Scope::name tier too (2026-10-01) ─────────
+# Agents and docs name a method `Class.method` (Python, JS, Java) or `Class#method` (Ruby, JSDoc); every SYM verb
+# answered "not found" while `Class::method` resolved. RED-FIRST on the parent binary: (i)-(l) fail; (m) is a pin.
+for sel in 'Box.lid' 'Box#lid'; do
+    OUTI="$( "$BIN" "$FIX" --no-cache --callees="$sel" 2>&1 )"
+    if printf '%s' "$OUTI" | grep -q 'n="boxHelper"' && ! printf '%s' "$OUTI" | grep -q 'n="crateHelper"'; then
+        ok "(i) --callees=$sel resolves like Box::lid and names boxHelper only"
+    else
+        no "(i) --callees=$sel did not resolve to Box::lid alone"; printf '%s\n' "$OUTI" | tail -2
+    fi
+done
+PY="$( mktemp -d )"; trap 'rm -rf "$PY"' EXIT
+printf 'class Shape:\n    def area(self, k):\n        return k\n\nclass Disc:\n    def area(self, k):\n        return k * 3\n\ndef run():\n    return Shape().area(2)\n' >"$PY/shapes.py"
+OUTJ="$( "$BIN" "$PY" --no-cache --callers=Shape.area 2>&1 )"
+if printf '%s' "$OUTJ" | grep -q 'defs="1"' && printf '%s' "$OUTJ" | grep -q 'n="run"'; then
+    ok "(j) --callers=Shape.area (Python) resolves to the one Shape method (defs=\"1\") and lists run"
+else
+    no "(j) --callers=Shape.area did not resolve to Shape's area"; printf '%s\n' "$OUTJ" | tail -2
+fi
+OUTK="$( "$BIN" "$PY" --no-cache --impact=Shape#area 2>&1 )"
+if printf '%s' "$OUTK" | grep -q '<impact[^>]* defs="1"'; then
+    ok "(k) --impact=Shape#area resolves to one definition"
+else
+    no "(k) --impact=Shape#area did not resolve"; printf '%s\n' "$OUTK" | tail -2
+fi
+OUTL="$( "$BIN" "$PY" --no-cache --edit-check=Shape.area 2>&1 )"
+if printf '%s' "$OUTL" | grep -q '<edit-check[^>]* p="shapes.py:2"'; then
+    ok "(l) --edit-check=Shape.area answers about shapes.py:2"
+else
+    no "(l) --edit-check=Shape.area did not answer about Shape's area"; printf '%s\n' "$OUTL" | tail -2
+fi
+OUTM="$( "$BIN" "$FIX" --no-cache --callees=Nope.lid 2>&1 )"
+if printf '%s' "$OUTM" | grep -qE 'not found|matched no|no symbol'; then
+    ok "(m) --callees=Nope.lid refuses (a wrong dotted scope never degrades to the bare name)"
+else
+    no "(m) --callees=Nope.lid resolved — the dotted tier leaks into bare-name matching"; printf '%s\n' "$OUTM" | tail -2
 fi
 
 exit $fail

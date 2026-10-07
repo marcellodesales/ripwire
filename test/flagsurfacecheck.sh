@@ -19,7 +19,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 cd "$ROOT"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN"; exit 2; }
 
@@ -35,7 +35,7 @@ NOROOT="$TMP/definitely-not-a-root"
 # NOTE the scrape must accept bracketed/parenthesised forms too — --help writes optional knobs as
 # "[--around-depth=N]" and alternatives as "(--regex)"; anchoring on whitespace alone silently misses them
 # and then reports a documented flag as undocumented.
-"$BIN" --help 2>&1 | grep -oE '\-\-[a-z][a-z0-9-]+' | sort -u > "$TMP/flags.txt"
+"$BIN" --help=all 2>&1 | grep -oE '\-\-[a-z][a-z0-9-]+' | sort -u > "$TMP/flags.txt"
 COUNT="$( wc -l < "$TMP/flags.txt" | tr -d ' ' )"
 [ "$COUNT" -ge 80 ] && ok "harvested $COUNT advertised long flags from --help" \
                     || { no "only $COUNT flags harvested — the --help scrape broke, not the parser"; echo "ALL FAIL"; exit 1; }
@@ -82,11 +82,12 @@ done
 # omission from an accidental one. Anything NOT in this list is a flag a user can only find by reading
 # source, which is a documentation bug. Keep the reasons; a bare list rots into a dumping ground.
 #   --stable, --most-important-last, --no-auto-order  deprecated/hidden aliases of --order= (warn + redirect)
+#   --readability                                     deprecated/hidden alias of --biggest-first (warn + redirect)
 #   --anchor                                          RIPWIRE_DEV-gated, a recorded negative-result experiment
 #   --cochange-boost                                  EXPERIMENTAL opt-in; held-out was +0.0pp, default OFF
 #   --no-prefilter                                    debug: the full-scan soundness oracle for --regex
 #   --route                                           back-compat no-op (routing is the default now)
-ALLOW_UNDOC=" --stable --most-important-last --no-auto-order --anchor --cochange-boost --no-prefilter --route "
+ALLOW_UNDOC=" --stable --most-important-last --no-auto-order --readability --anchor --cochange-boost --no-prefilter --route "
 filtered=""
 for f in $undocumented; do
     case "$ALLOW_UNDOC" in *" $f "*) ;; *) filtered="$filtered $f" ;; esac

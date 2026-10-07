@@ -63,13 +63,14 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 FIX="$ROOT/test/preproccondfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){   printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){   printf '  FAIL  %s\n' "$*"; fail=1; }
 skip(){ printf '  SKIP  %s\n' "$*"; }
 
@@ -99,7 +100,7 @@ presence Cond.cs     '#region grouped'               'C# #region negative contro
 # ══ 1. CAPTURE — one named assertion per grammar node kind the extractor must descend through ════════
 "$BIN" "$FIX" --deps --no-cache >"$TMP/deps" 2>"$TMP/deps.err"
 rc=$?
-[ "$rc" -eq 0 ] && ok "--deps exits 0" || { no "--deps exits $rc"; head -3 "$TMP/deps.err"; }
+if [ "$rc" -eq 0 ]; then ok "--deps exits 0"; else { no "--deps exits $rc"; head -3 "$TMP/deps.err"; }; fi
 [ -s "$TMP/deps" ] || { echo "preproccondcheck: empty --deps output, cannot proceed"; exit 2; }
 
 inc(){ # inc <target> <label>
@@ -258,22 +259,30 @@ if "$BIN" "$DEEP" --deps --no-cache >"$TMP/deep.out" 2>"$TMP/deep.err"; then
 else
     no "600-deep guard stack: non-zero exit"; head -3 "$TMP/deep.err"
 fi
-# …and the degrade is ANNOUNCED, not silent. DEGRADED_PATH_ALERT is compiled out under NDEBUG, so first
-# establish whether alerts are observable in THIS binary at all (probe an unrelated, always-degrading
-# path); a Release leg then SKIPs instead of failing, and the plain leg — which CI runs as a second job
-# for exactly this reason, CONTRIBUTING.md §5 — is what actually proves the alert fires.
-"$BIN" "$ROOT" --rank-by=churn --since=notadate >/dev/null 2>"$TMP/probe.err"
-if grep -q 'math degraded' "$TMP/probe.err"; then
-    if grep -q 'import-container nesting past the depth bound' "$TMP/deep.err"; then
-        ok "600-deep guard stack: the depth bound announces itself via DEGRADED_PATH_ALERT"
-    else
-        no "600-deep guard stack: depth bound hit SILENTLY — no DEGRADED_PATH_ALERT on stderr"
-    fi
-else
-    skip "600-deep guard stack: DEGRADED_PATH_ALERT compiled out of this binary (NDEBUG); the plain-flavour leg proves it"
-fi
+# …and the degrade is ANNOUNCED, not silent. DISCLOSE is compiled out under NDEBUG, and CMakeLists
+# defines NDEBUG for exactly the build types --version names Release / RelWithDebInfo / MinSizeRel, so that
+# token decides whether an alert is owed here (the reading kotlincheck §12 and estchargecheck share). A Release
+# leg SKIPs with its flavour named; every other flavour ASSERTS, and the plain leg — which CI runs as a second
+# job for exactly this reason, CONTRIBUTING.md §5 — is what proves the alert fires.
+#
+# RE-POINTED 2026-09-16. The decision used to be a probe: `--rank-by=churn --since=notadate`, skip if it printed
+# no alert. e7688981 (M8) made an unresolvable --since a refusal that exits 1 before any degrade path runs, so the
+# probe went silent on EVERY flavour and this arm printed its NDEBUG skip on the plain build, asserting nothing,
+# with the gate green. A probe borrows another feature's degrade path, and that path can be fixed away; the build
+# type is a property of the binary itself.
+DEEP_FLAVOUR="$( "$BIN" --version 2>/dev/null | sed -nE 's/^[^(]*\(([^,)]*).*/\1/p' )"
+case "$DEEP_FLAVOUR" in
+    Release|RelWithDebInfo|MinSizeRel)
+        skip "600-deep guard stack: this $DEEP_FLAVOUR build defines NDEBUG, so DISCLOSE is compiled out; the plain-flavour leg proves it" ;;
+    *)
+        if grep -qF '[math degraded] ingest: import-container nesting past the depth bound' "$TMP/deep.err"; then
+            ok "600-deep guard stack: the depth bound announces itself via DISCLOSE on this '${DEEP_FLAVOUR:-unknown}' (non-NDEBUG) build"
+        else
+            no "600-deep guard stack: '${DEEP_FLAVOUR:-unknown}' is a non-NDEBUG build, yet the depth bound was hit SILENTLY — no DISCLOSE on stderr: $( head -c 200 "$TMP/deep.err" )"
+        fi ;;
+esac
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/deep.out" 2>/dev/null && ok "600-deep guard stack: XML well-formed" || no "600-deep guard stack: XML malformed"
+    if xmllint --noout "$TMP/deep.out" 2>/dev/null; then ok "600-deep guard stack: XML well-formed"; else no "600-deep guard stack: XML malformed"; fi
 else
     skip "600-deep guard stack: xmllint absent"
 fi
@@ -281,15 +290,15 @@ fi
 # ══ 5. HYGIENE — determinism, warm == cold, well-formed XML ═══════════════════════════════════════════
 "$BIN" "$FIX" --deps --no-cache >"$TMP/d1" 2>/dev/null
 "$BIN" "$FIX" --deps --no-cache >"$TMP/d2" 2>/dev/null
-cmp -s "$TMP/d1" "$TMP/d2" && ok "deterministic (two --no-cache runs identical)" || no "non-deterministic"
+if cmp -s "$TMP/d1" "$TMP/d2"; then ok "deterministic (two --no-cache runs identical)"; else no "non-deterministic"; fi
 
 "$BIN" "$FIX" --deps --cache="$TMP/c.bin" >"$TMP/cold" 2>/dev/null
 "$BIN" "$FIX" --deps --cache="$TMP/c.bin" >"$TMP/warm" 2>/dev/null
-cmp -s "$TMP/cold" "$TMP/warm" && ok "warm == cold (guarded includes survive the extraction cache)" || { no "warm != cold"; diff "$TMP/cold" "$TMP/warm" | head -4; }
-cmp -s "$TMP/cold" "$TMP/d1"   && ok "cached run == --no-cache run" || no "cached run differs from --no-cache run"
+if cmp -s "$TMP/cold" "$TMP/warm"; then ok "warm == cold (guarded includes survive the extraction cache)"; else { no "warm != cold"; diff "$TMP/cold" "$TMP/warm" | head -4; }; fi
+if cmp -s "$TMP/cold" "$TMP/d1"; then ok "cached run == --no-cache run"; else no "cached run differs from --no-cache run"; fi
 
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/d1" 2>/dev/null && ok "xml well-formed" || no "xml malformed"
+    if xmllint --noout "$TMP/d1" 2>/dev/null; then ok "xml well-formed"; else no "xml malformed"; fi
 else
     skip "xml well-formedness (xmllint absent)"
 fi
@@ -311,13 +320,12 @@ monotonicity_check()
     ( cd "$ROOT" && git rev-parse --verify HEAD >/dev/null 2>&1 ) || { skip "monotonicity: not a git repo"; return; }
     . "$ROOT/test/lib/headbinlib.sh"                   # sha-keyed cache — shared with the other monotonicity gates
 
-    local WT="$TMP/head"
-    ( cd "$ROOT" && git worktree add -q --detach "$WT" HEAD ) 2>"$TMP/wt.err" \
-        || { skip "monotonicity: cannot create HEAD worktree ($( head -1 "$TMP/wt.err" ))"; return; }
-    trap '( cd "$ROOT" && git worktree remove --force "'"$WT"'" >/dev/null 2>&1 ); rm -rf "$TMP"' EXIT
+    local WT="$TMP/head"                               # a private clone, never a registered worktree (test/worktreeleakcheck.sh)
+    ripwire_private_checkout "$ROOT" HEAD "$WT" 2>"$TMP/wt.err" \
+        || { skip "monotonicity: cannot check out HEAD ($( head -1 "$TMP/wt.err" ))"; return; }
 
     local OLDBIN
-    OLDBIN="$( ripwire_head_binary "$ROOT" "$TMP" )" || { skip "monotonicity: pre-change build failed"; return; }
+    OLDBIN="$( ripwire_head_binary "$ROOT" "$TMP" )" || { headbin_refusal $? "monotonicity"; return; }
 
     local IN="$WT/src"
     # (a) captured includes — compare the PER-FILE COUNT, never the emitted <inc> rows. serialize.h caps

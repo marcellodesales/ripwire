@@ -44,14 +44,17 @@
 // lines) and self-heals to canonical order on the next write; a malformed line degrades+skips, never throws.
 
 #include "model.h"              // HashMap<> — the flat, cache-friendly lookup index (never std::unordered_map)
-#include "infra/Diagnostics.h"  // DEGRADED_PATH_ALERT — the degrade path for a malformed line / unwritable file
+#include "infra/Diagnostics.h"  // DISCLOSE — the degrade path for a malformed line / unwritable file
 #include "arch.h"               // D5: relForHash — the SAME lexical, no-I/O root-relative strip the baseline sidecars use
+#include "pathguard.h"          // CWE-59/367: rw::pathguard::openNoFollowTruncate — writeNotes truncates, so its open must refuse a link atomically
 #include "infra/blanktext.h"    // §S3: rw::hasVisibleContent — the ONE "present but carries nothing" predicate
 
 #include <algorithm>
 #include <array>
+#include <cerrno>    // ELOOP — the one errno writeNotes re-words into its own symlink alert
 #include <cstdint>
 #include <fstream>
+#include <sstream>   // the note lines are assembled in memory, then handed to the no-follow descriptor
 #include <string>
 #include <string_view>
 #include <utility>
@@ -295,6 +298,7 @@ inline std::string shortSha( std::string_view sha )
 // empty); a third but no fourth ⇒ a hand-edited 4-field oddity (sha only, degrade rather than reject).
 inline void splitNoteTail( std::string_view rest, std::string& text, std::string& sha, std::string& branch )
 {
+    ASSUME_NO_ALIAS3( text, sha, branch );
     const std::size_t t3 = rest.find( '\t' );
     if( t3 == std::string_view::npos ) { text = std::string( rest ); return; }
     text = std::string( rest.substr( 0, t3 ) );
@@ -305,18 +309,85 @@ inline void splitNoteTail( std::string_view rest, std::string& text, std::string
     branch = std::string( tail.substr( t4 + 1 ) );
 }
 
+// THE ONE PLACE THE NOTES SIDECAR IS READ — openNotesSidecar's other half, with the same answer to a link.
+//
+// A link at `.ripwire_notes` used to be followed on the way in, so the link chose what was read as notes. The
+// read now refuses a link with
+// the same O_NOFOLLOW the write uses, one syscall with nothing in front of it to race; why an in-tree link is
+// refused too, rather than followed the way the crawl follows one, is round 3 of src/pathguard.h. Refused or
+// absent, the caller reads no notes, and only the refusal says anything.
+//
+// What one read found BESIDE the notes: the two ways it comes back short. It is the DISCLOSE sink for this file's read
+// degrades — --notes prints both on <notes> (lines_skipped=, refused=), and addNote refuses to rewrite a sidecar holding
+// lines it could not parse, because the sorted rewrite would delete them. Every OTHER reader used to pass a local one
+// and drop it on the floor (readNotesRelative's channel-less overload, removed below) — degraded() now rides the
+// NoteIndex it built (loadNoteIndex), so --for/--expand/pack-task/edit-check/handoff/lanes/the MCP verbs all see it too,
+// as the one terse kNotesDegradedAttr marker rather than the detailed counts (CodeRabbit 4053600616 follow-up).
+struct NotesReadStats
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        MalformedLine,    // a line missing the target/date tabs: on disk, absent from the answer
+        EmptyTarget,      // a line whose target is empty: on disk, absent from the answer
+        SymlinkRefused,   // a link at the name: refused unopened, so no note at all was read
+    };
+    std::uint32_t linesSkipped   = 0;
+    bool          symlinkRefused = false;
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        switch( why )
+        {
+            case DisclosureWhy::MalformedLine:
+            case DisclosureWhy::EmptyTarget:    ++linesSkipped; break;
+            case DisclosureWhy::SymlinkRefused: symlinkRefused = true; break;
+        }
+    }
+    // true iff THIS read left something out (a skipped line, or the whole sidecar refused) — the one fact
+    // every notes-surfacing emitter besides --notes now carries (CodeRabbit 4053600616 follow-up). --notes
+    // still prints the detail (lines_skipped=/refused=); every other surface prints only this terse marker.
+    bool degraded() const noexcept { return linesSkipped != 0 || symlinkRefused; }
+};
+
+// THE ONE SPELLING OF THE L3 DEGRADE MARKER — identical on every notes-surfacing emitter: the map, --expand,
+// --for (XML and --json), pack-task (XML and --json), edit-check, handoff, lanes/landing-plan, and the MCP
+// verbs that surface notes (for, pack_task, from_trace, fetch_body). Present ONLY when NotesReadStats::degraded()
+// is true for the read that built the answer; absent on a clean read (no sidecar, or every line parsed) keeps
+// the INERTNESS CONTRACT above — zero added bytes. --notes alone keeps the detailed reading (lines_skipped=/
+// refused=); every other surface points back at it rather than repeating the counts.
+// const char* (not string_view): several call sites hand these straight to rw::emitRaw, whose std::fputs
+// backend needs a NUL-terminated pointer — the same reason every other legend constant in this tree is spelled
+// this way (kAtStampLegend, kIgnoredLegend, …).
+inline constexpr const char* kNotesDegradedAttr    = " notes_degraded=\"1\"";
+inline constexpr const char* kNotesDegradedJsonKey = ",\"notes_degraded\":true";
+// The plain-text reading, for a surface (packtask.h's `report` ledger) that splices into an EXISTING
+// `<!-- ripwire …` comment rather than opening a standalone one. No "--" anywhere in either spelling below —
+// a literal double hyphen is ill-formed inside an XML comment (G4), and "--notes" spelled that way once did
+// exactly that (measured: xmllint rejected the map, --for and pack-task roots alike).
+inline constexpr const char* kNotesDegradedReading =
+    "notes_degraded=\"1\": the .ripwire_notes sidecar had unreadable lines or was refused this run (the notes verb's own listing names which, lines_skipped=/refused=)";
+// The standalone-comment spelling, for a surface that appends its own `<!-- … -->` (same reading as above).
+inline constexpr const char* kNotesDegradedComment =
+    "<!-- notes_degraded=\"1\": the .ripwire_notes sidecar had unreadable lines or was refused this run (the notes verb's own listing names which, lines_skipped=/refused=) -->";
+
+inline rw::pathguard::NoFollowRead readNotesSidecar( const std::string& path, NotesReadStats& stats )
+{
+    rw::pathguard::NoFollowRead sidecar = rw::pathguard::openNoFollowRead( "the field-notes sidecar", path );
+    if( sidecar.refused ) { DISCLOSE( stats, NotesReadStats::DisclosureWhy::SymlinkRefused, "notes: refusing to read the notes sidecar through a symlink" ); }
+    return sidecar;
+}
+
 // tolerant read (readAckRecords precedent): skip blank/'#'/CRLF; a line missing either of the first two tabs
 // degrades+skips. splitNoteTail (above) owns the legacy-vs-stamped decision for everything after them.
-inline std::vector<Note> readNotes( const std::string& path )
+inline std::vector<Note> readNotes( const std::string& path, NotesReadStats& stats )
 {
-    std::vector<Note> notes;
-    std::ifstream f( path );
-    if( !f )
+    std::vector<Note>           notes;
+    rw::pathguard::NoFollowRead sidecar = readNotesSidecar( path, stats );
+    if( !sidecar.opened )
     {
         return notes;
     }
     std::string line;
-    while( std::getline( f, line ) )
+    while( sidecar.readLine( line ) )
     {
         while( !line.empty() && ( line.back() == '\r' || line.back() == '\n' ) )
         {
@@ -329,25 +400,26 @@ inline std::vector<Note> readNotes( const std::string& path )
         const std::size_t t1 = line.find( '\t' );
         const std::size_t t2 = ( t1 == std::string::npos ) ? std::string::npos : line.find( '\t', t1 + 1 );
         if( t1 == std::string::npos || t2 == std::string::npos )
-        { DEGRADED_PATH_ALERT( "notes: malformed line skipped (want <target>\\t<date>\\t<text>)" ); continue; }
+        { DISCLOSE( stats, NotesReadStats::DisclosureWhy::MalformedLine, "notes: malformed line skipped (want <target>\\t<date>\\t<text>)" ); continue; }
         Note n;
         n.target = line.substr( 0, t1 );
         n.date   = line.substr( t1 + 1, t2 - t1 - 1 );
         splitNoteTail( std::string_view( line ).substr( t2 + 1 ), n.text, n.sha, n.branch );
-        if( n.target.empty() ) { DEGRADED_PATH_ALERT( "notes: empty-target line skipped" ); continue; }
+        if( n.target.empty() ) { DISCLOSE( stats, NotesReadStats::DisclosureWhy::EmptyTarget, "notes: empty-target line skipped" ); continue; }
         notes.push_back( std::move( n ) );
     }
     return notes;
 }
+
 
 // D5 read-side normalization: re-relativize every target against `root` on load. This is what keeps a
 // LEGACY .ripwire_notes (absolute targets, written before this fix or hand-edited) surfacing correctly on
 // the current checkout without a rewrite. Best-effort like the rest of this file: an out-of-root absolute
 // target degrades to itself unchanged (normalizeNoteTarget's outsideRoot signal is ignored here — a read
 // never fails; the entry simply stays dangling, which --notes already reports).
-inline std::vector<Note> readNotesRelative( const std::string& path, const std::string& root )
+inline std::vector<Note> readNotesRelative( const std::string& path, const std::string& root, NotesReadStats& stats )
 {
-    std::vector<Note> notes = readNotes( path );
+    std::vector<Note> notes = readNotes( path, stats );
     for( Note& n : notes )
     {
         bool outsideRoot = false;
@@ -371,19 +443,44 @@ inline std::string noteLine( const Note& n )
     return line;
 }
 
+// THE ONE PLACE THE NOTES SIDECAR IS OPENED, and the whole of its CWE-59/CWE-367 story.
+//
+// `.ripwire_notes` is a fixed name at the root of a crawled repository and the write TRUNCATES, so a link
+// committed at that name turned --note-add into an arbitrary-file overwrite. The refusal is the OPEN itself
+// — O_NOFOLLOW, one syscall, nothing between deciding and creating for a replacement to land in. The first
+// fix asked lstat and then opened anyway, which is check-then-open; see
+// src/pathguard.h. The two alerts are this site's two failure kinds, unchanged, and they stay macros HERE so
+// each keeps its own file/line.
+inline int openNotesSidecar( const std::string& path )
+{
+    auto [ fd, openErr ] = rw::pathguard::openNoFollowTruncate( "the field-notes sidecar", path );
+    if( fd < 0 )
+    {
+        if( openErr == ELOOP ) { DISCLOSE( Diagnostics::answerRefused, "--note-add exits 1: pathguard names the refused link on stderr and the verb says it could not write",
+                                           "notes: refusing to write the notes sidecar through a symlink" ); }
+        else                   { DISCLOSE( Diagnostics::answerRefused, "--note-add exits 1: pathguard names the OS reason on stderr and the verb says it could not write",
+                                           "notes: cannot write notes file" ); }
+    }
+    return fd;
+}
+
 // write SORTED (self-healing: canonical order regardless of the on-disk shape read). The leading '#' header is
 // constant across every version (identical in a merge → never a conflict) and is skipped by readNotes.
 inline bool writeNotes( const std::string& path, std::vector<Note> notes )
 {
     sortNotes( notes );
-    std::ofstream f( path, std::ios::trunc );
-    if( !f ) { DEGRADED_PATH_ALERT( "notes: cannot write notes file" ); return false; }
+    const int fd = openNotesSidecar( path );
+    if( fd < 0 )
+    {
+        return false;
+    }
+    std::ostringstream f;
     f << "# ripwire field notes v1 — one per line: <canonical-id or path> <TAB> <ISO-date> <TAB> <text> [<TAB> <HEAD sha> <TAB> <branch>]. Kept SORTED (merge-friendly union); dates are git committer-clock, not wall time; the trailing sha/branch pair is present only on provenance-stamped notes.\n";
     for( const Note& n : notes )
     {
         f << noteLine( n ) << '\n';
     }
-    return bool( f );
+    return rw::pathguard::writeAllAndClose( fd, f.str() );
 }
 
 // append (target,date,text[,sha,branch]), re-sort, write; return the EXACT written data line so --note-add
@@ -391,10 +488,18 @@ inline bool writeNotes( const std::string& path, std::vector<Note> notes )
 // sha,branch) is not duplicated (re-running the same add is a no-op line, still printed) — sha/branch are
 // part of the identity so a legacy unstamped entry and a later re-add of the SAME text from a real commit
 // are both kept (they are genuinely different provenance claims, not a duplicate).
-inline std::string addNote( const std::string& path, std::string_view target, std::string_view date, std::string_view text,
+//
+// A sidecar holding lines readNotes could not parse is NOT rewritten: the sorted rewrite keeps only what was read, so it
+// would delete committed text nobody asked to delete. `stats` comes back with linesSkipped > 0 and "" is returned; the
+// caller names the refusal.
+inline std::string addNote( const std::string& path, NotesReadStats& stats, std::string_view target, std::string_view date, std::string_view text,
                             std::string_view sha = {}, std::string_view branch = {} )
 {
-    std::vector<Note> notes = readNotes( path );
+    std::vector<Note> notes = readNotes( path, stats );
+    if( stats.linesSkipped != 0 )
+    {
+        return {};
+    }
     Note n{ std::string( target ), std::string( date ), std::string( text ), std::string( sha ), std::string( branch ) };
     bool dup = false;
     for( const Note& e : notes )
@@ -427,6 +532,10 @@ struct NoteIndex
     std::string                                      root;       // D5: the ingest root this index was loaded for
     std::vector<Note>                                notes;      // owns storage, sorted (byte-stable emit order)
     HashMap<std::string, std::vector<std::uint32_t>> byTarget;   // target → indices into `notes`
+    // the read that built `notes` left something out (NotesReadStats::degraded()) — carried alongside empty()
+    // rather than folded into it: a fully-degraded read (every line malformed, or the sidecar refused) leaves
+    // `notes` empty too, and the marker must still reach the caller, which is exactly the byte this lane adds.
+    bool                                              degraded = false;
 
     bool empty() const noexcept { return notes.empty(); }
 
@@ -438,12 +547,13 @@ struct NoteIndex
     }
 };
 
-inline NoteIndex buildNoteIndex( std::vector<Note> notes, std::string root = {} )
+inline NoteIndex buildNoteIndex( std::vector<Note> notes, std::string root = {}, bool degraded = false )
 {
     sortNotes( notes );
     NoteIndex idx;
-    idx.root = std::move( root );
-    idx.notes = std::move( notes );
+    idx.root     = std::move( root );
+    idx.notes    = std::move( notes );
+    idx.degraded = degraded;
     idx.byTarget.reserve( idx.notes.size() );   // reserve to expected size — skip the ankerl rehash cascade
     for( std::uint32_t i = 0; i < idx.notes.size(); ++i )
     {
@@ -454,7 +564,9 @@ inline NoteIndex buildNoteIndex( std::vector<Note> notes, std::string root = {} 
 
 inline NoteIndex loadNoteIndex( const std::string& root )
 {
-    return buildNoteIndex( readNotesRelative( notesPath( root ), root ), root );
+    NotesReadStats     stats;   // the channel every caller now has (the removed channel-less overload's gap)
+    std::vector<Note>  notes   = readNotesRelative( notesPath( root ), root, stats );
+    return buildNoteIndex( std::move( notes ), root, stats.degraded() );
 }
 
 }   // namespace rw::notes

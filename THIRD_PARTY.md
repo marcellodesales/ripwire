@@ -1,11 +1,13 @@
 # Third-party code
 
-Everything in `third_party/` is upstream open-source code, kept byte-for-byte with its original
-license block intact. Nothing here is relicensed; each file is governed by the license named
-below, not by the repository's `LICENSE`.
+Everything in `third_party/` is upstream open-source code with its original license block intact,
+kept byte-for-byte except for the local patches recorded under `third_party/patches/` (see the
+notes below). Nothing here is relicensed; each file is governed by the license named below, not by
+the repository's `LICENSE`.
 
 Code under `src/` — including `src/infra/` — is first-party and covered by the repository
-`LICENSE` (Apache-2.0).
+`LICENSE` (Apache-2.0), except the adapted passages listed under
+[Adapted code under `src/`](#adapted-code-under-src), which keep their upstream licence.
 
 There are **no downloaded dependencies**. Everything the build compiles is in this repository:
 `third_party/*.h*` are the header-only libraries, and `third_party/deps/` holds the full build
@@ -56,6 +58,7 @@ is why the sizes are what they are — `parser.c` is one big static table, not h
 | `deps/javascript` | tree-sitter-javascript (v0.23.1) | Max Brunsfeld | MIT | `3a837b6f3658ca3618f2022f8707e29739c91364` | https://github.com/tree-sitter/tree-sitter-javascript | 2.4 MB |
 | `deps/ts_typescript` | tree-sitter-typescript (v0.23.2; supplies both the `typescript` and `tsx` grammars) | Max Brunsfeld | MIT | `f975a621f4e7f532fe322e13c4f79495e0a7b2e7` | https://github.com/tree-sitter/tree-sitter-typescript | 17 MB |
 | `deps/elixir` | tree-sitter-elixir (ABI 14) | Elixir contributors | Apache-2.0, MIT (generated sources; see NOTICE) | `4b0c7118760af58a2e7081bbc8396e136f820b37` | https://github.com/elixir-lang/tree-sitter-elixir | 12 MB |
+| `deps/dart` | tree-sitter-dart (ABI 15) | UserNobody14 and contributors | MIT | `be07cf7118d3dba06236a3f19541685a68209934` | https://github.com/UserNobody14/tree-sitter-dart | 6.8 MB |
 | `deps/ruby` | tree-sitter-ruby (v0.23.1) | Rob Rix | MIT | `71bd32fb7607035768799732addba884a37a6210` | https://github.com/tree-sitter/tree-sitter-ruby | 15 MB |
 | `deps/bash` | tree-sitter-bash (v0.23.3) | Max Brunsfeld | MIT | `487734f87fd87118028a65a4599352fa99c9cde8` | https://github.com/tree-sitter/tree-sitter-bash | 10 MB |
 | `deps/csharp` | tree-sitter-c-sharp (v0.23.5) | Max Brunsfeld, Damien Guard, Amaan Qureshi and contributors | MIT | `cac6d5fb595f5811a076336682d5d595ac1c9e85` | https://github.com/tree-sitter/tree-sitter-c-sharp | 28 MB |
@@ -67,6 +70,9 @@ is why the sizes are what they are — `parser.c` is one big static table, not h
 | `deps/swift` | tree-sitter-swift | Alex Pinkus | MIT | `31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5` | https://github.com/alex-pinkus/tree-sitter-swift | 20 MB |
 | `deps/php` | tree-sitter-php (v0.24.2; the `php/` sub-grammar only) | Josh Vera, GitHub | MIT | `5b5627faaa290d89eb3d01b9bf47c3bb9e797dea` | https://github.com/tree-sitter/tree-sitter-php | 6.9 MB |
 | `deps/lua` | tree-sitter-lua (v0.5.0) | Munif Tanjim | MIT | `10fe0054734eec83049514ea2e718b2a56acd0c9` | https://github.com/tree-sitter-grammars/tree-sitter-lua | 392 KB |
+| `deps/markdown` | tree-sitter-markdown (v0.5.3; the block grammar `tree-sitter-markdown/` only) | Matthias Deiml | MIT | `f969cd3ae3f9fbd4e43205431d0ae286014c05b5` | https://github.com/tree-sitter-grammars/tree-sitter-markdown | 2.1 MB |
+| `deps/kotlin` | tree-sitter-kotlin (ABI 14) | fwcd | MIT | `1852ea17b7f60fb3f9d84e0b1555d56b46b39fb1` | https://github.com/fwcd/tree-sitter-kotlin | 32 MB |
+| `deps/gdscript` | tree-sitter-gdscript (master) | Preston Knopp | MIT | `c5c8fa4861b5a4f04a7e60d97587fc3b6cc5639e` | https://github.com/PrestonKnopp/tree-sitter-gdscript | 2624 KB |
 | `deps/doctest` | doctest (v2.4.12) | Viktor Kirilov | MIT | `1da23a3e8119ec5cce4f9388e91b065e20bf06f5` | https://github.com/doctest/doctest | 0.7 MB |
 
 Notes:
@@ -74,8 +80,18 @@ Notes:
 - `deps/tree_sitter` keeps upstream's own `CMakeLists.txt` (the build `add_subdirectory`s it),
   `lib/src`, `lib/include` and `lib/tree-sitter.pc.in`. Its `lib/src/unicode/` is a subset of ICU
   carrying its own `LICENSE` (Unicode-DFS-2016) and `ICU_SHA` provenance file, left untouched.
+- `deps/gdscript` is pinned to a commit that is 12 commits AHEAD of upstream's newest tag
+  (`git describe --tags` reports `v6.1.0-12-gc5c8fa4`), not to the tag itself: v6.1.0 predates
+  fixes this vendoring depends on. The pin is a 40-hex commit for the usual reason — a tag can be
+  force-moved server-side, a SHA cannot.
 - `deps/swift` is pinned to a bare commit rather than a tag because upstream's default branch does
   not carry a generated `parser.c`; that commit's generated output is what is vendored here.
+  `deps/swift/src/scanner.c` carries two local patches, recorded under
+  `third_party/patches/swift/` and policed by `test/vendorpatchcheck.sh` — see that directory's
+  README for the convention and the full list of vendored-code patches across every dependency.
+- `deps/kotlin` is pinned to a bare commit rather than the last tag (`v0.3.8`, Aug 2024) because
+  that tag predates a scanner segfault fix (upstream #136) present on `main`; the pinned commit is
+  `main`'s tip as of this vendoring, chosen for the fix, not for being a release.
 - `deps/ts_typescript` keeps `common/scanner.h`, which both sub-grammars' `src/scanner.c` include.
 - `deps/php` keeps the repo-relative layout `common/scanner.h` + `php/src/…` for the same reason, and
   for one more: upstream hosts TWO sub-grammars (`php/`, `php_only/`) whose `src/scanner.c` each
@@ -86,5 +102,83 @@ Notes:
   `scripts/cmake/` — everything its own `CMakeLists.txt` reads. Its `doctest/extensions/` MPI
   headers are dropped: they include an external `<mpi.h>` this build never compiles. doctest is
   built only when the repository is configured with `-DRIPWIRE_TESTS=ON`.
-- Nothing in `third_party/deps/` is modified. Re-deriving any row is `git clone` + `git checkout
-  <pinned commit>` + the prune described above; a diff against the upstream commit is the audit.
+- `third_party/deps/` is upstream's code except for the local patches recorded under
+  `third_party/patches/<dep>/` (`third_party/patches/README.md` lists each one and why). The tree
+  ships patched. Re-deriving a row is `git clone` + `git checkout <pinned commit>` + the prune
+  described above + `git apply` of that dependency's patches in number order. The audit compares
+  the files that are kept: diff the vendored tree against the upstream commit's tree after the same
+  prune, so the pruned paths are not counted as deletions. That diff must equal those patches, and
+  `test/vendorpatchcheck.sh` checks that every patch is still applied.
+
+## Adapted code under `src/`
+
+These passages are not vendored files: they are functions rewritten into ripwire's own sources from an
+upstream implementation, and the upstream notice travels with them in a comment at the adapted code.
+
+| Where | Adapted from | Upstream | License |
+| --- | --- | --- | --- |
+| `src/infra/os_win32_logic.h` — `appendQuotedArg` (CreateProcessW argument quoting) | libuv `quote_cmd_arg`, `src/win/process.c` | https://github.com/libuv/libuv at `e15526ade343bdfc7cdaaeb0a51b9bba656533ce` | MIT |
+| `src/infra/os_win32_logic.h` — `kWin32ErrnoTable` (Win32/Winsock error → errno rows) | libuv `uv_translate_sys_error`, `src/win/error.c` | same commit | MIT |
+| `src/infra/os_win32.cpp` — `stat` by `GetFileInformationByName` with the handle fallback, and the `open` flag → `CreateFileW` mapping | libuv `fs__stat_path` and `fs__open`, `src/win/fs.c` | same commit | MIT |
+
+libuv's MIT notice. Its `LICENSE` names two copyright holders (the libuv project, and Joyent for the parts that
+originate in joyent/libuv, which include `src/win/`) under the same permission text:
+
+```
+Copyright (c) 2015-present libuv project contributors.
+Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+Each adapted passage says what it changed (the quoting works on UTF-8 bytes and always quotes; several errno
+rows answer what a POSIX caller expects rather than what libuv's event loop does). Re-deriving any row is a
+read of the named upstream function at the pinned commit beside the comment.
+
+### Reference-as-value usages (codebase-memory-mcp)
+
+| Where | Adapted from | Upstream | License |
+| --- | --- | --- | --- |
+| `src/ingest_valuerefs.h` — `ValueRefWalk` (a function named in a value position becomes a usage at its enclosing scope; a call through a value is recorded beside it) | codebase-memory-mcp `handle_usages`, `try_emit_usage`, `is_direct_argument_value`, `is_value_field`, `internal/cbm/extract_usages.c` | https://github.com/DeusData/codebase-memory-mcp at `96c3f41cf334d87670cb085f1fcf16f637293222` | MIT |
+
+The mechanism is ported, not the code: the C walker over every identifier became a C++23 walk over a closed list
+of value positions per grammar, with lexical scope tracking, a slot (`into=`) per row, and calls through a value
+recorded as their own role; the rows never enter the call graph (src/valuerefs.h says what a row does and does not
+mean). codebase-memory-mcp's MIT notice:
+
+```
+MIT License
+
+Copyright (c) 2025 DeusData
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

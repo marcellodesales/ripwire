@@ -29,12 +29,13 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/statcompat.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -65,21 +66,6 @@ echo "fake-object" > "$CACHEDIR/.git/HEAD"
 FIVE_DAYS_AGO=$(( $(date +%s) - 5*86400 ))
 touch -t "$(date -r "$FIVE_DAYS_AGO" +%Y%m%d%H%M.%S 2>/dev/null || date -d "@$FIVE_DAYS_AGO" +%Y%m%d%H%M.%S)" "$CACHEDIR" 2>/dev/null \
     || touch -d "@$FIVE_DAYS_AGO" "$CACHEDIR" 2>/dev/null
-
-# L3 (Linux probe): portable stat reader(s). GNU coreutils and BSD/macOS disagree on both the flag and the
-# format directives, and the `stat -f FMT ... || stat -c FMT ...` fallback this gate used is a TRAP. On GNU,
-# `-f` means FILESYSTEM status and takes NO format argument, so FMT is parsed as a second FILE: measured on
-# coreutils 9.11, `stat -f %i FILE` PRINTS a six-line filesystem block for FILE on stdout and exits 1. The
-# `||` arm then appends the right number under six lines of junk -- so a string compare fails, a numeric
-# compare dies with "integer expression expected", and a `|| echo MISSING` variant reports MISSING forever
-# (a gate that then passes by comparing nothing to nothing). Detect the flavour ONCE, use one form.
-if stat --version >/dev/null 2>&1; then   # GNU coreutils
-    mtime_of(){ stat -c '%Y'  "$1" 2>/dev/null; }
-    mode_of(){  stat -c '%a'  "$1" 2>/dev/null; }
-else                                     # BSD / macOS
-    mtime_of(){ stat -f '%m'  "$1" 2>/dev/null; }
-    mode_of(){  stat -f '%Lp' "$1" 2>/dev/null; }
-fi
 
 BEFORE_MTIME="$( mtime_of "$CACHEDIR" )"
 
@@ -165,9 +151,9 @@ if [ -d "$XDG4/ripwire" ]; then
     # A4-P4: the auto-cache filename is now split by verb class → ripwire-<hash>-{lean,rich}.bin (a plain
   # map is the lean class). The <hash> stability + ladder/mode contract is unchanged. Y4: new blobs
     # live in a 2-hex-char shard subdir (legacy flat blobs are still honored in place), so look in BOTH layouts.
-    find "$XDG4/ripwire" -maxdepth 2 -type f | grep -q '/\([0-9a-f]\{2\}/\)\{0,1\}ripwire-[0-9a-f]\{16\}-\(lean\|rich\)\.bin$' \
-        && ok "defaultCachePath: cache file named ripwire-<hash>-<class>.bin lives under \$XDG_CACHE_HOME/ripwire (flat or shard)" \
-        || no "defaultCachePath: no ripwire-<hash>-<class>.bin found under \$XDG_CACHE_HOME/ripwire (flat or shard)"
+    find "$XDG4/ripwire" -maxdepth 2 -type f | grep -q '/\([0-9a-f]\{2\}/\)\{0,1\}ripwire-[0-9a-f]\{16\}-\(lean\|rich\)-c[0-9]\{1,\}p[0-9]\{1,\}\.bin$' \
+        && ok "defaultCachePath: cache file named ripwire-<hash>-<class>-c<format>p<parser>.bin lives under \$XDG_CACHE_HOME/ripwire (flat or shard)" \
+        || no "defaultCachePath: no ripwire-<hash>-<class>-c<format>p<parser>.bin found under \$XDG_CACHE_HOME/ripwire (flat or shard)"
 else
     no "defaultCachePath: \$XDG_CACHE_HOME/ripwire was not created"
 fi
@@ -189,7 +175,7 @@ fi
 
 # ── (e) STABLE per-root path: same root + same env -> same defaultCachePath (warm reuse still works) ─
 env -u TMPDIR XDG_CACHE_HOME="$XDG4" "$BIN" "$CORPUS" >/dev/null 2>/dev/null
-COUNT1="$(find "$XDG4/ripwire" -maxdepth 2 -type f | grep -c '/\([0-9a-f]\{2\}/\)\{0,1\}ripwire-[0-9a-f]\{16\}-\(lean\|rich\)\.bin$')"
+COUNT1="$(find "$XDG4/ripwire" -maxdepth 2 -type f | grep -c '/\([0-9a-f]\{2\}/\)\{0,1\}ripwire-[0-9a-f]\{16\}-\(lean\|rich\)-c[0-9]\{1,\}p[0-9]\{1,\}\.bin$')"
 [ "$COUNT1" = "1" ] \
     && ok "defaultCachePath: two runs on the same root (same class) produce exactly ONE cache file (stable path, warm reuse intact)" \
     || no "defaultCachePath: expected exactly 1 cache file after 2 runs, found $COUNT1"

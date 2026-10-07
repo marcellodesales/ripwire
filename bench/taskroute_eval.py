@@ -33,10 +33,52 @@ int parseConfigValue() { return StorageDriver(); }
 int renderXmlRow() { return parseConfigValue(); }
 int sendRequest() { return renderXmlRow(); }
 int cacheValue() { return sendRequest(); }
+int classify() { return cacheValue(); }
+int report() { return classify(); }
+int patch() { return report(); }
+int header() { return patch(); }
+int prefix() { return header(); }
+int audit() { return prefix(); }
+int release() { return audit(); }
+int target() { return release(); }
+int binary() { return target(); }
+// Single-word CAPITALIZED classes, no camel seam: the routing-noise round's collision class (2026-09-19).
+class A {}; class E {}; class Fix {}; class Report {};
+class Summary {}; class Lane {}; class WORK {}; class Split {};
 """,
         encoding="utf-8",
     )
-    run(["git", "add", "router.cpp"], repo)
+    # Ordinary English words that are ALSO indexed names are the collision class the weak symbol tier
+    # draws its false positives from, and until 2026-09-10 this fixture repo had none: every name here
+    # was camelCase or Pascal, so no corpus row could exercise the tier at all. The nine lowercase
+    # functions above are the CODE half of the class; the config keys below are the t="sec" half (a JSON
+    # key or a markdown heading — the kind an English word collides with most often, and the kind
+    # --expand answers with a line of config rather than a definition).
+    (repo / "package.json").write_text(
+        """{
+  "name": "route-eval-fixture",
+  "version": "1.2.3",
+  "license": "MIT",
+  "summary": "fixture package for the routing evaluator",
+  "agent": "ripwire-eval",
+  "author": "ripwire",
+  "notes": "keys here index as t=sec symbols, never as code"
+}
+""",
+        encoding="utf-8",
+    )
+    # A SUBDIRECTORY, because the recency route's directory scope needs one: "what changed in storage"
+    # may only compose a scope when the corpus really holds that directory. Both names are camelCase and
+    # appear in no prompt, so no row's symbol resolution changes (the 225 pre-existing rows are
+    # byte-identical on status/intent across this addition).
+    (repo / "storage").mkdir()
+    (repo / "storage" / "queue.cpp").write_text(
+        """int flushPending() { return 1; }
+int drainPending() { return flushPending(); }
+""",
+        encoding="utf-8",
+    )
+    run(["git", "add", "router.cpp", "package.json", "storage/queue.cpp"], repo)
     run(["git", "commit", "-qm", "base"], repo)
     return repo
 

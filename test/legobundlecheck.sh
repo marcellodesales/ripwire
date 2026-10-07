@@ -53,7 +53,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -63,9 +63,14 @@ echo "legobundlecheck: BIN=$BIN"
 OFFTASK="cache invalidation"
 ONTASK="Circle Square shape area implementors"
 
-"$BIN" . --no-cache --for="$OFFTASK" >"$TMP/off.xml"  2>/dev/null
-"$BIN" . --no-cache --for="$ONTASK"  >"$TMP/on.xml"   2>/dev/null
-"$BIN" . --no-cache --for="$ONTASK"  >"$TMP/on2.xml"  2>/dev/null
+# L2 (round-1 lever B1, 2026-09-19): --sections=lego,compose opts back into the full <lego>…</lego> render
+# these assertions test — the §P3 scope/identity mechanism this gate exists for is unchanged by the stub
+# default (the stub is built from the SAME post-filter legoScoped, after this gate's own machinery runs);
+# without the flag every row below would see the counted stub instead (test/forsectioncollapsecheck.sh owns
+# THAT shape). Byte-identical to the pre-L2 default otherwise.
+"$BIN" . --no-cache --for="$OFFTASK" --sections=lego,compose >"$TMP/off.xml"  2>/dev/null
+"$BIN" . --no-cache --for="$ONTASK"  --sections=lego,compose >"$TMP/on.xml"   2>/dev/null
+"$BIN" . --no-cache --for="$ONTASK"  --sections=lego,compose >"$TMP/on2.xml"  2>/dev/null
 
 for f in off on; do
     [ -s "$TMP/$f.xml" ] || no "bundle $f.xml is empty — the rest of this gate is meaningless"
@@ -153,7 +158,8 @@ fi
 # landing made packLego's p= root-relative and disclosed the root NOWHERE, so this document served relative
 # paths against a root it never named — the one thing --lego's p= exists to let you do (open the file) is
 # undoable without it. Every other byte of the reference is unchanged, which is what this arm is for.
-"$BIN" test/legofix --no-cache --lego=Shape >"$TMP/standalone" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; the embedded golden below was recorded from the full default, so this run asks for it.
+"$BIN" test/legofix --no-cache --legend=full --lego=Shape >"$TMP/standalone" 2>/dev/null
 # RE-PINNED 2026-09-04 (capture-audit H5, floormarkcheck arm (9)): the reference gained the shared lego legend
 # (graphlegend.h kLegoLegend — the verb shipped with none) and counts_floor="1" on <lego> (implementors= is read
 # off the name-based extends/implements edges) plus the M15 gauge pair (0/0 on this fixture: every call resolves).
@@ -191,7 +197,8 @@ printf '%s' "$ONLEGO" | grep -q '<impl n="Triangle"' \
 # ── 8) §L10b LOW tail: --lego=Vehicle (a Rust trait) prints caveat="not-extracted-for-lang" with no
 #      clause anywhere defining that value — fixed by the legend addition this arm's LEGO_LEGEND above
 #      already pins; this arm checks the VALUE actually fires on the fixture and that the legend defines it.
-"$BIN" test/legofix --no-cache --lego=Vehicle >"$TMP/vehicle" 2>/dev/null
+# L1 (2026-09-19): the legend-definition arm below reads the FULL legend's prose, so this run asks for it.
+"$BIN" test/legofix --no-cache --legend=full --lego=Vehicle >"$TMP/vehicle" 2>/dev/null
 grep -q 'caveat="not-extracted-for-lang"' "$TMP/vehicle" \
     && ok "--lego=Vehicle (Rust trait): caveat=\"not-extracted-for-lang\" fires" \
     || no "--lego=Vehicle did not carry the expected caveat (fixture or extraction changed)"

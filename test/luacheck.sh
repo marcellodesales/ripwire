@@ -64,7 +64,7 @@ FIX="$ROOT/test/luafix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 cxof(){ "$1" "$2" --metrics --no-cache 2>/dev/null | grep -o "n=\"$3\"[^>]* cx=\"[0-9]*\"" | grep -o ' cx="[0-9]*"' | tr -d ' '; }
 
@@ -80,7 +80,7 @@ echo "=== 0. PRESENCE: the fixture really spells every shape the arms below asse
 # ═══════════════════════════════════════════════════════════════════════════
 # A gate whose probe target can vanish passes for the wrong reason (CONTRIBUTING.md §2). These greps are
 # the guard: if a fixture edit deletes a shape, THIS arm reds instead of the assertion going inert.
-presence(){ grep -qF -- "$2" "$FIX/$1" && ok "fixture $1 spells: $3" || no "fixture $1 no longer spells: $3"; }
+presence(){ if grep -qF -- "$2" "$FIX/$1"; then ok "fixture $1 spells: $3"; else no "fixture $1 no longer spells: $3"; fi; }
 presence greeter.lua 'local function fallback'   'shape 1 — a plain local function_declaration'
 presence util.lua    'function M.trim(s)'        'shape 2 — a dot_index function_declaration'
 presence greeter.lua 'function Greeter:greet()'  'shape 3 — a colon (method) function_declaration'
@@ -97,8 +97,8 @@ presence main.lua    'local iife_pick = (function()' 'the IIFE module idiom the 
 MAP_OUT="$TMP/map.xml"
 "$BIN" "$FIX" --no-cache >"$MAP_OUT" 2>"$TMP/map.err"
 MAP_EXIT=$?
-[ "$MAP_EXIT" -eq 0 ] && ok "default map: exits 0 on the Lua fixture" || no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"
-command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$MAP_OUT" && ok "default map: passes xmllint --noout" || no "default map: xmllint failed"; }
+if [ "$MAP_EXIT" -eq 0 ]; then ok "default map: exits 0 on the Lua fixture"; else no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"; fi
+command -v xmllint >/dev/null 2>&1 && { if xmllint --noout "$MAP_OUT"; then ok "default map: passes xmllint --noout"; else no "default map: xmllint failed"; fi; }
 [ -s "$TMP/map.err" ] && no "default map: unexpected stderr (ABI/degrade?): $( cat "$TMP/map.err" )" || ok "default map: clean stderr (no ABI mismatch / degrade)"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -106,10 +106,27 @@ echo
 echo "=== 1. STRUCTURE: all FIVE definition spellings, 8 symbols across 3 files ==="
 # ═══════════════════════════════════════════════════════════════════════════
 
-grep -q 'files=3 symbols=8' "$MAP_OUT" && ok "header: files=3 symbols=8" || no "header: expected files=3 symbols=8: $( grep -o 'files=[0-9]* symbols=[0-9]*' "$MAP_OUT" )"
-grep -q 'edges=3' "$MAP_OUT" && ok "header: edges=3" || no "header: expected edges=3: $( grep -o 'edges=[0-9]*' "$MAP_OUT" )"
-grep -q 'ambiguous=0' "$MAP_OUT" && ok "header: ambiguous=0" || no "header: expected ambiguous=0: $( grep -o 'ambiguous=[0-9]*' "$MAP_OUT" )"
-grep -q 'unresolved=0' "$MAP_OUT" && ok "header: unresolved=0" || no "header: expected unresolved=0: $( grep -o 'unresolved=[0-9]*' "$MAP_OUT" )"
+# RE-PINNED 2026-09-20 (train-12, issue #60): 8 -> 10. TWO synthetic module-scope owners, one each in
+# greeter.lua and main.lua, and they own real Lua top-level code — a Lua module IS a script. greeter.lua:3
+# and main.lua:9 are `local x = require("…")` calls and main.lua:22 is an `iife_pick(…)` call, all outside
+# every function, all of which had no caller node before. util.lua gets NO owner: it defines functions and
+# returns a table, and never calls anything at top level — which is the control that makes the other two
+# meaningful rather than a per-file constant. §5's iife_pick DEFINITION floor is untouched: the owner owns
+# the CALL, and no definition of iife_pick appears (still asserted below).
+# hdrCounts: the map header's own stats run, never a bare attribute grep — the legend spells `edges= ` and
+# `files=/symbols=` in prose, so an unanchored grep reports an empty count for an attribute the document
+# states correctly (train-12 hit exactly that in kotlincheck and phpcheck).
+hdrCounts(){ grep -oE 'files=[0-9]+ symbols=[0-9]+ edges=[0-9]+[^>]*' "$MAP_OUT" | head -1; }
+if grep -q 'files=3 symbols=10' "$MAP_OUT"; then ok "header: files=3 symbols=10"; else no "header: expected files=3 symbols=10: $( hdrCounts )"; fi
+LUA_MS="$( "$BIN" "$FIX" --no-cache '--graph-query=kind(all,modscope)' 2>/dev/null )"
+printf '%s' "$LUA_MS" | grep -q 'count="2"' \
+  && printf '%s' "$LUA_MS" | grep -q 'p="greeter.lua:1"' && printf '%s' "$LUA_MS" | grep -q 'p="main.lua:1"' \
+  && ! printf '%s' "$LUA_MS" | grep -q 'p="util.lua' \
+    && ok '(#60) module-scope owners in greeter.lua and main.lua only — util.lua calls nothing at top level' \
+    || no "(#60) unexpected module-scope owner set: $( printf '%s' "$LUA_MS" | grep -o '<s [^>]*>' | tr '\n' ' ' )"
+if grep -q 'edges=3' "$MAP_OUT"; then ok "header: edges=3"; else no "header: expected edges=3: $( grep -o 'edges=[0-9]*' "$MAP_OUT" )"; fi
+if grep -q 'ambiguous=0' "$MAP_OUT"; then ok "header: ambiguous=0"; else no "header: expected ambiguous=0: $( grep -o 'ambiguous=[0-9]*' "$MAP_OUT" )"; fi
+if grep -q 'unresolved=0' "$MAP_OUT"; then ok "header: unresolved=0"; else no "header: expected unresolved=0: $( grep -o 'unresolved=[0-9]*' "$MAP_OUT" )"; fi
 
 python3 - "$MAP_OUT" <<'PYEOF' >"$TMP/parsed.json"
 import sys, re, json
@@ -147,7 +164,7 @@ print("E_TABLEFN:%s"    % edge("main.lua", "run", "fallback"))    # greeter.fall
 PYEOF
 cat "$TMP/struct_check"
 
-arm(){ grep -q "^$1:True" "$TMP/struct_check" && ok "$2" || no "$2 — MISSING"; }
+arm(){ if grep -q "^$1:True" "$TMP/struct_check"; then ok "$2"; else no "$2 — MISSING"; fi; }
 arm S1_LOCALFN  'shape 1: `local function fallback(n)` -> t="fn"'
 arm S2_DOTINDEX 'shape 2: `function M.trim(s)` -> t="fn" named by the FIELD, not by M'
 arm S3_COLON    'shape 3: `function Greeter:greet()` -> t="method" (the colon IS the method evidence)'
@@ -159,7 +176,7 @@ arm E_XFILE     'edge: greet -> shout (util.shout(), CROSS-FILE)'
 arm E_TABLEFN   'edge: run -> fallback (greeter.fallback(), CROSS-FILE, from inside a table field)'
 
 CR="$( "$BIN" "$FIX" --callers=trim --no-cache 2>/dev/null )"
-echo "$CR" | grep -q 'n="shout"' && ok "--callers=trim lists shout" || no "--callers=trim did not list shout: $CR"
+if echo "$CR" | grep -q 'n="shout"'; then ok "--callers=trim lists shout"; else no "--callers=trim did not list shout: $CR"; fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo
@@ -175,7 +192,9 @@ echo "=== 2. IMPORTS: Lua HAS them, as of kParserVer 81 ==="
 #
 # The fixture spells two cross-file requires (main -> greeter, greeter -> util; guarded in §0), so these
 # are real measurements and not a tautology: `<deps files="2">` names the two files that HAVE a directive.
-DEPS="$( "$BIN" "$FIX" --deps --no-cache 2>/dev/null )"
+# L1 (2026-09-19): the CLI default legend is compact and hoists schema= into the root element; these arms pin the
+# full-default root prefix `<deps files=`, so this run asks for the full legend.
+DEPS="$( "$BIN" "$FIX" --deps --no-cache --legend=full 2>/dev/null )"
 echo "$DEPS" | grep -q '<deps files="2"' && ok '--deps: files="2" — require("greeter")/require("util") are Include records' \
     || no "--deps: expected files=2 on the Lua fixture: $( echo "$DEPS" | grep -o '<deps [^>]*>' )"
 echo "$DEPS" | grep -q 'dep_files="3"' && ok '--deps health: dep_files="3" — Lua IS dependency-capable (all 3 fixture files count)' \
@@ -199,7 +218,7 @@ echo "=== 3. CENSUS: --skipped no longer drops Lua, and names it ==="
 SK="$( "$BIN" "$FIX" --skipped --no-cache 2>/dev/null )"
 echo "$SK" | grep -q 'unsupported_ext="0"' && ok '--skipped: unsupported_ext=0 (no .lua falls out of the index)' \
     || no "--skipped: expected unsupported_ext=0: $( echo "$SK" | grep -o 'unsupported_ext="[0-9]*"' )"
-echo "$SK" | grep -q '<lang n="lua" files="3" symbols="8"/>' && ok '--skipped: <lang n="lua" files="3" symbols="8"/> census row' \
+echo "$SK" | grep -q '<lang n="lua" files="3" symbols="10"/>' && ok '--skipped: <lang n="lua" files="3" symbols="10"/> census row' \
     || no "--skipped: lua census row missing/wrong: $( echo "$SK" | grep -o '<lang [^/]*/>' )"
 
 # ═══════════════════════════════════════════════════════════════════════════

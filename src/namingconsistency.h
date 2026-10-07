@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // namingconsistency.h — `--naming-consistency`: TIER A convention normalization (DESIGN_READABILITY_METRICS
 // §9.2, the private research record; §-numbers below refer to it). Of the three Tier-A categories that
@@ -74,8 +77,9 @@ inline const char* styleTag( ConventionStyle st ) noexcept
         case ConventionStyle::Snake:     return "snake";
         case ConventionStyle::Screaming: return "screaming";
         case ConventionStyle::Mixed:     return "mixed";
-        default:                         return "none";
+        case ConventionStyle::NoSignal:  return "none";
     }
+    return "none";
 }
 
 // Classifies a name ALREADY known to have >=2 splitIdentifier subtokens (the caller's job). Scans the raw
@@ -181,7 +185,8 @@ inline std::string recombineToStyle( const std::vector<std::string>& toks, Conve
                 out += detail::titleCaseToken( toks[i] );
                 break;
             case ConventionStyle::Camel:
-            default:
+            case ConventionStyle::Mixed:      // no single target style: camel, the same answer the default gave
+            case ConventionStyle::NoSignal:
                 out += ( i == 0 ) ? naminglens::toLowerAscii( toks[i] ) : detail::titleCaseToken( toks[i] );
                 break;
         }
@@ -224,7 +229,18 @@ struct ConventionScan
 {
     std::vector<StyledSymbol>    symbols;   // every styled (non-NoSignal) eligible symbol
     std::vector<ConventionGroup> groups;    // sorted by (lang, kind) once scanNamingConsistency returns
+    std::size_t                  componentExempt = 0;   // JSX components kept out of both (isJsxComponentName)
 };
+
+// A PascalCase FUNCTION in a .tsx/.jsx file is a JSX component by the language's own rule — JSX reads a lowercase tag as
+// an intrinsic element (`<activityPane/>` is not the component), so its case is not a style choice and a camel proposal
+// would break every use site. Such a name neither votes nor is flagged, and the header counts it (component_exempt=).
+// Stated floor: a component in a plain .js/.ts file (JSX in .js is legal) still votes and can be flagged; this reads the
+// file extension, not the body, so a non-component PascalCase function in a .tsx file is exempt too.
+inline bool isJsxComponentName( const Symbol& s, ConventionStyle style, std::string_view path ) noexcept
+{
+    return s.kind == SymKind::Function && style == ConventionStyle::Pascal && ( path.ends_with( ".tsx" ) || path.ends_with( ".jsx" ) );
+}
 
 inline std::size_t groupIndexOf( std::vector<ConventionGroup>& groups, Lang lang, KindBucket kind )
 {
@@ -263,6 +279,11 @@ inline ConventionScan scanNamingConsistency( const IngestResult& ing )
         const ConventionStyle style = classifyConventionStyle( s.name );
         if( style == ConventionStyle::NoSignal )
         {
+            continue;
+        }
+        if( isJsxComponentName( s, style, ing.files[ s.fileId ] ) )
+        {
+            ++scan.componentExempt;
             continue;
         }
 
@@ -342,7 +363,10 @@ inline constexpr const char* kNamingConsistencyLegend =
     "safe to suggest for that reason alone. propose= is a SUGGESTION, never a safe-to-blind-apply rename: an "
     "actual rename needs the uses verb to prove the complete reference set first. A mixed name (naming-case's own "
     "finding: a snake separator AND a camel transition inside ONE identifier) never wins a vote and is always "
-    "flagged when its group has a decided convention. Exit 0 always: a lens, not a gate. "
+    "flagged when its group has a decided convention. A PascalCase function in a .tsx/.jsx file is a JSX component (JSX "
+    "reads a lowercase tag as an intrinsic element), so it neither votes nor is flagged; component_exempt=N counts them, "
+    "keyed on the extension alone, so a PascalCase function there that is not a component is exempt too, "
+    "absent when 0 (a component in a plain .js/.ts file still votes). Exit 0 always: a lens, not a gate. "
     "groups=(language,kind) pairs with at least one styled name candidates=styled names scanned "
     "decided=groups that cleared both floors flagged=off-convention names in decided groups "
     "g rows: lang= kind=fn|var style=the group's dominant convention, or UNAVAILABLE agree=leading-style votes "
@@ -388,20 +412,22 @@ inline int writeNamingConsistencyReport( const IngestResult& ing, int pageLimit,
     std::fputs( kNamingConsistencyLegend, stdout );
     // R-E fix (2026-08-19): the shared root-relative clause, emitted exactly when root= is (graphlegend.h).
     std::fputs( rw::rootRelPathsLegend( !rootAttr.empty() ), stdout );
-    std::printf( "<naming-consistency groups=\"%zu\" candidates=\"%zu\" decided=\"%zu\" flagged=\"%zu\"%s%s>",
-                 scan.groups.size(), scan.symbols.size(), decidedCount, total, disclosure, rootAttr.c_str() );
+    // present only when a JSX component was kept out (isJsxComponentName), absent at zero like the house counts
+    const std::string componentAttr = rw::countAttrXmlOrEmpty( "component_exempt", scan.componentExempt );
+    rw::emitTo( stdout, "<naming-consistency groups=\"{}\" candidates=\"{}\" decided=\"{}\" flagged=\"{}\"{}{}{}>",
+                 scan.groups.size(), scan.symbols.size(), decidedCount, total, componentAttr, rw::cstr( disclosure ), rootAttr.c_str() );
 
     for( const ConventionGroup& g : scan.groups )
     {
         if( g.decided )
         {
-            std::printf( "<g lang=\"%s\" kind=\"%s\" style=\"%s\" agree=\"%u\" total=\"%u\"/>",
+            rw::emitTo( stdout, "<g lang=\"{}\" kind=\"{}\" style=\"{}\" agree=\"{}\" total=\"{}\"/>",
                          langTag( g.lang ), kindBucketTag( g.kind ), styleTag( g.dominant ),
                          g.votes[ std::uint8_t( g.dominant ) ], g.total );
         }
         else
         {
-            std::printf( "<g lang=\"%s\" kind=\"%s\" style=\"UNAVAILABLE\" why=\"%s\" total=\"%u\"/>",
+            rw::emitTo( stdout, "<g lang=\"{}\" kind=\"{}\" style=\"UNAVAILABLE\" why=\"{}\" total=\"{}\"/>",
                          langTag( g.lang ), kindBucketTag( g.kind ), g.why, g.total );
         }
     }
@@ -418,11 +444,11 @@ inline int writeNamingConsistencyReport( const IngestResult& ing, int pageLimit,
         const std::string     path( escapeXml( rel, escPath ) );
         const std::string     name( escapeXml( s.name, escName ) );
         const std::string     propose( escapeXml( recombineToStyle( sym.toks, group->dominant ), escProp ) );
-        std::printf( "<f p=\"%s:%u\" n=\"%s\" lang=\"%s\" kind=\"%s\" style=\"%s\" propose=\"%s\"/>",
+        rw::emitTo( stdout, "<f p=\"{}:{}\" n=\"{}\" lang=\"{}\" kind=\"{}\" style=\"{}\" propose=\"{}\"/>",
                      path.c_str(), s.line, name.c_str(), langTag( sym.lang ), kindBucketTag( sym.kind ),
                      styleTag( sym.style ), propose.c_str() );
     }
-    std::printf( "</naming-consistency>" );
+    rw::emitRaw( stdout, "</naming-consistency>" );
     return 0;
 }
 

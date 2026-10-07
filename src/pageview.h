@@ -1,4 +1,6 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
 
 // pageview.h — §P8 ("Contract-level" bullets 1+2): the ONE paging window
 // and the ONE root-element disclosure every high-cardinality verb shares, so the vocabulary cannot drift
@@ -170,17 +172,22 @@ inline constexpr int kCochangePartnerCap  = 30;
 // ── LB-H (r10 GitNexus round) — the display cap on --impact's SECONDARY import tier ──────────────────────
 // Deliberately the SAME 40 as the symbol rows above rather than a third number: it counts a comparable
 // unit (one row per file, one row per symbol) on the same screen, and a second calibration nobody could
-// re-derive is how this family drifted apart the first time. It is NOT raisable by --limit — rule 6 above
-// reserves the paging half for the PRIMARY listing, so a secondary one discloses through
-// shown_importers=/importers_capped= and nothing else. Nothing is hidden by that: importers= on the root
-// is always the full count, and --uses=SYM lists the import SITES under its own, separate cap.
+// re-derive is how this family drifted apart the first time. Rule 6 above reserves the PAGING half for the
+// PRIMARY listing, so this one discloses through shown_importers=/importers_capped= and never pages: offset=
+// does not move it. cut-fix C (2026-09-23) made it SIZED by --limit, though (graph.h impactImportTier): when it
+// was fixed at 40, a cut tier had no call at all that fetched the rest, which is the one thing principle 3 of
+// docs/METHODOLOGY.md §9 asks of a cut. Sizing rather than paging keeps pagingsweepcheck's continuity arm true:
+// the <f> rows are siblings AFTER the <s> rows, never inside a paged row (the --doc-drift shape, which stays
+// unraisable for exactly that reason — docdrift.h). importers= on the root is always the full count.
 inline constexpr int kImportReachRowCap   = 40;
 // P4 (capture-audit 2026-09-04, lane L7): default windows for the three verbs that had none. Lens 8 measured the
 // defaults on the ripwire tree: --tree 187,209 B (3,773 rows), --zoom 433,867 B (390 top modules x 6 levels),
 // --external-surface 67,862 B (1,422 rows led by sh builtins). Each is a first screen ≤ ~12 KB here, paged with the
 // house quintet + next=. Explicit --limit=N raises any of them (effectiveRowCap).
+inline constexpr std::size_t kTreeSymbolsPerFile = 3;   // cut-fix E: --tree's <s> rows per <file>, disclosed by the root's shown_symbols=/symbols_capped=
 inline constexpr int kTreeRowCap            = 80;    // files, by best symbol's rank: 80 rows ≈ 11.5 KB on this repo (100 = 14.3 KB)
-inline constexpr int kZoomTopModuleCap      = 40;    // top-level modules, size desc (their children ride along: levels_shown=2)
+inline constexpr int kZoomTopModuleCap      = 40;    // top-level modules, rank-mass desc then size desc then id (massSizeIdLess; their children ride along: levels_shown=2)
+inline constexpr std::size_t kZoomBridgeCap = 12;    // cut-fix E: --zoom's <bridge> rows (traffic desc), a secondary listing disclosed by secondaryCutAttrs
 inline constexpr int kExternalSurfaceRowCap = 100;   // names, by ref count (≈ 5.2 KB on this repo)
 
 // The values pageDisclosure() renders under EVERY PageSyntax (XML attrs and §A3a/§A4c JSON keys) — hoisted
@@ -246,9 +253,14 @@ inline PageDisclosureValues computePageDisclosure( std::size_t rowsShown, std::s
 // once, and each surface supplies only its own punctuation.
 struct PageSyntax
 {
-    const char* capOnly;      // printf: rowsShown, cappedLiteral
-    const char* full;         // printf: rowsShown, cappedLiteral, rowTotal, hasMoreLiteral, nextOffset, offset, limit
-    const char* pagingOnly;   // printf: rowTotal, hasMoreLiteral, nextOffset, offset, limit — rule 1's noun-prefixed
+    bool json;                // WHICH DIALECT. The three format members below are documentation now:
+                              // the emitters branch on this and pass a LITERAL, because a runtime
+                              // format string needs std::vformat + std::make_format_args, whose
+                              // signature changed in C++23 and whose behaviour has not been uniform.
+                              // A literal is checked at compile time and cannot vary by library.
+    const char* capOnly;      // std::format: rowsShown, cappedLiteral
+    const char* full;         // std::format: rowsShown, cappedLiteral, rowTotal, hasMoreLiteral, nextOffset, offset, limit
+    const char* pagingOnly;   // std::format: rowTotal, hasMoreLiteral, nextOffset, offset, limit — rule 1's noun-prefixed
                               // exception (pagingDisclosure below), where the caller spelled its own shown_<noun>= pair
     const char* yes;          // how this surface spells a true boolean
     const char* no;
@@ -258,17 +270,19 @@ struct PageSyntax
 };
 inline constexpr PageSyntax kXmlPageSyntax
 {
-    " shown=\"%zu\" capped=\"%s\"",
-    " shown=\"%zu\" capped=\"%s\" total=\"%zu\" has_more=\"%s\" next_offset=\"%zu\" offset=\"%d\" limit=\"%d\"",
-    " total=\"%zu\" has_more=\"%s\" next_offset=\"%zu\" offset=\"%d\" limit=\"%d\"",
+    false,
+    " shown=\"{}\" capped=\"{}\"",
+    " shown=\"{}\" capped=\"{}\" total=\"{}\" has_more=\"{}\" next_offset=\"{}\" offset=\"{}\" limit=\"{}\"",
+    " total=\"{}\" has_more=\"{}\" next_offset=\"{}\" offset=\"{}\" limit=\"{}\"",
     "1", "0",
     " counts_floor=\"1\""
 };
 inline constexpr PageSyntax kJsonPageSyntax
 {
-    ",\"shown\":%zu,\"capped\":%s",
-    ",\"shown\":%zu,\"capped\":%s,\"total\":%zu,\"has_more\":%s,\"next_offset\":%zu,\"offset\":%d,\"limit\":%d",
-    ",\"total\":%zu,\"has_more\":%s,\"next_offset\":%zu,\"offset\":%d,\"limit\":%d",
+    true,
+    ",\"shown\":{},\"capped\":{}",
+    ",\"shown\":{},\"capped\":{},\"total\":{},\"has_more\":{},\"next_offset\":{},\"offset\":{},\"limit\":{}",
+    ",\"total\":{},\"has_more\":{},\"next_offset\":{},\"offset\":{},\"limit\":{}",
     "true", "false",         // JSON spells its booleans as booleans; a leading comma splices after the caller's own keys
     ",\"counts_floor\":true"
 };
@@ -288,24 +302,64 @@ inline const char* pageDisclosure( char* buf, std::size_t bufCap, std::size_t ro
     if( !v.active ) { buf[0] = '\0';  return buf; }
 
     const char* isCapped = v.capped ? syn.yes : syn.no;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
-    int written = 0;
+    // The dialect row is chosen at runtime BY DESIGN (see the table above), so this is the one place that
+    // needs a runtime format. -Wformat-nonliteral goes with printf: there is no printf here to mis-parse.
+    std::size_t written = 0;
     if( !v.paging )
     {
-        written = std::snprintf( buf, bufCap, syn.capOnly, rowsShown, isCapped );
+        written = syn.json ? rw::formatTo( buf, bufCap, ",\"shown\":{},\"capped\":{}", rowsShown, isCapped )
+                           : rw::formatTo( buf, bufCap, " shown=\"{}\" capped=\"{}\"", rowsShown, isCapped );
     }
     else
     {
-        written = std::snprintf( buf, bufCap, syn.full, rowsShown, isCapped, rowTotal, v.hasMore ? syn.yes : syn.no,
-                                 v.nextOrTotal, v.offsetOut, v.limitOut );
+        written = syn.json
+            ? rw::formatTo( buf, bufCap, ",\"shown\":{},\"capped\":{},\"total\":{},\"has_more\":{},\"next_offset\":{},\"offset\":{},\"limit\":{}",
+                            rowsShown, isCapped, rowTotal, v.hasMore ? syn.yes : syn.no, v.nextOrTotal, v.offsetOut, v.limitOut )
+            : rw::formatTo( buf, bufCap, " shown=\"{}\" capped=\"{}\" total=\"{}\" has_more=\"{}\" next_offset=\"{}\" offset=\"{}\" limit=\"{}\"",
+                            rowsShown, isCapped, rowTotal, v.hasMore ? syn.yes : syn.no, v.nextOrTotal, v.offsetOut, v.limitOut );
     }
-    if( v.floor && written > 0 && std::size_t( written ) < bufCap )
+    if( v.floor && written > 0 && written < bufCap )
     {
-        std::snprintf( buf + written, bufCap - std::size_t( written ), "%s", syn.floor );
+        rw::formatTo( buf + written, bufCap - written, "{}", syn.floor );
     }
-#pragma clang diagnostic pop
     return buf;
+}
+
+// ── LB-G (listing-paging round, 2026-09-10) — the SECONDARY listing's pair, emitted ONLY on a CUT ────────
+//
+// Rule 6 reserves the paging half for a report's PRIMARY listing; a SECONDARY one "discloses through its own
+// shown_<noun>=/<noun>_capped= pair". Three reports had that listing and no pair at all: --doc-drift's per-doc
+// <a> rows (cut at 12), --flags' per-gate <read> rows (cut at 8) and --flip's six row families (cut at 25).
+// They are per-CHILD listings — one per <doc>, one per <gate> — so there is no single root window to page,
+// and the honest disclosure is the pair on the child that was cut.
+//
+// EMITTED ONLY WHEN THE CUT HAPPENED, both halves together or neither. Rule 3 says capped= is always emitted
+// beside its shown=, and that is exactly what this does — what it does NOT do is emit shown_<noun>="8"
+// <noun>_capped="0" on the ninety-nine children that fit, which on --flags would be 86 of 88 gates paying
+// bytes to say nothing was dropped. Rule 3's own sentence sanctions the shape ("If a verb emits no shown=,
+// it emits no capped= either — --skill-scan emits the pair only on a capped scan; that is conformant"), and
+// the round's rule 1 requires it: a capped="0" is a disclosure that never fires, and the reader cannot tell
+// it from one that cannot fire.
+//
+// `totalAttr` is rule 2's total: pass nullptr when the element ALREADY carries the row total under its own
+// name (--flags' reads=, --doc-drift's <weak-file-line n=>), and a name when it does not (--doc-drift's <doc>,
+// whose row population is drift= + dated= and has no single attribute — a reader should not have to sum two
+// numbers to learn what was cut). A caller must never pass a name the element already uses for something
+// else: `anchors=` on <doc> counts EVERY anchor in the doc, not the failed ones these rows list, and reusing
+// it would rebuild the dark=/dark_gates= count-vs-bool collision §P8 renamed its way out of.
+inline std::string secondaryCutAttrs( const char* noun, std::size_t shown, std::size_t total, const char* totalAttr = nullptr )
+{
+    if( shown >= total )
+    {
+        return {};   // nothing was cut: the element is byte-identical to what it was
+    }
+    std::string a = " shown_" + std::string( noun ) + "=\"" + std::to_string( shown )
+                  + "\" " + std::string( noun ) + "_capped=\"1\"";
+    if( totalAttr != nullptr )
+    {
+        a += " " + std::string( totalAttr ) + "=\"" + std::to_string( total ) + "\"";
+    }
+    return a;
 }
 
 // The PAGING HALF ALONE — rule 1's noun-prefixed exception, and the ONLY sanctioned way to emit a page
@@ -325,20 +379,51 @@ inline const char* pageDisclosure( char* buf, std::size_t bufCap, std::size_t ro
 // five facts too, and a second body with the quotes moved around is exactly the clone that lets the two
 // dialects drift. XML callers keep the default and are byte-identical (syn.yes/no are "1"/"0", which is what
 // the old "%u" printed).
+// `emitTotal=false` drops the leading total= for an element that ALREADY carries the row total under its own
+// name — the same judgement secondaryCutAttrs' `totalAttr = nullptr` makes one paragraph above, and for the
+// same reason §P8/N4 dropped the bare shown= beside a noun-prefixed pair: stating one fact twice under two
+// names forces a parser to know they are the same number to avoid double-counting it. The map's <recent>
+// blocks spell their total as of= (rule 2's "the report's own count attribute"), so they pass false; every
+// pre-existing caller keeps the default and is byte-identical.
 inline const char* pagingDisclosure( char* buf, std::size_t bufCap, std::size_t rowTotal,
                                      std::size_t windowEnd, int limit, int offset,
-                                     const PageSyntax& syn = kXmlPageSyntax ) noexcept
+                                     const PageSyntax& syn = kXmlPageSyntax, bool emitTotal = true ) noexcept
 {
     // M2: a CUT primary listing (windowEnd < rowTotal — the caller's own <noun>_capped="1") carries the
     // paging half on a bare run too, for the same reason pageDisclosure's cap half now does.
     const bool hasMore = windowEnd < rowTotal;
     if( limit <= 0 && offset <= 0 && !hasMore ) { buf[0] = '\0';  return buf; }
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
-    std::snprintf( buf, bufCap, syn.pagingOnly, rowTotal, hasMore ? syn.yes : syn.no,
-                   hasMore ? windowEnd : rowTotal, offset > 0 ? offset : 0, limit > 0 ? limit : 0 );
-#pragma clang diagnostic pop
+    // The four rendered VALUES are decided once, above both dialects, instead of being re-derived inside each
+    // arm's argument list — which is what this function used to do, four ternaries per arm. total= is then
+    // written separately when the element wants it, so the optional attribute costs one branch rather than a
+    // second copy of the whole format string. (The format string itself must stay a LITERAL per arm: rw::formatTo
+    // takes a consteval std::format_string, so a PageSyntax row cannot carry it — see the table's own note.)
+    const char* const hasMoreOut = hasMore ? syn.yes : syn.no;
+    const std::size_t nextOrTotal = hasMore ? windowEnd : rowTotal;
+    const int         offsetOut  = offset > 0 ? offset : 0;
+    const int         limitOut   = limit  > 0 ? limit  : 0;
+
+    std::size_t written = 0;
+    if( emitTotal )
+    {
+        written = syn.json ? rw::formatTo( buf, bufCap, ",\"total\":{}", rowTotal )
+                           : rw::formatTo( buf, bufCap, " total=\"{}\"", rowTotal );
+    }
+    if( written >= bufCap )
+    {
+        return buf;
+    }
+    if( syn.json )
+    {
+        rw::formatTo( buf + written, bufCap - written, ",\"has_more\":{},\"next_offset\":{},\"offset\":{},\"limit\":{}",
+                      hasMoreOut, nextOrTotal, offsetOut, limitOut );
+    }
+    else
+    {
+        rw::formatTo( buf + written, bufCap - written, " has_more=\"{}\" next_offset=\"{}\" offset=\"{}\" limit=\"{}\"",
+                      hasMoreOut, nextOrTotal, offsetOut, limitOut );
+    }
     return buf;
 }
 

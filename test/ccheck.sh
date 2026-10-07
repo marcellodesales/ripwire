@@ -44,13 +44,14 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"   # arm (f5) builds a git repo: GIT_DIR/GIT_WORK_TREE and the agent-home vars unset
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 FIX="$ROOT/test/cfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -62,9 +63,9 @@ echo "ccheck: BIN=$BIN  FIX=$FIX"
 MAP_OUT="$TMP/map.xml"
 "$BIN" "$FIX" --no-cache >"$MAP_OUT" 2>"$TMP/map.err"
 MAP_EXIT=$?
-[ "$MAP_EXIT" -eq 0 ] && ok "default map: exits 0 on the C fixture" || no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"
+if [ "$MAP_EXIT" -eq 0 ]; then ok "default map: exits 0 on the C fixture"; else no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"; fi
 
-command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$MAP_OUT" && ok "default map: passes xmllint --noout" || no "default map: xmllint failed"; }
+command -v xmllint >/dev/null 2>&1 && { if xmllint --noout "$MAP_OUT"; then ok "default map: passes xmllint --noout"; else no "default map: xmllint failed"; fi; }
 
 # no degrade / ABI-mismatch warning must reach stderr on the clean fixture (proves grammarAbiOk passed)
 [ -s "$TMP/map.err" ] && no "default map: unexpected stderr (ABI/degrade?): $( cat "$TMP/map.err" )" || ok "default map: clean stderr (no ABI mismatch / degrade)"
@@ -94,10 +95,10 @@ echo
 echo "=== structure: 9 symbols across 3 files, tags + edges match the fixture ==="
 # ═══════════════════════════════════════════════════════════════════════════
 
-grep -q 'symbols=9' "$MAP_OUT" && ok "header: symbols=9 (util.h:add_one, util.c:5, main.c:2)" || no "header: expected symbols=9: $( grep -o 'symbols=[0-9]*' "$MAP_OUT" )"
-grep -q 'edges=3' "$MAP_OUT" && ok "header: edges=3 (add_two->add_one, run->add_one, compute->add_two)" || no "header: expected edges=3: $( grep -o 'edges=[0-9]*' "$MAP_OUT" )"
-grep -q 'ambiguous=0' "$MAP_OUT" && ok "header: ambiguous=0 (util.h's decl-only add_one never splits the cross-lang candidate set)" || no "header: expected ambiguous=0: $( grep -o 'ambiguous=[0-9]*' "$MAP_OUT" )"
-grep -q 'unresolved=0' "$MAP_OUT" && ok "header: unresolved=0" || no "header: expected unresolved=0: $( grep -o 'unresolved=[0-9]*' "$MAP_OUT" )"
+if grep -q 'symbols=9' "$MAP_OUT"; then ok "header: symbols=9 (util.h:add_one, util.c:5, main.c:2)"; else no "header: expected symbols=9: $( grep -o 'symbols=[0-9]*' "$MAP_OUT" )"; fi
+if grep -q 'edges=3' "$MAP_OUT"; then ok "header: edges=3 (add_two->add_one, run->add_one, compute->add_two)"; else no "header: expected edges=3: $( grep -o 'edges=[0-9]*' "$MAP_OUT" )"; fi
+if grep -q 'ambiguous=0' "$MAP_OUT"; then ok "header: ambiguous=0 (util.h's decl-only add_one never splits the cross-lang candidate set)"; else no "header: expected ambiguous=0: $( grep -o 'ambiguous=[0-9]*' "$MAP_OUT" )"; fi
+if grep -q 'unresolved=0' "$MAP_OUT"; then ok "header: unresolved=0"; else no "header: expected unresolved=0: $( grep -o 'unresolved=[0-9]*' "$MAP_OUT" )"; fi
 
 python3 - "$TMP/parsed.json" <<'PYEOF' >"$TMP/struct_check"
 import json, sys
@@ -126,30 +127,30 @@ print("H_DECL:%s POINT:%s POINTT:%s COLOR:%s SQUARE:%s ADDONE:%s ADDTWO:%s ADDTW
 PYEOF
 cat "$TMP/struct_check"
 
-grep -q "H_DECL:True"      "$TMP/struct_check" && ok "util.h: body-less prototype add_one still emitted, t=\"fn\""      || no "util.h: add_one prototype missing or wrong tag"
-grep -q "POINT:True"       "$TMP/struct_check" && ok "util.c: struct Point tagged t=\"cls\""                            || no "util.c: Point missing or not t=\"cls\""
-grep -q "POINTT:True"      "$TMP/struct_check" && ok "util.c: typedef PointT tagged t=\"struct\" (type-alias bucket)"   || no "util.c: PointT missing or wrong tag"
-grep -q "COLOR:True"       "$TMP/struct_check" && ok "util.c: enum Color tagged t=\"struct\" (type bucket)"             || no "util.c: Color missing or wrong tag"
-grep -q "SQUARE:True"      "$TMP/struct_check" && ok "util.c: #define SQUARE tagged t=\"fn\" (macro bucket)"            || no "util.c: SQUARE macro missing or wrong tag"
-grep -q "ADDONE:True"      "$TMP/struct_check" && ok "util.c: add_one() definition tagged t=\"fn\""                     || no "util.c: add_one missing or wrong tag"
-grep -q "ADDTWO:True"      "$TMP/struct_check" && ok "util.c: add_two() definition tagged t=\"fn\""                     || no "util.c: add_two missing or wrong tag"
-grep -q "ADDTWO_EDGE:True" "$TMP/struct_check" && ok "util.c: same-file call edge add_two -> add_one present"           || no "util.c: add_two -> add_one edge MISSING"
-grep -q "RUN:True"         "$TMP/struct_check" && ok "main.c: run() tagged t=\"fn\""                                    || no "main.c: run missing or wrong tag"
-grep -q "COMPUTE:True"     "$TMP/struct_check" && ok "main.c: compute() tagged t=\"fn\""                                || no "main.c: compute missing or wrong tag"
-grep -q "RUN_EDGE:True"     "$TMP/struct_check" && ok "main.c: CROSS-FILE edge run -> add_one (resolves to util.c's DEF, not util.h's decl)" || no "main.c: run -> add_one edge MISSING"
-grep -q "COMPUTE_EDGE:True" "$TMP/struct_check" && ok "main.c: cross-file edge compute -> add_two"                      || no "main.c: compute -> add_two edge MISSING"
+if grep -q "H_DECL:True"      "$TMP/struct_check"; then ok "util.h: body-less prototype add_one still emitted, t=\"fn\""; else no "util.h: add_one prototype missing or wrong tag"; fi
+if grep -q "POINT:True"       "$TMP/struct_check"; then ok "util.c: struct Point tagged t=\"cls\""; else no "util.c: Point missing or not t=\"cls\""; fi
+if grep -q "POINTT:True"      "$TMP/struct_check"; then ok "util.c: typedef PointT tagged t=\"struct\" (type-alias bucket)"; else no "util.c: PointT missing or wrong tag"; fi
+if grep -q "COLOR:True"       "$TMP/struct_check"; then ok "util.c: enum Color tagged t=\"struct\" (type bucket)"; else no "util.c: Color missing or wrong tag"; fi
+if grep -q "SQUARE:True"      "$TMP/struct_check"; then ok "util.c: #define SQUARE tagged t=\"fn\" (macro bucket)"; else no "util.c: SQUARE macro missing or wrong tag"; fi
+if grep -q "ADDONE:True"      "$TMP/struct_check"; then ok "util.c: add_one() definition tagged t=\"fn\""; else no "util.c: add_one missing or wrong tag"; fi
+if grep -q "ADDTWO:True"      "$TMP/struct_check"; then ok "util.c: add_two() definition tagged t=\"fn\""; else no "util.c: add_two missing or wrong tag"; fi
+if grep -q "ADDTWO_EDGE:True" "$TMP/struct_check"; then ok "util.c: same-file call edge add_two -> add_one present"; else no "util.c: add_two -> add_one edge MISSING"; fi
+if grep -q "RUN:True"         "$TMP/struct_check"; then ok "main.c: run() tagged t=\"fn\""; else no "main.c: run missing or wrong tag"; fi
+if grep -q "COMPUTE:True"     "$TMP/struct_check"; then ok "main.c: compute() tagged t=\"fn\""; else no "main.c: compute missing or wrong tag"; fi
+if grep -q "RUN_EDGE:True"     "$TMP/struct_check"; then ok "main.c: CROSS-FILE edge run -> add_one (resolves to util.c's DEF, not util.h's decl)"; else no "main.c: run -> add_one edge MISSING"; fi
+if grep -q "COMPUTE_EDGE:True" "$TMP/struct_check"; then ok "main.c: cross-file edge compute -> add_two"; else no "main.c: compute -> add_two edge MISSING"; fi
 
 # cross-check via --callees / --callers (independent of the raw-XML parse)
 CE="$( "$BIN" "$FIX" --callees=run --no-cache 2>/dev/null )"
-echo "$CE" | grep -q 'count="1"'      && ok "--callees=run reports count=1"          || no "--callees=run did not report count=1: $CE"
+if echo "$CE" | grep -q 'count="1"'; then ok "--callees=run reports count=1"; else no "--callees=run did not report count=1: $CE"; fi
 echo "$CE" | grep -q 'n="add_one"'    && echo "$CE" | grep -q 'util.c'               \
     && ok "--callees=run resolves add_one to util.c (the definition, not util.h's decl)" \
     || no "--callees=run did not resolve to util.c's add_one: $CE"
 
 CR="$( "$BIN" "$FIX" --callers=add_one --no-cache 2>/dev/null )"
-echo "$CR" | grep -q 'count="2"'  && ok "--callers=add_one reports count=2 (run, add_two)" || no "--callers=add_one did not report count=2: $CR"
-echo "$CR" | grep -q 'n="run"'     && ok "--callers=add_one lists run"     || no "--callers=add_one missing run: $CR"
-echo "$CR" | grep -q 'n="add_two"' && ok "--callers=add_one lists add_two" || no "--callers=add_one missing add_two: $CR"
+if echo "$CR" | grep -q 'count="2"'; then ok "--callers=add_one reports count=2 (run, add_two)"; else no "--callers=add_one did not report count=2: $CR"; fi
+if echo "$CR" | grep -q 'n="run"'; then ok "--callers=add_one lists run"; else no "--callers=add_one missing run: $CR"; fi
+if echo "$CR" | grep -q 'n="add_two"'; then ok "--callers=add_one lists add_two"; else no "--callers=add_one missing add_two: $CR"; fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo
@@ -206,6 +207,140 @@ grep -q "ADDTWO_EDGE_GONE:True" "$TMP/mut_check" \
 grep -q "RUN_EDGE_GONE:True" "$TMP/mut_check" \
     && ok "mutation: renamed main.c CROSS-FILE call site -> run -> add_one edge vanished (non-tautological)" \
     || no "mutation: run -> add_one edge survived a renamed call site — the edge assertion is a tautology"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== a body-less type specifier in a signature is not the function's encloser (comparison table tmux-07/tmux-15) ==="
+# ═══════════════════════════════════════════════════════════════════════════
+# tmux writes `static enum cmd_retval⏎cmd_set_environment_exec(…)`. The tags query captures every named
+# enum_specifier as a type definition, and the body-less one in the return type then CLIMBED to the enclosing
+# function_definition (the climb exists for function_declarator → function_definition) and took the WHOLE
+# function's span. So `--at` chained `struct cmd_retval` around the function, `--grep` labelled hits in="cmd_retval",
+# and a call inside a function with an `enum box_lines` PARAMETER was attributed to a caller `struct box_lines`.
+# RED on main 953818d6 for (a)-(d); (e) pins that the real enum definition is untouched.
+EN="$TMP/enumsig"
+mkdir -p "$EN/cpp"
+cat >"$EN/a.c" <<'EOF'
+enum cmd_retval { CMD_RETURN_NORMAL, CMD_RETURN_ERROR };
+enum box_lines { BOX_SINGLE, BOX_DOUBLE };
+
+static int helper(int x)
+{
+	return x + 1;
+}
+
+static enum cmd_retval
+cmd_split_exec(int a)
+{
+	helper(a);
+	errmsg("ENUMSIG no current session");
+	return CMD_RETURN_NORMAL;
+}
+
+int
+menu_display(int a,
+    enum box_lines lines)
+{
+	return helper(a) + (int)lines;
+}
+EOF
+cp "$EN/a.c" "$EN/cpp/b.cpp"
+EN_AT="$( "$BIN" "$EN" --no-cache --at=a.c:13 2>/dev/null )"
+printf '%s' "$EN_AT" | grep -q 'sym="cmd_split_exec" chain="1"' \
+    && ok "(a) --at inside a 'static enum X⏎name(' function chains the function alone" \
+    || no "(a) --at chains something around cmd_split_exec: $( printf '%s' "$EN_AT" | grep -o '<at .*' | cut -c1-300 )"
+EN_GREP="$( "$BIN" "$EN" --no-cache --grep="ENUMSIG no current session" 2>/dev/null )"
+# Each fixture file's hit is checked on its own (a.c and its C++ copy): one right attribution must not cover the other.
+EN_HITS="$( printf '%s' "$EN_GREP" | tr '>' '\n' | awk '/^<f p=/ { f = $2 } /^<hit / { print f, $0 }' )"
+for f in a.c cpp/b.cpp; do
+    printf '%s\n' "$EN_HITS" | grep -q "^p=\"$f\" <hit l=\"13\" in=\"cmd_split_exec\"" \
+        && ok "(b) the --grep hit in $f names in=\"cmd_split_exec\"" \
+        || no "(b) the --grep hit in $f is not attributed to the function: $( printf '%s\n' "$EN_HITS" | grep "^p=\"$f\"" | head -1 )"
+done
+EN_CALLERS="$( "$BIN" "$EN" --no-cache --callers=helper 2>/dev/null )"
+if printf '%s' "$EN_CALLERS" | grep -q '<s t="fn" n="menu_display"' && ! printf '%s' "$EN_CALLERS" | grep -q 't="struct"'; then
+    ok "(c) a call in a function with an 'enum box_lines' parameter is attributed to the function, no struct caller"
+else
+    no "(c) --callers=helper names a struct as a caller: $( printf '%s' "$EN_CALLERS" | grep -o '<s [^>]*>' | tr '\n' ' ' )"
+fi
+# (c2) the CALLEE direction of the same defect (tmux `cmd_find_target(…, enum cmd_find_type type, …)`: the 23 call
+# edges of the function hung off `cmd_find_type`, so --callees=cmd_find_target read count="0"). The function owns its
+# callees; the body-less parameter specifier owns none.
+EN_CE="$( "$BIN" "$EN" --no-cache --callees=menu_display 2>/dev/null )"
+EN_CE_ENUM="$( "$BIN" "$EN" --no-cache --callees=box_lines 2>/dev/null | grep -o '<callees [^>]*>' )"
+if printf '%s' "$EN_CE" | grep -q '<s t="fn" n="helper"' && printf '%s' "$EN_CE_ENUM" | grep -q 'count="0"'; then
+    ok "(c2) --callees=menu_display lists helper; the 'enum box_lines' specifier owns no callee"
+else
+    no "(c2) the parameter specifier still owns the function's calls: menu_display=$( printf '%s' "$EN_CE" | grep -o '<callees [^>]*>' ) box_lines=$EN_CE_ENUM"
+fi
+EN_CPP="$( "$BIN" "$EN/cpp" --no-cache --at=b.cpp:13 2>/dev/null )"
+printf '%s' "$EN_CPP" | grep -q 'sym="cmd_split_exec" chain="1"' \
+    && ok "(d) the C++ grammar (.cpp, and .h which C++ owns) gets the same span" \
+    || no "(d) C++: --at chains something around cmd_split_exec: $( printf '%s' "$EN_CPP" | grep -o '<at .*' | cut -c1-300 )"
+"$BIN" "$EN" --no-cache --at=a.c:1 2>/dev/null | grep -q '<s n="cmd_retval" t="struct" l="1" el="1"/>' \
+    && ok "(e) the real 'enum cmd_retval { … }' definition is unchanged (t=\"struct\", its own line)" \
+    || no "(e) the bodied enum definition moved"
+
+# (f) the body-less specifier mints NO definition at all (review rv-answer-honesty-067 item 1). Keeping it as a small
+# def of its own sat in the function's return-type position, wholly before the name — extentsuspect.h's R3 derailed-
+# parse signature — so clean functions read extent_suspect="head" and --hotspots stopped ranking them (tmux: 0 -> 206
+# flagged rows, extent_suspect_files 80, ranked 241 -> 206). It is a type USE: no def, no extent flag, one cmd_retval.
+# The C++ sibling is a body-less `class Widget` in a return type (the bare class pattern); struct/union need a body
+# or a declaration parent in the tags queries, so they never reach this path. RED at 6ef65b15.
+cat >"$EN/cpp/w.cpp" <<'EOF'
+class Widget { public: int x; };
+static int wh(int a) { return a; }
+
+class Widget *
+make_widget(int a)
+{
+	wh(a);
+	return nullptr;
+}
+EOF
+# Each absence below is read only off an answer that completed: a failed or partial run is a FAIL, not "nothing found".
+if ! EN_MAP="$( "$BIN" "$EN" --no-cache --top-k=100000 2>/dev/null )"; then
+    no "(f) premise: the --top-k=100000 map run failed (rc!=0), so an absent extent_suspect= proves nothing"
+elif ! printf '%s' "$EN_MAP" | grep -q '<s '; then
+    no "(f) premise: the map has no rows"
+elif printf '%s' "$EN_MAP" | grep -q 'extent_suspect='; then
+    no "(f) a clean 'static enum X⏎fn(' / 'class W *fn(' file carries extent_suspect: $( printf '%s' "$EN_MAP" | grep -o '<s [^>]*extent_suspect[^>]*>' | head -3 | tr '\n' ' ' )"
+else
+    ok "(f) no extent_suspect on the enum/class return-type and enum-parameter functions"
+fi
+if ! EN_SK="$( "$BIN" "$EN" --no-cache --skipped 2>/dev/null )" || ! printf '%s' "$EN_SK" | grep -q '<skipped '; then
+    no "(f2) premise: --skipped failed or emitted no <skipped> report"
+elif printf '%s' "$EN_SK" | grep -q 'extent_suspect_files='; then
+    no "(f2) --skipped names extent_suspect_files on the clean fixture"
+else
+    ok "(f2) --skipped carries no extent_suspect_files"
+fi
+EN_CR="$( printf '%s' "$EN_MAP" | grep -o '<s t="[a-z]*" n="cmd_retval"[^>]*>' )"
+if [ -n "$EN_CR" ] && ! printf '%s' "$EN_CR" | grep -q 'overloads='; then
+    ok "(f3) cmd_retval is one definition per file (no overloads=) — the return-type uses mint none"
+else
+    no "(f3) the return-type specifier still mints a definition: $EN_CR"
+fi
+EN_W="$( printf '%s' "$EN_MAP" | grep -o '<s t="[a-z]*" n="Widget"[^>]*>' )"
+if [ -z "$EN_W" ]; then
+    no "(f4) premise: the map has no Widget row at all — the real 'class Widget { … }' definition is missing, so (f4) proves nothing"
+elif printf '%s' "$EN_W" | grep -q 'overloads='; then
+    no "(f4) C++ 'class Widget *make_widget(' still mints a second Widget definition"
+else
+    ok "(f4) C++ body-less class in a return type mints no definition (the real Widget row is there)"
+fi
+if command -v git >/dev/null 2>&1; then
+    git -C "$EN" init -q . && git -C "$EN" -c user.email=t@t -c user.name=t add -A && git -C "$EN" -c user.email=t@t -c user.name=t commit -qm base
+    EN_HOT="$( "$BIN" "$EN" --no-cache --hotspots 2>/dev/null | grep -o '<hotspots [^>]*>' )"
+    EN_HOT_FILES="$( printf '%s' "$EN_HOT" | grep -oE ' files="[0-9]+"' | grep -oE '[0-9]+' )"
+    if [ -z "$EN_HOT" ] || [ "${EN_HOT_FILES:-0}" -lt 1 ]; then
+        no "(f5) premise: --hotspots answered no <hotspots> root over the fixture's files: ${EN_HOT:-none}"
+    elif printf '%s' "$EN_HOT" | grep -q 'unranked_extent_suspect='; then
+        no "(f5) --hotspots withholds files as extent-suspect: $EN_HOT"
+    else
+        ok "(f5) --hotspots ranks every file (no unranked_extent_suspect; files=$EN_HOT_FILES)"
+    fi
+fi
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo

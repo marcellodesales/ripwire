@@ -36,7 +36,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -110,14 +110,34 @@ est_of(){   "$BIN" "$@" --no-cache 2>/dev/null | grep -oE 'est_tokens=[0-9]+' | 
 # identical to this binary's `test/fixture` map, which arm #1b re-asserts. The fixture's emit ORDER is
 # unchanged (important-first) and the auto-flip threshold (16000) is still >18x this number, so only the
 # pin moved -- no contract did.
-EFIX="$( est_of test/fixture )"
+# L1 (2026-09-19): the CLI default legend is compact; the 863 pin and test/golden.xml were recorded from the full default, so
+# #1/#1b ask for the full legend (byte-identical to the old default); #8 counts real <s> rows, which the compact legend spells in its comment.
+EFIX="$( est_of test/fixture --legend=full )"
 OFIX="$( order_of test/fixture )"
-{ [ "$EFIX" = "884" ] && [ "$OFIX" = "important-first" ]; } \
+# RE-PIN 2026-09-12 (row 6, sc=): 884 -> 894. The map legend's sc= reading (the composition rule id = p::sc::n,
+# replacing the shorter id=canonical(...) clause) is +40 B on a fixture whose 14 rows carry ONE scoped symbol, so the
+# legend outgrows the row saving here; on a real tree the rows win (this repo's flagless map: -15.3%). Only the pin moved.
+# RE-PIN 2026-09-13 (PR #215 review, CodeRabbit 5191303552): 894 -> 895, and NOT because anything grew. The byte MODEL
+# still charged each scoped symbol `path::scope::name` -- the id= the row stopped printing -- so it billed the path and
+# the name a second time on every scoped row. Charged at what the row prints (` sc=""` + the scope) it prices fewer
+# bytes, and the reported est_tokens is emitted-bytes / the MODEL'S OWN rate (tokensForEmittedBytes with
+# mapEst.bytesPerToken()), so a model that prices a different mix publishes a different rate: here 2.496 -> 2.497 B/tok
+# against an emitted size that did not move one byte. Hence +1, on a document byte-identical to its previous self --
+# this fixture's golden is 2,234 B before and after, and est_tokens= is the ONLY character that differs in it.
+# RE-PIN 2026-09-16 (#228, test/rootspellingcheck.sh): 895 -> 863, and the document SHRANK, it did not re-price. This
+# gate reads test/fixture with the root TYPED `test/fixture`, and until #228 the builtin layer tagger read the `test/`
+# of that spelling as a directory inside the tree: all six <f> rows carried layer="test" (cd test/fixture && ripwire .
+# printed none). The tag now comes from the root-relative path, so the six attributes are gone; the byte model also
+# charges each file path as p= prints it (root-relative) instead of with the typed root prepended.
+# RE-PIN 2026-10-04 (train 25): 863 -> 905, the document GREW by its legend and nothing else. The v1 header legend's
+# unresolved=/external= clauses now state the false-edge rule (+106 B); test/golden.xml was re-recorded beside it and differs
+# from its previous self by exactly those two clauses and est_tokens=. Order is unchanged (important-first).
+{ [ "$EFIX" = "905" ] && [ "$OFIX" = "important-first" ]; } \
     && ok "test/fixture (est_tokens=$EFIX) does NOT auto-flip — order=$OFIX (golden neutral)" \
     || no "test/fixture unexpectedly changed order or est_tokens (est=$EFIX order=$OFIX)"
 
 # ── #1b: byte-identity against the committed golden ─────────────────────────────────────────────────────
-if diff -q <( "$BIN" test/fixture --no-cache 2>/dev/null ) "$ROOT/test/golden.xml" >/dev/null 2>&1; then
+if diff -q <( "$BIN" test/fixture --no-cache --legend=full 2>/dev/null ) "$ROOT/test/golden.xml" >/dev/null 2>&1; then
     ok "test/fixture output byte-identical to test/golden.xml"
 else
     no "test/fixture output DIFFERS from test/golden.xml — golden neutrality broken"
@@ -183,8 +203,8 @@ fi
 #    <s> emitted under auto-flip must equal the LAST <s> emitted under the un-flipped (--no-auto-order)
 #    run on the identical input, proving the auto path actually reverses emit order. A broken
 #    implementation that only rewrites the order= string (without reordering) would fail this. ───────────
-FIRST_AUTO="$( "$BIN" src --top-k=100000 --no-cache 2>/dev/null              | grep -oE '<s [^>]*' | head -1 )"
-LAST_PLAIN="$( "$BIN" src --top-k=100000 --no-auto-order --no-cache 2>/dev/null | grep -oE '<s [^>]*' | tail -1 )"
+FIRST_AUTO="$( "$BIN" src --top-k=100000 --no-cache --legend=full 2>/dev/null | grep -oE '<s [^>]*' | head -1 )"
+LAST_PLAIN="$( "$BIN" src --top-k=100000 --no-auto-order --no-cache --legend=full 2>/dev/null | grep -oE '<s [^>]*' | tail -1 )"
 { [ -n "$FIRST_AUTO" ] && [ "$FIRST_AUTO" = "$LAST_PLAIN" ]; } \
     && ok "self-mutation check: auto-flip is a REAL reorder (first-under-auto == last-under-plain)" \
     || no "self-mutation check FAILED: auto-flip did not actually reorder symbols (first-auto='$FIRST_AUTO' last-plain='$LAST_PLAIN')"

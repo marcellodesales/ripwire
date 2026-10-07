@@ -32,7 +32,7 @@ TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 FIX="$TMP/guardfix"; FIX2="$TMP/langfix"
 mkdir -p "$FIX" "$FIX2"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -95,14 +95,17 @@ EOF
 
 echo "chainguardcheck: BIN=$BIN  CORPUS=$FIX + $FIX2 (generated)"
 
-MAP="$( "$BIN" "$FIX" --no-cache 2>/dev/null | tr '>' '\n' )"
+# L1 (2026-09-19): the CLI default legend is compact and spells ambiguous=/edges= inside its comment; arms (i)/(j)
+# read the real header gauges, so the two maps they read ask for the full legend.
+MAP="$( "$BIN" "$FIX" --no-cache --legend=full 2>/dev/null | tr '>' '\n' )"
 callees(){ "$BIN" "$FIX" "--callees=$1" --no-cache 2>/dev/null | grep -o '<callees.*</callees>' | tr '/' '\n'; }
 
 # ── presence guards (a gate that cannot observe what it asserts is green-while-inert) ──
-for want in '::Pool::run"' '::Cfg::enable"' '::EDecoy::enable"' '::Opts::tick"' '::Opts::ping"' \
-            '::App::run"' '::App::tick"' '::App::goThis"' '::App::goVar"' '::App::goLoc"' \
-            '::App::goShadow"' '::App::goVarShadow"' '::App::goBare"' '::App::goOne"' \
-            '::App::deepPin"' '::App::deepShadow"'; do
+# row 6 (2026-09-12): a scoped row prints n= then sc= (the short id); the canonical id composes as <f p=>::sc::n
+for want in 'n="run" sc="Pool"' 'n="enable" sc="Cfg"' 'n="enable" sc="EDecoy"' 'n="tick" sc="Opts"' 'n="ping" sc="Opts"' \
+            'n="run" sc="App"' 'n="tick" sc="App"' 'n="goThis" sc="App"' 'n="goVar" sc="App"' 'n="goLoc" sc="App"' \
+            'n="goShadow" sc="App"' 'n="goVarShadow" sc="App"' 'n="goBare" sc="App"' 'n="goOne" sc="App"' \
+            'n="deepPin" sc="App"' 'n="deepShadow" sc="App"'; do
     printf '%s\n' "$MAP" | grep -qF "$want" || no "presence guard: fixture symbol $want not indexed"
 done
 [ "$fail" = 0 ] && ok "presence: all fixture symbols indexed"
@@ -202,8 +205,8 @@ EDG="$( printf '%s\n' "$MAP" | grep -o 'edges=[0-9]*' | head -1 )"
     || no "(i) header gauge is '$EDG', expected edges=15 — a recovered edge is missing or one was lost"
 
 # ── (j) cross-language stability (FIX2): Python/TS chained-call edges are byte-stable ─────────────────
-MAP2="$( "$BIN" "$FIX2" --no-cache 2>/dev/null | tr '>' '\n' )"
-printf '%s\n' "$MAP2" | grep -qF '::PApp::go"' || no "(j) presence guard: PApp.go not indexed in FIX2"
+MAP2="$( "$BIN" "$FIX2" --no-cache --legend=full 2>/dev/null | tr '>' '\n' )"
+printf '%s\n' "$MAP2" | grep -qF 'n="go" sc="PApp"' || no "(j) presence guard: PApp.go not indexed in FIX2"
 GO2="$( "$BIN" "$FIX2" --callees=go --no-cache 2>/dev/null | grep -o '<callees.*</callees>' | tr '/' '\n' )"
 ( printf '%s\n' "$GO2" | grep -q 'p.py:2"' ) && ( printf '%s\n' "$GO2" | grep -q 'p.py:6"' ) \
     && ok "(j-py) PApp.go() self.pool.acquire() keeps its COMPLETE split (Python shape capture changes no edge)" \

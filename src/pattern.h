@@ -59,6 +59,7 @@
 #include "model.h"
 #include "infra/Diagnostics.h"
 #include "infra/namesplit.h"   // isIdentChar / isIdentStart — the ONE ASCII identifier-character pair
+#include "infra/tschildren.h"  // ChildCursor/forEachChild/collectChildren — the O(C) child walk (P1-0)
 
 #include <tree_sitter/api.h>
 
@@ -383,6 +384,13 @@ inline const std::vector<TemplateSet>& templateTable()
                           "class RwWrapCls { void RwWrapFn(){ var rwwrapv = @@; } }", "class RwWrapCls { @@ }" } },
         { "javascript", { "@@", "function rwwrapfn(){ @@; }", "function rwwrapfn(){ @@ }", "class RwWrapCls { @@ }" } },
         { "typescript", { "@@", "function rwwrapfn(){ @@; }", "function rwwrapfn(){ @@ }", "class RwWrapCls { @@ }" } },
+        // #285: .tsx moved to its own querySub ("tsx", not "typescript" — see kLangTable's .tsx row and
+        // queries/typescript/tags.scm's header for why) so this table needs its own entry too, or
+        // templatesFor("tsx") returns nullptr and supportedPatternGrammars() silently drops .tsx from
+        // --pattern's served set entirely (measured: test/patterncheck.sh arm 4e's `<Foo bar={$V} />`
+        // against a .tsx fixture went from hits>0 to hits=0 the moment the querySub split landed). Same
+        // wrapper shapes as "typescript"/"javascript" — JSX is an expression, so it wraps the same.
+        { "tsx",        { "@@", "function rwwrapfn(){ @@; }", "function rwwrapfn(){ @@ }", "class RwWrapCls { @@ }" } },
         { "python",     { "@@", "def rwwrapfn():\n    @@\n", "class RwWrapCls:\n    @@\n" } },
         { "go",         { "@@", "package rwwrappkg\n\nfunc rwwrapfn() {\n@@\n}\n", "package rwwrappkg\n\n@@\n",
                           "package rwwrappkg\n\nfunc rwwrapfn() {\nrwwrapv := @@\n}\n" } },
@@ -419,21 +427,21 @@ inline bool isCommentKind( const char* type ) noexcept
 // extra/zero-width child, and so the loop is obviously bounded by tree depth.
 inline TSNode smallestContaining( TSNode root, std::uint32_t begin, std::uint32_t end )
 {
-    TSNode n = root;
+    TSNode      n = root;
+    ChildCursor cursor( root );   // ONE cursor for the whole descent: each level finishes before the next starts
     for( ;; )
     {
         bool descended = false;
-        const std::uint32_t childCount = ts_node_child_count( n );
-        for( std::uint32_t c = 0; c < childCount; ++c )
+        forEachChild( n, cursor.cur, [ & ]( TSNode child )
         {
-            const TSNode child = ts_node_child( n, c );
             if( ts_node_start_byte( child ) <= begin && ts_node_end_byte( child ) >= end && ts_node_end_byte( child ) > ts_node_start_byte( child ) )
             {
                 n         = child;
                 descended = true;
-                break;
+                return false;   // stop: this level is decided
             }
-        }
+            return true;
+        } );
         if( !descended )
         {
             return n;
@@ -486,21 +494,21 @@ inline std::uint32_t snapshotNode( PatternProgram& prog, TSNode n, std::string_v
     // Literal: keep every child, named and anonymous alike (the `+` in `a + b` is load-bearing), minus
     // comments. A childless literal carries its own text and must match it exactly.
     std::vector<TSNode> kids;
-    const std::uint32_t childCount = ts_node_child_count( n );
-    kids.reserve( childCount );
-    for( std::uint32_t c = 0; c < childCount; ++c )
+    kids.reserve( ts_node_child_count( n ) );
+    ChildCursor cursor( n );   // this frame's own — the loop below recurses into snapshotNode
+    forEachChild( n, cursor.cur, [ & ]( TSNode child )
     {
-        const TSNode child = ts_node_child( n, c );
         if( isCommentKind( ts_node_type( child ) ) )
         {
-            continue;
+            return true;
         }
         if( ts_node_end_byte( child ) <= ts_node_start_byte( child ) )
         {
-            continue;   // zero-width (a MISSING recovery node) — never a shape constraint
+            return true;   // zero-width (a MISSING recovery node) — never a shape constraint
         }
         kids.push_back( child );
-    }
+        return true;
+    } );
     if( kids.empty() )
     {
         PatNode& self  = prog.nodes[index];
@@ -572,7 +580,7 @@ inline PatternProgram compileFor( const TSLanguage* grammar, std::string_view gr
         for( const std::string_view tmpl : ts->templates )
         {
             const std::size_t slot = tmpl.find( "@@" );
-            VERIFY( slot != std::string_view::npos );   // every row in templateTable() carries the slot
+            ASSUME( slot != std::string_view::npos );   // every row in templateTable() carries the slot
             std::string src( tmpl.substr( 0, slot ) );
             const std::uint32_t begin = std::uint32_t( src.size() );
             src += norm.src;
@@ -580,11 +588,7 @@ inline PatternProgram compileFor( const TSLanguage* grammar, std::string_view gr
             src += std::string( tmpl.substr( slot + 2 ) );
 
             TSParser* parser = ts_parser_new();
-            if( parser == nullptr )
-            {
-                DEGRADED_PATH_ALERT( "pattern: ts_parser_new returned null" );
-                continue;
-            }
+            ASSUME( parser != nullptr, "ts_parser_new: the default tree-sitter allocator aborts on failure (alloc.c)" );
             if( !ts_parser_set_language( parser, grammar ) )
             {
                 ts_parser_delete( parser );
@@ -648,9 +652,10 @@ struct GrammarRow
 {
     const TSLanguage* grammar = nullptr;
     std::string_view  name;      // kLangTable querySub — the TEMPLATE key: "cpp", "python", …
-    // V-3 (adversarial verification 2026-08-20). querySub is NOT unique per grammar OBJECT: `.cu`/`.cuh`
-    // ride tree_sitter_cuda under querySub "cpp", and `.tsx` rides tree_sitter_tsx under "typescript".
-    // The template key MUST stay shared (the cpp tags.scm is what compiles against the cuda grammar), but
+    // V-3 (adversarial verification 2026-08-20). querySub is NOT always unique per grammar OBJECT: `.cu`/
+    // `.cuh` ride tree_sitter_cuda under querySub "cpp" (`.tsx` was the other example, under "typescript",
+    // until #285 gave it its own querySub "tsx" — see kLangTable's .tsx row). The template key MUST stay
+    // shared where it genuinely can (the cpp tags.scm is what compiles against the cuda grammar), but
     // the DISCLOSURE name must not be, or `grammars="cpp"` claims the C++ grammar resolved when only the
     // CUDA one did — while eligible_files=, which is keyed on the grammar OBJECT, correctly counts the
     // .cpp file as unscanned. Two attributes on one element, contradicting each other, on a run where
@@ -813,6 +818,12 @@ inline std::string_view nodeText( TSNode n, std::string_view src ) noexcept
     return src.substr( a, b - a );
 }
 
+// stripQuotePair lives in infra/namesplit.h (a tree-sitter-free leaf) so lintrules.h, which graph.h
+// includes, can share it without pulling <tree_sitter/api.h> into every graph.h consumer (the gate
+// harnesses build graph.h with no tree-sitter include path). Spelled pattern::stripQuotePair here, as
+// before, so every call site is unchanged.
+using namesplit::stripQuotePair;
+
 // Structural equality for metavariable unification (ast-grep does_node_match_exactly). NOT whole-subtree
 // text equality: `a + b` and `a  +  b` must unify (only whitespace differs) while `a + b` and `a - b`
 // must not, and re-serializing text cannot tell those two cases apart.
@@ -835,14 +846,26 @@ inline bool nodesMatchExactly( TSNode a, TSNode b, std::string_view src, unsigne
     {
         return false;
     }
-    for( std::uint32_t i = 0; i < an; ++i )
+    // O(children) on both sides: a bound metavariable and its candidate both come from the FILE, so each
+    // list is as wide as the comments in it (a comment is a NAMED extra) — `$X == $X` over two 16 000-comment
+    // argument lists measured 126x the plain map (test/childwalkscalecheck.sh, arm B36). a's list is
+    // materialised so b's can be walked in lockstep; each frame owns its cursors because the body recurses.
+    std::vector<TSNode> aKids;
+    aKids.reserve( an );
     {
-        if( !nodesMatchExactly( ts_node_named_child( a, i ), ts_node_named_child( b, i ), src, depth + 1 ) )
-        {
-            return false;
-        }
+        ChildCursor aCursor( a );
+        forEachNamedChild( a, aCursor.cur, [ & ]( TSNode c ) { aKids.push_back( c ); return true; } );
     }
-    return true;
+    bool          same  = true;
+    std::uint32_t index = 0;
+    ChildCursor   bCursor( b );
+    forEachNamedChild( b, bCursor.cur, [ & ]( TSNode bc )
+    {
+        same = index < aKids.size() && nodesMatchExactly( aKids[ index ], bc, src, depth + 1 );
+        ++index;
+        return same;
+    } );
+    return same;
 }
 
 // V-2 (adversarial verification 2026-08-20). The ellipsis probe ABANDONS a candidate node when the run of
@@ -859,6 +882,16 @@ inline bool nodesMatchExactly( TSNode a, TSNode b, std::string_view src, unsigne
 struct MatchStats
 {
     std::uint64_t ellipsisCappedCount = 0;
+    // QUALIFIED-CALLEE NEAR MISSES (lane honesty-cuts-066). The matcher is kind- and text-exact, so a bare callee in the
+    // pattern (`escapeXml($X, ...)`) never matches a SCOPE-QUALIFIED spelling of the same name (`rw::escapeXml( s, esc )`):
+    // the callee is a qualified_identifier there, not an identifier. On this repository that left 47 such calls out of
+    // hits="213" while --uses counted 265, and nothing said so. findMatches now re-asks every candidate the exact match
+    // refused with ONE relaxation — a pattern leaf may match the final name segment of a qualified/scoped name — and
+    // counts the nodes only that relaxation matches. They are NOT hits (the pattern did not say `rw::`); the count is
+    // disclosed as unmatched_qualified= so a reader knows the exact answer left them out and how to spell them in.
+    std::uint64_t qualifiedUnmatchedCount = 0;
+    bool          relaxQualified          = false;   // set by findMatches for the second ask only
+    bool          relaxedLeafHit          = false;   // the second ask used the relaxation at least once
 };
 
 bool matchAt( const PatternProgram& prog, std::uint32_t patIndex, TSNode cand, std::string_view src, MatchEnv& env, MatchStats& stats, unsigned depth );
@@ -867,18 +900,21 @@ bool matchAt( const PatternProgram& prog, std::uint32_t patIndex, TSNode cand, s
 // function grows a second concern: matchAt decides what ONE node is, this decides how a LIST lines up.
 inline bool matchChildren( const PatternProgram& prog, const PatNode& pat, TSNode cand, std::string_view src, MatchEnv& env, MatchStats& stats, unsigned depth )
 {
+    // O(children), not O(children²): `cand` is a node of the CORPUS, so its width — and, since comments
+    // are extras spliced into the child array, its comment count — comes from the file being searched.
+    // A 16 000-comment function body measured 174× the plain map of the same file before this became a
+    // cursor (test/childwalkscalecheck.sh, arm B7).
     std::vector<TSNode> kids;
-    const std::uint32_t childCount = ts_node_child_count( cand );
-    kids.reserve( childCount );
-    for( std::uint32_t c = 0; c < childCount; ++c )
+    kids.reserve( ts_node_child_count( cand ) );
+    ChildCursor cursor( cand );   // this frame's own — matchAt below recurses back into matchChildren
+    forEachChild( cand, cursor.cur, [ &kids ]( TSNode child )
     {
-        const TSNode child = ts_node_child( cand, c );
-        if( isCommentKind( ts_node_type( child ) ) )
+        if( !isCommentKind( ts_node_type( child ) ) )
         {
-            continue;   // comments are transparent on the candidate side too
+            kids.push_back( child );   // comments are transparent on the candidate side too
         }
-        kids.push_back( child );
-    }
+        return true;
+    } );
 
     std::size_t ci = 0;                       // next unconsumed candidate child
     std::size_t pi = 0;                       // next unmatched pattern child
@@ -938,6 +974,46 @@ inline bool matchChildren( const PatternProgram& prog, const PatNode& pat, TSNod
     return ci == kids.size();
 }
 
+// The final name segment of a scope-qualified name node (`a::b::c` -> `c`), or a null node when `n` is not one. By node
+// TYPE, so one rule serves every grammar that spells it: C/C++/CUDA qualified_identifier, Rust scoped_identifier, C#/PHP
+// qualified_name. The `name` field when the grammar has one, else the last named child; a nested qualified name descends.
+inline TSNode qualifiedTail( TSNode n ) noexcept
+{
+    for( unsigned depth = 0; depth < 16 && !ts_node_is_null( n ); ++depth )
+    {
+        const std::string_view type = ts_node_type( n );
+        if( type != "qualified_identifier" && type != "scoped_identifier" && type != "qualified_name" )
+        {
+            return depth == 0 ? TSNode{} : n;
+        }
+        TSNode next = ts_node_child_by_field_name( n, "name", 4 );
+        if( ts_node_is_null( next ) )
+        {
+            const std::uint32_t kids = ts_node_named_child_count( n );
+            next = kids == 0 ? TSNode{} : ts_node_named_child( n, kids - 1 );
+        }
+        n = next;
+    }
+    return TSNode{};
+}
+
+// The second ask's one relaxation (MatchStats::qualifiedUnmatchedCount): a pattern LEAF of another kind than `cand`
+// still matches when `cand` is a qualified name whose final segment is that leaf, kind and text. Records that it did.
+inline bool relaxedQualifiedLeaf( const PatternProgram& prog, const PatNode& pat, TSNode cand, std::string_view src, MatchStats& stats )
+{
+    if( !stats.relaxQualified || pat.childCount != 0 )
+    {
+        return false;
+    }
+    const TSNode tail = qualifiedTail( cand );
+    if( ts_node_is_null( tail ) || ts_node_symbol( tail ) != pat.kindId || nodeText( tail, src ) != prog.textOf( pat ) )
+    {
+        return false;
+    }
+    stats.relaxedLeafHit = true;
+    return true;
+}
+
 // Does the candidate node satisfy pattern node `patIndex`?
 inline bool matchAt( const PatternProgram& prog, std::uint32_t patIndex, TSNode cand, std::string_view src, MatchEnv& env, MatchStats& stats, unsigned depth )
 {
@@ -966,13 +1042,27 @@ inline bool matchAt( const PatternProgram& prog, std::uint32_t patIndex, TSNode 
     }
     if( ts_node_symbol( cand ) != pat.kindId )
     {
-        return false;
+        return relaxedQualifiedLeaf( prog, pat, cand, src, stats );   // false outside the second ask
     }
     if( pat.childCount == 0 )
     {
         return nodeText( cand, src ) == prog.textOf( pat );
     }
     return matchChildren( prog, pat, cand, src, env, stats, depth );
+}
+
+// The second ask for a node the exact match refused: would a qualified spelling of a pattern leaf have matched it?
+// Counted, never a hit. Its ellipsis abandons are not the exact answer's, so they are rolled back, not double counted.
+inline void countQualifiedNearMiss( const PatternProgram& prog, TSNode n, std::string_view src, MatchStats& stats )
+{
+    const std::uint64_t ellipsisBefore = stats.ellipsisCappedCount;
+    MatchEnv            relaxedEnv;
+    stats.relaxQualified = true;
+    stats.relaxedLeafHit = false;
+    const bool relaxedMatch = matchAt( prog, 0, n, src, relaxedEnv, stats, 0 );
+    stats.qualifiedUnmatchedCount += ( relaxedMatch && stats.relaxedLeafHit ) ? 1u : 0u;
+    stats.relaxQualified      = false;
+    stats.ellipsisCappedCount = ellipsisBefore;
 }
 
 // Every node in one file's tree that the pattern matches, reported as [startByte,endByte) pairs in
@@ -988,6 +1078,8 @@ inline void findMatches( const PatternProgram& prog, TSNode root, std::string_vi
     }
     const std::uint16_t rootKindId = prog.nodes[0].kindId;
     std::vector<TSNode> stack;
+    std::vector<TSNode> kids;     // reused across nodes — a warm walk allocates nothing per node
+    ChildCursor         cursor( root );
     stack.push_back( root );
     while( !stack.empty() && out.size() < budget )
     {
@@ -1000,11 +1092,17 @@ inline void findMatches( const PatternProgram& prog, TSNode root, std::string_vi
             {
                 out.emplace_back( ts_node_start_byte( n ), ts_node_end_byte( n ) );
             }
+            else
+            {
+                countQualifiedNearMiss( prog, n, src, stats );
+            }
         }
-        const std::uint32_t childCount = ts_node_child_count( n );
-        for( std::uint32_t c = childCount; c > 0; --c )
+        // Collected once, then pushed in REVERSE so the stack pops left to right — the same visit order
+        // the indexed loop had, at O(children) instead of O(children²) (src/infra/tschildren.h).
+        collectChildren( n, cursor.cur, kids );
+        for( std::size_t c = kids.size(); c > 0; --c )
         {
-            stack.push_back( ts_node_child( n, c - 1 ) );
+            stack.push_back( kids[ c - 1 ] );
         }
     }
     std::sort( out.begin(), out.end() );

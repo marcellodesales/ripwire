@@ -52,9 +52,18 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
-attr(){ printf '%s' "$2" | grep -oE "$1=\"[^\"]*\"" | head -1 | sed -E "s/^$1=\"//; s/\"$//"; }
+# Attributes are read from the ROOT `<grep …>` ELEMENT ONLY, never from the whole document. This gate
+# greps the live tree for words this gate is itself about, so a returned HIT's CDATA can contain the
+# literal text of an attribute: src/grep_tier.h documents the very defect arm 11g checks, in a comment
+# that spells `tier="comment+string"`. A whole-document search then reads an "attribute" out of a search
+# RESULT. That is how 11g went red on 2026-09-20 (CI run 35533898709, gcc Release shard 1): a corpus
+# change flipped --grep=deterministic to the CODE tier, the root correctly carried no tier= at all and
+# suppressed_comment= instead, and the helper picked the sentence up out of the hit text and demanded a
+# tier_partial for a label the answer had never made. Every attribute this gate asks for is a root
+# attribute, so narrowing the region is correct for all of them and fixes the class, not the instance.
+attr(){ printf '%s' "$2" | grep -o '<grep [^>]*>' | head -1 | grep -oE "$1=\"[^\"]*\"" | head -1 | sed -E "s/^$1=\"//; s/\"$//"; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
 echo "greptiercheck: BIN=$BIN"
@@ -107,7 +116,7 @@ echo "=== (2) --grep-in=any: every tier, and NO tier attributes at all ==="
 # ═══════════════════════════════════════════════════════════════════════════
 A_OUT="$( "$BIN" "$SB" --no-cache --grep=TIERTOKEN_frob --grep-in=any 2>/dev/null )"
 a_hits="$( attr hits "$A_OUT" )"
-[ "$a_hits" = "5" ] && ok "(2) --grep-in=any keeps all 5 hits" || no "(2) --grep-in=any expected hits=5, got $a_hits"
+if [ "$a_hits" = "5" ]; then ok "(2) --grep-in=any keeps all 5 hits"; else no "(2) --grep-in=any expected hits=5, got $a_hits"; fi
 if printf '%s' "$A_OUT" | grep -qE 'suppressed_comment=|suppressed_string=|tier_budget=|tier_unclassified=|tier="'; then
     no "(2b) --grep-in=any leaked a tier attribute onto an untiered answer"
 else
@@ -300,8 +309,9 @@ printf '%s' "$A_OUT" | grep -q 'complete="1"' \
 # ═══════════════════════════════════════════════════════════════════════════
 echo "=== (8) the legend defines the tier vocabulary exactly when it appears ==="
 # ═══════════════════════════════════════════════════════════════════════════
-D_LEGEND="$( printf '%s' "$D_OUT" | grep -o '<!--.*-->' | head -1 )"
-A_LEGEND="$( printf '%s' "$A_OUT" | grep -o '<!--.*-->' | head -1 )"
+# L1 (2026-09-19): the CLI default legend is compact; (8)/(8b) read the FULL legend's tier prose, so both legends are taken from full-legend runs.
+D_LEGEND="$( "$BIN" "$SB" --no-cache --grep=TIERTOKEN_frob --legend=full 2>/dev/null | grep -o '<!--.*-->' | head -1 )"
+A_LEGEND="$( "$BIN" "$SB" --no-cache --grep=TIERTOKEN_frob --grep-in=any --legend=full 2>/dev/null | grep -o '<!--.*-->' | head -1 )"
 printf '%s' "$D_LEGEND" | grep -qi 'suppressed_comment' \
     && ok "(8) the suppressing answer defines its own tier attributes in-band" \
     || no "(8) rows were suppressed and the legend never said what suppressed_comment means"
@@ -473,14 +483,109 @@ for q in deterministic "malformed rules line" TIERTOKEN_prose; do
 done
 
 # ═══════════════════════════════════════════════════════════════════════════
+echo "=== (12) the literal question — no code hit in source code lifts the source STRING hits ==="
+# ═══════════════════════════════════════════════════════════════════════════
+# Comparison-table rows tmux-16 / textual-16 (find-literal, 2026-09-30): "which code reads the option
+# escape-time" / "who reads the TEXTUAL_DRIVER env var". The code tier was NOT empty — a regress shell
+# script's `set -g escape-time 0` and a CHANGELOG line parse as code — so the code tier won and the
+# answers themselves, the C string "escape-time" in the options table and get_environ("TEXTUAL_DRIVER"),
+# rode only as suppressed_string=N. A code hit in a test/doc file, or in a shell/YAML/TOML/JSON file where a
+# bare word IS code, is a usage of the literal, not the program text that holds it. When no code hit sits
+# in source code and a string hit sits in a source file, the string tier is served WITH code
+# (tier="code+string"); comments stay held back. RED on the pre-fix binary: tier absent, the options.c row
+# missing, suppressed_string="1".
+LT="$TMP/literalsandbox"
+mkdir -p "$LT/src" "$LT/tests" "$LT/scripts"
+cat >"$LT/src/options.c" <<'EOF'
+static const char *option_names[] = { "LITTOKEN-escape-time", 0 };
+/* LITTOKEN-escape-time is documented in a comment, which stays held back */
+int options_count( void )
+{
+    return 1;
+}
+EOF
+cat >"$LT/tests/keys.sh" <<'EOF'
+tmux set -g LITTOKEN-escape-time 0
+EOF
+cat >"$LT/scripts/setup.sh" <<'EOF'
+tmux set -s LITTOKEN-escape-time 10
+EOF
+cat >"$LT/NEWS.md" <<'EOF'
+- added the LITTOKEN-escape-time option
+EOF
+LT_OUT="$( "$BIN" "$LT" --no-cache --grep=LITTOKEN-escape-time 2>/dev/null )"
+lt_tier="$( attr tier "$LT_OUT" )"
+lt_sup_s="$( attr suppressed_string "$LT_OUT" )"
+lt_sup_c="$( attr suppressed_comment "$LT_OUT" )"
+if [ "$lt_tier" = "code+string" ] && [ -z "$lt_sup_s" ] && [ "$lt_sup_c" = "1" ]; then
+    ok "(12) no code hit in source code: the source string is served with code, tier=code+string, the comment still held"
+else
+    no "(12) expected tier=code+string, no suppressed_string, suppressed_comment=1; got tier=$lt_tier suppressed_string=$lt_sup_s suppressed_comment=$lt_sup_c"
+    printf '%s\n' "$LT_OUT" | grep -o '<grep [^>]*>'
+fi
+printf '%s' "$LT_OUT" | grep -q '<f p="src/options.c"' \
+    && ok "(12b) the string literal that holds the option (src/options.c) is a row" \
+    || no "(12b) src/options.c is not served — the literal's own definition is still behind suppressed_string"
+if printf '%s' "$LT_OUT" | grep -q '<f p="tests/keys.sh"' && printf '%s' "$LT_OUT" | grep -q '<f p="NEWS.md"' \
+   && printf '%s' "$LT_OUT" | grep -q '<f p="scripts/setup.sh"'; then
+    ok "(12c) the code-tier usages (test script, shell script, doc) are still served beside it"
+else
+    no "(12c) the lift dropped a code-tier row"
+fi
+printf '%s' "$LT_OUT" | grep -o '<!--.*-->' | head -1 | grep -q 'code+string' \
+    && ok "(12d) the legend defines the code+string label in the answer that emits it" \
+    || no "(12d) tier=code+string was emitted and the legend never says what it means"
+# (12e) NOT a blanket lift: the same literal as an IDENTIFIER in a C source file keeps the code tier alone.
+cat >"$LT/src/reader.c" <<'EOF'
+int LITTOKEN_reader( void ) { return 0; }
+const char *reader_name = "LITTOKEN_reader";
+EOF
+cat >"$LT/tests/reader.sh" <<'EOF'
+LITTOKEN_reader
+EOF
+LR_OUT="$( "$BIN" "$LT" --no-cache --grep=LITTOKEN_reader 2>/dev/null )"
+if [ -z "$( attr tier "$LR_OUT" )" ] && [ "$( attr suppressed_string "$LR_OUT" )" = "1" ]; then
+    ok "(12e) a code hit in source code keeps today's answer: code tier, the string held back"
+else
+    no "(12e) the lift fired with a source code hit present: tier=$( attr tier "$LR_OUT" ) suppressed_string=$( attr suppressed_string "$LR_OUT" )"
+fi
+# (12g) BOTH halves mean the same "source code" (review of this lane, item 3): a STRING in a JSON or shell file under a
+# source path is not "a source file holds it as a string", any more than a bare word there is a code hit. With only
+# such strings the lift must not fire and the answer is main's: code tier, the string held back. RED at 6ef65b15.
+LN="$TMP/literalneg"
+mkdir -p "$LN/regress" "$LN/src"
+printf 'tmux set -g LNTOKEN-escape-time 0\n'         >"$LN/regress/keys.sh"
+printf '{"LNTOKEN-escape-time": 500}\n'                >"$LN/src/defaults.json"
+printf 'echo "LNTOKEN-escape-time"\n'                  >"$LN/src/tool.sh"
+LN_OUT="$( "$BIN" "$LN" --no-cache --grep=LNTOKEN-escape-time 2>/dev/null )"
+if [ -z "$( attr tier "$LN_OUT" )" ] && [ -n "$( attr suppressed_string "$LN_OUT" )" ]; then
+    ok "(12g) strings only in JSON/shell files under src/ do not lift: code tier, suppressed_string=$( attr suppressed_string "$LN_OUT" )"
+else
+    no "(12g) a JSON/shell string under src/ lifted the string tier: tier=$( attr tier "$LN_OUT" ) suppressed_string=$( attr suppressed_string "$LN_OUT" )"
+    printf '%s\n' "$LN_OUT" | grep -o '<grep [^>]*>'
+fi
+
+# (12f) the MCP grep twin lifts the same rows (one collection, one decision).
+LT_MCP="$( printf '%s\n%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grep","arguments":{"path":"'"$LT"'","pattern":"LITTOKEN-escape-time"}}}' \
+    | "$BIN" "$LT" --mcp --no-cache 2>/dev/null | tail -1 )"
+if printf '%s' "$LT_MCP" | grep -q 'code+string' && printf '%s' "$LT_MCP" | grep -q 'src/options.c'; then
+    ok "(12f) the MCP grep twin serves the lifted string row and the same label"
+else
+    no "(12f) the MCP grep twin did not lift the string tier"; printf '%s\n' "$LT_MCP" | cut -c1-400
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 echo "=== (10) determinism + well-formed XML on every tiered surface ==="
 # ═══════════════════════════════════════════════════════════════════════════
 for q in TIERTOKEN_frob TIERTOKEN_prose TIERTOKEN_md; do
     r1="$( "$BIN" "$SB" --no-cache --grep="$q" 2>/dev/null )"
     r2="$( "$BIN" "$SB" --no-cache --grep="$q" 2>/dev/null )"
-    [ "$r1" = "$r2" ] && ok "(10) --grep=$q is byte-identical across runs" || no "(10) --grep=$q is nondeterministic"
+    if [ "$r1" = "$r2" ]; then ok "(10) --grep=$q is byte-identical across runs"; else no "(10) --grep=$q is nondeterministic"; fi
     if command -v xmllint >/dev/null 2>&1; then
-        printf '%s' "$r1" | xmllint --noout - 2>/dev/null && ok "(10b) --grep=$q is well-formed XML" || no "(10b) --grep=$q is not well-formed XML"
+        if printf '%s' "$r1" | xmllint --noout - 2>/dev/null; then ok "(10b) --grep=$q is well-formed XML"; else no "(10b) --grep=$q is not well-formed XML"; fi
     fi
 done
 

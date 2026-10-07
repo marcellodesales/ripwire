@@ -99,7 +99,7 @@ FIXTURE="$TMP/fixture"
 MUTANT="$TMP/mutant"
 mkdir -p "$FIXTURE" "$MUTANT"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 command -v python3 >/dev/null 2>&1 || { printf 'contextratiocheck: python3 missing (gate cannot run)\n'; exit 2; }
@@ -402,8 +402,9 @@ fi
 # Beck & Diehl's per-class congruence (FSE 2011) and Martin's instability is its crude ancestor. Shipping
 # it unattributed reads as a rename of a published metric. This arm pins the credit where the READER meets
 # it — the legend — and pins that the novelty claim stays narrow.
-legend="$( "$BIN" "$FIXTURE" --context-ratio --no-cache 2>/dev/null | head -c 6000 )"
-help="$( "$BIN" --help 2>&1 )"
+# L1 (2026-09-19): the CLI default legend is compact; (J) reads the FULL legend's prose, so it asks for it.
+legend="$( "$BIN" "$FIXTURE" --context-ratio --no-cache --legend=full 2>/dev/null | head -c 6000 )"
+help="$( "$BIN" --help=all 2>&1 )"
 # `grep -c` and not `grep -q`: the short-circuiting form closes the pipe under the writer and the SIGPIPE
 # noise lands in the middle of this gate's own output (seen under the sanitizer build, where the writer is
 # slow enough to still be writing). Counting reads the whole input and says nothing.

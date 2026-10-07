@@ -21,7 +21,7 @@ section, and it is not an afterthought.
 | **Co-change / known-item evals** | `--eval`, `--eval-retrieval` (see `bench/ANSWERQUALITY.md`) | Whether the tool surfaces the other files a real historical commit touched; and known-item retrieval across four rankers. |
 | **Ensemble calibration harness** | `bench/ensemblecal/` | Whether `--ensemble`'s four evidence families are actually orthogonal, how often each fires, how stable each is across commits — and the preset ladder derived from that (§9). |
 | **Differential argv harness** | `test/argvdiffcheck.sh` | That a refactor changed *nothing observable*: two binaries, every argv vector, stdout + stderr + exit code byte-identical. |
-| **The gate suite** | `test/regression.sh`, `test/pargates.py` | 562 gate scripts plus the determinism, cache-transparency and golden contracts. |
+| **The gate suite** | `test/regression.sh`, `test/pargates.py` | 664 gate scripts plus the determinism, cache-transparency and golden contracts. <!-- gatecount --> |
 | **`--quality-delta`** | `src/quality.h` | Ten measured code-quality failure modes, reported only where a change made them worse. |
 
 ### The labeling protocol (why the held-out eval is allowed to disagree with the ranker)
@@ -615,8 +615,20 @@ refresh** (`make_snapshot.py --freeze --corpus src`, `--corpus` deliberately has
 
 ### Query-mention anchoring
 
-A file, dotted module, or `Type.method` named literally in the task text is lifted just below the top
-hit. It is on by default and byte-identical when the text names nothing indexed.
+A file, dotted module, `Type.method`, or a verbatim identifier (snake_case/camelCase, backticked, `ns::fn`,
+`name()` when the task carries no pasted code; defined in at most 3 files; at most 2 identifier-resolved definitions
+lifted per task, within the 8 direct-symbol slots `Type.method` also uses) named
+literally in the task text is lifted just below the top hit. It is on by default and byte-identical when the text
+names nothing indexed.
+
+The identifier half was pre-registered and measured once on the 92-question LocBench held-out set
+(the served-head grade of `bench/locbench/calibrate_confidence.py`, which lives on the `lane/served-syms-result`
+branch and is not on main; v0.6.4 as base): gold file in head 75 → 76, every gold file 55 → 56, gold function
+51 → 52, first-gold-file MRR 0.6017 → 0.6040, served bytes +0.4% (the lane's own run, on its branch binary).
+The 0.6.5 release train re-ran the same set on the merged binary, with every other 0.6.5 change in: gold file in
+head 75 → 76, every gold file 55 → 56, gold function 51 → 52, gold file in the bundle 86 → 86, first-gold-file MRR
+0.6017 → 0.6026, served bytes 702,455 → 705,555 (+0.44%). Each +1 is a
+single question, so the result is "no regression, named-symbol case fixed", not a recall gain.
 
 The reproducible in-tree ablations, both machine-generated scoreboards:
 
@@ -1420,6 +1432,23 @@ incorrectly, because a record is only ever served to a lookup of its own path �
 record's own stored key against the key that found it, so even a 64-bit pathHash collision reparses rather
 than answers.
 
+**Band (8) after the build tag (2026-09-26, #334 follow-up).** The auto name now also carries the cache
+format, `ripwire-<rootKey>-lean-c<format>p<parser>.bin`: two builds of different formats alternating on one tree
+(an installed release and a local build) refused and rewrote each other's blob on every run, measured
+`reparsed=5 reused=0` on every run of three alternating rounds on `test/fixture`, `reused=5` on every run
+after the first with the tag. Band (8) holds per build: every configuration of one binary still shares one
+blob per class, so a gate battery (one binary) is unaffected, and so are two local builds of one format. A
+root gains blobs only per FORMAT that actually ran on it. That is not the registered negative above, and
+the budget pass is what keeps it so. It evicts in tiers, oldest-first within each: other roots' blobs first,
+then another build's blobs of the root being written, never this build's blobs of that root. The 30-day age
+pass retires a format nobody runs. Where one root's blobs from two formats do not fit the 2 GiB budget
+together (llvm-project, 1.76 GB per build), the other format's blobs of that root are evicted once every
+other root's are gone, and that build re-parses on its next run: the pre-tag cost, now paid only in that
+regime. An upgrade adds new blobs beside the old ones, and the old version's blobs of the root being written are
+tier 1, so near the budget every other root's blob goes before them. Measured by review on 2026-09-26: an
+llvm-sized upgrade beside five newer 50 MB roots evicted all five; the untiered order of a079f26c kept all
+five, and the pre-tag in-place rewrite never swept. Gates: `test/cacheidentitycheck.sh` (D3), `test/evictioncheck.sh` (h2, h3).
+
 ### `.gitignore` honoured by default, `--no-ignore` to override — PRE-REGISTERED 2026-09-03 (owner decision 1-B)
 
 **Why.** The tool is named for ripgrep, whose defining default is that ignored files are not searched;
@@ -2205,6 +2234,208 @@ checks into their own `flowTaskChoice` function (mirroring the existing `instrum
 extraction) and by inlining the small filler-word loop directly rather than introducing a shared
 helper that collided token-for-token with `weakSymbolCandidate`'s existing shape.
 
+### MCP `no_route`: the CLI's recovery from a route mis-fire, reachable from an agent (2026-09-10)
+
+**The gap (audit F-R1-07).** `for`'s header carries `route=` — WHICH ranker answered and why — and the
+tool's own description tells the agent to read it. An agent that read it and disagreed had nowhere to go:
+`tools/call {"name":"for","arguments":{...,"no_route":true}}` was refused by name, and `explore` /
+`pack_task` had no such parameter either. The CLI's own answer to a route mis-fire (`--no-route`) was
+unreachable from the MCP surface. The mis-fire is measured, not hypothetical: `--for="parse tree"` on this
+repo routes name-exact, returns three rows from `bench/` and `test/`, and misses `parseTree` entirely,
+which `--no-route` finds at rank 1 (F-R1-06; the `ImplausibleAnchor` guard scales with corpus size, so
+SMALL repos are the exposed ones).
+
+**What shipped.** One declared optional boolean, `no_route`, on `for` and `explore` (and its `pack_task`
+alias). It is the CLI flag's twin, not a near-twin: under it the router is not asked, and — exactly as
+`verbs_for.h` does under `--no-route` — the query-shape demotion, the mention anchor and the co-change
+prior are all skipped, because each is part of the routed reading. There is then no route to disclose, so
+`ctxRootOpen` emits no `route=`, byte-for-byte what the CLI does.
+
+**Gated as a parity claim, not as a feature.** `test/mcpforparitycheck.sh` gains seven arms, and each one
+is asserted against the CLI's OWN behavior rather than against a remembered rule: the CLI emits no
+`route=` under `--no-route`, so neither may the MCP twin; every CLI `--no-route` row must be present in
+the MCP `no_route` set (subset, for the same payload reason the existing arms give); a quoted `"true"` is
+a STRING and refuses by name; `pack_task` honors it; and a verb that does NOT route (`grep`) must still
+refuse it, because the declaration is per-verb. The first arm asserts the call ANSWERED — measured while
+writing the gate, two of the arms went GREEN against the pre-change binary purely on emptiness, since a
+refused call returns no content and an empty document trivially has no `route=`.
+
+**Manifest cost, attributed.** 41,220 → 41,474 B; ceiling re-anchored 41,300 → 41,650. Schemas
+17,161 → 17,415 (+254: two property stanzas at +127 each — the schema envelope plus the description every
+declared property is obliged to carry). **Descriptions are byte-identical at 19,632 B**: a first draft
+added a pointer clause to both tool descriptions and it was REMOVED rather than re-anchored around,
+because that file's own rule is that the ceiling moves for a declared argument's obliged bytes and never
+for prose. The `--quality-delta` verbosity row this change first raised on `dispatchMcpLine`
+(1,376 → 1,387 lines) was likewise fixed rather than acked: the second hand-rolled five-line boolean
+accumulate became ONE guarded `boolArg` reader that `post_check` now shares — the rule `intArg` already
+states for the numeric fields — leaving the dispatcher smaller than before the change.
+
+### `--help-task` catalog tier: the verbs and the skills with no route (2026-09-10)
+
+**Two measurements, one cause.** `--help-task` recommended on **3 of 39** phrasings of the 13 surfaces
+added since the 2026-08-28 audit (F-R1-08), and could name **8 of the 16** shipped skills (F-R1-09) —
+nine skill directories existed that no `--help-task` answer could ever point at. `--help-task` and the
+skill catalog were two routers with two vocabularies. Three of the unrouted surfaces are VERBS rather
+than shaping flags: `--handoff` (which has its own shipped skill), `--plan-lint`, and the PROSE form of
+`--from-trace` — `looksLikeTrace` matches a PASTED artifact (`AddressSanitizer:`, `#0 … in`), and "I
+have a sanitizer report" contains none of those literals, so the #108 name-ladder work was unreachable
+from prose.
+
+**Ten intents, in a `catalogTaskChoice` tier placed LAST in `directTaskChoice`** so every older, more
+specific route keeps its rows: `handoff-brief` → `--handoff`, `plan-lint` → `--plan-lint=FILE`,
+`trace-prose` → `--from-trace=-`, `scan-skills`/`scan-skill` → `--scan-skills` / `--scan-skill=FILE`,
+`opt-remark` → `--for=TASK`, `architecture-health` → `--deps`, `quality-check` → `--quality-delta`,
+`perf-symbol` → `--around=SYM`, `graph-query` → `--graph-query=EXPR`, `maintenance-risk` →
+`--hotspots`. Each takes conjunctive evidence in the shape `instrumentedTaskChoice` established, and the
+value-carrying ones fire only when the task supplies the value.
+
+Two of them are worth stating plainly rather than listing. **`opt-remark` is the one skill with no verb
+of its own** — it is a contributor workflow around clang remarks and a profiling build — so it routes to
+the ranked lens and its reason string says exactly that, instead of implying a dedicated surface exists.
+**`graph-query` composes an expression** out of what the task supplied (the symbol it named, the
+direction it asked for) with a stated default depth, the same way `--grep-context=2` and
+`--slice-flow=back` are defaults; the gate unquotes what the router emitted and runs it through the real
+verb, so a composed expression the verb would refuse fails the gate rather than the user.
+
+| measurement | before | after |
+| --- | ---: | ---: |
+| skills the router can name (of 16, `ripwire-router` excluded) | **8** | **16** |
+| audit's 39 surface phrasings, recommends | **3** | **9** |
+| corpus `split=test` (n=114) accuracy / coverage | 0.754 / 0.627 | **0.939 / 0.907** |
+| corpus `split=dev` (n=111) accuracy / coverage | — | 0.946 / 0.929 |
+| corpus `split=all` (n=225) accuracy / coverage | 0.809 / 0.730 | **0.942 / 0.918** |
+| precision / harmful / neg-specificity, every split | 1.000 / 0.000 / 1.000 | 1.000 / 0.000 / 1.000 |
+| the 189 rows that predate this tier, (status, intent, resolved_symbols) | — | **0 differing** |
+
+The remaining 30 of 39 are declined by design and are gated as such: six SHAPING flags (`--scope`,
+`--slice-depth`, `--slice-flow`, `--allow-dirty`, `--no-ignore`, `--no-post-check`) are modifiers on
+other verbs and not commands a one-command router can recommend alone; `--pin-census` is eval-only; and
+the value-carrying abstentions (`--edit-plan=FILE`, `--grep=LIT --handles`, `--plan-lint` with no file
+named) keep the 2026-08-28 rule that the router may not emit a command the verb would refuse.
+
+**Red-first is the GATE here, not the eval.** Coverage has no floor by the round-1 rule, so the eval
+exits 0 either way; eleven `taskroutecheck` arms fail against the pre-change binary (every one abstained
+with `score="0"`), plus the two execution arms, and the skill-vocabulary arm — which reads BOTH sides
+from disk, the skill directories and the names `src/taskroute.h` can emit — fails against the pre-change
+source, naming all eight unreachable skills. That arm is the durable half: a new skill that ships
+without a route now fails as loudly as a route naming a skill that does not exist.
+
+**Two corrections the pre-insertion verification caught**, recorded because "every row verified before
+insertion" is only worth something if the failures are shown too. A plan file that names ITSELF
+(`PLAN_*.md`, `DESIGN_*.md`) is now surface evidence the prose need not repeat. And `"before i commit"`
+was re-weighted below the quality-check floor: it is a TIMING word, not a quality word, and at its first
+weight it stole *"lint the plan file layout before I commit it"* from the plan-lint abstention.
+
+### The four restored stop rules become measurable (2026-09-10)
+
+**The defect (audit F-R1-03).** #112 restored four frontmatter STOP RULES to the skill descriptions —
+`before-you-build` "A small feature with an obvious home needs none of this.", `fresh-eyes` "A
+single-lens question is a single call.", `orient` "Stop at the first rung that answers.",
+`write-tests` "For one target one `--seams` or `--callers` pass suffices." — and **no row in
+`test/skillevalfix/prompts.tsv` could see any of them**. Stripping all four left `split=test` bm25-desc
+hit@1 byte-identical at 63.8% and `split=dev` **1.4pp better**, with `skillevalcheck` 15/15 green
+either way. That is the same failure #112 itself repaired: the fix restored the TEXT without adding a
+MEASUREMENT, so the next rewrite that drops a stop rule ships green.
+
+**What now measures them.** 16 rows between the `STOP-RULE ROWS (2026-09-10)` markers in the corpus
+(all `split=dev` — the test split is frozen; `test/skillevalsplitcheck.sh` confirms `split=test`
+hit@1 unchanged at 63.8%), plus a new **stop-rule arm** in `test/skillevalcheck.sh` that asserts two
+different things, because a stop rule can fail two different ways:
+
+1. **PRESENCE, exact.** Each sentence is pinned in the gate verbatim, and the arm's strip must actually
+   remove it from that skill's `SKILL.md`. A rewrite that drops OR REWORDS a rule makes its strip a
+   no-op and the gate names which rule and stops. Whitespace between words is matched as `\s+` because
+   frontmatter folds — the wrap position is formatting, not the thing being measured.
+2. **LOAD-BEARING, differential.** The 16 rows are scored against `skills/` and against a mechanically
+   stripped copy the gate builds itself; the real tree must win by ≥12.5pp.
+
+| measurement (bm25-desc hit@1) | with the four rules | stripped |
+| --- | ---: | ---: |
+| the 16 stop-rule rows | **75.0%** | 50.0% |
+| — of which the 8 that echo the rules (`desc`) | **100.0%** | 50.0% |
+| — of which the 8 written to avoid them (`judged`) | 50.0% | **50.0%** |
+| whole corpus, `split=dev` (n=99) | **76.2%** | 72.6% |
+| whole corpus, `split=test` (n=183, frozen) | 63.8% | 63.8% |
+
+**The null result is the interesting one, and it is reported rather than buried.** The audit's own
+caveat was that its 8 prompts echo the stop rules' vocabulary and are therefore `desc`-shaped, and it
+proposed rows "phrased without quoting it". Eight such rows were written and measured: **50.0% with the
+rules and 50.0% without — zero discrimination.** A BM25 arm scores description TEXT, so it can only
+detect a sentence's removal through rows that share that sentence's words. "Phrase it without quoting
+the rule" is not available to this instrument; the exact-PRESENCE assertion above is what covers the
+case a lexical corpus cannot. The 8 rows are kept as ordinary hard judged rows (4/8 route correctly —
+their misses go to `find-bug`, `write-tests`, `handoff` and `navigate`, which is its own signal about
+how the descriptions read a "one lens only" request phrased in a user's words).
+
+**Red-first.** Against a skills tree with the four sentences mechanically stripped, six arms fail
+(four PRESENCE, the absolute floor, the differential) while **all 15 pre-existing arms still pass** —
+which is precisely the F-R1-03 finding, now closed by construction.
+
+**Floors were NOT moved.** A floor move is a deliberate recalibration commit. Slack as measured after
+this round: `split=test` hit@1 63.8% vs floor 52.0 (+11.8pp), sep-auc 0.901 vs 0.83 (+0.071);
+`split=dev` hit@1 76.2% vs floor 59.0 (+17.2pp), sep-auc 0.926 vs 0.75 (+0.176). The dev pair is
+outside the gate file's own stated policy (~10pp, ~0.06–0.07) and is left as a named owner decision
+(audit F-R1-10).
+
+### `--help-task` weak-tier precision: the self-confirming gate and the config-key read (2026-09-10)
+
+**The defect, in one sentence each.** `does` was a symbol-slot cue AND `how does` is the
+`understand-symbol` gate, so *"how does &lt;indexed-word&gt; …?"* minted the very symbol the gate then
+required — **13 of 25** adversarial prose prompts recommended `--expand=&lt;English word&gt;`
+(audit F-R1-01/04; the Codex `UserPromptSubmit` hook injects that answer into a live session at
+`confidence="high"`). And `resolveTaskSymbols` had no kind filter, so **6 of those 13** names existed
+only as `t="sec"` rows — JSON keys and markdown headings — and `--expand='version'` answered with
+`"version": "1.2.3"` out of a `package.json`, exit 0, no disclosure (F-R1-02).
+
+**Why the corpus said `harmful=0.000` throughout.** `bench/taskroute_eval.py::make_repo` built a
+fixture repo whose every symbol was camelCase or Pascal. The weak tier only fires on all-lowercase
+names, so **no corpus row could reach it**: the class was invisible by construction, not by luck.
+This is the same shape as the 2026-08-28 round's own finding — a measured precision of 1.000 over a
+population that excludes the failure. The fixture repo now carries both halves of the collision
+class (nine lowercase code definitions, plus a `package.json` whose keys index as `t="sec"`), and
+the 158 pre-existing rows are **byte-identical on (status, intent, resolved_symbols)** across that
+fixture change — the new symbols are reachable only from the new rows.
+
+**The rule that shipped.** An intent word is evidence about what the user WANTS; it may never
+double as the positional evidence that they NAMED something. `cueOccurrenceIsIntentGate`
+disqualifies exactly the cue OCCURRENCE that satisfies the gate (`understand`/`understanding`
+anywhere, `does` when preceded by `how`) — never the word, so a later independent cue in the same
+task still resolves the name. Plus `weakEvidenceKind`: a weak reading must be backed by a
+non-`Section` definition; an identifier-shaped mention is untouched, because there the SHAPE is the
+evidence. Rank is deliberately NOT part of the kind test (`k` is 0.0000 for nearly every row of any
+large corpus, so gating on it would make resolution depend on corpus size).
+
+**Coverage cost, named rather than summarised.** Exactly one shape is given up: the bare
+*"How does &lt;lowercase-name&gt; work?"* spelling now abstains, and `test/taskroutecheck.sh`'s arm for it
+is inverted into an assertion of the new invariant. The same weak lowercase name still routes to
+`--expand` through any cue the gate does not consume (*"the implementation of classify"*), which is
+what makes this a rule about self-confirmation rather than a retreat from the weak tier. **No corpus
+row lost its route**: every confusion line on both splits is identical to the pre-round run.
+
+**Measured, pre-change binary → post-change binary, same corpus (189 rows), same day:**
+
+| Set | Rows | Metric | Before | After |
+| --- | ---: | --- | ---: | ---: |
+| audit set A (2026-08-28 shape) | 25 | false recommends | 0 | **0** |
+| audit set B (word after a cue) | 25 | false recommends | **13** | **0** |
+| `prompts.tsv` test | 89 | precision / harmful / neg-spec | 0.797 / 0.135 / 0.657 | **1.000 / 0.000 / 1.000** |
+| `prompts.tsv` test | 89 | accuracy / coverage | 0.787 / 0.870 | **0.921** / 0.870 |
+| `prompts.tsv` dev | 100 | precision / harmful / neg-spec | — | **1.000 / 0.000 / 1.000** |
+| `prompts.tsv` dev | 100 | accuracy / coverage | — | **0.940** / 0.920 |
+| `prompts.tsv` all | 189 | precision / harmful | 0.879 / 0.085 | **1.000 / 0.000** |
+| 158 pre-existing rows | 158 | (status, intent, resolved_symbols) diff | — | **0 differing rows** |
+
+The pre-change `split=test` run **exits 1** on the grown corpus (precision under the 0.90 floor,
+harm over 0.02, specificity under 0.90), and four `test/taskroutecheck.sh` arms are red against the
+pre-change binary — the red-first proof that the corpus and the gate can now see this class. The map
+itself is untouched: default map, `--for`, `--grep` and `--pack-task` are byte-identical between the
+two binaries on this repo, and `src/taskroute.h` is included by exactly one translation unit.
+
+**The 2026-08-28 set is not in the repo.** That round's 20 adversarial prompts were never committed
+(`git log -S`, whole-tree grep: absent). Set A above — 25 prompts of the same shape, containing that
+round's own repro string verbatim — is the stand-in, and it was 0/25 both before and after: the
+sentence-POSITION fix that round shipped did not regress; it was defeated by a phrasing it never saw.
+
 ### Skill-routing surface forms — S1b round, PRE-REGISTERED 2026-08-19 (before any skill edit)
 
 **Why this round exists, and why it is close to one already rejected.** The S1 round above ran a
@@ -2593,6 +2824,13 @@ judged 97/152, for-routed 91/152); held-out judged bm25-desc **44/85** (today's 
 numbers for this exact text: C2 = 85 / 84 / 84 (Opus / Sonnet / Fable), 0 negative fires. What this landing
 claims is "no routing loss under three LLM readers and one artifact boundary removed", not the decisive win
 the band asked for — the record above stands as written.
+
+**Amendment 2026-09-10 — the per-description 320 is retired (owner).** It was a design ceiling, not a client
+limit: Codex has no per-description cut — it trims every description round-robin only when the whole catalog
+overflows its total budget — and it rejects a description over 1,024 characters; Claude Code caps an entry at
+1,536. Holding 320 pushed routing boundaries and the `agentloopcodexcheck` stop-rule markers out of the text
+(PR #112). `test/skilldescbudgetcheck.sh` now fails only a description over 1,024 and keeps the 5,400 set
+total, which is what guards the round-robin tail cut. The rules above stay as registered.
 
 ### Subtoken acronym shredding — PRE-REGISTERED 2026-08-19 (before the fix is measured)
 
@@ -3250,6 +3488,9 @@ Python and TypeScript all refuse. One limit the fixture DISCOVERED and now pins:
 (`void f( DCfg cfg ){ cfg.opts.enable(); }`) cannot narrow, because the binding capture records a
 parameter's name but not its type, and the parameter still shadows a same-named field — so the honest
 split is the only sound answer. That is the same answer Rule 2 already gives a depth-1 parameter receiver.
+*(Superseded 2026-09-16 for depth 1: Rule 2 now reads a parameter's written type lexically — the declaration in
+scope at the call site decides, and a type written in namespace `std` never narrows — so a depth-1 parameter
+receiver narrows; test/narrowcheck.sh arms 7-24. The depth-2 parameter base above is unchanged.)*
 
 **The recon report's `composeEdges` hoist is unnecessary — re-derived, and the design changed by it.**
 `graph.h::buildFieldNarrowTables` (`graph.h:648`) already runs at `graph.h:919`, ahead of the resolve
@@ -5119,20 +5360,63 @@ verb elides* — count it and the headline becomes a function of how deep your c
 on disk. On one corpus, three spellings of the same root read **18.6 points apart** before the
 subtraction and agreed exactly after it.
 
-**Root-neutralised on this repository (re-derived 2026-08-23):**
+**Root-neutralised on this repository (re-derived 2026-09-10):**
 
-| Result size | Byte reduction | previous (2026-08-01) |
+| Result size | Byte reduction | previous (2026-09-09) |
 | --- | --- | --- |
-| top-10 | 86.5% | 46.7% |
-| **top-50** | **81.4%** | 67.0% |
-| top-100 | 81.6% | 66.2% |
+| top-10 | 89.5% | 81.3% |
+| **top-50** | **81.8%** | 71.0% |
+| top-100 | 84.3% | 73.7% |
+
+**`--pack-signatures` did not regress. The denominator did.** The move from 81.4% to 71.0% was
+attributed by bisection, not asserted, and it is mostly ONE commit — `08e757b0` (2026-09-05, lane L7's
+P16), which cut `kMaxExpandSibs` from **40 to 8**. That shrank `--expand`'s `<b>` elements ~23% at
+top-50 (41,827 B → 32,283 B on a FIXED tree), and since this ratio is `1 - sig/body`, a leaner
+baseline reads as a smaller saving.
+
+The attribution is a 2×2, binary × tree, on the 2026-08-30 corpus:
+
+| | 2026-08-30 binary | today's binary |
+| --- | --- | --- |
+| **2026-08-30 tree** | 85.6 / **80.2** / 80.7 | 80.6 / **74.7** / 73.6 |
+
+Same tree, same top-50 membership (44 of 45 symbols shared), signature side flat (8,269 B → 8,163 B).
+The published 80.2% was correctly measured and correctly dated; it stopped being reproducible the day
+the cap landed. The remainder — 74.7 → 72.3 → 71.0 — is ordinary corpus drift as this repository
+changed, of which the 2026-09-09 printf-to-`std::print` conversion is **1.3 points**.
+
+**Read this as a caution about the metric, not only about the number.** The denominator is `--expand`'s
+rendered output, so it includes `sibs=`/`inc=` file-context attributes that are not the symbol's body.
+That makes the headline move when `--expand`'s rendering is tuned, in both directions: adding
+`sibs=`/`inc=` on 2026-08-15 moved it UP from 70.0/61.0/63.8, and capping `sibs` moved it back down.
+A measure that rises when the baseline is padded and falls when the baseline is made cheaper is
+measuring the comparison, not the verb.
+
+**2026-09-10 — the cap was raised, and this is the same effect running forward.** `kMaxExpandSibs` went
+8 → **100**, so the figure rose 71.0% → 81.8%. `--pack-signatures` again elides exactly what it always
+did; `--expand` simply stopped hiding the file context it was cutting. The cap was set on **recall**
+grounds, not to move this number: at 8 it fired on **68.5%** of bodies and hid **89.3%** of all sibling
+names, while its stated cost — "~3.5 KB per `--pack-task` bundle" — was not reproducible, because
+`--pack-task` emits no `sibs=` at all, before or after. Symbols-per-file here is median 4, p90 18,
+p99 85; 100 clears the tail, fires on 15.8% of bodies, costs +36% on a single-symbol `--expand` answer
+and **nothing** on `--for` or `--pack-task`, which are byte-identical at every cap. The full inventory
+of the 205 caps in `src/` — and of the 7 ranking parameters partitioned out of the same census, which
+together make the 212 cap-shaped constants the generator parses — is `docs/LIMITS.md`, generated and
+gated by `test/limitstablecheck.sh`. Those figures were **114 / 6 / 120** until 2026-09-10, and the
+difference is not new code: `docs/limits_build.py` required the literal `inline constexpr` with the
+value on the same line, so 92 declarations under 81 distinct names — `kType3MaxBucket`, which bounds
+clone DETECTION; `kSkillScanFindingCap`, which bounds a security verdict; `kHandoffSymbolsPerFile`,
+which truncates output and discloses — were outside a register whose first line says "Every
+compile-time cap in `src/`". The old number was the size of a regex's output presented as the size of a
+population; `test/limitstablecheck.sh` arm (H) now plants a plain `constexpr`, a `static constexpr`
+member and a wrapped initializer in a synthetic tree and requires each to appear. What each cap COSTS, measured per verb, is `docs/TUNING.md`.
 
 The three figures moved together on 2026-08-15, and the cause is on the *denominator* side, not this
 verb's: `--expand`'s `<b>` bodies now carry `sibs=`/`inc=` file-context attributes, which grows the
 full-body side of the ratio. The verb elides no more than it did. `docs/COMMANDS.md`'s own
 `--pack-signatures` caption is regenerated from a live capture and carries the same triple, and
 `test/showcasecapturecheck.sh` fails if the caption and its own recount drift more than 1.5 points
-apart — at the time of writing that recount reads 86.5 / 81.1 / 81.3.
+apart — at the time of writing that recount reads 89.5 / 81.8 / 84.3.
 
 **Quote the top-50 figure.** The signature payload is top-50 regardless of `--top-k`, so it is what
 the command actually emits. A "~70%" headline is reachable at larger N but overstates the smaller
@@ -5153,8 +5437,11 @@ tolerance (the pre-change binary measured 67.0), so the true binary-to-binary to
 **This is gated, not asserted.** `test/showcasecapturecheck.sh` re-derives all three figures from
 this repository on every run, in the same quantity as the caption, and fails if the caption and the
 recount drift more than 1.5 points apart — plus a separate regression band at top-50, derived as the
-caption's own figure ±9 points (72–90% at the caption's current 81.4%). The
-documentation cannot silently diverge from the binary.
+caption's own figure ±9 points (73–91% at the caption's current 81.8%). The band is re-centred when
+the corpus moves it, and the centre is *derived* from the two edges in the gate's own message rather
+than hand-copied, because it was hand-copied once and went stale. `--help` states the same band, and
+`test/showcasecapturecheck.sh` arm (C-help) fails if it does not. The documentation cannot silently
+diverge from the binary.
 
 See §7 for the case where this verb makes output **larger**.
 
@@ -5552,7 +5839,7 @@ four `--quality-delta` shapes, against 2–6 before: this lane closed `sa@key`, 
 shapes by absolute legend size and reports the fraction as INFO. A `legend<=payload` arm is
 unsatisfiable on the case these verbs exist to handle well — a clean tree's payload is near-zero by
 construction — so at 40% of a 572 B payload the whole legend would have to fit in 381 B, shorter than
-the list of the ten measured kinds. **A ≤40% relative ceiling for `--quality-delta` and ≤50% for
+the list of the ten measured kinds (eleven since 0.6.5). **A ≤40% relative ceiling for `--quality-delta` and ≤50% for
 `--safe-delete`/`--test-gate` were considered and are recorded as UNREACHABLE rather than as missed
 work**: post-fix fractions are 87.0% / 91.4% / 78.8% on the clean cases and 81.4–86.7% wherever
 the payload is real. The same reasoning `test/testgatelegendbudgetcheck.sh` recorded in 2026-08-28.
@@ -5579,13 +5866,28 @@ copy here would be exactly the dialect divergence that gate exists to catch. Com
 tags, wrap, stable-order defaults), seven individually invoked standalone gates (`g1freshcheck`,
 `skillscan`, `htmlexport`, `compresscheck`, `handoffcheck`, `releaseinstallcheck`,
 `taskroutecheck`), and a single loop
-naming **562 gate scripts**, all of which exist on disk.
+naming **664 gate scripts**, all of which exist on disk. <!-- gatecount -->
 
 `python3 test/pargates.py . ./build/ripwire -j 6` runs the same scripts in parallel so a full
 verification fits in one sitting. It does not modify `regression.sh`.
 
 `test/manifestcheck.sh` fails if a committed top-level `*check.sh` is missing from `regression.sh`,
 so the list cannot rot.
+
+**The number itself is generated — never edit it.** The count above, and every other place this
+repository publishes it, is written by `python3 docs/gatecount_build.py` from that loop and gated by
+`test/gatecountcheck.sh`, the same way `docs/COMMANDS.md` and `docs/LIMITS.md` are build products of
+`--help` and of `src/`. It was hand-written at eight sites until 2026-09-10, and the failure that ended
+that was not a typo: two lanes that each add one gate both write N+1, git auto-merges the **identical**
+text clean, and the tree then publishes N+1 against a loop of N+2. Every check in the tree stays green
+through it — "my count equals my own loop" holds on each branch, "my loop equals main's loop" holds
+after the merge, and the member *sets* differ at the same number. It collided seven times in one night
+and serialised every gate-adding lane. Each published site now carries a marker comment (spelled in
+`CONTRIBUTING.md`) that the generator owns; a count on an unmarked line is a hand-written count and the
+generator refuses the tree rather than leave it behind. `test/manifestcheck.sh`'s derived-vs-stated arms
+are kept as the post-hoc catch: the generator is how the sites are *written*, manifestcheck is what
+notices if one was written some other way. After adding a gate — or after any rebase that moved the
+loop — the whole merge recipe is: union the `for _g in …` sets, run the generator, done.
 
 ### The TOML config-key tier — shape coverage, and the ceiling that was declined
 
@@ -5692,6 +5994,91 @@ A probe over three hand-picked fixtures would not have found this; 90 repos did.
 consequence and its resolution), and `.dSYM` debug-symbol bundles — 197 yaml-format relocation files
 and zero real config in the private validation corpus — are pruned by name suffix, pinned by a gate arm.
 
+### The narrow-counter family across four vendored scanners (2026-09-10)
+
+**Instrument:** the G1 asan flavour (`-fsanitize=address,undefined,integer,float-divide-by-zero,`
+`float-cast-overflow -fno-sanitize-recover=all`) plus `test/vendorpatchcheck.sh` arm I on
+`test/vendorwrapfix/`, over seven clones that had never been sanitizer-tested.
+
+**The trigger was one real file.** `rails/guides/source/getting_started.md` (105 436 B) exits 134 on
+its own — a single `.md` file, no include graph, no ripwire logic — at `markdown/src/scanner.c:1362`,
+where `s->indentation += advance( s, lexer )` accumulates a `size_t` column count into a `uint8_t`.
+Line 122 of that guide is a pipe-table row padded to 301 columns. Pre-existing since the grammar was
+vendored (`1d11ee80`, 2026-08-12). **64 tabs also suffice**, because `advance()` charges a tab at tab
+stop 4 — far more reachable in a real repository than 256 spaces, and its own fixture arm.
+
+**The shape is a family, which ruled out the ignorelist route.** Six of markdown's `+= advance(…)`
+instances are live aborts from three-line documents, in `match`, `parse_star`, `parse_plus`,
+`parse_ordered_list_marker`, `parse_minus` and `scan` — including the soft-line-ending lookahead at
+`scanner.c:1501`, which a fixture driving only `:1362` never reaches — and
+`parse_fenced_code_block`'s `level++` is a seventh. An exact-function `fun:` entry for `scan` would
+have exempted the site that fired and left five neighbours armed: the "exempted the neighbour, not
+the site" failure arm E was written for.
+
+**Sweeping the shape found three more grammars**, each a live `rc=134`: `rust/src/scanner.c:77`
+(`opening_hash_count++`), `lua/src/scanner.c:32` (`++count`), `csharp/src/scanner.c:205`
+(`dollar_advanced++`). Cleared as bounded rather than lucky: markdown's atx `level` (`uint16_t`,
+guarded `<= 6`), cpp/cuda's `delimiter_length` (`MAX_DELIMITER_LENGTH`), csharp's brace/quote
+counters, swift's `match_count`, elixir's `length`.
+
+#### The abort window and the wrong-parse window are different sizes
+
+This is the finding that governs both the remedy and the fixtures, and it is measured, not argued.
+The sanitizer aborts at **every** width ≥ 256. The **wrong parse** only fires while the wrapped
+value lands *under the threshold the parser tests* — `N mod 256` in 0..3:
+
+| N | indented `# Buried` | fence of N marks |
+| --- | --- | --- |
+| 255 | correct | correct |
+| 256, 257 | **heading minted at exit 0** | **fence never opens; body leaks as live markdown** |
+| 300 | correct — by luck (300 − 256 = 44) | correct — by luck |
+
+Two consequences. First, **saturation is the right remedy for both markdown counters**: indentation
+is read `>= 4`, `< 4` and `< list_item_indentation( block )` (max 17), and `level` is read `>= 3`
+before a fence may open — all *fixed* thresholds, where 255 answers exactly as any larger true value
+would. Wrapping does not blur those predicates, it inverts them. Second, **a fixture pinned at a
+round 300 reproduces the abort while asserting nothing about the parse**, so its plain-build arm
+would survive a full revert of the fix. Every width in `test/vendorwrapfix/` is therefore pinned at
+exactly 256 and gated with `==`, not `>=`.
+
+**The delimiter counters are genuinely a different case, also by measurement.** rust's
+`opening_hash_count`, lua's `count` and csharp's `dollar_advanced` close a token by matching the
+opening count, not against a fixed threshold. At 255, 256, 257 and 300 the symbols *after* the token
+are recovered identically in every case — there is no extraction difference to repair, so saturation
+would be a different wrong answer that merely looks like one. Those three keep an explicit cast,
+which makes the conversion defined (all G1 asks) and contributes **nothing** to `kParserVer`.
+
+**`kParserVer` 86 → 87, and the two measurements behind it disagree, so both are reported.** Map
+output is **byte-identical over 3 538 files** (1 258 `.md`, 132 `.rs`, 96 `.lua`, a 1-in-16 sample of
+2 052 `.cs`, from rails, django, vuejs/core, ripgrep, telescope.nvim, dotnet/runtime and this
+repository): no corpus file reaches 256 columns of indentation. A **constructed** 256-column ATX line
+does move — pristine emits `n="BuriedHeading"`, saturating does not. Byte-identical on real files is
+not byte-identical on all files, which is what `swift/001` and `yaml/002` could claim and this cannot,
+so the bump is owed, with `kIngestParserVerMirror` and a re-derived `test/qschemetrip.hash` in the
+same commit.
+
+**Post-patch, three corpora that had never been sanitizer-tested sweep clean** under the full G1
+stack — exit 0, empty stderr: rails (`files=3916 symbols=60700 edges=107493`), django
+(`files=3449 symbols=47830 edges=62591`), vuejs/core (`files=628 symbols=8287 edges=6731`).
+
+**The gate has two halves and the plain-build half was mutation-proven.** One fixture file per
+grammar, so a reverted patch turns exactly one file red. The exit code is the sanitizer tripwire and
+fires only under asan; the semantic assertions hold on the plain build, where a revert is an exit-0
+wrong answer rather than a crash. Run against a **fully reverted** binary, arm I comes back red with
+exactly `buriedByTwoFiftySixColumns buriedBySixtyFourTabs buriedInsideFence` — the mutation control
+that separates a gate from a comment. The fixture's list-continuation line is deliberately **not** in
+that list: it drives `scanner.c:1501` for the abort arm but mints no phantom either way, so asserting
+its absence would be a vacuous assertion dressed as coverage. Presence guards measure in `awk`
+because BSD grep caps interval repetition at 255, so a `{256,}` regex is a hard error on the macOS
+leg while passing under GNU grep.
+
+**Running that mutation found two defects in the gate itself**, both of which would have shipped: the
+run-measuring `awk` reset its accumulator on every line, so it reported the *last* line's value (0)
+rather than the file's longest run; and the patch files were being generated with `git diff` against
+the lane's own commit rather than against pristine upstream, which still reverse-apply-checks clean
+(arm B's test) while being useless as a re-vendor record. Each of the four patches is now verified to
+reconstruct the working tree byte-for-byte when applied to `origin/main`'s vendored sources.
+
 ### Swift shape coverage + TS #private — hand-port of stranded commit bb78f97 (2026-08-10)
 
 **Instrument:** `test/swiftshapecheck.sh` over `test/swiftshapefix/{EnumsAndTypes,Members,ProtocolSurface}.swift`
@@ -5780,12 +6167,15 @@ regenerated file. It skips (exit 0) when no reference binary is given, self-test
 and asserts it left the tree unmodified — an assertion that is itself **controlled**: a stray file is
 created on purpose, must be detected, and must then be gone.
 
-### `--quality-delta`'s ten measured failure modes
+### `--quality-delta`'s eleven kinds: ten measured failure modes and placeholder
 
 These are the exact `kind=` strings the binary emits, from `src/quality.h`:
 
 `complexity` · `verbosity` · `nesting` · `params` · `duplication` · `dead-code` · `api-surface` ·
-`error-masking` · `short-horizon-churn` · `new-clone-of-reused-helper`
+`error-masking` · `short-horizon-churn` · `new-clone-of-reused-helper` · `placeholder`
+
+The first ten each target a failure mode measured in the literature; `placeholder` (added 0.6.5) is an
+honesty check on "done" — a stub or TODO the change added — and never gates.
 
 Note that some user-facing summaries abbreviate four of these (`dup`, `dead`, `churn`,
 `clone-of-reused-helper` / `reuse-decline`). **Match against the strings above** when grepping real
@@ -5793,6 +6183,87 @@ output.
 
 The verb reports only what a change made *worse*, against git HEAD. `--quality-ack` records a
 reviewed exception; `--ack-only=KIND` scopes it.
+
+### error-masking widened: log-only and rethrow-only (0.6.5) — hand-labelled precision, and which shapes gate
+
+`error-masking` counted only an EMPTY handler (empty braces, `pass`, `...`, a comment-only body). 0.6.5 adds
+two shapes from `src/handlershape.h`, walked over the same parse the query rows use:
+
+- **log-only** — a BROAD handler (catches everything, or the root error type: `Exception`, `Throwable`,
+  `StandardError`, a bare `except:`/`rescue`, any JS/TS `catch`) whose body is only logging/print calls and
+  never names the caught error. `logger.exception`, `exc_info=`, `traceback.format_exc()` and Ruby's `$!`
+  count as naming it; a narrow handler never counts (its type states the cause). Go: `if err != nil { … }`
+  with no `else` and a body of non-fatal log calls that never read `err`.
+- **rethrow-only** — the ONLY handler of its try re-raises the error it caught, unchanged (bare `raise` /
+  `throw;`, or `raise e` / `throw e` of the caught name; `raise … from …` and a wrapped throw are not
+  unchanged). Sole handler, because `catch( Specific e ) { throw e; }` ahead of a broader sibling routes one
+  type past it and is not redundant.
+
+**Labelling rule, fixed before labelling.** A hit is TRUE when the shape as specified is really there: for
+log-only, an error is caught, its identity (type, message, traceback) is not carried by anything the handler
+does, and execution continues past the handler; for rethrow-only, deleting the handler (keeping any `else`
+/ `finally`) changes nothing observable. A deliberate best-effort fallback is TRUE — it is the shape, the
+same way an intentional empty `catch {}` is an empty catch; whether to keep it is the reviewer's call. FALSE
+is anything else: the error is carried or checked some other way, or the code does not continue.
+
+**Corpus.** Every hit, de-duplicated by its text, from source already on the measuring machine and read
+in place: the three peer checkouts the idea came from (shallow, one commit each — they cannot be replayed),
+the CPython 3.13 standard library, the Python packages in a local package-manager cache, the Go 1.24
+standard library and module cache, the npm CLI with its bundled dependencies, and Homebrew's Ruby. No
+repository was fetched for this.
+
+| shape | language | hits labelled | TRUE | FALSE | precision | gates? |
+| --- | --- | --- | --- | --- | --- | --- |
+| log-only | Python | 41 | 40 | 1 | **0.976** | **yes** |
+| log-only | JS / TS | 7 | 7 | 0 | 1.000 | no — n < 20 |
+| log-only | Go | 3 | 2 | 1 | 0.667 | no — n < 20 |
+| rethrow-only | Python | 33 | 33 | 0 | **1.000** | **yes** |
+| rethrow-only | JS | 1 | 1 | 0 | — | no — n < 20 |
+
+The two FALSE rows: a Go `if err != nil { fmt.Printf( … ) }` whose `err` is passed to `check( err )` on the
+next line (the error is handled after all — the Go walk cannot see past its own block), and a Python
+`except BaseException: print( previous_tb )` that prints the traceback of the error being reported and exits
+right after. Two of the TRUE rethrow-only rows carry the ecosystem's own linter suppression for this exact
+shape (`# noqa: TRY203`, `// eslint-disable-next-line no-useless-catch`).
+
+**The gate rule** (`kHandlerShapeGates`, `src/lintrules.h`): a (shape, language) pair gates only at precision
+≥ 0.8 on ≥ 20 labelled hits. That admits Python for both shapes and nothing else. Every other language
+still gets the row, as `sev="minor"`, which never fires exit 2 — Java, C#, Kotlin, Ruby and C++ had no
+sample at all on this machine, and JS/TS and Go too few. The full legend says so on the row's report.
+
+**Replay on this repo's history.** `--quality-delta=C` for the last 40 first-parent commits of `main`
+(each one a merged train or lane, `3ddbfe85`..`b343b988`), with the 0.6.4 binary and with this one:
+**+0 rows** in either kind, and all 40 `--json` documents byte-identical between the two binaries (626 rows
+each, 24 gating across the 40). This repository has no Python/JS handler of either shape and no TODO comment
+added in that window, so on upgrade its own reports are unchanged; the replay shows the widening costs no
+noise here, not that it finds anything here. The rows the shapes produce were measured on the corpus above.
+
+### placeholder (0.6.5) — what the eleventh kind counts, and a labelled sample
+
+A stub or TODO the change ADDED, counted per enclosing symbol and compared with the baseline like
+error-masking. Every row is `origin="new-symbol"` by construction and never gates. It counts: Rust
+`todo!()`/`unimplemented!()` (and a `panic!` saying "not implemented"), Kotlin `TODO()`, C#
+`NotImplementedException`, Python's bare `raise NotImplementedError` as the whole body of a FREE function,
+any throw/raise/panic/`fatalError`/`assert` whose string says "not implemented", "not yet implemented",
+"unimplemented", "implement me" or a whole-word `TODO`, and a comment line that opens with `TODO`/`FIXME`
+and names no issue (`#12`, `ABC-12`, `gh-12`, a URL). A raise whose text declares a subclass contract
+("must be implemented by subclasses", "override", "abstract") never counts, nor does an `@abstractmethod`.
+
+Two rules were narrowed by measurement before shipping, on 25-hit seeded samples of the corpus above:
+a bare "any `raise NotImplementedError`" rule was dominated by guards for unsupported cases in library
+code, and a whole-METHOD-body rule by abstract-by-convention interfaces (asyncio's event-loop ABC is dozens
+of them, undecorated). Hence free functions only for the bare form — a stated recall floor for an
+undecorated placeholder method, which still counts when its message says "not implemented".
+
+| sample (seed 20260926, 25 each, de-duplicated) | criterion | TRUE |
+| --- | --- | --- |
+| stub (653 unique hits: 616 Python, 22 Go, 13 JS, 2 Ruby) | the code declares a case or a function not implemented | 25 / 25 |
+| stub | stricter: a placeholder standing in for a whole unfinished function | 1 / 25 |
+| todo (10,855 unique hits) | a TODO/FIXME comment line naming no issue | 25 / 25 |
+
+The stricter reading is what "a stub" means in conversation, and on library code it is rare: most hits
+are declared-unimplemented BRANCHES ("… is not implemented for directed graphs"). That is still what the
+kind is for — a change that adds one has a stated gap — and it is why the kind is report-only.
 
 ### Co-change: the finding that contradicted the obvious design
 
@@ -5814,6 +6285,13 @@ Private C++ corpus, 1,574 files.
 *fusing* structure into the lexical ranker made it worse (7.7% at 5, against 40.3% lexical alone).
 The result is published because it constrains the design: the graph answers "what is load-bearing",
 not "what changes together", and the tool uses different machinery for each.
+
+**Measured at HEAD (disclosed 2026-09-26).** Every commit above was ranked on the index, bodies and graph at the
+corpus's HEAD, which already contain that commit's change, and gold keeps only files still present at HEAD
+(`src/eval.h`). The absolute recall values, PageRank's 3.8% included, are therefore most likely upper bounds; not
+proven, since the HEAD index also holds files added after each commit, which compete for the top-k and push recall
+down. The lexical-over-PageRank ordering would reverse only if lexical recall fell more than tenfold relative to
+PageRank's at the parent revisions; that has not been measured. The corpus is private and cannot be re-measured from this tree.
 
 ### End-to-end agent A/B
 
@@ -6491,9 +6969,11 @@ Listed because the reason is more useful than the silence.
   shipped**. See `bench/locbench/anchorhop_calib.json`. The mention anchor's reproducible numbers are
   the ablations in §4.
 - **A single round gate-count.** Two in-tree numbers disagree (`test/pargates.py`'s docstring says
-  ~210; `test/argvdiffcheck.sh` says 200+), while the loop in `test/regression.sh` names 562. The
-  loop is the authority; the stale docstrings are a known drift. `test/manifestcheck.sh` asserts this
-  very number against the loop's actual length, so it cannot go stale silently again.
+  ~210; `test/argvdiffcheck.sh` says 200+), while the loop in `test/regression.sh` names 664. The <!-- gatecount -->
+  loop is the authority; the stale docstrings are a known drift. Since 2026-09-10 the number is not
+  written by hand anywhere: `docs/gatecount_build.py` derives it from the loop and rewrites every
+  published site, `test/gatecountcheck.sh` fails if any of them drifts, and `test/manifestcheck.sh`
+  still asserts this very number against the loop's actual length as the post-hoc catch.
 - **"282 argv vectors."** The gate asserts a floor of ≥250 assembled from five sources; 282 was a
   point-in-time snapshot. Quote the floor, not the snapshot.
 - **"~70% fewer bytes" for `--pack-signatures`**, unqualified. See §5 — quote the root-neutralised
@@ -6507,6 +6987,37 @@ Listed because the reason is more useful than the silence.
   prototyped on two corpora and rejected — see "Shotgun Surgery — two formulations measured" at the end of
   this document. What ships for the smell is the co-change check `--situ` / `--pr-context` already
   carried; its backtest numbers there are the only ones this project publishes about it.
+- **"484 matched pairs, 146 right-direction, 30.2%"** for `--readability`'s construct-validity proxy
+  (`--help=--readability`, this document, and README.md all carried it). It was first computed by
+  walking `git log --all` over a clone whose branch set changes every time a lane is pushed — a rerun
+  of the identical, unmodified script gave 413 pairs (38.3%) and, separately, 409 pairs (38.4%),
+  neither matching the published number and neither touching `src/readability.h`. A number that moves
+  when an unrelated lane is pushed is not measuring the lens; it is measuring which branches exist in
+  the shared `.git` right now. Pinned to the immutable `v0.6.2` tag, the same instrument reproduces
+  deterministically: **412 function pairs, 154 right-direction (37.4%)**. The mechanism behind the
+  inversion is not "the lens is wrong 63% of the time" — it is that the sign of a function's
+  token-count change predicts the lens's direction in **96.0%** of pairs (388/404 whose token count
+  changed), with the Halstead-volume term driving 91.1% of the 258 wrong-direction pairs (62.6%). Full protocol,
+  the instrument-fix note, and the decomposition: `docs/research/readability-construct-validity.md`
+  §3a/§3c — a draft investigation, PR [#313](https://github.com/redhat-et/ripwire/pull/313) (open;
+  cited here for the derivation only, nothing shipped depends on it merging). The shipped `--help`
+  text now states the pinned figures; this entry keeps the retracted number visible rather than
+  silently replacing it.
+
+  **WITHDRAWN (2026-09-22): the ordering claim itself.** The 96.0%/token-count finding above answers
+  *why* the lens's direction moves; it does not by itself say whether that ordering predicts anything
+  actionable. `docs/research/readability-construct-validity.md` §4 tested that directly — whether a
+  least-readable-quartile function is more likely to be fixed later, on ripwire's own history — and at
+  raw and tercile level the association looked strong (RR 2.87). Stratified into ten narrow token-count
+  deciles, holding size roughly constant, it does not survive: **8 of the 10 deciles show a CI that
+  includes 1 on both outcomes** (point estimates 0.81–1.86, no consistent direction); the only two
+  deciles that stay significant are the two with the most leftover internal token-range spread (D10's
+  internal range is 16.3×). The reading is that the raw/tercile separation is a residual size effect,
+  measured in the lens's own units, not an independent later-fix signal — so the ordering claim
+  (`--readability` orders functions least-readable first) is withdrawn; the flag still orders by
+  Halstead volume/token entropy/length, it is just not claimed to order by readability. Full
+  derivation, the decile table, and the discarded nearest-neighbour check: same document §4, same PR
+  #313 (open; cited for the derivation only).
 
 ---
 
@@ -6542,7 +7053,7 @@ only five are **independent evidence**, and every pooled number below pools exac
 | **rustCLI** | 250 | 6 004 | 6 020 | **4 068** | *(no git)* | Rust 115, md 75, Bash 11, TS 8 |
 | **appleXR** | 320 | 1 860 | 582 | **454** | *(no git)* | json 158, Swift 49, C/C++ hdr 45, ObjC 40, Metal 13 |
 | *ripwire-src* | 95 | 2 795 | 7 929 | *1 958* | `61c6b54` | a **subset of ripwire** — not independent |
-| *ctxpack* | 920 | 7 476 | 8 312 | *4 027* | `b5ac9f2` | ripwire's **pre-cutover ancestor** — shared lineage |
+| *ripwire-ancestor* | 920 | 7 476 | 8 312 | *4 027* | `b5ac9f2` | ripwire's **pre-cutover ancestor** — shared lineage |
 | *gameA-later* | 4 075 | 59 350 | 39 152 | *17 552* | `86a6dbb7` | a later **snapshot of gameA** |
 | *gameA-earlier* | 734 | 15 006 | 17 235 | *8 935* | `dabfaf0` | an earlier **snapshot of gameA** |
 
@@ -6575,7 +7086,7 @@ numbers below should be re-derived on any tree where it is deployed as a gate �
 | rustCLI | 4 068 | 292 · 7.18% | 1 303 · 32.03% | **0 · 0.00%** *(now UNAVAILABLE)* | **UNAVAILABLE** |
 | appleXR | 454 | 45 · 9.91% | 16 · 3.52% | 7 · 1.54% | **UNAVAILABLE** |
 | *ripwire-src* | *1 958* | *482 · 24.62%* | *55 · 2.81%* | *101 · 5.16%* | *558 · 28.50%* |
-| *ctxpack* | *4 027* | *503 · 12.49%* | *825 · 20.49%* | *94 · 2.33%* | *874 · 21.70%* |
+| *ripwire-ancestor* | *4 027* | *503 · 12.49%* | *825 · 20.49%* | *94 · 2.33%* | *874 · 21.70%* |
 | *gameA-later* | *17 552* | *2 257 · 12.86%* | *1 690 · 9.63%* | *629 · 3.58%* | *781 · 4.45%* |
 | *gameA-earlier* | *8 935* | *1 111 · 12.43%* | *929 · 10.40%* | *291 · 3.26%* | *57 · 0.64%* |
 
@@ -6656,7 +7167,7 @@ whose denominator is the 23 367 symbols in the three corpora where git could be 
 
 **Per-corpus maxima by |φ|:** ripwire +0.262 (structural × historical), tree-sitter +0.167
 (structural × confusion), rustCLI −0.166 (structural × lexical), gameA +0.161 (structural
-× confusion), appleXR ≤ 0.024; among the non-independent extras, ctxpack +0.278 — the largest value
+× confusion), appleXR ≤ 0.024; among the non-independent extras, ripwire-ancestor +0.278 — the largest value
 anywhere in the study. **Every pair on every corpus is |φ| < 0.28, most are < 0.17, and the largest
 Jaccard overlap between any two families is 0.119 pooled (0.221 on any single corpus).**
 
@@ -6728,13 +7239,13 @@ trees, so added and deleted code cannot masquerade as instability.
 | Ladder | commits | sampled | span (committer dates) |
 | --- | ---: | ---: | --- |
 | ripwire | 148 first-parent | every ~18 | 2026-07-31 → 2026-08-05 |
-| ctxpack | 792 first-parent | every ~99 | 2026-06-20 → 2026-08-05 |
+| ripwire-ancestor | 792 first-parent | every ~99 | 2026-06-20 → 2026-08-05 |
 | gameA | 1 620 first-parent | every ~202 | 2026-06-03 → 2026-07-21 |
 
 Jaccard of each family's flagged symbol set, consecutive sampled commits (mean) and oldest-vs-newest
 (endpoint):
 
-| Family | ripwire | ctxpack | gameA | consecutive range | endpoint range |
+| Family | ripwire | ripwire-ancestor | gameA | consecutive range | endpoint range |
 | --- | --- | --- | --- | --- | --- |
 | lexical | 1.000 / 0.999 | 1.000 / 1.000 | 1.000 / 0.999 | **1.000** | **0.999 – 1.000** |
 | structural | 0.995 / 0.965 | 0.965 / 0.859 | 0.990 / 0.939 | 0.965 – 0.995 | 0.859 – 0.965 |
@@ -6743,7 +7254,7 @@ Jaccard of each family's flagged symbol set, consecutive sampled commits (mean) 
 
 **`historical` jitters an order of magnitude harder than the other three, on all three histories.**
 Per-symbol flag-flip rate per sampled step: structural 0.06–0.66%, lexical 0.00%, confusion
-0.01–0.45%, **historical 1.21–6.67% (peak 32.99% on one ctxpack step)**. Endpoint to endpoint the
+0.01–0.45%, **historical 1.21–6.67% (peak 32.99% on one ripwire-ancestor step)**. Endpoint to endpoint the
 historical sets overlap by Jaccard 0.426–0.546; on gameA, **161 of the 401 still-present symbols it
 flagged in June (40%) were no longer flagged in July**, on code that did not change between the two
 commits. This is not a bug — churn
@@ -6754,7 +7265,7 @@ something.
 
 **Honest limits of this pass.** All three histories are dense but short in wall-clock (5–50 days), so
 every sampled commit's 12-month churn window contains the whole history; a longer-lived repository
-would show *less* churn-cut movement per commit. The ctxpack endpoint figures are the least reliable
+would show *less* churn-cut movement per commit. The ripwire-ancestor endpoint figures are the least reliable
 row in the table — that tree grew from 208 to 4 027 eligible functions across the window, leaving a
 177-symbol surviving universe at the endpoint. Stability was measured on three repositories, two of
 which share a lineage; it was **not** measured on rustCLI or appleXR, which have no git history
@@ -6854,7 +7365,7 @@ K ≥ 3 — fails C2 outright (0.00% on two of five corpora) and fails the gate 
 output set's endpoint Jaccard is **0.438 – 0.719**. Dropping `historical` instead produces a set that
 is both smaller *and* measurably steadier. Output-set stability, on the same three ladders:
 
-| Preset | ripwire | ctxpack | gameA |
+| Preset | ripwire | ripwire-ancestor | gameA |
 | --- | --- | --- | --- |
 | lenient (all 4, K ≥ 1) | 0.943 / 0.812 | 0.947 / 0.804 | 0.970 / 0.910 |
 | default (all 4, K ≥ 2) | 0.878 / 0.622 | 0.851 / 0.548 | 0.907 / 0.633 |
@@ -6918,7 +7429,7 @@ counts **four** families, not five. That third result is the uncomfortable one a
 was run rather than assumed.
 
 Measured 2026-08-06, binary built at `feat/quality-panel`. Corpora, denominators and the overfitting caveat
-are §9.1's, unchanged — five independent trees, **27 999 eligible functions**, `ctxpack` and `ripwire-src`
+are §9.1's, unchanged — five independent trees, **27 999 eligible functions**, `ripwire-ancestor` and `ripwire-src`
 reported separately and never pooled.
 
 #### 9.9.1 Per-family fire rate, with the two new columns
@@ -6930,7 +7441,7 @@ reported separately and never pooled.
 | gameA | 17 157 | 12.65% | 9.77% | 3.57% | 5.20% | 0.23% | 16.37% |
 | rustCLI | 4 068 | 7.18% | 32.03% | **UNAVAILABLE** | **UNAVAILABLE** | 0.98% | 0.10% |
 | appleXR | 454 | 9.91% | 3.52% | 1.54% | **UNAVAILABLE** | 6.17% | 0.88% |
-| *ctxpack* | *4 027* | *12.49%* | *20.49%* | *2.33%* | *21.70%* | *0.99%* | *2.83%* |
+| *ripwire-ancestor* | *4 027* | *12.49%* | *20.49%* | *2.33%* | *21.70%* | *0.99%* | *2.83%* |
 | *ripwire-src* | *2 013* | *24.89%* | *2.73%* | *5.07%* | *27.77%* | *1.99%* | *0.79%* |
 
 Two properties of the new columns matter more than their levels:
@@ -6959,8 +7470,8 @@ Two properties of the new columns matter more than their levels:
 | **state** | +0.162 | −0.054 | +0.070 | +0.026 | +0.003 | 1.000 |
 
 Largest |φ| on any single corpus: ripwire +0.252, tree-sitter +0.167, gameA +0.190, rustCLI +0.204, appleXR
-+0.126; among the non-independent extras ctxpack **+0.278** and ripwire-src +0.218. **The largest value
-anywhere in the study is still ctxpack's +0.278 `structural × historical` — the same pair, the same number
++0.126; among the non-independent extras ripwire-ancestor **+0.278** and ripwire-src +0.218. **The largest value
+anywhere in the study is still ripwire-ancestor's +0.278 `structural × historical` — the same pair, the same number
 §9.3 reported — and it involves neither new family.** The largest involving a new family anywhere is
 **+0.204** (rustCLI `structural × colocation`); pooled, **+0.162** (`structural × state`).
 
@@ -7012,9 +7523,9 @@ and left the *shape* alone: 38.74% → 7.79% → 1.66% → 0.18%, roughly 5×, 4
 
 Same protocol as §9.5: **one binary, the corpus varied** over a ladder of past commits in a throwaway clone,
 restricted to symbols present in both trees. Ladders: ripwire (138 first-parent commits, every ~17,
-2026-07-31 → 2026-08-05) and ctxpack (792, every ~99, 2026-06-20 → 2026-08-05).
+2026-07-31 → 2026-08-05) and ripwire-ancestor (792, every ~99, 2026-06-20 → 2026-08-05).
 
-| Family | ripwire (mean / endpoint) | ctxpack (mean / endpoint) | worst mean |
+| Family | ripwire (mean / endpoint) | ripwire-ancestor (mean / endpoint) | worst mean |
 | --- | --- | --- | ---: |
 | lexical | 1.000 / 0.999 | 1.000 / 1.000 | **1.000** |
 | state | 0.999 / 0.990 | 1.000 / 1.000 | **0.999** |
@@ -7026,7 +7537,7 @@ restricted to symbols present in both trees. Ladders: ripwire (138 first-parent 
 **`colocation` is the least stable family in the panel, on the ladder where the corpus grew.** Its 0.222
 endpoint Jaccard is the worst number in either study — worse than `historical`'s 0.426–0.546 — while on the
 ripwire ladder it is a perfect 1.000/1.000. That contrast is the whole finding, and the mechanism is the one
-§9.5 already named for churn: **a fixed-size worst-40 cut over a ranking whose population moves.** ctxpack grew
+§9.5 already named for churn: **a fixed-size worst-40 cut over a ranking whose population moves.** ripwire-ancestor grew
 from 208 to 4 027 eligible functions across its window, so the top 40 by outside-reading volume turns over
 completely; ripwire's tree barely changed size in five days, so it does not move at all. A family that is
 steady only while the corpus is not growing cannot carry a gate.
@@ -7071,7 +7582,7 @@ Per corpus, in full:
 **The exclusion is validated by the output the preset actually emits**, not only by the per-family numbers.
 Output-set Jaccard down the same two ladders:
 
-| Preset | ripwire | ctxpack |
+| Preset | ripwire | ripwire-ancestor |
 | --- | --- | --- |
 | lenient (all 6, K ≥ 1) | 0.949 / 0.805 | 0.962 / 0.848 |
 | default (all 6, K ≥ 2) | 0.901 / 0.599 | 0.878 / 0.688 |
@@ -7092,7 +7603,7 @@ of actual defect or maintenance cost, they are not tuned per corpus, and `strict
 `structural + lexical, K ≥ 2` because `confusion` cannot apply there — the verb says so (`unavailable=`,
 `of="2"`) rather than wearing a four-family label silently. One limit is new and belongs here: **the stability
 pass covers two ladders, not three.** §9.5 measured gameA as well; this pass did not, so `colocation`'s
-verdict rests on ctxpack alone for the corpus-growth case. Two ladders were enough to disqualify it — the
+verdict rests on ripwire-ancestor alone for the corpus-growth case. Two ladders were enough to disqualify it — the
 finding is that it *can* move that far, which one counterexample establishes — but a third would say more
 about how often.
 
@@ -8236,7 +8747,13 @@ families may ship rows but earn no measured claim from this round.
 **The corpus problem, settled — the reason this registration exists.** The survey lane described "a
 pinned 38-instance corpus". **It is not pinned in any file**: `bench/slice/run_slicerecall.py`
 MINES at run time — newest-first fix-shaped commits from the `--repo` tree's own history, cap 40 —
-so the instance set is a function of the HEAD it runs at. Settled here, from the harness code and a
+so the instance set is a function of the HEAD it runs at. (2026-09-22: the harness now takes `--ref`,
+default `v0.6.2` — an immutable point, not a bare HEAD — and records the resolved ref+sha in its own
+output; this turns (b) below from operator discipline into the harness's own default. The `b156027`
+numbers already recorded here are unaffected — they were pinned by hand, the same mechanism `--ref`
+now automates. To re-run that recorded measurement with today's harness, pass `--ref=b156027` as well
+as checking out `b156027`: the default `--ref` of `v0.6.2` would otherwise mine a later, different
+population.) Settled here, from the harness code and a
 read-only count: **(a)** the paired design is real — all arms run per instance inside ONE
 invocation with one binary, so a v3−v2 delta computed within one invocation is a valid paired
 statistic under any drift; but validity-under-drift is not enough, because the newest-first cap
@@ -9163,7 +9680,7 @@ history — read them as a gauge, never a proportion. The census reports each po
 its own unit, full stop.
 
 **What the existing oracle can and cannot see — the instrumentation verdict, established by reading
-`bench/scip_amb_precision.py`.** The prior census (pre-cutover history-of-record: ctxpack
+`bench/scip_amb_precision.py`.** The prior census (pre-cutover history-of-record: ripwire-ancestor's
 `bench/ANSWERQUALITY.md`, appended 2026-07-11) measured amb-flagged precision **0.378** (loguru,
 300 buckets / 794 edges) and **0.841** (rq, 520 / 622) against a non-ambiguous control of **1.000**
 over 2,077 edges. Its grouping key is whether the callee NAME has >1 in-corpus definition — and a
@@ -12339,6 +12856,13 @@ arm-vs-arm table says."* **ripwire beats the random-rank placebo on 6 of 30 ques
 required. The consequence is therefore honoured here: the table below is published because the losses are the
 result, and **no claim of ranking superiority over any arm is made or implied by it.**
 
+**Disclosed 2026-09-26: every question was asked at the one corpus pin, which already contains all 30 graded
+commits** (`derive_questions.py` asserts HEAD == pin). So every arm's index holds each graded change, S5's
+`--rank-by=churn-decay` read history that includes it in every run, and from the post-fix run on so did S2's
+`--situ` co-change. No ranking claim rests on this instrument. Its per-shape and before/after figures, here and in
+the Graft round below, were measured at a pin that already contained the graded change (the Graft CHECK axis, run
+at `c~1`, is not affected).
+
 All five registered arms plus the placebo ran on all 30 questions; nothing is absent, and codanna stayed out.
 The harness is committed at `bench/roundc-h2h/` — `scorer.py` is the single metric implementation every arm is
 scored through, and `derive_questions.py` re-derives the frozen question table from the corpus (it reproduces
@@ -12579,7 +13103,8 @@ reproduces Round C's published value exactly and re-ran stable on the four rows 
   days at HEAD's clock, from the same mining pass the teleport already ran. The first cut ordered rows by
   decayed weight and named none of the S5 gold; the age analysis showed q25's gold at 9 days and the
   weight-first 40th row at 21 days, so the order became newest-first — and q25 completes at 4,562 B where it
-  was 37,845 B incomplete. The other five S5 rows carry gold aged 26–484 days (the questions are
+  was 35,238 B incomplete (corrected 2026-09-26 from 37,845 B, which matches no committed results file; that
+  completion is not established, see the 2026-09-26 correction under the post-fix result). The other five S5 rows carry gold aged 26–484 days (the questions are
   stride-sampled from a 1,200-commit window, so their "recently" is not recent): no recency verb can serve
   them, the placebo wins three of them on budget alone, and that is the honest shape.
 - **L4 — "where is `<commit subject>` implemented" (S1: 1/6 ripwire, 0/6 graft-ask, 4/6 floor) and "how
@@ -12587,7 +13112,7 @@ reproduces Round C's published value exactly and re-ran stable on the four rows 
   serves `sigs shown="4" total="40"` — four signatures for a 21-file gold (q21) — and `--for` returns a set,
   not a path. Question-shape losses; registered as follow-ups (raise the compact sig quota under the same
   budget; a file-level `--path`). Not fixed here.
-- **L5 — the placebo (post-fix 11 / 14 / 5).** Fourteen mutually-incomplete ties and five placebo wins
+- **L5 — the placebo (post-fix 11 / 14 / 5; 10 / 15 / 5 without q25, see the 2026-09-26 correction below).** Fourteen mutually-incomplete ties and five placebo wins
   (q08, q20 and three S5 rows) on the rows where ripwire's byte budget is largest. The stop condition stands.
 
 Graft's own losses, for the record: `graft-expert`'s `callers <PascalCase(stem)>` emitted **0 bytes** on q02,
@@ -12618,12 +13143,22 @@ tier" resolves no cross-file call for them.
 Per shape, complete / gold named, post-fix: S1 ripwire 1/6 · 7/43 (graft-ask 0/6 · 3/43) · S2 4/6 · 5/14
 (2/6 · 3/14) · S3 **4/6 · 9/11** (2/6 · 2/11) · S4 1/6 · 7/31 (1/6 · 5/31) · S5 **1/6 · 6/30** (0/6 · 5/30).
 The rows that flipped: q10 (S3, the stem partner, 1,814 B incomplete → 2,095 B complete), q25 (S5, `<recent>`,
-37,845 B incomplete → 4,562 B complete); q12 went 6,233 → 2,073 B. The cost: +281 B of legend on every
+35,238 B incomplete → 4,562 B complete; `results.json`, corrected 2026-09-26 from 37,845 B); q12 went 6,233 → 2,073 B. The cost: +281 B of legend on every
 rows-bearing `--affected`/`--situ`/`--test-gate` document (`testgatelegendbudgetcheck` re-pinned 2260 → 2540
 with the measurement), and +2.6 KB on every `--rank-by=churn-decay` map for the 40 `<rc>` rows.
 
 **The stop condition still fires (11 < 16) and no ranking claim is published.** The tool is measurably
 better on the two axes the losses named and it does not clear the bar the registration set.
+
+**Correction (2026-09-26): q25's completion and its paired win are not established.** q25 was asked at a pin
+that already contained its graded commit (see the Round C disclosure), and `<recent>` lists the newest commits'
+files at that pin, so the 9-day age that put q25's gold into it is most likely the graded commit's own touch. Without q25 the post-fix
+figures are 10/30 and 32/129 (30/129 if the q28/q29 +1s have the same cause), S5 0/6, paired 5/20/5 · 7/20/3 ·
+8/8/14 · 10/15/5; lane 2 below becomes 13/30 and 38–40/129, paired 8/17/5 · 10/17/3 · 10/8/12 · 12/13/5. Not yet
+re-measured at q25's parent revision; the arithmetic re-derives from `results_post*.json` with q25/q28/q29 set to
+their `results.json` rows. Without q25 the paired rows against graft-ask, graft-expert and `rg` equal the pre-fix
+column (5/20/5, 7/20/3, 8/8/14) and S5 is back to its pre-fix 0/6, so "measurably better on the two axes the losses
+named" above survives the q25 correction for L2 only, not for L3.
 
 ### The CHECK axis — "I have a change in my working tree, which tests must run?" (N = 6, `check_axis.py`)
 
@@ -12687,7 +13222,8 @@ trimmed surface files enter the tail. One row moved the other way: q24 (18-file 
 the tail's 24 slots now being taken by higher-ranked trimmed files. The five byte losses against graft-ask are
 untouched by design (they are the legend). **The stop condition still fires — 13 of 30 against a required 16
 — and no ranking claim is published.** The remaining tied rows are the shapes named above: stride-sampled S5
-gold, multi-file S4/S1 proxies, and two S3 graph-recall misses.
+gold, multi-file S4/S1 proxies, and two S3 graph-recall misses. The lane 2 column carries q25 unchanged, so the
+2026-09-26 correction above applies to it: 13/30 and 38–40/129 without q25.
 
 ### Registered follow-ups (not funded here)
 
@@ -12719,7 +13255,9 @@ tree (`grep -ril shotgun docs src README.md` was empty on 2026-09-08); the name 
 `test/docscommandscheck.sh` arm (I) keeps it there, and this section is the check's measurement. The
 **static** one — Lanza & Marinescu's CM×CC detection strategy — was prototyped on the call graph ripwire
 already builds and is **not built**: on two corpora it flags only stable hub APIs, and its per-file value
-correlates with how widely edits to that file actually scatter at Spearman **+0.16**. A third candidate, a
+correlates with how widely edits to that file actually scatter at Spearman **+0.21** (this repository, pinned
+`v0.6.2`; first recorded 2026-09-08, unpinned: +0.16 blended across both corpora — see the pinned re-run note
+below). A third candidate, a
 per-file "degree of scatter" scan over history, is not built either: its ranking is the directory layout read
 back, not a defect list.
 
@@ -12730,18 +13268,35 @@ repository (1,731 files, 15,220 symbols, 1,587 non-merge commits) and a private 
 (2,366 files, 48,771 symbols, 1,637 commits). Commits touching more than 30 files are dropped, the Code Maat
 bulk-commit rule every `--cochange` walk already applies.
 
+**Pinned re-run (2026-09-22, `REF=v0.6.2` = `15a20855c7`).** The 2026-09-08 walk above was a bare `git log`
+with no ref recorded — the same unpinned-population defect retracted elsewhere in this document for
+`bench/readability_refactor_pairs.py`'s "484 matched pairs". `bench/shotgun/README.md` now takes `REF`
+(default `v0.6.2`); re-run at that pin, **this repository** measures **2,171 files, 21,619 symbols, 2,930
+non-merge commits (2,884 kept, ≤30-file cap)** — a later, larger population (`v0.6.2` postdates the 2026-09-08
+run by two weeks of landed work), **not a reproduction** of the 1,731/15,220/1,587 figures above. Every "this
+repository" row in (a)-(c) below now carries both: the pinned figure, and *first recorded as* the 2026-09-08
+figure, which does not reproduce. The **private game tree** corpus cannot be pinned or re-measured from this
+repository: it is a private, unpushed local checkout with no ref or sha ever recorded against the 2026-09-08
+run, outside anything this tree's own gates can verify or reproduce. Its rows are **RETRACTED** as a
+reproducible figure — kept below only as the historical record, not current evidence. The `--top-k=100000` map
+is now built from a worktree checked out at the same ref the log was walked from (previously the map came from
+whatever the live checkout happened to be, a second, independent unpinned-population channel the 2026-09-08
+run never disclosed).
+
 ### (a) The static strategy — CM > 7 and CC > 5, over unambiguous call edges
 
 CM = distinct caller symbols, CC = distinct caller FILES (files stand in for the book's classes; both trees are
 C-family). Only a call edge whose callee name has exactly one in-corpus definition, or a same-file one, is
 credited. The alternative — crediting every `.size()` to every class that defines `size` — flags 263 / 2,655
-symbols with `empty` / `find` / `size` on top; that is a resolver artifact and is kept in the script only to
-show why the floor is the rule.
+symbols with `empty` / `find` / `size` on top (2026-09-08 corpus; not re-derived in the pinned round below —
+the resolver-artifact point stands regardless of the exact count, and this aside is not one of the pinned
+table rows); that is a resolver artifact and is kept in the script only to show why the floor is the rule.
 
 | corpus | callables | flagged (CM>7 ∧ CC>5) | CC p50 / p90 / p99 / max | top-45 rows, hand-classified |
 | --- | --- | --- | --- | --- |
-| this repository | 8,697 | **57** (0.66%) | 1 / 2 / 7 / 90 | 45 stable APIs — `svector::push_back` (90 files), `fastmath::min`, `DEGRADED_PATH_ALERT`, `VERIFY`, `escapeXml`, the paging helpers; **0** a maintainer would call a scatter defect |
-| game tree | 24,575 | **117** (0.48%) | 1 / 2 / 8 / 219 | 45 stable APIs — a test framework's `TEST_CASE` / `REQUIRE` / `CHECK`, vendored physics getters, SIMD `sqrt` / `abs`, `VERIFY`; **0** |
+| this repository, pinned `v0.6.2` (2026-09-22) | 11,677 | **92** (0.79%) | 1 / 2 / 6 / 102 | 45 stable APIs — `svector::push_back` (102 files), `emitTo`, `DISCLOSE`, `ASSUME`, the `model.h`/`graphlegend.h` helpers; **0** a maintainer would call a scatter defect |
+| this repository, first recorded 2026-09-08 (unpinned — does not reproduce) | 8,697 | 57 (0.66%) | 1 / 2 / 7 / 90 | 45 stable APIs — `svector::push_back` (90 files), `fastmath::min`, `DEGRADED_PATH_ALERT`, `VERIFY`, `escapeXml`, the paging helpers; 0 a maintainer would call a scatter defect |
+| game tree — **RETRACTED**, private corpus, not reproducible from here | 24,575 | 117 (0.48%) | 1 / 2 / 8 / 219 | 45 stable APIs — a test framework's `TEST_CASE` / `REQUIRE` / `CHECK`, vendored physics getters, SIMD `sqrt` / `abs`, `VERIFY`; 0 |
 
 The list is short enough to read, and every row is a hub that is *supposed* to have many callers. High fan-in
 says a contract change WOULD be wide; it says nothing about whether the contract changes. The number that tests
@@ -12750,18 +13305,24 @@ scatter (mean files per commit, over the commits that touched the file):
 
 | corpus | files (map ∩ history, ≥ 3 commits) | ρ( CC_file , mean files/commit ) | mean files/commit by CC_file quintile, Q1 → Q5 |
 | --- | --- | --- | --- |
-| this repository | 330 | **+0.158** | 8.63 · 8.65 · 9.40 · 8.76 · 9.67 |
-| game tree | 431 | **+0.163** | 6.89 · 7.07 · 7.64 · 7.79 · 8.19 |
+| this repository, pinned `v0.6.2` | 545 | **+0.207** | 8.94 · 8.71 · 8.09 · 8.95 · 10.04 |
+| this repository, first recorded 2026-09-08 (unpinned) | 330 | +0.158 | 8.63 · 8.65 · 9.40 · 8.76 · 9.67 |
+| game tree — **RETRACTED**, not reproducible | 431 | +0.163 | 6.89 · 7.07 · 7.64 · 7.79 · 8.19 |
 
-Flat on both. The static form does not predict the phenomenon, so it is not a flag; the half of it a reader can
-already see is `in=` / `amp=` on `--metrics`.
+Flat on both, and flat again on the pinned re-run: the static form does not predict the phenomenon, so it is
+not a flag; the half of it a reader can already see is `in=` / `amp=` on `--metrics`. (2026-09-22 review fix:
+`bench/shotgun/cc_vs_history.py`'s quintile split iterated a Python `set` — hash-randomized order, not content
+— so re-running the identical pinned recipe reproduced ρ and n exactly but reshuffled the Q1-Q5 scatter numbers
+run to run; the script now iterates `sorted(indexed)`, and the figures above are the deterministic result,
+confirmed stable across repeated fresh-seed re-runs.)
 
 ### (b) Per-file historical scatter as a repo-wide scan
 
 | corpus | files/commit, median · mean | commits touching ≥ 3 directories | per-file mean dirs/commit, p50 / p95 / max | what tops the ranking |
 | --- | --- | --- | --- | --- |
-| this repository | 2 · 3.95 | 30% | 3.22 / 7.79 / 14.4 | the 16 `skills/*/SKILL.md` files — one directory per skill, edited as a set |
-| game tree | 2 · 3.68 | 16% | 2.14 / 5.13 / 6.78 | a generated voice-line manifest family, one JSON per character |
+| this repository, pinned `v0.6.2` | 2 · 3.87 | 28% | 3.20 / 6.83 / 16.00 | the `skills/*/SKILL.md` files — one directory per skill, edited as a set |
+| this repository, first recorded 2026-09-08 (unpinned) | 2 · 3.95 | 30% | 3.22 / 7.79 / 14.4 | the 16 `skills/*/SKILL.md` files — one directory per skill, edited as a set |
+| game tree — **RETRACTED**, not reproducible | 2 · 3.68 | 16% | 2.14 / 5.13 / 6.78 | a generated voice-line manifest family, one JSON per character |
 
 Both tops are families a layout produces, and `--cochange=FILE` already lists each family's partners. A scan
 whose ranking is the directory tree is not a finding. Not built.
@@ -12776,14 +13337,17 @@ contained (the evaluation shape of Zimmermann et al.; 150-commit warm-up).
 
 | corpus | probes | ≥ 1 partner predicted | precision@8 | recall | a named partner is in the commit |
 | --- | --- | --- | --- | --- | --- |
-| this repository | 3,334 | 92% | **0.352** | 0.347 | 82% |
-| game tree | 2,516 | 89% | **0.427** | 0.429 | 81% |
-| this repository, partners with `deg ≥ 0.5` only | 3,334 | 65% | **0.541** | 0.218 | 71% |
-| game tree, `deg ≥ 0.5` only | 2,516 | 68% | **0.660** | 0.389 | 81% |
+| this repository, pinned `v0.6.2` | 6,978 | 93% | **0.313** | 0.309 | 77% |
+| this repository, `deg ≥ 0.5` only, pinned `v0.6.2` | 6,978 | 58% | **0.533** | 0.206 | 67% |
+| this repository, first recorded 2026-09-08 (unpinned) | 3,334 | 92% | 0.352 | 0.347 | 82% |
+| this repository, `deg ≥ 0.5` only, first recorded 2026-09-08 | 3,334 | 65% | 0.541 | 0.218 | 71% |
+| game tree — **RETRACTED**, not reproducible | 2,516 | 89% | 0.427 | 0.429 | 81% |
+| game tree, `deg ≥ 0.5` only — **RETRACTED**, not reproducible | 2,516 | 68% | 0.660 | 0.389 | 81% |
 
 Reference band: ROSE (Zimmermann, Weißgerber, Diehl & Zeller, TSE 2005) reports, at file granularity on
 Eclipse, roughly a quarter of the further files predicted and a correct location in its top three about two
-thirds of the time. The shipped rule sits in that band on both corpora.
+thirds of the time. The shipped rule sits in that band on the pinned run too (precision@8 0.31-0.53, recall
+0.21-0.31 across the two `deg` cuts) — narrower than 2026-09-08's 0.35-0.54, same conclusion.
 
 **Is an alarm a real forget?** History cannot label intent, but it can say whether the named partner was edited
 shortly after. For every commit where the check would have named a partner with `deg ≥ 0.5` that the commit did
@@ -12791,18 +13355,24 @@ not touch:
 
 | corpus | commits alarmed | a named partner is edited within the next 3 commits | per named file | chance: a random active file within 3 |
 | --- | --- | --- | --- | --- |
-| this repository | 54% | **56%** of alarmed commits | 31% (n = 2,210) | 1% |
-| game tree | 32% | **32%** | 20% (n = 1,218) | 2% |
+| this repository, pinned `v0.6.2` | 54% | **44%** of alarmed commits | 24% (n = 4,121) | 1% |
+| this repository, first recorded 2026-09-08 (unpinned) | 54% | 56% of alarmed commits | 31% (n = 2,210) | 1% |
+| game tree — **RETRACTED**, not reproducible | 32% | 32% | 20% (n = 1,218) | 2% |
 
-Thirty and sixteen times chance. The rate also climbs with the scatter of the change itself — on this repository
-46% for one-file commits, 60% at 4–7 files, 73% at 8–15 — which is the smell's definition read back from data:
-the wider a change already is, the more likely a site was missed.
+About twenty-four times chance on the pinned run (about thirty-one times chance, first recorded) — both far
+above the 1% baseline; the direction holds, the margin narrowed. The rate also climbs with the scatter of the
+change itself on the pinned run — 37% follow-up for 1-file commits, 39% at 2-3, 48% at 4-7, 58% at 8-15 (first
+recorded: 46% / — / 60% / 73% at the buckets that sentence named) — which is the smell's definition read back
+from data either way: the wider a change already is, the more likely a site was missed. (The 16-30-file bucket
+dips to 47% on the pinned run, n=83 — noted rather than smoothed; too small a bucket to read as a reversal.)
 
 **What this does not measure.** A follow-up edit is evidence the partner was in play, not proof the first commit
-was incomplete; a feature landed over several commits leaves the same trace. Single-file commits get an alarm at
-any `deg` 90% / 72% of the time, and at `deg ≥ 0.5` 37% / 23% — the row's own printed percentage ("co-edited in
-N% of commits") is what lets a reader discount a 2% partner. The default was not changed here: a floor would
-trade recall 0.35 → 0.22 for precision 0.35 → 0.54 on this repository, and no terminality number was taken for
+was incomplete; a feature landed over several commits leaves the same trace. Single-file commits get an alarm,
+pinned `v0.6.2` / this repository first recorded 2026-09-08 / game tree (**RETRACTED**, not reproducible): at
+any `deg` 91% / 90% / 72% of the time, and at `deg ≥ 0.5` 37% / 37% / 23% — the row's own printed percentage
+("co-edited in N% of commits") is what lets a reader discount a 2% partner. The default was not changed here: a
+floor would trade recall 0.31 → 0.21 for precision 0.31 → 0.53 on this repository, pinned `v0.6.2` (first
+recorded 2026-09-08: recall 0.35 → 0.22 for precision 0.35 → 0.54), and no terminality number was taken for
 either side (METHODOLOGY §9, principle 1).
 
 ### (d) The validation set neither formulation can see
@@ -12819,3 +13389,1084 @@ verb's contract. `--clones` lists none of the four: it runs at a 40-token floor 
 delta verb runs at `kMinCloneTokens = 18` (`src/quality.h`, whose comment still says the two match). A whole-repo
 view of a family the delta verb sees one member at a time is a clone-lens question; it is recorded here, not
 built.
+
+## `est_tokens` against a real tokenizer, and the loop the per-call number cannot see (2026-09-09)
+
+Two instruments, both new, both in `bench/tokenaudit/`. They exist because of METHODOLOGY §9 principle 6 —
+measuring gets its own instrument — and because the two most-quoted numbers this tool prints had none.
+
+### 1. Is `est_tokens` true? (`bench/tokenaudit/sweep.py`, gate `test/tokenbudgetcheck.sh` #18)
+
+Everything that validated `est_tokens` before this validated its *properties*: present, positive,
+deterministic, monotone under a tighter budget, bounded by an allowance derived from the estimate's own
+constants. `test/tokenbudgetcheck.sh`'s own header said the accuracy figure "is REPORTED by the agent in
+the T1 write-up", which was 2026-07 and has never been re-derived.
+
+**Method.** 25 invocations × 2 corpora (this repository; a 1,500-file private C++ tree), stdout captured,
+`est_tokens=` read off the answer, real tokens counted with tiktoken `o200k_base` and `cl100k_base`
+(they agree to within 1.4% on every row — the ≤4% spread `kTokenCalib`'s header claims, re-derived).
+`ANTHROPIC_API_KEY` was absent, so **Claude's own tokenizer is unmeasured**; o200k_base remains the public
+stand-in the table was calibrated against, and that limit is the same one §2f states for not vendoring a BPE
+table. Results: `bench/tokenaudit/results/tokenaudit-2026-09-09.json`, at `built_from=4c10be9d7`.
+
+**Three findings, in order of what they cost a caller.**
+
+**(a) Nine of twenty-five invocations print a price at all.** The sixteen that do not include every
+navigation verb — `--callers`, `--callees`, `--impact`, `--uses`, `--affected`, `--edit-check`, `--grep`,
+`--test-gate`, `--hotspots`, `--lint`, `--tree`, `--clones` — and both JSON dialects. These are the answers
+whose fixed-legend share is *largest*, so the price is missing exactly where it is highest. One
+`--edit-check` on a macro with thousands of call sites emitted 348,224 B / 99,006 real tokens in a single
+answer, priced at nothing and capped by nothing.
+
+**(b) The signed error is 15-19% high at the median and runs both ways.** Per verb, `(est − o200k)/o200k`:
+map +2.8% / +9.8%, `--metrics` +4.4% / +7.2%, `--pack-signatures` +17.0% / +18.5%, `--around` +14.7% /
++13.7%, `--pack-task` +18.9% / +24.6%, `--for` +21.9% / +25.5% conceptual and +26.1% / +35.6% named,
+`--expand` +1.9% / **−18.4%** (this repository / the C++ tree). Median +15.9% / +18.5%; MAPE over the eight
+pinned fixture invocations 21%. **The mechanism is measured, not inferred:** real bytes-per-token across
+these documents ranges **2.44 (dense signature rows) to 4.66 (legend prose)**, while the conversion applies
+one language-keyed rate near 2.5 to markup and 3.8 to bodies. The error is a property of the *document
+shape*, not of the corpus language the rate is keyed on — which is why no additional `kTokenCalib` row
+fixes it, and why the body rate that is right on large C++ bodies under-reads 16-18% on short dense ones.
+The sentence in `src/serialize.h` §H7 that said the number "never systematically under-reads" was false on
+two corpora and has been replaced with this range and a pointer to the gate.
+
+**(c) What a `--token-budget=N` delivers.** Real o200k tokens as a fraction of the requested N, this
+repository / the C++ tree: `--for` 76%/75% at N=1500, 74%/67% at 3000, 54%/48% at 6000; `--pack-task`
+82%/81%, 52%/61%, 58%/57%. Part of the shortfall at a large N is content exhaustion. At the binding
+budgets it is the estimate: it over-reads by 25-42% there, and the budget is a hard ceiling **on the
+estimate**, so a caller asking for 3,000 tokens of context is handed about 2,000.
+
+**Nothing in `kTokenCalib` was changed, and that is a decision, not an omission.** The error is signed both
+ways and keyed on document shape: no single rate and no per-language row corrects a +40% legend-heavy
+bundle and a −16% short body at once. The change that would is a per-SPAN charge — prose bytes at a prose
+rate, the way `kBytesPerTokenBody` already charges body bytes at a body rate — which moves a number pinned
+by the goldens, `fornotesbudgetcheck`, `forbudgetmonotoncheck` and `packtaskquotacheck`. That is a round.
+What this round leaves is the instrument that makes such a round's before/after measurable: `#18` holds
+every pinned invocation inside a measured band and the set's MAPE under a 30% ceiling, against counts
+`bench/tokenaudit/pin.py` writes into `test/estcalib.manifest` from the frozen corpus `test/estcalibfix`.
+The gate needs no Python package — the tokenizer runs out of band and the gate reads numbers, the same
+split `test/printf_parity.manifest` uses, because G3 forbids a host-installed build dependency. Three
+mutation controls were run before it was believed: doubling one pin reddens the band arm, truncating the
+manifest reddens `#18c`, and shrinking every pin 40% takes the MAPE to 95% and reddens `#18b`.
+
+### 2. The legend's price in tokens, beside the byte claim it is published in
+
+`--help` states the compact saving in **bytes** ("at least 50% of a small `--callers`/`--uses`/`--impact`/
+`--affected` answer") and `test/legendcostcheck.sh` holds the binary to that, in bytes, on the symbol
+`lookupLang`. Measured on the same verbs and the same symbol in **tokens**:
+
+| verb | byte saving | token saving | gap |
+| --- | --- | --- | --- |
+| `--callers` | 70.9% | 60.5% | 10.4 pt |
+| `--uses` | 65.8% | 55.2% | 10.6 pt |
+| `--impact` | 51.9% | **39.4%** | 12.5 pt |
+| `--affected` | 70.1% | 65.8% | 4.3 pt |
+
+The gap has one cause and it is measurable: the legend is English prose at **4.4 B/tok** and the rows it is
+being compared against are markup at **2.7 B/tok**, so a byte share systematically overstates a token
+share — by 0.4 to 12.6 points across the whole sweep. `--impact` clears the published 50% floor in bytes
+and misses it in tokens, and tokens is the user-facing unit. The claim is not withdrawn — it is true as
+written and gated as written — but a reader who converts it to tokens will be up to 12 points optimistic.
+
+Across the sweep the legend's **token** share ran 3.2% (the whole map) to **79.8%** (`--callees`), with
+`--edit-check` 62.9% and `--test-gate` 52.4% on this repository. That brackets the outside evaluation which
+started this work (callstack/agent-device #2400, 2026-09-08: "a fixed per-call preamble, 62% of `--callers`'
+whole response"); `--callers` itself measures 42.9% / 33.3% on the two corpora here, so their 62% is a
+smaller answer than either, and the *shape* of their finding reproduces.
+
+One negative worth recording: **`--legend=compact` is not a saving on `--for`.** Measured −0.8% and −1.9%
+in tokens at `4c10be9d` — the compact posture emitted *more* — because `--for` is budget-shaped and the
+bytes the legend frees are refilled from the trim ladder's tail. Re-measured after this section's own
+commit the same two arms read −0.1% and −1.9%, so the magnitude moves with the corpus and the DIRECTION is
+what to carry: on `--for` the compact posture is a wash or a small loss, never the 39-66% token saving the
+navigation verbs show. `--help`'s advice is right for the navigation verbs and wrong-signed for the bundle
+it also names.
+
+### 3. The loop the per-call number cannot see (`bench/tokenaudit/loop_ledger.py`)
+
+Every number ripwire prints is per call. The claim it makes is per loop. `bench/substitution_report.py` §5
+counts the *calls* in that loop and deliberately prints no byte or token figure, so a verb could hold its
+terminality rate steady while its answers doubled in size and the report would not move. `loop_ledger.py`
+reads the agent's own Claude Code transcripts and prints aggregates only — no prompt, no path, no session
+id. Its Bash classifier is a port of `hooks/ripwire-nudge.sh`'s, deliberately, so a disagreement between
+the two instruments is a finding rather than a definition mismatch. (The first draft matched a retrieval
+command only at the start of the line and under-counted native retrieval by ~2×; that is the same gap the
+hook's own 2026-08-12 classifier-gap round recorded.)
+
+**Aggregates, 78 sessions in this project's transcript directory, `o200k_base`:** 3,456 ripwire calls and
+4,733 native retrieval calls — ripwire is **42.2% of retrieval calls** but only **4.3% of retrieval tokens**
+(1.16 M against 26.08 M). Median tool-result size 333 tokens for a ripwire call against 717 for a native
+one (mean 407 against 5,700 — the native mean carries the whole-file tail). Non-terminality by the meter's
+own definition (a native retrieval call within the next 3 tool calls) is **48.2%**.
+
+**And the number that reframes all of them.** The same transcripts' provider-reported usage totals
+12.85 **billion** `cache_read_input_tokens` against 43.2 M output and 221 M cache-creation — cache reads are
+**98% of everything billed**. Tool results of every kind are 0.25% of the billed total *at the moment they
+are written*, and are then re-read by every subsequent turn in the session. A per-call `est_tokens` prices
+an answer once; the loop pays for it once per remaining turn. That is the axis on which "10% more tokens
+than grep-and-read" is decided, and no ripwire surface can currently see it.
+
+**A disagreement between our own two instruments, reported as a finding.** On the 38 session ids present in
+both, the substitution meter logged **4.71× as many tool-call rows as the transcripts contain** — 8.02× on
+native retrieval against 1.87× on ripwire calls — and reads a 16.2% substitution rate where the transcript
+ledger reads 45.2%. The mechanism is identified: the sessions with the largest gaps are orchestrators (one
+spawned 50 `Agent` subagents and 35 continuations; another 29), and a subagent's `PreToolUse` hook reports
+the **parent's** `session_id` while its transcript is a different session. So the meter attributes every
+subagent's retrieval to the parent — which is native-heavy work that never saw a nudge and never chose an
+arm. This is not yet a correction to any published number, and it is not evidence that either instrument is
+wrong about its own population; it is evidence that **`session` in `~/.ripwire/substitution.jsonl` is not
+the unit §4's per-session arm reads it as**, and that arm should be re-derived with subagent rows either
+excluded or attributed to their own session before it is quoted again.
+
+**What surface should change — and the measurement that decides it.** Not `est_tokens` on more verbs: at
+4.3% of retrieval tokens, a more accurate price on each ripwire answer moves nothing a caller would feel.
+The measurement says the cost that matters is *cumulative and re-billed*, so the surface is
+`bench/substitution_report.py` — a per-session roll-up carrying the token columns this ledger computes
+beside the call counts it already prints, so terminality and size are read together. That is a bench
+change, not an output change, and it adds no byte to any answer.
+## The plain-text prose tier — heading tiling vs one whole-file unit (2026-09-09)
+
+`.rst`, `.adoc`, `.org` and `.mdx` join `kLangTable` on `Lang::Markdown` and the vendored markdown BLOCK
+grammar (gate `test/textdocscheck.sh`). Two designs were possible and the choice was measured, not argued:
+serve each document as ONE prose unit, or tile it into sections the way `--recall` already tiles markdown.
+
+**Why the question is decidable at all.** reStructuredText's title underlines (`=====`, `-----`) are
+byte-for-byte setext headings, so the existing section tier tiles a `.rst` document with no new code —
+the tiled arm costs nothing to build, which is what makes "is it worth it" a real question rather than a
+budget one.
+
+**Corpus.** The astropy documentation tree at
+`bench/external/swex/snapshots/astropy__astropy-14508/docs` — 292 `.rst` files, 2.28 MB. Authored by
+nobody involved in this tool, and by a project that predates it.
+
+**Arms.** A = the tree as committed (tiled). B = the ONE-UNIT control: the identical prose with every
+setext-capable underline line (`^=+$`, `^-+$`) deleted, so no headings exist and `--recall` must serve
+whole documents. Prose bytes are otherwise untouched; the control is asserted to have taken
+(`install.rst`: 15 underlines → 0; corpora 2,283,152 B vs 2,253,938 B).
+
+**Questions.** Five, pre-registered with their answer strings before the first run, each answered in one
+section of one document: the LTS backport window, conda installation, disabling logging colour, the
+Quantity/numpy slice deficiency, and the glossary's one-element-tuple notation.
+
+**Metric.** Per (question, budget): does the SERVED text contain the pre-registered answer string, and
+what does the bundle cost (`est_tokens`)? Budgets are `--max-tokens` 2000 / 4000 / 8000 — the knob that
+SHAPES a recall bundle, not `--token-budget`, which asserts and exits 3.
+
+| `--max-tokens` | tiled hits | one-unit hits | tiled mean est_tokens | one-unit mean est_tokens |
+| --- | --- | --- | --- | --- |
+| 2000 | 5/5 | 3/5 | 1299 | 1436 |
+| 4000 | 5/5 | 2/5 | 2659 | 2781 |
+| 8000 | 5/5 | 4/5 | 5379 | 6041 |
+| **total** | **15/15** | **9/15** | | −6% / −4% / −11% |
+
+Tiling wins on both axes at every budget. It is shipped.
+
+**What this does NOT show.** N = 5 questions on ONE corpus in ONE format; it is a design decision between
+two spellings of a feature, not a retrieval-quality claim. Coverage inside `.rst` is partial and stated
+rather than implied: `=` (701) and `-` (620) are 1321 of that corpus's 1948 underlines (67.8%), and
+`*`/`^`/`"`/`~`/`+`/`#` titles read as prose. AsciiDoc's `== Section` and Org's `* Heading` are not
+markdown headings in any spelling, so those two formats serve as one whole-file unit — `--recall` prints
+`section-granular` only where it is true, and gate arm C pins both directions.
+
+**`.txt` was REFUTED by census in the same lane, not deferred.** 69 of 69 crawled `.txt` files in this
+repository are build manifests, gate fixtures or captured output — 571,706 B, the largest 69,729 B = 7.5x the
+corpus median document — and none is prose. Across three checkouts on the development machine the
+commonest `.txt` basenames are `requirements.txt` (111), `meson_options.txt` (67) and `CMakeLists.txt`
+(50) against `README.txt` (71) and `index.txt` (32). Admitting it would hand BM25 half a megabyte of gate
+dumps that the generated-document demotion does not catch (no marker, no fences — the limit
+`classifyGeneratedDoc` states about itself). `.txt` stays prose to every reader-facing lens and an
+unindexed extension in `unindexed=`, alongside `.log`, `.lock` and `.out`. An evidence-based admission
+test that reads BYTES rather than the extension is the open follow-up.
+
+## The super-linear warm `--grep` floor: measured to one operation, fixed, byte-identical (2026-09-09)
+
+The tgrep head-to-head of 2026-09-09 (its section "Head-to-head vs tgrep (microsoft/tgrep 1.0.5)" lands
+with the harvest-tgrep lane) left one item open: warm `--grep` cost 40.2 µs/file at 2,240 files,
+39.1 µs at 15,865 and 937.8 µs at 182,555 — a 24× per-file regression across an 11.5× corpus step — and
+it named the decisive experiment: time the verb with the graph construction stubbed out. This section
+ran that experiment, then followed the house perf reflex (start from the measurement, inspect only the
+symbols the profile names). The full phase tables and the reproduce block are in `bench/PROFILE.md`
+("2026-09-09 — the super-linear warm `--grep` floor"); this is the evidence chain and the verdict.
+
+**The stub, without a stub.** `--help-task` returns before `buildGraph` and shares `--grep`'s lean cache
+blob, so it is the crawl + cache-load + validation + model-build arm with the graph removed. Warm on
+llvm-project (182,555 files, same checkout as the head-to-head), interleaved, two reps each:
+
+| arm | wall | peak RSS |
+| --- | ---: | ---: |
+| `--grep=<absent literal>` | 159.7 s, 153.9 s | 6.15 GB |
+| `--callers=main` (graph, no scan) | 152.9 s, 151.8 s | 5.91 GB |
+| `--help-task` (no graph) | 3.8 s, 3.4 s | 5.93 GB |
+
+The floor did move — by 150 s. The cost is the graph; the cache load plus per-file validation is
+16 µs/file on llvm against 28 µs/file on go, linear; and the memory-cliff hypothesis is refuted on the
+same row, since the 5.9 GB is the ingest's own tables and is present in the arm that takes 3.8 s.
+
+**Which operation.** The ingest path already carried `PROFILE_SCOPE_DESCRIBE` scopes at the grep path's
+granularity for crawl, cache and model; `buildGraph` carried one scope for the whole function. This round
+added the loop and post-loop scopes that land, plus a scratch six-span split inside the per-reference
+loop. Of 153.2 s in the loop, 145.1 s sat in ONE span — CHA-lite cone + arity + locality — across
+2,213,632 references at a mean 65.5 µs and a worst case of 41.7 ms. Split again: arity 0.015 s, locality
+0.27 s, **the CHA-lite cone ≈ 143 s**. The obvious hypothesis was measured and rejected: the five linear
+passes over same-name candidates visited 1.23 billion candidates and cost 3.3 s.
+
+The cone was recomputed per call: 86,667 BFS pairs for 2,984 distinct receiver types (≈29 rebuilds each),
+mean cone 1,075 class names, quadratic `std::find` dedup, 1.65 ms a cone. On go the same span is 1.1 ms
+in total because the model has no inheritance edges there — the flat rungs of the ladder were flat because
+the corpora had no deep hierarchies, not because the code was linear.
+
+**The fix and its proof.** `ChaConeMemo` (`src/graph.h`) computes each receiver type's cone once, over
+interned class names, with the per-call walk's exact seed, discovery order and 4,096 outer-loop cap, and
+answers membership by binary search. Warm llvm: `--grep` 9.2 s / 9.0 s, `--callers` 8.6 s / 8.7 s, the
+default map 248 s → 10 s; `--help-task` unchanged. Default maps at `--top-k=100000` are byte-identical
+pre/post on go (10,415,057 B) and llvm (21,802,319 B). Gate `test/chaconecheck.sh` pins the set the memo
+must reproduce: a cone keyed on the receiver type and not the callee (Dog and Cat on one `speak`), the
+memo-hit path from a second file, a receiver with no inheritance facts degrading rather than emptying the
+tier, a parameter-receiver control, and the cap's own shape (Base→{A,B}, A→A1..A4095, B→B1: B is never
+expanded, so B1::m is outside the cone; count=4095, amb="1"). All arms pass against the pre-fix binary —
+the expected values are the per-call walk's own answers — and 24 existing resolver gates pass unchanged.
+
+**What remains, stated as a floor.** Warm `--grep` on llvm is 9 s: `buildGraph` 5.9 s (the resolve loop
+4.5 s, of which the candidate spray over 1.23 billion visits is 2.2 s), ingest 2.8 s, the 2.9 GB scan
+1.0 s on its own thread. Per file that is 50 µs at 182,555 files against 33 µs at 15,865 — 1.5×, not 24×.
+`rg` answers the same absent literal in 4.3 s; a resident tgrep in 0.018 s. The next rung is the linear
+candidate passes, which is a different design (a per-name file/directory index) and is not started here.
+The cold parse on llvm carried the same ~186 s cone cost inside its 231 s and was not re-measured.
+
+**The head-to-head's top rung, re-timed post-fix.** The same six frozen queries the lane declared for the
+llvm rung, the same argv (`--grep-in=any`), the plain build with the memo, warm, three reps each, medians:
+
+| query | ripwire warm, head-to-head (pre-fix) | **ripwire warm, post-fix** |
+| --- | ---: | ---: |
+| L1 `pthread_mutex_lock` | 193.09 s | **8.99 s** |
+| L3 `TODO` | 195.58 s | **9.00 s** |
+| L6 `zzqxvnotpresentzz` (absent) | 176.35 s | **9.20 s** |
+| R3 `malloc.*free` | 215.34 s | **9.23 s** |
+| R4 `[Qq]z[Xx]v.*[Jj]w` (prefilter-defeating) | 171.19 s | **9.11 s** |
+| R1 `^#include` | 233.06 s | 10.08 s — not comparable: this branch predates the lane's line-anchor fix |
+
+Every query is now within a second of the absent literal: the scan is still hidden behind the graph, the
+graph is just 17× smaller.
+
+**A correctness finding the timing table surfaced, stated as one.** The tgrep lane replaces `grepScanText`'s
+one-iterator-per-file regex scan with one per LINE, so that `^` and `$` mean line anchors. Priced interleaved on
+the scan's own `grep/1` scope with the lane merged onto this fix (host load 31; the pair-wise scope, not the
+wall clock, is the comparison): on llvm-project R1 `^#include` returns **1,487 hits on main and 289,646 on
+the lane** — 288,159 matches today's shipped binary misses silently, on one query, while reporting a confident
+count — and the per-line shape is *faster* (3.40 s against 4.48 s), because bounding each search to a line
+stops `.*` from running across lines, so it does strictly less work per attempt. R3 `malloc.*free` 2.28 → 1.68 s;
+the prefilter-defeating R4, which scans every byte, 1.27 → 1.50 s (+0.22 s on 2.9 GB, ≈3 ns a line); the literal
+control 1.16 → 1.20 s (an unchanged path: the noise floor). On go every pair is within noise or faster,
+including a forced full scan. Nothing super-linear, and the largest cost is 18% on the one pattern with no
+literal at all. Re-deriving the lane's Q\* formula with its own tgrep numbers (B = 11.113 s,
+q_index = 2.7513 s over the same six) and a post-fix q_scan of ≈ 9.3 s gives **Q\* ≈ 1.7 queries against
+ripwire-warm** where the lane read 0.1 — the resident index still pays for itself inside a two-query
+session at this scale, but no longer "before the first query finishes". tgrep itself was not re-run; only
+the ripwire column moved.
+## Head-to-head vs tgrep (microsoft/tgrep 1.0.5) — the resident-index crossover, and two losses converted to code (2026-09-09)
+
+**Instrument.** `bench/tgrep-h2h/`: `queries.json` (16 queries frozen before any arm was timed, each
+with its selectivity and purpose), `arms.py` (the verb map and the DELIVERY POSTURE of each arm),
+`run.py` (the ladder driver), `readout.py` (every table below), `results.json` (the run, scrubbed of
+absolute paths). Raw per-arm output is written outside the checkout and is not tracked — an untracked
+file in this tree makes `git status --porcelain` dirty, which flips the `+dirty` half of every stamped
+verb's `at=` anchor for any determinism arm running beside the harness.
+
+**Versions and corpora.** ripwire `4c10be9d`, plain build (never Release: `NDEBUG` compiles
+`DEGRADED_PATH_ALERT` out). tgrep 1.0.5 at `50f5d8f6a54e9e4d16d021954cfcd4e77d342d7b`, `cargo build` in its release profile. `rg` from Homebrew, always with `--sort path`. One 18-core macOS arm64 host, shared with
+concurrent harvest lanes. Ladder by ripgrep's own file-listing count: this tree's `src/` 159 · the whole ripwire tree 2,240 ·
+a private C++/ObjC++ tree (`privcpp` in the harness, named in the local ledger) 3,248 · `golang/go` `49c3ea64` 15,865 · `llvm/llvm-project` `2061c237` (shallow) 182,555.
+
+**The question, stated correctly — the round brief's framing was half right.** `--grep`/`--regex` was
+a Zoekt-style trigram index until 2026-07-27, when P3 removed it: building a **per-invocation** index
+cost 1860 ms / 814 MB on a 2815-file tree and was thrown away after one query, which is strictly more
+work than the single scan it replaced. **That verdict is not re-opened and it still holds.** tgrep's
+index is *resident* — built once, held by a server, reused by every query in a session — so the
+question is not *index versus scan*, it is: after how many queries in one session, and at what corpus
+size, does a **persisted** index pay for itself? That is Q\* = B / (q_scan − q_index).
+
+### One-off costs
+
+| corpus | files | ripwire cold (ingest+scan) | peak RSS | ripwire cache on disk | tgrep index build | peak RSS | index on disk |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| rwsrc | 159 | 0.190 s | 0.17 GB | 4.6 MB | 0.056 s | 41 MB | 6.3 MB |
+| rwtree | 2,240 | 0.383 s | 0.36 GB | 10.0 MB | 0.437 s | 211 MB | 33.4 MB |
+| privcpp | 3,248 | 1.097 s | 0.83 GB | 21.4 MB | 0.395 s | 132 MB | 47.8 MB |
+| go | 15,865 | 1.826 s | 1.27 GB | 58.8 MB | 1.042 s | 159 MB | 120.3 MB |
+| llvm-project | 182,555 | 252.7 s | 6.01 GB | 542.0 MB | 11.1 s | 541 MB | 1,037.3 MB |
+
+**What "warm" means for `--grep`, measured.** The warm cache restores the tree-sitter symbol graph;
+it does not cache text. On `go`: cold 1.826 s, warm 0.512 s — the 1.3 s difference is the parse, and
+the 0.51 s that remains is the read-and-scan of 227 MB, paid again on every single call. `--grep`'s
+`in=` is what the cache buys; the hit set is not.
+
+### Q\* — queries per session at which the index has paid for itself
+
+Means over all 16 frozen queries; B is tgrep's index build.
+
+| corpus | files | ripwire queries | q_scan (rg, all 16) | q_scan (ripwire warm) | q_index (tgrep, all 16) | B | Q\* vs rg | Q\* vs ripwire-warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| this tree's `src/` | 159 | 16/16 | 0.0107 s | 0.0783 s | 0.0128 s | 0.056 s | never — the index is slower | 0.9 |
+| the ripwire tree | 2,240 | 16/16 | 0.1062 s | 0.3185 s | 0.0602 s | 0.437 s | **9.5** | **1.7** |
+| privcpp | 3,248 | 16/16 | 0.1087 s | 0.3237 s | 0.0342 s | 0.395 s | **5.3** | **1.4** |
+| go | 15,865 | 16/16 | 0.3707 s | 1.0095 s | 0.1418 s | 1.042 s | **4.6** | **1.2** |
+| llvm-project | 182,555 | 6/16 | 7.2005 s | 197.4362 s | 2.7513 s | 11.113 s | **2.5** | **0.1** |
+
+The ripwire column on the llvm rung is the declared six-query subset (`run.py`'s `RW_QUERIES`), so its
+Q\* is computed against tgrep's mean over *those same six*, never against tgrep's mean over sixteen —
+the two would be different workloads. Every other rung ran all sixteen on every arm.
+
+**The realistic session query count, with an instrument.** `~/.ripwire/substitution.jsonl` classifies
+every recorded tool event; 14,872 carry `class="grep"` across 522 sessions. Of the 96 sessions that
+grep at all, the median issues **26** grep-class commands (p25 8, p75 198, p90 449, max 1,975).
+Against rg, Q\* is 9.5 queries at 2,240 files, 5.3 at 3,248, 4.6 at 15,865 and **2.5 at 182,555**;
+against ripwire-warm it is 1.7, 1.4, 1.2 and **0.1** — below a single query at the top rung, meaning a
+resident index would have paid for itself before the first `--grep` on that tree finished. Against a
+median of 26 grep-class commands per grepping session: **the crossover has already flipped at the
+smallest realistic repository size, and by one to two orders of magnitude.**
+
+**The top rung's ripwire-warm column was superseded the same day, and the number above is kept as the
+record of what this harness measured.** The profiling lane (`ChaConeMemo`, commit `bc38d419`, its own
+section "the super-linear warm floor was the CHA-lite cone") re-timed the same six frozen queries with the
+same argv on the plain build, warm, three reps: 8.99 s (L1), 9.00 s (L3), 9.20 s (L6, the absent literal),
+9.23 s (R3), 9.11 s (R4), against 176–215 s here — measured by that lane on its tip, not by
+`bench/tgrep-h2h/`, and cited rather than copied into the table. Re-deriving this section's own formula
+with its own tgrep numbers (B = 11.113 s, q\_index = 2.7513 s over the same six) and a post-fix
+q\_scan ≈ 9.3 s gives **Q\* ≈ 1.7 against ripwire-warm at 182,555 files, not 0.1**: a resident index
+still pays for itself inside a two-query session at that scale, but no longer before the first query
+finishes. tgrep's columns did not move. This harness's own re-run of the llvm rung on the merged tree is
+registered as owed, so the table can carry a measured post-fix row rather than a cited one. It has not
+flipped at 159
+files, where rg outruns the index outright — the one honest "no" in the table.
+
+**The top rung, where the gap stops being an optimisation question.** Per-query medians on
+llvm-project (182,555 files, 2.9 GB), ripwire warm:
+
+| query | ripwire warm | tgrep (resident) | tgrep `--no-index` | rg |
+| --- | ---: | ---: | ---: | ---: |
+| L1 `pthread_mutex_lock` (rare literal) | 193.09 s | 0.011 s | 8.70 s | 5.25 s |
+| L3 `TODO` (medium literal) | 195.58 s | 0.089 s | 8.33 s | 4.48 s |
+| L6 `zzqxvnotpresentzz` (absent) | 176.35 s | 0.018 s | 7.72 s | 4.30 s |
+| R1 `^#include` | 233.06 s | 1.81 s | 13.57 s | 5.85 s |
+| R3 `malloc.*free` | 215.34 s | 0.028 s | 9.08 s | 4.09 s |
+| R4 `[Qq]z[Xx]v.*[Jj]w` (prefilter-defeating, 0 hits) | 171.19 s | 11.24 s | 17.38 s | 13.47 s |
+| L2 `return` (delivery-bound, 326 MB out) | not run | 7.30 s | 9.86 s | 8.73 s |
+| L4 `int` (delivery-bound, 563 MB out) | not run | 10.43 s | 14.43 s | **6.90 s** |
+
+Two readings. First, **ripwire needs three minutes to say "not found"** on that tree — 176 s against
+tgrep's 0.018 s and rg's 4.30 s. Second, **L4 is the one cell where rg beats tgrep**, which is exactly
+the failure mode tgrep's own BENCHMARKS.md names ("a query returning tens of thousands of matches can
+spend more on delivery than the index ever saved on file selection") — their model predicts our data
+on their own losing cell, which is the reason to trust the rest of their table.
+
+**Would it fit ripwire's own cache?** The two ratios that decide whether "put the index in the cache"
+is even a candidate:
+
+| corpus | tgrep build ÷ ripwire cold ingest | tgrep index bytes ÷ ripwire cache bytes |
+| --- | ---: | ---: |
+| rwsrc | 0.29× | 1.37× |
+| rwtree | 1.14× | 3.33× |
+| privcpp | 0.36× | 2.23× |
+| go | 0.57× | 2.05× |
+| llvm-project | 0.04× | 1.91× |
+
+Building a trigram index costs the same order as the parse the warm cache already pays for once, and
+would grow the artifact 2–3×. **It is affordable, and it would buy almost nothing — which is the most
+useful thing this round measured.**
+
+`src/verbs_grep.h::startGrepScanPrefetch` already runs the text scan on its own thread, concurrent
+with the graph build, so ripwire's warm per-query cost is `max(ingest, scan)` — and the ingest wins at
+every rung. Timed interleaved on the same warm cache, against a verb that builds the same graph and
+scans no text:
+
+| corpus | warm `--callers=main` (no text scan) | warm `--grep` (full text scan) |
+| --- | ---: | ---: |
+| the ripwire tree, 2,240 files | 0.09 s | 0.09 s |
+| `go`, 15,865 files | ~0.62 s | ~0.65 s |
+
+At the top of the ladder it is not close: on llvm-project the *absent literal* `zzqxvnotpresentzz`
+costs **176.4 s** and the prefilter-defeating, zero-hit regex `[Qq]z[Xx]v.*[Jj]w` — a full
+`std::regex` verification of 2.9 GB — costs **171.2 s**. Two completely different scan workloads, the
+same wall time, because neither is what the clock is measuring. A postings index attacks the side of
+that `max()` that is already free: it would save ~0% of a literal query at any rung, and only the
+excess on the heaviest regexes (`^#include` 233 s, `malloc.*free` 215 s against a ~171 s floor), for
+the price of a new on-disk format, a new field in the cache-identity contract and a soundness gate per
+pattern shape.
+
+**So P3's removal note is right for a second reason it does not yet state.** Not only "building the
+index is more work than the one scan it saves" — also "the scan is already free behind the ingest".
+What the numbers point at instead is the **warm-ingest floor**: 0.09 s at 2,240 files, ~0.6 s at
+15,865, ~171 s at 182,555, paid on every `--grep` call to annotate at most 100 printed hits with `in=`.
+`grepEnrich` already builds its enclosing-symbol index only for files that actually have hits; the
+ingest that precedes it is not lazy in the same way. **And that floor is not linear in corpus size**:
+per file it is 40.2 µs at 2,240 files, 39.1 µs at 15,865 — flat — and 937.8 µs at 182,555. Between
+those last two rungs the corpus grew 11.5× and the floor grew 276×, a 24× per-file regression on a
+tree whose cold peak RSS is 6.45 GB. Nothing in the gate suite exercises a corpus large enough to see
+it. **Answered the same day** (the profiling lane, `bc38d419`): it was the graph — 143 of 154 s inside
+`buildGraph` was the CHA-lite inheritance cone rebuilt per call, 86,667 rebuilds for 2,984 receiver types
+with a quadratic dedup, so the flat rungs were flat because those corpora had no deep hierarchies, not
+because the code was linear. Memoised (`ChaConeMemo`, `src/graph.h`, gated by `test/chaconecheck.sh`,
+default maps byte-identical pre/post on go and llvm), warm llvm `--grep` went 159.7 s → 9.2 s and the
+per-file floor 50 µs at 182,555 against 33 µs at 15,865 — 1.5×, not 24×. The super-linearity this
+harness measured was real; its cause is now named and removed, and what remains is that lane's stated
+floor (the linear candidate passes), not this one's.
+
+### Losses first — the agreement matrix
+
+(path, line) hit sets, ripwire `--grep-in=any --limit=1000000` against tgrep and rg, over the nine
+queries the frozen set declares as the agreement subset. **tgrep and rg agreed with each other on
+every one of those, at every rung**, so every disagreement below is ripwire's.
+
+Outside that subset tgrep and rg differ on exactly three `go` cells, and both causes were traced
+rather than assumed — neither is the trigram index, since `tgrep --no-index` reproduces both:
+`R2 TODO|FIXME|XXX` misses four lines in `src/regexp/testdata/basic.dat`, because `.dat` is one of
+the ~65 extensions tgrep's walker rejects as binary before ever reading the file
+(`tgrep-core/src/walker.rs`), which ripgrep does not do; `L4 int` and `L5 err` differ by a byte on
+the lines of `crlf.input`-style files, because tgrep always strips a trailing `\r` where rg keeps it
+unless told otherwise. Both are documented in tgrep's README — and neither is disclosed on the ANSWER, which
+is the asymmetry the disclosure table below is about: ripwire's skipped classes ride on the root
+element, tgrep's live in prose.
+
+| corpus | exact agreement, pre-fix | after this round's two fixes | what moved |
+| --- | --- | --- | --- |
+| rwsrc | 8 / 9 | **9 / 9** | `^#include` 1 → 1,648 (rg: 1,648) |
+| rwtree | 6 / 9 | 6 / 9 | `^#include` 29 → 2,149 of rg's 2,828; every one of the 679 still missing is under `third_party/` |
+| privcpp | 7 / 9 | 7 / 9 | `^#include` 26 → 6,171 against rg's 6,171 — but with a ±4 symmetric difference (4 in `CMakeFiles/`, pruned; 4 in a gitignored `.bak`, served) |
+| go | 4 / 9 | not re-measured — a ripwire pass over `go` is ~1 s a query and the machine was committed to the llvm rung | — |
+
+Three buckets, and only the first was a defect in the matcher:
+
+- **Bucket A — `^` and `$` were FILE anchors. FIXED.** `--regex='^#include'` reported 1 hit on
+  this tree's `src/` where `rg -n '^#include' src` reported 1,648; on the private tree, 26 against 6,171; on
+  `go`, 14 against 2,389. `--regex` hands a whole file's bytes to one `std::sregex_iterator` built
+  with `ECMAScript | optimize`, so ECMAScript's `^` matched only at offset 0 of that buffer. The verb's
+  own answer is line-shaped. Fixed by making `grepScanText` search **one line at a time**
+  (`src/search.h`), gated by `test/grepanchorcheck.sh`. Post-fix, ripwire's `(path,line)` hit set over
+  this tree's `src/` equals `rg -n`'s **exactly** on five anchored patterns: `^#include` 1,648,
+  `^int ` 18, `^\s*//` 41,005, `h>$` 42, and `^$` 9,936 — the last two being the zero-width cases the
+  trailing-newline rule decides.
+  **`std::regex::multiline` is the obvious fix and it is unusable**: Apple libc++'s
+  `__l_anchor_multiline<char>::__exec` reads `*std::prev(__s.__current_)` before testing whether the
+  position is the first character, so at offset 0 it reads one byte before the buffer — `--regex='^'`
+  over `src/` crashed 8 of 10 runs, and a 40-line standalone with no ripwire code faulted on 74 of
+  this repository's ~130 headers, single-threaded. It surfaced as five *nondeterministic* gate-suite
+  shard failures in CI run 34357046881 rather than as one red arm, and twenty targeted plain-build
+  gates passed on the crashing binary; one ASan run on the command the change touched would have named
+  it immediately. The line-at-a-time replacement is what grep, rg and tgrep do, costs nothing
+  measurable (six regexes on this tree, whole-buffer vs line-oriented medians: 0.77/0.78, 0.55/0.46,
+  0.53/0.54, 0.32/0.34, 0.75/0.84, 0.42/0.42 s), and narrows one thing that is now stated in `--help`:
+  a match may no longer span lines. Arm I of the gate is the crash regression; arm J pins that a
+  trailing newline terminates the last line rather than beginning an empty one, against `grep -c '^'`
+  itself (a second defect the first cut of the rewrite had). **The gate suite's own blind spot is the finding behind the finding:**
+  `test/regexcheck.sh` has carried `'^int '` in its battery since it was written, commented "an
+  anchored line start" — and its independent `grep -lE` oracle arm runs a *shorter* pattern list that
+  omits that pattern. Soundness (`prefiltered == full-scan`) and determinism were both satisfied by a
+  consistently wrong anchor.
+- **Bucket B — the built-in crawl denylist, undisclosed under `complete="1"`. DISCLOSED.** On this
+  repository `--grep='malloc('` served 33 hits carrying `complete="1"` where `rg -F 'malloc(' .`
+  found 78 matching lines; the 45 missing are exactly the lines under `third_party/`. `rw::kCrawlSkipDirs`
+  prunes `vendor`, `third_party`, `build`, `dist`, `out`, `target`, `node_modules`, `captures` whole,
+  and increments a directory counter that only `--skipped` reported — while the grep legend claimed
+  `corpus_excluded=` covered "the built-in crawl policy", which it never did. Now `corpus_pruned_dirs=`
+  on the CLI root and the MCP twin, and the legend's false clause is corrected. The *policy* is
+  unchanged and remains right (LINEAGE §3a, the ripgrep row); what changed is that the answer says so.
+- **Bucket C — unindexed extensions past the 500-candidate cap. NOT FIXED, already disclosed.**
+  `.s` on `go` (27 hits of `pthread_[a-z_]+_init` missing), `.yaml` on the private tree (42 of 46 hits of
+  `[0-9a-f]{8}-[0-9a-f]{4}`). `unindexed_candidates_capped="1"` already says the candidate list was a
+  floor, so this is a documented ceiling and not a silent loss. Raising it is a ranking question, not
+  a correctness one, and is not attempted here.
+
+One further defect the matrix surfaced, in the *other* direction and NOT fixed here: `--grep` **serves**
+hits from files the repository's `.gitignore` excludes when those files carry an unindexed extension —
+a gitignored `.bak` file in the private tree (`.gitignore:78:canyon/*.bak`), four hits, which `rg` does
+not serve. `recordPreSizeDrop` records the `unsupported` row *before* the ignore test
+(`src/ingest_crawl.h`, and that ordering is deliberate and commented), so `grepCollectAux` never sees
+the ignore verdict. Recorded here with its fix location; not folded, because the safe fix moves a crawl
+ordering the code argues for on other grounds.
+
+### What this comparison does NOT show
+
+- **The scan is all it prices.** Neither tgrep nor rg carries a symbol graph, so nothing here speaks to
+  what `--grep` is *for* — the `in=` enclosing-symbol chain, the `<enc>` caller counts, `--handles`.
+  ripwire's per-query cost includes work the baselines do not do at all.
+- **Most of tgrep's win is not the index.** On R4 `[Qq]z[Xx]v.*[Jj]w`, a pattern tgrep's own `--stats`
+  reports as `MatchAll (full scan) (candidates: 159/159)`, tgrep-via-server answers `go` in 0.026 s
+  against rg's 0.397 s and `tgrep --no-index`'s 0.569 s. With zero index contribution the server is
+  still 15× faster than rg — that is its 50,000-entry resident file-CONTENT cache, and ripgrep's file listing
+  (the walk alone, 0.03 s versus 0.79 s for the full query) rules out the directory walk as the explanation.
+  A one-shot CLI (G5) cannot hold anything resident between invocations, so **that half of the win is
+  unavailable to ripwire at any price.** Only the postings half is portable.
+- **One machine, shared, and the load was not constant.** Arms ran back to back per query rather than
+  interleaved, and at the end of the llvm rung the 18-core host was at a 1-minute load average of 38.8
+  with 62 concurrent `ripwire` processes belonging to other work; the earlier cells were taken under
+  materially lighter load. The conclusions turn on 10×–10⁴× gaps, on a Q\* one to two orders of
+  magnitude below the observed session query count, and on comparisons between two ripwire cells taken
+  minutes apart — none of which a 2× noise factor moves. A single llvm absolute is an order of
+  magnitude, not a precise figure.
+- **One tgrep posture.** Index pre-built, server warm — the posture tgrep's own README advertises. A
+  cold `tgrep serve` answers from an *empty* index and returns nothing until the first build publishes;
+  tgrep documents that in `AGENTS.md` and it is not measured here.
+
+---
+
+## What `skip=` counts, and the corpus behind the skip-classification numbers (2026-09-14)
+
+`test/pargates.py`'s summary line is the thing a contributor reads before every push, and until this round
+its `skip=` count was a function of where the checkout sat on disk. This section pins the four numbers the
+change publishes, the corpus they were measured on, and how to rebuild that corpus from nothing. The rule
+itself is pinned by `test/skipclassifycheck.sh`; the classifier is `classify_skipped()` in
+`test/pargates.py`; the nearest gate-side contract is `test/gateexitcheck.sh` arm (D), which holds less than
+this rule does — see "What the rule does not hold" below.
+
+**The defect, in one measurement.** A gate's transcript opens with a banner naming its own absolute paths,
+and `test/w3fixlegendcheck.sh`'s transcript is byte-identical after line 1 at any checkout, so the banner
+is the only thing that moves: **217 B** from an 87-character worktree root against **67 B** from a
+12-character one. That is 150 B of shift from a 75-character rename — about 2 B per character, because the
+root is spelled twice. Any gate whose skip marker sat near byte 400 was therefore classified one way in
+one checkout and the other way in another.
+
+**The reported symptom, reproduced — and it belongs to a named tree.** The original observation was
+`skip=2` from a 137-character worktree against `skip=3` from a 38-character one, on commit `3c191bdf`
+(a feature branch, not the merge base). On that tree w3fixlegendcheck's N=3 partition arm ties
+(`TIE 0.0928 vs 0.093`) and honestly skips, and the tie row is the third thing the gate prints. Running
+that tree's own gate from two checkouts with one binary, arm output byte-identical after line 1:
+
+| checkout root | banner | the tie row starts at | (in bytes) | old rule's verdict |
+| --- | ---: | ---: | ---: | --- |
+| 38 characters | 168 | 302 | 308 | SKIP |
+| 138 characters | 268 | 402 | 408 | PASS |
+
+It straddles the window by two characters. **The unit is load-bearing and it is characters, not bytes.**
+The harness decodes the capture and slices the decoded string — `out = raw.decode("utf-8", "replace")`
+then `out[:400]` — so the old ruler counted code points. The six-byte gap in the table is the box-drawing
+rule and the em dash on the two rows above the tie row, and this suite prints both liberally, so a byte
+offset compared against that threshold is a unit error even when it happens to land the same way (302 and
+402 fall either side of 400 exactly as 308 and 408 do).
+
+Those two offsets carry three conditions, and naming them is the same lesson one level down. The tree
+decides whether the arm ties at all. The ROOT length moves the row 1 B per character here, not the 2 B of
+the fixture measurement above, because this gate's banner spells the root once — it reaches 2 B per
+character only when the binary also sits under that root, which is the posture the original report was in.
+And the BINARY path is in the same banner, so how it is spelled moves the row too: measured on the same
+clean checkout at a 38-character root, the tie row starts at 308 with the binary named at a 101-character
+absolute path and at 240 with the same binary named at 33 characters. What does NOT move it is whether the
+tree is dirty: clean and dirty both give 308 and 240 respectively, because the row's offset is the gate's
+own printed rows and no git stamp appears among them. The figures above were taken on a clean checkout with
+the binary at a 101-character path outside the tree. On the merge base `c1915d21` that arm does **not** tie — N=3
+passes — so w3fixlegendcheck's only skip marker there is the NDEBUG degrade row about 3 KB in, and the
+symptom cannot be shown on that tree at any path length. This is why an absolute byte offset in this
+section always names the tree it was taken on: the offsets are a property of a gate's output on a
+particular corpus, and only the banner arithmetic and the 400-character boundary are constants.
+
+**Population.** One full suite run on main at `c1915d21` captures **628** transcripts. That is deliberately
+the suite BEFORE this change's own gate — the question is whether the new rule moves a verdict on the
+suite that already existed, so the new gate is not part of the population it is judged against. A capture
+taken on the branch yields 629 and answers a different question.
+
+**Number 1 — how many gates the window's contents actually depended on.** Counting transcripts whose FIRST
+line contains the crawl root: **515 of 628** (524 contain it anywhere). Of those, **24** print a skip
+MARKER downstream of a root mention — the population whose classification could move — against **28** by
+the bare substring the old classifier actually looked for; the four extra only narrate the word. An earlier draft published 506,
+which came from grepping gate SOURCES for the banner assignment — a different population from the one the
+claim is about, and the reason this section states the recipe beside every figure.
+
+**Number 2 — the rule is behaviour-preserving.** Replaying both rules over all 628 transcripts: **zero**
+gates are classified differently, and the skip set is the same three either way (`argvdiffcheck`,
+`editchecknotecheck`, `g1freshcheck` — all three environmental, and all three absent a reference binary or
+a configured sanitizer tree rather than anything about the code).
+
+**Number 3 — which gates a rename can actually move, and in which direction.** Substituting the checkout
+root throughout each transcript is the only thing a rename changes:
+
+| substituted root | old rule moves | new rule moves |
+| --- | --- | --- |
+| a 2-character root | 0 | 0 |
+| a 39-character scratch clone | 0 | 0 |
+| a root 255 characters deeper | **1** — `editchecknotecheck` | 0 |
+
+**The zero in the first two rows is an artifact of the sample, and saying so is the point.** A first version
+of this measurement sampled only nearby-length paths, reported zero moves under both rules, and would have
+read as "the old rule was fine" inside the evidence for replacing it. Nothing is reachable by SHORTENING on
+this machine: the nearest candidate needs 148 characters removed from an 87-character root, so the only
+reachable direction is depth. The reachable case is `editchecknotecheck`, which declares its skip at byte
+145 and needs 255 more characters of path — a 342-character root, ordinary for a nested worktree or a CI
+runner — to push that declaration out of a 400-character window, at which point a gate that proved nothing is
+counted as a pass. Which gates are in range is a property of the machine rather than of the commit. A zero
+that names the range it covered is evidence; a zero that does not is unfalsifiable.
+
+Better than conditioning that row is publishing its FORM, because the offset is linear in the invocation.
+On that tree the tie row is exactly:
+
+    banner  = 22 + len(BIN) + 7 + len(ROOT)
+    tie row = banner + 134 characters   (= banner + 140 bytes)
+            = 163 + len(BIN) + len(ROOT) characters   (169 + … in bytes)
+
+where **22** is `w3fixlegendcheck: BIN=`, **7** is `  ROOT=`, and the tail is everything between the banner
+and the tie row: one newline, the section line `── 1. partition root counters` (29 characters, 33 bytes),
+another newline, the N=2 PASS row (102 characters, 104 bytes), and a third newline. Characters is the unit
+that matters, because the old classifier decoded the capture and sliced the decoded string, so its 400
+counted code points; the two path lengths are ASCII and contribute equally either way, and the whole
+six-unit gap is that multibyte prefix. Dirtiness is not a term in either form.
+
+It was validated by PREDICTION rather than by fit. Four measured points (roots 37/38/38/138 against binary
+paths 101/101/33/101) all satisfy it — but four points fitted is not four points predicted, so a root
+length never run, 65 characters, was computed in advance as 163 + 101 + 65 = **329 characters** (335 bytes)
+and then measured at exactly 329 characters and 335 bytes. A reader who measures a different number can
+therefore decompose the difference instead of doubting the row, and the first thing to check is which unit
+they counted in: 302 against 308 on one run is the same row counted two ways, not two different rows.
+
+Where an offset here is quoted without a unit note, bytes and characters agree because everything before
+the marker is ASCII — that is true of all three standing skips (`editchecknotecheck` at 145,
+`argvdiffcheck` at 15, `g1freshcheck` at 47) and therefore of the +255 reachability figure above.
+
+**Number 4 — the end-to-end property.** The full suite at the same commit, same binary, from two checkouts:
+
+| checkout root | summary line |
+| --- | --- |
+| 39 characters | `gates=629 pass=625 skip=3 fail=1` |
+| 87 characters | `gates=629 pass=626 skip=3 fail=0` |
+
+`skip=3` both ways, naming the same three gates. The single red in the short tree is environmental and
+unrelated: `test/clonededupcheck.sh` needs a second, golden binary for its byte-identity arm, defaults it
+to the tree's own build output, and correctly refuses when a scratch checkout has none.
+
+**What the rule does not hold, stated as a limit.** A whole-gate skip that prints any PASS row before its
+skip marker now counts as a pass — in a transcript it is indistinguishable from a gate that proved an arm
+and then skipped one. Measured: no gate in the 628 does this, and both sanctioned skips already follow the
+convention (announce the skip before claiming anything). But nothing enforces it. `test/gateexitcheck.sh`
+arm (D) is the nearest gate-side contract and holds less than this: it flags an `exit 0` only where a skip
+word and `ALL PASS` fall within three lines of each other, so it does not police marker order. Enforcing
+the convention needs a static sweep of every gate's skip path; until that exists the convention is
+unenforced, and a gate that grew a fixture-present PASS row above its skip banner would move from skip to
+pass silently.
+
+**Cost of reading verdicts instead of a fixed prefix.** Over the same 628 transcripts (1.6 MB),
+`classify_skipped()` costs 19 ms in total, 30 µs per gate, and 0.50 ms on the largest single transcript
+(46 KB, `mcpframehonestycheck`). The three linear scans are not measurable against the run they summarise.
+
+### Rebuilding the corpus and the replay from nothing
+
+Neither the corpus nor the replay script is committed: the corpus is 3.1 MB of transcripts, and a script
+without it is half a reproduction. Both are rebuilt from this repository in about twelve minutes.
+
+1. **Capture.** Check out the base commit the claim is about (`c1915d21` for the figures above) and build
+   it. Copy `test/pargates.py`, and immediately after its classification line insert a dump of each gate's
+   transcript, keyed by gate name:
+
+   ```python
+   try:
+       with open(os.path.join(OUTDIR, g + ".txt"), "w") as fh:
+           fh.write(out)
+   except OSError:
+       pass
+   ```
+
+   Run the full suite through that copy (`python3 <copy> . ./build/ripwire -j 6`). Nothing else is
+   instrumented, and `out` is the same string the classifier sees. On main at `c1915d21` this writes 628
+   files and the run itself reports `fail=0`, so every transcript in the corpus is an `rc == 0` one.
+
+2. **Replay.** Lift `_MARKER_RE`, `_SKIP_RE`, `_PASS_RE` and `classify_skipped` out of the branch's
+   `test/pargates.py` with `ast`, executing those four definitions and nothing else — importing the module
+   is not an option, because it reads its argument vector and crawls a tree at import time. Lifting rather
+   than reimplementing is what stops the replay from drifting away from the shipped rule. Classify every
+   transcript with `classify_skipped(0, out)` and, for the old rule, with the single line the change
+   replaced, quoted verbatim: `rc == 0 and "SKIP" in out[:400]`. Compare, and exit non-zero on any
+   disagreement — the replay is a check, not a report. For the rename table, substitute the detected root
+   with each alternate and re-classify under both rules.
+
+The detected root comes from the first transcript whose first line names it, which is why the detection
+scans until one matches instead of reading only the first file: 113 of the 628 do not name the absolute
+root on their first line — that is the complement of the 515 above, and it is not a claim that those 113
+print no banner, only that the root is not in it.
+
+## `--slice=SYM:VAR` def-use row order — PRE-REGISTERED 2026-09-22 (before any src/ change and before any number below was computed)
+
+`--slice=SYM:VAR` seed rows emitted in SOURCE order (the file's own line order), unstated on the root. The
+red-first gate arm (commit `48a4f071`) registered a rule and a decision procedure before any implementation
+code or any number existed:
+
+> **Rule under test: R1 def-use coverage.** A `--slice=SYM:VAR` row's score is the number of distinct
+> sliceable locals with an occurrence on that line; rows emit score-descending, then line ascending, then
+> binding line ascending (file is constant: one definition). Zero fitted parameters.
+>
+> **Measurement:** `bench/slice/run_slice_linerecall.py` from `lane/research-arise-slice` (LocBench V1 test,
+> Python single-function rows), plus one scratch arm that reads the EMITTED order: per (scored instance,
+> inventory variable) whose v1 rows hold a gold line, Recall@{1,3,5,10,20} and MRR of the `l=` values in
+> emission order against gold & rows, versus a uniform random permutation of the same rows (200 shuffles,
+> seed 20260920, own RNG). Population: every inventory variable (unseeded); the gold-touched subset is
+> reported beside it, never instead of it.
+>
+> **Decision:** ADOPT R1 ordering iff the new binary's emitted-order MRR beats the random control's MRR on
+> the all-inventory population. Otherwise stop ranking: emit in source order, and state that order in the
+> header as a presentation order, not a ranking.
+
+Neither the harness (`bench/slice/run_slice_linerecall.py`) nor the scratch arm that reads emission order is
+committed to this tree — both live on the unmerged `lane/research-arise-slice`, and the scratch arm is a
+43-line diff over that harness. The numbers below are reproduced from that harness's output and from an
+independent re-run against both binaries (base `15a20855` and this lane), not from a script this tree ships;
+`docs/research/slice-line-recall.md`, cited by an earlier draft of this feature, does not exist on `main` or
+on this lane and is not the record of this claim — this section is.
+
+## `--slice=SYM:VAR` def-use row order — MEASURED 2026-09-22 against the band above: **ADOPTED — the emitted-order MRR beats the random control**
+
+**Population, stated precisely (correcting the scratch arm's own label):** 478 (scored instance, inventory
+variable) pairs, from 173 LocBench V1 Python instances, **whose v1 rows hold a gold line** — not "every
+inventory variable, unseeded" as the scratch arm's `all_inventory` label implied. A pair with no gold line
+among its rows scores 0 under every candidate order, so the ADOPT/DON'T-ADOPT decision is unaffected either
+way; only the population's name was overstated.
+
+| arm | @1 | @3 | @5 | @10 | @20 | MRR |
+| --- | --- | --- | --- | --- | --- | --- |
+| source order (base `15a20855`, the "before") | 0.198 | — | — | — | — | 0.525 |
+| random control (200 shuffles, seed 20260920, sequential stream) | 0.268 | 0.676 | 0.827 | 0.939 | 0.983 | 0.602 |
+| def-use coverage (this lane, emitted order, the "after") | 0.285 | 0.743 | 0.847 | 0.937 | 0.983 | 0.628 |
+
+@3/@5/@10/@20 were not separately reported for source order at registration time — only MRR and @1 were
+measured for that arm; the table states that gap rather than filling it in.
+
+The registered decision is the MRR row: **0.628 > 0.602 > 0.525** — def-use coverage beats the random
+control, which beats source order. ADOPTED per the pre-registered rule.
+
+**The control's spread, so the margin has a scale.** Across the control's own 200 shuffles, the mean MRR's
+standard deviation is 0.0117 (the registered sequential RNG stream) / 0.0116 (an independent per-pair RNG,
+cross-check only); the emitted-order MRR exceeds 199 of those 200 shuffle means (197/200 under the
+independent RNG) — roughly +2.2σ. A paired bootstrap of (emitted MRR − that pair's own control mean) over
+the 478 pairs gives Δ = +0.026, 95% CI [0.004, 0.049] — excludes zero, narrowly.
+
+**The gain is concentrated at @1/@3, honestly split per pair.** Per pair against its own control mean:
+better on 182, WORSE on 227, tied on 69 — def-use coverage loses the per-pair comparison more often than it
+wins. The population-level win lives in where gold lands when the rule is right: @1/@3 favor def-use
+clearly, @10/@20 tie the shuffle (0.937 vs 0.939, 0.983 vs 0.983 — the shuffle is marginally ahead at @10).
+On average 43% of a pair's rows share the top def-use-coverage score, so line order (the tiebreak) still
+does real work inside that band.
+
+**In-sample, honestly.** Zero fitted parameters — the rule is a fixed count-and-sort, not tuned against this
+population — but the population itself is the LocBench V1 Python set the rule was measured on; there is no
+held-out split. **Python only.** The coverage count follows the `--slice` inventory exactly (as registered),
+and that inventory is uneven across languages the tool serves — Python lambda/JS arrow params are not
+inventory locals while Python nested-def/Rust closure params are, Python `self` counts as a param local
+while Rust `self` does not, Java/Python attribute identifiers share a name with same-spelled locals while
+C++/JS field/property identifiers do not. None of this was measured for C/C++, JS/TS, Go, Java, C#, Ruby,
+Rust, or Swift; the `order="defuse"` ranking ships for every served language on the strength of the Python
+measurement alone, stated here rather than left implicit.
+
+**Falsifiable claim, restated to match what the table shows:** *"Ranking `--slice=SYM:VAR` rows by def-use
+coverage puts a gold line first (rank 1) more often than a random shuffle of the same rows, on LocBench V1
+Python."* That is an @1 claim (0.285 vs 0.268), not a claim that the rule outranks a shuffle on every pair
+or at every depth — @10/@20 tie, and the per-pair split has more losses than wins. `--help` and
+`src/slice.h`'s `sliceDefUseRowOrder` comment are worded to this claim, not to the broader "ranks above it"
+a first draft of this feature shipped.
+
+## `--slice=SYM:VAR` row order over the WHOLE function span — MEASURED 2026-09-23: **FAIL, `order="defuse"` unchanged**
+
+**Scope — this does not retract the ADOPT above.** The ADOPT above is the narrow claim: among the rows
+`--slice=SYM:VAR` already emits, def-use coverage descending beats a random shuffle at rank 1 (478 pairs,
+MRR 0.628 vs 0.602). This section is a separate, WIDER question, pre-registered before any number existed
+(`docs/research/arise-line-ranking-prereg.md` §4, signed `5b7f01c4`, round 3, on
+`origin/lane/arise-line-ranking`): does the same rule find a gold line first over the WHOLE function span,
+not just among the rows it already narrowed down to. It does not — and per the prereg's own §4.3.1, a
+wide-pool FAIL changes only the disclosure, never the shipped order: plain source order was already
+measured WORSE than random on the narrow pool (0.525 vs 0.602), so replacing `order="defuse"` with it would
+be a regression, not a fix.
+
+**What was already at chance (the reason the attempt ran at all).** Over the whole function span, the
+SHIPPED rule (`order="defuse"`, R1: def-use coverage) scores R1@1 0.0477 against a random-shuffle control
+CTL@1 0.0423 — indistinguishable from chance at this sample size.
+
+**The one pre-registered attempt (R3: definitions before uses, then coverage) — result.** LocBench V1
+Python, 173 single-function instances (88 held-out repos), 498 variable instances: R3@1 0.0344 vs CTL@1
+0.0423, Δ = −0.0079, bootstrap 95% CI [−0.0310, 0.0189] (10,000 resamples, seed
+`ripwire-arise-line-rank-v1`) — includes zero. 1 of 4 pre-registered PASS conditions held (R3@1 > R0@1
+only; margin ≥ 0.02 NO, CI excludes 0 NO, R3@1 > R1@1 NO). Per-instance vs the shipped rule: 2 better, 7
+worse, 164 tied. The narrow-pool arm (informational; moot once the wide pool failed) also did not clear:
+`score_arise_narrowpool.py`'s own definition gives 506 pairs, defuse MRR 0.602, defrole 0.570 — NOT the
+ADOPT table's 478 pairs above, a DEFINITION difference (no span restriction, no `--expand`/gold-outside-
+span skips, and a regex-named-gold pair rule instead of "rows hold a gold line"), not tree drift or a
+re-run on the same rows. Filtered to EVALS' own definition, the SAME run gives 484 pairs, defuse MRR
+0.6295, defrole MRR 0.5963 — close to, but still not identical to, the ADOPT table's 478/0.628. `defrole
+< defuse` holds under both definitions.
+
+**Provenance.** Signed result head `13292db7` on `origin/lane/arise-result` (unmerged; every number above
+is reproduced here, in the committed tree, so nothing that cites this section points at an unmerged
+branch). Independently re-run byte-identical to the committed output (result review, 2026-09-23).
+
+**What this supersedes.** Any reading of the ADOPT section above, or of `--slice`'s legend/help, as a claim
+that `--slice=SYM:VAR` ranks lines by relevance across a whole function is superseded by this section: the
+rule is proven only to order the rows it already emits, never to find the most relevant line in a function
+it has not narrowed down first. `src/compactlegend.h`'s `order` reading, `src/slice.h`'s v1/v2 legends, and
+`--help=slice` are worded to this scope.
+
+## Map data Sections never crowd code out of the default map (#339 F1) — PRE-REGISTERED 2026-09-30 (before any fix code or arm number)
+
+The registration below was frozen on 2026-09-30 (frozen text sha256 `e731a459614b32eda140c5c424beb8867ff8bbc24cdbf8ddea524cf47d38ae93`)
+and lands here with the gate, `test/mapdatasectioncheck.sh` (red on `a5229aca`), before any fix code or arm number. It is
+reproduced verbatim, except that its headings are demoted one level to sit under this section and three references to files
+outside this repository (a design note, a decision log, a scratch directory) are replaced by neutral words. Deviations decided
+after the freeze are listed with the result, never edited into this text.
+
+This supersedes the DRAFT, which is left unchanged. Design: the lane's design note (outside this repository). It lands verbatim in `docs/EVALS.md` with the gate commit, before any fix code or arm number exists. Line refs are at BASE `b90547fa`.
+
+**Owner rulings, 2026-09-30:**
+- **R1:** A touches only the map's uniform prior. Every other rank consumer stays byte-identical. There is no per-verb census.
+- **R2:** `--eval` decides on code-seeded commits.
+- **R3:** paired, stratified bootstrap margins on three repos replace the priorwt precedent.
+- **R4:** FIND terminality is a post-release readout with a revert guard.
+
+**Hypothesis.** Under A, every non-Section node outranks every in-degree-0 Section in the map. Then code rows survive the #339 shapes, the non-Section order is unchanged when there are no Section→non-Section edges, and nothing outside the map scope moves.
+
+### 0. Arms and pins
+
+**A.** A new entry point, `rw::rankDefaultMap(…)`, whose name is frozen for MEAS.
+- It is the uniform teleport with Section entries ×`kSectionPriorMul`=0.1, followed by the unchanged `biasPrior`.
+- `static_assert(kSectionPriorMul*kSpecificNameMul < kCommonNameMul*kPrivateNameMul)` re-reads the invariant (0.17 < 0.25) from BASE's constants. β is set by it; it is never fit and never swept.
+
+**Map scope.** The list is exhaustive:
+- the plain map: main.cpp:1762 with no payload verb and the default `--rank-by` (XML, `--json`, `--html`, `--max-tokens`);
+- `--tree` (verbs_report.h:3521);
+- MCP rank_by pagerank (mcpverbs.h:479, the CLI-parity twin);
+- MCP analyze when `changed==0` (mcpindex.h:1198). Analyze is `ix.rank`'s only reader (mcpverbs.h:438).
+
+Everything else keeps BASE bytes, including every payload verb's whole output.
+
+**Disclosure.**
+- **Attribute:** `data_sections_cut="N"` on each map-scope root, where N = Sections indexed − Section rows shown. It is omitted at 0.
+- **`next=`:** `next="--graph-query='kind(all,sec)' --offset=M --limit=K"`, where M = Section rows shown and K = the effective top-k.
+  - `kind(…,sec)` (query.h:63) is main's only kind filter. `--exclude/--include/--path/--scope` filter paths.
+  - graph-query is out of scope. It keeps BASE order (rank desc, id asc; verbs_navigate.h:335–342) and pages itself (`pageDisclosure`, `next_offset=`). So no page exceeds K rows at any N (#339: ≈2,000).
+  - Shown rows are skipped exactly when A's Section-relative order equals BASE's. That holds when no non-Section→Section edge exists, because Section ranks then scale by one factor.
+- **Pre-specified fallback:** if Gate D's set equality fails anywhere, the attribute ships without `next=`. This is a §9.1 dead-end cut, counted apart. No other spelling is tried after data.
+
+**B (fallback).** Code-first row pick (design §2B). The rank vector is untouched.
+
+**C.** Rejected.
+
+**PLACEBO_s (s=1..20).** A, with `kind==Section` replaced by membership in R_s.
+- R_s is n_sec non-Section ids drawn without replacement by `std::mt19937_64(s)` over crawl order.
+- The draw is stratified on the Sections' `priorwt::weight` values, so the removed mass is within 1% of A's. Any shortfall comes from the nearest stratum and is disclosed.
+- It is not degree-matched (disclosed). R_s is dumped and hashed. s is passed by env var.
+- It is skipped where n_sec > 0.5 × the non-Section count.
+
+**Pins.**
+- #339: `pr-339`@`221afc08`, used for S1 only. It is re-pinned before measuring, never after.
+- Corpora:
+  - ripwire@`b90547fa`;
+  - django `03988c5a`/tree `1afcf39f`;
+  - webpack `a943d69c`/tree `4d708c08` (`extcorpus.lock`);
+  - the frozen `snapshot.*pack`.
+
+  The clones are full-history, and HEAD and tree are verified on every run.
+
+**Design numbers are predictions, not data.**
+- The 3/8–7/8 table, the `k=` values and "1 `sec` row in ripwire's top 200" came from the installed 0.6.5 (`built_from=3fcd515ff`). That binary is not an arm.
+- #339's 6/8 and 4/8 came from its review.
+- Step 1 after the freeze re-reads them on BASE (BASE+339 for S1), before any other arm runs.
+
+**Builds.** 9 builds, run after the 3 now running: BASE, BASE+MEAS, A, A+MEAS, B, PLACEBO+MEAS, and BASE/A/B+339 (throwaway merges, never pushed).
+- Each has its own worktree and a Release build, with the same toolchain and flags. Every run uses `--no-cache`.
+- The binary table records sha256, `built_from=` (plus the patch sha256) and the compiler.
+- **At run time,** each wrapper logs `shasum -a 256 $BIN` immediately before the run. Output whose hash ≠ the arm's pin is rejected.
+- Also sha256-pinned before first use: MEAS and PLACEBO (kept outside the repository, never pushed), the fixture generator, Gate S's argv list and MEAS's key/class list.
+
+### 1. Primary, gating, end-to-end (§7): code rows in the emitted top-K
+
+**Harness:** `RIPWIRE_BIN=$BIN test/mapdatasectioncheck.sh`, red-first, with a deterministic generator.
+
+**Fixture:** 8 Python functions (a call chain, an uncalled `main`, `_helper`) plus one data file, with long or short names. The data file is S1 (#339 `db/schema.rb` columns), S2 (md headings), S3 (YAML keys) or S4 (JSON keys).
+
+- **Primary cells (K=200):** S1 at 20/40 tables; S2/S3/S4 long at N=200/220/220.
+- **Grid, gating for A:** shape × {long, short} × N∈{20,40,200} × K∈{200,16}.
+- **Surfaces:** XML, `--json`, the `--html` node set, `--tree` (code file first), `--max-tokens`, MCP analyze (clean tree).
+- **Statistic:** code rows shown / 8. It is exact, so no CI.
+- **BASE must be red** on each primary cell. The predictions are 6, 4, 3, 3; S4 is unmeasured. A cell green on BASE is reported inert and dropped before any A/B number exists, and never replaced.
+- **Pass:** 8/8 on every cell × surface.
+- **Reported only:** bytes before the 1st and the 8th code row (§9.1 #8).
+
+### 2. Gates for A
+
+**Edge census, first:** Section in/out degree by edge type, per corpus and fixture.
+
+**I1.** At `--top-k=S`, no non-Section row follows an in-degree-0 Section row. S is the header's `symbols=`; `--top-k=0` emits no map (cli.h:34).
+
+**I2.** A's non-Section row sequence ≡ BASE's (`--top-k=S --json`, three corpora), with every inversion listed.
+- Bound: 0 inversions between rows whose BASE scores differ by >1e-6 relative.
+- If Section→non-Section edges exist, the bound is instead Kendall τ ≥ 0.99 over the top 200.
+
+**Gate S (R1).** It replaces the census and the draft's §3(b) margins. There is no acceptance path.
+- **(i) Static.** A's diff leaves `priorwt::weight`, graph.h:4378, `biasPrior`, `rankGraphTeleport`, `rankGraph` and `diffTeleport` byte-unchanged. `rankDefaultMap`'s call sites equal the map scope.
+- **(ii) Dynamic.** BASE vs A stdout and exit status are `cmp`-identical, on the three corpora and on S2/S3-long-200. MCP analyze also runs with one uncommitted code edit. The argv list is frozen before any A binary runs:
+  - `--eval`, `--eval-retrieval`, `run_recalleval.py --lane both`, `run_extcorpus.py`;
+  - `--for` (default, candidates, `--anchor`), `--expand`;
+  - `--map-diff` (git, no-git), `--rank-by=churn|churn-decay|authority|hub|rrf`;
+  - `--impact`, `--graph-query`, communities/drill/zoom, `--seams`, `--report`, `--exercises`;
+  - MCP analyze (dirty), MCP impact.
+
+**Gate D.**
+- N equals the `kind(all,sec)` count= minus the Section rows shown.
+- Following `next=` and then `next_offset=` until `capped="0"` yields exactly the cut Sections, each once, with every page ≤ K rows. This must hold on every §1 cell at K∈{200,16} and on the three corpora.
+- The attribute is defined in the XML, JSON and compact legends. Legend coverage fails on an undefined one.
+
+**Byte identity.** Section-free fixtures and goldens do not change. The golden refresh is listed per file, with the reason ("`k=` rescale" or "Section rows moved").
+
+### 3. Non-regression and readouts
+
+#### (a) `--eval` co-change (R2, R3): the `map` column decides
+By R1, eval.h:325 (seeded) and graph.h:5148 (anchored) are non-map consumers. So every printed `--eval` row is byte-identical under A (Gate S), and the bar applies to the one vector A changes.
+
+**MEAS.**
+- It is additions only, in eval.h only; for BASE it also adds a ≤3-line shim, `rankDefaultMap → rankGraph`.
+- It is active only with `RIPWIRE_MEAS_EVAL_ROWS=<path>` and writes only there.
+- It writes one row per scored commit:
+  - the key (newest-first ordinal, sha256 of the sorted changed paths);
+  - the seed path and class;
+  - n_gold and the Section-only gold count;
+  - hits@5/10/20 for every printed ranker and for `map`.
+- `map` = eval.h:326–331's per-file sum over `rankDefaultMap`'s vector, with the seed excluded.
+
+**Output-neutrality, proven before any A number:**
+- `git apply --numstat` shows 0 deletions, and the patch adds no stdout/stderr write.
+- Every non-339 build's `--eval` stdout and exit status `cmp`-equal BASE's on the three corpora (env set on MEAS builds).
+- In each MEAS arm, the rows re-sum exactly to the dumped accumulators (`%.17g`), which reproduce every printed figure.
+- Keys, seeds and classes equal BASE+MEAS's pinned list, or the run is void.
+
+**Code-seeded (mechanical).** The seed (eval.h:299–306: most symbols, tie → lowest id) holds ≥1 indexed symbol whose kind is neither Section nor ModuleScope. Otherwise the seed is `data` (≥1 Section) or `none`. The class is computed on BASE and is the same in every arm.
+
+**Deciding test, code-seeded only.**
+- Commits are paired. The CI is a 95% percentile bootstrap, resampling within repo: 10,000 resamples, seed 20260930. The pooled Δ is commit-weighted.
+- **A fails** if, for any k∈{5,10,20}, the pooled-Δ lower bound is < −1.0 pp or any repo's point Δ is < −2.0 pp.
+- A repo with 0 code-seeded commits is not evaluable.
+
+**Secondary, non-deciding:** `data`/`none` seeds, and gold-kind strata. Ranking is at corpus HEAD, so absolute levels are upper bounds, but the paired Δ is valid.
+
+#### (b) §8 placebo (gates claims, not the ship)
+- It runs on `map`. Fixtures are skipped because they have no matched set.
+- A gain is claimed only if A's pooled Δ beats all 20 placebo Δs (one-sided p ≤ 1/21) and its lower bound is > 0.
+- A loss inside the placebo range is generic perturbation.
+
+#### (c) FIND terminality (P1, R4): post-release, not a merge gate
+- **Command:** `bench/substitution_report.py <frozen log>`, the §5 map row, per repo via `--tag`.
+- **Windows:** baseline = the 21 days before the release that ships the arm; readout = the first ≥200 map rows after it.
+- **Revert guard:** Δ < −5 pp with the Newcombe 95% CI upper bound < 0 → revert.
+- **Power:** ≈ ±9 pp, so this is a guard, not evidence.
+
+### 4. Decision rule (in order; nothing re-tuned after data)
+1. BASE must be red on §1, with inert cells dropped first.
+2. **Ship A** iff all of these hold:
+   - §1 passes;
+   - I1 = 0 and I2 is within bound;
+   - Gate S passes;
+   - Gate D passes, or its fallback applies;
+   - byte identity holds;
+   - §3(a) passes.
+
+   A Gate S or D failure is a wiring defect. Fix only the wiring (β and the kind test unchanged), rerun §1–§3, and log a deviation.
+3. **Ship B** iff A fails only §3(a). B is judged on §1 over the surfaces it wires, on byte identity when no swap fires, and on Gate S(ii) vs BASE.
+4. **A fails §1, I1 or I2:** the premise is false. Go to step 3.
+5. **B also fails §1:** ship the gate and fixtures, revert the feature, and record the negative (EVALS §7). #339 F1 stays open, and C needs its own registration.
+6. **§3(c) trips:** revert.
+
+**What would prove the design wrong:**
+- a Section with in-degree > 0 inside a crowded top-K;
+- an I2 breach;
+- a code-seeded `map` loss beyond margin that the placebo does not reproduce. That would mean demoting data removes co-change signal, which points to B.
+
+**Blind spots:** doc-seeking tasks in doc-heavy repos. Payload verbs and dirty-tree MCP analyze stay BASE by R1, so they can still crowd.
+
+### 5. Published
+- **EVALS:** "PRE-REGISTERED" (this text), then "RESULT at <sha>" with every number above, losses included, and β stated as derived.
+- **CHANGELOG:** the change, `data_sections_cut=`/`next=`, the `k=` golden rescale, and the numbers.
+
+## Map data Sections — RESULT at `4b3ace8a` (2026-10-01): A FAILED §3(a) by its registered margin; **B SHIPS**
+
+Every number below was measured on Release builds of the nine registered arms (AppleClang 17.0.0), each binary's sha256
+logged immediately before every run and checked against its pin; every run used `--no-cache`; every corpus's HEAD and
+tree were verified before and after each run. Deviations decided after the freeze are listed at the end.
+
+| arm | built from | sha256 (first 16) |
+| --- | --- | --- |
+| BASE | `a5229aca` (origin/main at lane start) | `2ff8bd0006952fdc` |
+| BASE+MEAS | `a5229aca` + MEAS (120 added lines in `src/eval.h`, 0 deleted) | `bc5798eeb6558641` |
+| A | `417ba41b` | `dc97c6bcb858ab7a` |
+| A+MEAS | `417ba41b` + MEAS | `b8b32df91e0b7f76` |
+| PLACEBO+MEAS | `417ba41b` + PLACEBO + MEAS | `89c6900f1dcfccbf` |
+| B | `4b3ace8a` | `deab515df2c22f5b` |
+| BASE/A/B+339 | each merged with `pr-339`@`221afc08` (throwaway, never pushed) | `a74778c45dc03cb6` / `4754026555efb8a6` / `b06eed61d5fc187b` |
+
+**Step 1 — BASE is red on every primary cell** (code rows of 8 at K=200; XML, `--json`, `--html` node set, `--max-tokens=1500`,
+MCP analyze all agree): S2 long N=200 **1/8**, S3 long N=220 **1/8**, S4 long N=220 **1/8**; S1 (BASE+339) 20 tables **7/8**,
+40 tables **1/8**. The design's predictions (3, 3, unmeasured, 6, 4) came from a different fixture and the installed 0.6.5; no
+primary cell was inert. `--tree` listed the code file first on every cell at BASE (an inert surface, reported, not evidence).
+Short names crowd less: 7/8 at N=200. K=16 reads 1/8 (long) and 7/8 (short) from N=20.
+
+**Edge census** (node-level, `--graph-query`; the graph has one edge type feeding PageRank): no edge between a Section and a
+non-Section in any corpus or fixture. Sections with in-edges have them only from Sections — ripwire 271 of 4,755, webpack 70 of
+12,402, django 0 of 724; every fixture Section is edge-less.
+
+**A** (`rankDefaultMap`: the uniform teleport with Section entries x0.1, then the unchanged `biasPrior`; x0.1 derived from
+0.1 x 1.7 = 0.17 < 0.5 x 0.5 = 0.25, held by a `static_assert`):
+- §1: **8/8 on all 40 fixture cells x 6 surfaces** and on the 12 S1 cells of A+339. Bytes before the 1st/8th code row on the
+  primary cells: 1,260/1,602 (S3, S4) and 1,356/1,698 (S2), against BASE's 979/— and 1,075/— (no 8th row): the legend clause and the root
+  disclosure ride in front of the rows.
+- I1: 0 in-degree-0 Sections ahead of a non-Section row, on the fixtures and on all three corpora (ripwire's 17,947 non-Section
+  rows are all in by K=17,976; django's 47,420 by K=47,420; webpack's 24,353 by K=24,376).
+- I2 (at the emitted 4-dp precision, see DEV-10): 0 strict rank reversals on all three corpora. The file-grouped JSON sequences
+  differ by 182 / 861 / 12 pairwise inversions, every one inside a 4-dp tie or a file-block reorder of tied files.
+- Gate S (i): `priorwt::weight`, the `priorWeight` assignment, `biasPrior`, `rankGraphTeleport`, `rankGraph`, `diffTeleport`
+  byte-identical; `rankDefaultMap`'s four call sites are exactly the map scope. (ii): 132 of 132 (root, argv) rows identical to
+  BASE with two non-ranking fields masked (DEV-9); 122 of 132 unmasked.
+- Gate D: on every fixture cell (K=200, 16; XML and `--max-tokens`) and on the three corpora at K=200 and 16, `next=` then
+  `next_offset=` paged exactly the cut Sections, each once (ripwire 4,755 cut, 24 pages at K=200; webpack 12,402, 776 pages at
+  K=16). `--json`, MCP analyze and MCP rank_by carried the XML's disclosure.
+- MEAS neutrality: every MEAS build's `--eval` stdout and exit status `cmp`-equal BASE's on the three corpora; the rows re-sum
+  exactly to the dumped accumulators, which reproduce every printed figure; keys, seeds and classes equal BASE+MEAS's list.
+- **§3(a), the deciding test** (the `map` column, code-seeded commits: ripwire 40, django 74, webpack 72; paired A − BASE, pp;
+  95% percentile bootstrap within repo, 10,000 resamples, seed 20260930):
+
+  | k | pooled Δ | 95% CI | ripwire | django | webpack |
+  | --- | --- | --- | --- | --- | --- |
+  | 5 | +0.927 | [+0.433, +1.521] | +0.714 | 0.000 | +1.997 |
+  | 10 | 0.000 | [0.000, 0.000] | 0.000 | 0.000 | 0.000 |
+  | 20 | **−0.386** | **[−1.068, +0.067]** | −1.795 | 0.000 | 0.000 |
+
+  **A FAILS**: at k=20 the pooled lower bound −1.068 pp is below −1.0 pp. No repo's point Δ is below −2.0 pp. Absolute `map`
+  recall on code-seeded commits is low in both arms (BASE 1.6 / 4.0 / 5.2%, A 2.5 / 4.0 / 4.8% at k=5/10/20): `map` ranks files
+  by the global, unseeded map vector, and the co-change gold is mostly elsewhere.
+  Secondary (non-deciding): data-seeded commits (n=53, 40 of them ripwire's, whose most-symbols file is often a long markdown
+  document) Δ +0.77 / +0.85 / **−12.18** pp; all 240 commits +0.89 / +0.19 / −2.99; code-seeded commits whose gold holds a data
+  file (n=64) +1.62 / 0.00 / −1.32, whose gold holds none (n=122) +0.56 / 0.00 / +0.10. The k=20 loss is concentrated where the
+  gold includes documentation, which the demotion pushes down the `map` file ranking.
+- §3(b) placebo (ripwire + django, n=114 code-seeded; webpack skipped by the registered rule, 12,402 Sections > 0.5 x 24,353;
+  every R_s matched A's removed teleport mass with no shortfall): A Δ +0.251 / 0.000 / −0.630 pp against placebo ranges
+  [−0.418, −0.418] / [+0.439, +0.439] / [0.000, +0.799]. No gain is claimable (k=5 beats all 20 placebos but its lower bound is
+  0.000, not > 0), and the k=20 loss lies OUTSIDE the placebo range: it is not generic perturbation. By the registration's own
+  prove-wrong clause, demoting data removes co-change signal, which points to B.
+
+**Decision, step 3: A fails only §3(a) → SHIP B.**
+
+**B** (`serialize.h` `codeFirstKeep`: the code-first row pick; the rank vector untouched; wired on serialize — XML, `--json`,
+`--max-tokens`, MCP analyze on a clean tree, MCP rank_by=pagerank — and `--html`; not `--tree`, DEV-11):
+- §1: **8/8 on all 40 fixture cells x 6 surfaces** and on the 12 S1 cells of B+339 (20 and 40 tables: 8/8 where BASE+339 read
+  7/8 and 1/8). Bytes before the 1st/8th code row on the primary cells: 1,246/1,588 (S3, S4) and 1,342/1,684 (S2).
+- The pick's invariant (a map that shows a Section shows every non-Section row) holds on every fixture probed and on the three
+  corpora at K=200 and 16.
+- Byte identity when no swap fires: BASE and B maps (XML and `--json`) are byte-identical on django and webpack at K=200 and 16,
+  on this repository at K=16, on `test/fixture` (so `test/golden.xml` and every map pin are unchanged) and on the uncrowded
+  fixture cells. Where a swap fires the root says so: this repository's default map at K=200 swaps its one `sec` row
+  (`data_sections_cut="1"`), and Gate D's walk pages the swapped Section first, then the rest, each once.
+- As shipped, `data_sections_cut=N` counts the Sections the swap displaced from the rank-order top-K (what Gate D checks),
+  not every indexed Section left unshown; the frozen Disclosure definition above is kept as registered, and the rest
+  are reached through `next=`.
+- Gate S (ii): 132 of 132 rows identical to BASE under the same two masks as A (122 of 132 unmasked, the same 10 rows).
+- `--eval` is untouched by construction (B changes neither the rank vector nor `src/eval.h`) and its stdout is in Gate S.
+
+**§3(c) FIND terminality** is a post-release readout: `bench/substitution_report.py` over the 21 days before the release that
+ships B and the first ≥200 map rows after it, per repo; revert if Δ < −5 pp with the Newcombe upper bound < 0. Not yet measured.
+
+**Deviations after the freeze** (each logged before the data it touches existed, except DEV-9 to DEV-11, logged after A's run):
+BASE is `a5229aca`, the lane's branch point (DEV-1); Gate D's walk ends on `has_more="0"`, because graph-query prints
+`capped="1"` on every page past offset 0 (DEV-2); A's `--tree` carried the count without `next=` and `--html` carries no
+attribute, having no disclosure root (DEV-3, DEV-4); the JSON map has no legend, so the definition rides the full and compact
+legends and `--help=all` (DEV-5); this registration's text above names no file outside the repository (DEV-6); `--max-tokens=1500`,
+`--tree` = code file first, MCP via `--mcp --top-k=K` (DEV-7); Gate S's argv list gained a `RIPWIRE_DEV=1` `--anchor` row before
+any A binary ran, because `--anchor` refuses without it (DEV-12); Gate S masks the MCP `_index` stamp (it folds file mtimes, so BASE differs
+from itself there) and the initialize reply's `dictv=` (DEV-9); I2 is read at the emitted 4-dp precision (DEV-10); B does not
+re-pick `--tree`, whose own offset paging a window swap would break (DEV-11).

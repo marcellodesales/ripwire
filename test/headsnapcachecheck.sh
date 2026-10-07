@@ -28,10 +28,12 @@
 # Usage:  test/headsnapcachecheck.sh   |   RIPWIRE_BIN=build_w2e/ripwire test/headsnapcachecheck.sh
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
+. "$ROOT/test/lib/statcompat.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ echo "  PASS  $1"; }
+ok(){ echo "  PASS  $1" || { fail=1; echo "  FAIL  could not write the PASS line for: $1"; }; return 0; }
 no(){ echo "  FAIL  $1"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -41,23 +43,18 @@ REPO="$( mktemp -d )"; TMP="$( mktemp -d )"; trap 'rm -rf "$REPO" "$TMP"' EXIT
 XDG="$TMP/xdg"; mkdir -p "$XDG"
 CACHEDIR="$XDG/ripwire"
 
-# L3 (Linux probe): portable stat reader(s). GNU coreutils and BSD/macOS disagree on both the flag and the
-# format directives, and the `stat -f FMT ... || stat -c FMT ...` fallback this gate used is a TRAP. On GNU,
-# `-f` means FILESYSTEM status and takes NO format argument, so FMT is parsed as a second FILE: measured on
-# coreutils 9.11, `stat -f %i FILE` PRINTS a six-line filesystem block for FILE on stdout and exits 1. The
-# `||` arm then appends the right number under six lines of junk -- so a string compare fails, a numeric
-# compare dies with "integer expression expected", and a `|| echo MISSING` variant reports MISSING forever
-# (a gate that then passes by comparing nothing to nothing). Detect the flavour ONCE, use one form.
-if stat --version >/dev/null 2>&1; then inode_of(){ stat -c %i "$1" 2>/dev/null; }   # GNU coreutils
-else                                    inode_of(){ stat -f %i "$1" 2>/dev/null; }   # BSD / macOS
-fi
 # Y4: shard-aware lookup — a blob may be flat under $CACHEDIR or under $CACHEDIR/<xx>/ (2-hex shard).
 snapfiles(){ find "$CACHEDIR" -maxdepth 2 -type f -name 'ripwire-qheadsnap-*.bin' 2>/dev/null; }
 nsnap(){ snapfiles | wc -l | tr -d ' '; }
 # run against $REPO with the private cache dir and a HEAD-snapshot cache enabled (auto path is internal to
 # computeHeadSnapshot; --no-cache only disables the WORKING-tree auto-cache, not the HEAD-snapshot cache — so
 # the HEAD cache is exercised even here, which is exactly what A4-P1 added).
-run(){ env -u TMPDIR XDG_CACHE_HOME="$XDG" "$BIN" "$REPO" --quality-delta "$@"; }
+# #228 part 1 — the IDENTITY BASIS (src/quality.h): a working tree that already IS HEAD is compared with
+# ITSELF and never materializes a HEAD tree, so it never reads or writes a qsnap/qheadsnap blob. That is the
+# right answer for that tree and the wrong FIXTURE for a CACHE gate, which needs the archived-HEAD path. The
+# marker below is a comment-only line appended to a comment-only TRACKED file: it makes `git diff HEAD`
+# non-empty (so the archived path runs) while adding no symbol, no row and no byte to the reported output.
+run(){ printf '// dirty marker\n' >> "$REPO/src/marker.cpp"; env -u TMPDIR XDG_CACHE_HOME="$XDG" "$BIN" "$REPO" --quality-delta "$@"; }
 
 mkdir -p "$REPO/src" "$REPO/tests"
 cat > "$REPO/src/lib.cpp" <<'EOF'
@@ -68,6 +65,7 @@ cat > "$REPO/tests/test_lib.cpp" <<'EOF'
 extern int helper( int x );
 int runTest() { return helper( 5 ) + 1; }
 EOF
+printf '// cache-gate dirty marker (see run() above)\n' > "$REPO/src/marker.cpp"   # comment-only, tracked: no symbols
 git -C "$REPO" init -q; git -C "$REPO" config user.email x@y; git -C "$REPO" config user.name x
 git -C "$REPO" add -A; git -C "$REPO" commit -qm init
 
@@ -76,7 +74,7 @@ echo "headsnapcachecheck: BIN=$BIN"
 # ── (a) equivalence + reuse (unchanged HEAD == working tree, 0 regressions) ───────────────────────────────
 run --no-cache >"$TMP/a1" 2>/dev/null; rc1=$?
 SF="$( snapfiles | head -1 )"
-[ -n "$SF" ] && ok "run 1 creates a HEAD-snapshot cache file" || no "no ripwire-qheadsnap-*.bin after run 1"
+if [ -n "$SF" ]; then ok "run 1 creates a HEAD-snapshot cache file"; else no "no ripwire-qheadsnap-*.bin after run 1"; fi
 I1="$( [ -n "$SF" ] && inode_of "$SF" )"
 
 run --no-cache >"$TMP/a2" 2>/dev/null; rc2=$?
@@ -118,7 +116,7 @@ run --no-cache >"$TMP/b1" 2>/dev/null; rcb=$?
     || { no "stale HEAD snapshot reused after a new commit (exit=$rcb)"; grep -oE 'regressions="[0-9]+"' "$TMP/b1"; }
 
 # a NEW snapshot file must now exist for the new sha (old sha's file may still be present until eviction)
-[ "$( nsnap )" -ge 1 ] && ok "new-sha snapshot cache present" || no "no snapshot cache after new commit"
+if [ "$( nsnap )" -ge 1 ]; then ok "new-sha snapshot cache present"; else no "no snapshot cache after new commit"; fi
 
 # ── (c) key separation on --exclude (A4-F5 stays correct) ─────────────────────────────────────────────────
 before="$( nsnap )"

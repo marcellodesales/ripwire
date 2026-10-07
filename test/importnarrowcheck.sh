@@ -26,7 +26,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 FIX="$ROOT/test/importnarrowfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -35,7 +35,8 @@ cd "$ROOT"
 
 echo "importnarrowcheck: BIN=$BIN  CORPUS=test/importnarrowfix"
 
-"$BIN" "$FIX" --no-cache >"$TMP/map" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact and spells ambiguous= inside its comment; arm 1 reads the real header gauge, so this run (and its arm-7 determinism twin) asks for the full legend.
+"$BIN" "$FIX" --no-cache --legend=full >"$TMP/map" 2>/dev/null
 
 # ── 1) headline: exactly TWO ambiguous calls remain — the two negative controls. The positive caller
 #       (caller.cpp) narrowed away its ambiguity entirely via Rule 3. ─────────────────────────────────
@@ -86,7 +87,7 @@ for c in callNeither callBoth; do
 done
 
 # ── 7) determinism — the include-set build + narrow must be byte-stable run-to-run. ─────────────────────
-"$BIN" "$FIX" --no-cache >"$TMP/map2" 2>/dev/null
+"$BIN" "$FIX" --no-cache --legend=full >"$TMP/map2" 2>/dev/null
 diff -q "$TMP/map" "$TMP/map2" >/dev/null \
     && ok "deterministic (importnarrowfix map byte-identical across two runs)" \
     || { no "non-deterministic importnarrowfix map"; diff "$TMP/map" "$TMP/map2" | head -6; }

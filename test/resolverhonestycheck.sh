@@ -41,7 +41,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){   printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){   printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -113,11 +113,13 @@ printf 'int foo8(double);\n'                > "$F/f8/b.cpp"
 printf 'int bar8() { return foo8(1); }\n'   > "$F/f8/caller.cpp"
 
 # F9 [B] PURE-VIRTUAL multi-candidate (realistic decl-only): two abstract area() decls in two ifaces,
-# caller calls s->area() → 2 edges → MUST carry amb=1.
+# caller calls s->area() → 2 edges → MUST carry amb=1. The receiver is an UNTYPED `auto` local: it was a
+# `Shape* s` PARAMETER until 2026-09-16, when Rule 2 began reading parameter types (narrowcheck arms 7-18) and
+# resolved it to Shape::area alone — which left check_signal's F9 row passing on ONE edge, vacuously.
 mkdir -p "$F/f9"
 printf 'struct Shape { virtual int area() const = 0; };\n'   > "$F/f9/s.h"
 printf 'struct Region { virtual int area() const = 0; };\n'  > "$F/f9/r.h"
-printf 'int compute9(Shape* s) { return s->area(); }\n'      > "$F/f9/u.cpp"
+printf 'extern Shape* shapes9[ 2 ];\nint compute9(int i) { auto s = shapes9[ i ]; return s->area(); }\n' > "$F/f9/u.cpp"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # INVARIANT 1 — SOUNDNESS: every resolved edge points at a def whose NAME matches the call and whose
@@ -178,11 +180,18 @@ check_signal "$F/f4" run      "F4 [A] Rule-3 pin"
 check_signal "$F/f8" bar8     "F8 [B] decl-only 2-way (audit find)"
 check_signal "$F/f9" compute9 "F9 [B] pure-virtual 2-way (audit find)"
 
-# F5: the cross-dir no-disambiguator call is DROPPED (0 edges) — honest, no amb, no unresolved.
+# F5: the cross-dir no-disambiguator call is DECLINED (0 edges) — no amb, no unresolved, no guess. A drop is only
+# honest when it is DISCLOSED: before test/declinecheck.sh it was silent, and the header said ambiguous=0
+# unresolved=0 beside a call it had refused. Now it must also count in the header's declined= and on the caller's
+# --callees root as declined_calls="1".
 n5="$( callee_count "$F/f5" run5 )"; n5="${n5:-0}"
 [ "$n5" = 0 ] && [ -z "$( amb_of "$F/f5" run5 )" ] \
-  && ok "F5 [drop] cross-dir no-narrow: 0 edges (honest §2a drop, not a silent pick)" \
-  || { no "F5: expected a clean drop, got $n5 edge(s)"; callees "$F/f5" run5; }
+  && ok "F5 [decline] cross-dir no-narrow: 0 edges (the §2a gate declines, not a silent pick)" \
+  || { no "F5: expected a decline with no edge, got $n5 edge(s)"; callees "$F/f5" run5; }
+d5="$( hdr "$F/f5" declined )"; d5="${d5:-0}"
+[ "$d5" = 1 ] && callees "$F/f5" run5 | grep -q 'declined_calls="1"' \
+  && ok "F5 [decline] disclosed: header declined=1 and --callees=run5 declined_calls=\"1\"" \
+  || no "F5: the decline is silent (header declined=$d5; --callees root: $( callees "$F/f5" run5 | grep -oE '<callees [^>]*>' ))"
 
 # F6: cross-language gap ⇒ unresolved ≥ 1 (the whole-corpus header carries it).
 u6="$( hdr "$F/f6" unresolved )"; u6="${u6:-0}"
@@ -269,7 +278,7 @@ a_witnesses=0
 for d_sym in "f2:bar" "f4:run"; do
     [ "$( all_edges "$F/${d_sym%%:*}" "${d_sym#*:}" )" -ge 1 ] && a_witnesses=$(( a_witnesses + 1 ))
 done
-[ "$a_witnesses" = 2 ] && ok "[A] precondition: both confident witnesses still emit >=1 <c> edge (arm is not inert)"                        || no "[A] precondition GONE: only $a_witnesses of 2 confident witnesses emit an edge — the omit-at-confident arm cannot observe what it asserts"
+if [ "$a_witnesses" = 2 ]; then ok "[A] precondition: both confident witnesses still emit >=1 <c> edge (arm is not inert)"; else no "[A] precondition GONE: only $a_witnesses of 2 confident witnesses emit an edge — the omit-at-confident arm cannot observe what it asserts"; fi
 for pair in "f2:bar:same-file unique" "f4:run:Rule-3 pin"; do
     d="${pair%%:*}"; rest="${pair#*:}"; sym="${rest%%:*}"; label="${rest#*:}"
     n="$( all_edges "$F/$d" "$sym" )"; k="$( split_edges "$F/$d" "$sym" )"
@@ -339,7 +348,7 @@ done
 
 # ── well-formed XML on a representative case ─────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
-    run "$F/f9" | xmllint --noout - 2>/dev/null && ok "xml well-formed (F9)" || no "xml malformed (F9)"
+    if run "$F/f9" | xmllint --noout - 2>/dev/null; then ok "xml well-formed (F9)"; else no "xml malformed (F9)"; fi
 else
     ok "xml well-formed (xmllint absent — skipped)"
 fi

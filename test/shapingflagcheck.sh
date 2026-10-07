@@ -35,11 +35,12 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 # fnorm FILE — stdout with the DOCUMENTED machine-dependent readings masked. Those are the only
 # non-determinisms the (B) and (F) byte-identity arms may not blame on a knob:
@@ -79,7 +80,7 @@ echo "shapingflagcheck: BIN=$BIN"
 export TMPDIR="$TMP/cache"; mkdir -p "$TMPDIR"
 "$BIN" . >/dev/null 2>&1 || true                       # the repo root: the (B)/(D)/anchor/hotspots arms
 
-git status --porcelain 2>/dev/null | grep -vE '^\?\? (build|asan|tsan)' > "$TMP/status.before"
+git status --porcelain 2>/dev/null | grep -vE '^\?\? (build|asan|tsan)' | LC_ALL=C sort > "$TMP/status.before"
 
 # ── (A) the SOURCE side: the read sites, re-derived ────────────────────────────────────────────────────
 # cli.h is excluded because that is where the fields are DECLARED and where the guards read them to decide
@@ -100,12 +101,22 @@ git status --porcelain 2>/dev/null | grep -vE '^\?\? (build|asan|tsan)' > "$TMP/
 # now that the token count rather than a byte budget travels to the header. Every one of them is a
 # DISCLOSURE of a budget the verb already honored — the columns those three verbs sit in are unchanged, so
 # this is a re-pin, exactly as the --expand and recall-default re-pins above were.
+# #61 (2026-09-09, 20->21): ONE more read, and the same kind. --for --detail=N already honored --max-tokens
+# (it bounds the bodies) and already printed max_tokens= on its root; what it never did was say whether the
+# DOCUMENT stayed inside the ceiling it named. The new site hands cfg.maxTokens to verbs_for.h's
+# forLensOverCeiling so the root can carry over_ceiling="1" when est_tokens exceeds it. Nothing about which
+# verbs read the flag changed, so kShapingVerbs' honorsMaxTokens column is untouched and this is a re-pin.
+# CodeRabbit PR #292 finding 4052087920 (2026-09-19, 13->14): ONE new read, the same kind as V1's above.
+# `noteWouldApplyGivenTopK` (src/main.cpp, ahead of the §F5 --max-tokens search) reads cfg.topKExplicit to
+# decide whether the ride-along note='s bytes should be charged to the search/verdict, the SAME predicate
+# `noteAppliesToBundle` already evaluates further down for the SAME two verbs (--expand/--outline). It does
+# not change which verbs honour --top-k, only fixes an existing verb's ceiling math, so this is a re-pin.
 MAXSITES="$( grep -c 'cfg\.maxTokens\|c\.maxTokens' src/main.cpp src/verbs_*.h src/mcpserver.h 2>/dev/null | awk -F: '{s+=$2} END{print s+0}' )"
 TOPSITES="$( grep -c 'cfg\.topK\|c\.topK'           src/main.cpp src/verbs_*.h src/mcpserver.h 2>/dev/null | awk -F: '{s+=$2} END{print s+0}' )"
-[ "$MAXSITES" = 20 ] && ok "(A) --max-tokens has 20 read sites outside cli.h (grep 'cfg\\.maxTokens' src/main.cpp src/verbs_*.h src/mcpserver.h)" \
-                     || no "(A) --max-tokens read sites moved 20 -> $MAXSITES: a verb gained or lost the budget, so kShapingVerbs' honorsMaxTokens column must be re-decided (and this number re-pinned)"
-[ "$TOPSITES" = 13 ] && ok "(A) --top-k has 13 read sites outside cli.h" \
-                     || no "(A) --top-k read sites moved 13 -> $TOPSITES: re-decide kShapingVerbs' honorsTopK column and re-pin this number"
+[ "$MAXSITES" = 21 ] && ok "(A) --max-tokens has 21 read sites outside cli.h (grep 'cfg\\.maxTokens' src/main.cpp src/verbs_*.h src/mcpserver.h)" \
+                     || no "(A) --max-tokens read sites moved 21 -> $MAXSITES: a verb gained or lost the budget, so kShapingVerbs' honorsMaxTokens column must be re-decided (and this number re-pinned)"
+[ "$TOPSITES" = 14 ] && ok "(A) --top-k has 14 read sites outside cli.h" \
+                     || no "(A) --top-k read sites moved 14 -> $TOPSITES: re-decide kShapingVerbs' honorsTopK column and re-pin this number"
 # no OTHER file may read them: a third file would be a verb family this table has never heard of.
 # 2026-08-29 main.cpp split: src/verbs_*.h are SECTIONS of main.cpp's own TU (RIPWIRE_MAIN_TU-guarded),
 # so they count as main.cpp in this derivation — the counts above sweep them, the exclusion below too.
@@ -282,8 +293,8 @@ case "$innerFrame" in
     *)                     no "(B-anchor) the derived --from-trace frame did NOT resolve to ${TRACE_FN} — it landed on: ${innerFrame:-<no innermost frame at all>}. The honouring row it feeds proves nothing until the anchor is fixed" ;;
 esac
 
-[ "$nNotice" -ge 20 ] && ok "(B) $nNotice ignore-disclosures fired across the table" || no "(B) only $nNotice ignore-disclosures fired (want >=20)"
-[ "$nHonor"  -ge 3  ] && ok "(B) $nHonor honouring rows proved to actually bind (not merely inert)" || no "(B) only $nHonor honouring rows bound"
+if [ "$nNotice" -ge 20 ]; then ok "(B) $nNotice ignore-disclosures fired across the table"; else no "(B) only $nNotice ignore-disclosures fired (want >=20)"; fi
+if [ "$nHonor"  -ge 3  ]; then ok "(B) $nHonor honouring rows proved to actually bind (not merely inert)"; else no "(B) only $nHonor honouring rows bound"; fi
 
 # ── (C) the two families must not BOTH speak ───────────────────────────────────────────────────────────
 # honorsPaging()'s members REFUSE these flags (exit 1). A verb there must get the refusal and NOT the notice,
@@ -316,9 +327,9 @@ cmp -s "$TMP/fp.out" "$TMP/fd.out" \
 
 # ── (E) --help must state --from-trace's budget ────────────────────────────────────────────────────────
 # The named §B9.2 gap: --from-trace DOES honour --max-tokens and --help never said so.
-"$BIN" --help 2>&1 | tr '\n' ' ' | grep -q -- '--from-trace' && HELPOK=1 || HELPOK=0
+"$BIN" --help=all 2>&1 | tr '\n' ' ' | grep -q -- '--from-trace' && HELPOK=1 || HELPOK=0
 [ "$HELPOK" = 1 ] || no "(E) --help does not mention --from-trace at all"
-"$BIN" --help 2>&1 | sed -n '/--from-trace=FILE/,/--note-add/p' | grep -q -- '--max-tokens' \
+"$BIN" --help=all 2>&1 | sed -n '/--from-trace=FILE/,/--note-add/p' | grep -q -- '--max-tokens' \
     && ok "(E) --help's --from-trace paragraph states that it honors --max-tokens" \
     || no "(E) --help's --from-trace paragraph still never mentions --max-tokens"
 
@@ -413,7 +424,7 @@ fprobeFor()
         --quality-panel=) printf '%s' '--quality-panel=default' ;;
         --limit=)        printf '%s' '--limit=3' ;;
         --offset=)       printf '%s' '--offset=1' ;;
-        --max-file-size=) printf '%s' '--max-file-size=1M' ;;
+        --max-file-size=) printf '%s' '--max-file-size=1M' ;;  --max-memory=) printf '%s' '--max-memory=8G' ;;
         --pack-budget-bytes=) printf '%s' '--pack-budget-bytes=1000' ;;
         --top-k=|--max-tokens=|--token-budget=) return 1 ;;   # the knobs themselves
         --mcp|--listen=|--help|--version) return 1 ;;         # servers and usage — named in the header
@@ -493,8 +504,8 @@ done < "$TMP/universe.tsv"
 [ "$nDeferred" -gt 0 ] && ok "(B) $nDeferred notice-only rows carry no hand-written probe and were asserted by (F) instead" || true
 
 # ── the harness must not mutate the tree ───────────────────────────────────────────────────────────────
-git status --porcelain 2>/dev/null | grep -vE '^\?\? (build|asan|tsan)' > "$TMP/status.after"
-STRAY="$( comm -13 "$TMP/status.before" "$TMP/status.after" 2>/dev/null | head -5 )"
+git status --porcelain 2>/dev/null | grep -vE '^\?\? (build|asan|tsan)' | LC_ALL=C sort > "$TMP/status.after"
+STRAY="$( LC_ALL=C comm -13 "$TMP/status.before" "$TMP/status.after" 2>/dev/null | head -5 )"
 [ -z "$STRAY" ] && ok "gate left the tree unmodified" \
                 || { no "gate MUTATED the tree:"; printf '%s\n' "$STRAY" | sed 's/^/        /'; }
 

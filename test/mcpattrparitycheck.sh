@@ -39,6 +39,7 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -54,18 +55,60 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 required"; exit 2; }
 # test/lib/strayfixture.sh's throwaway repo (branch `main` + a divergent `lane/probe`) exactly as
 # precedencecheck / substrfiltercheck / mcpclidiffcheck now do. Presence-guarded: no ref, no assertion.
 . "$ROOT/test/lib/strayfixture.sh"
-SFIX="$( mktemp -d )"; trap 'rm -rf "$SFIX"' EXIT
+SFIX="$( mktemp -d )"
+MFIX_CLEANUP=""
+trap 'rm -rf "$SFIX" $MFIX_CLEANUP' EXIT
 mkStrayFixture "$SFIX"
 strayFixtureHasRef "$SFIX" || {
     echo "  FAIL  fixture: no lane/* ref in the throwaway repo — the filter rows would refuse for the wrong reason"
     echo "1 CHECK(S) FAILED"; exit 1; }
 echo "  PASS  fixture: throwaway repo carries a lane/* ref for the kind=lane filter rows to select"
-echo "mcpattrparitycheck: BIN=$BIN  CORPUS=$ROOT  REFFIX=$SFIX"
 
-python3 - "$BIN" "$ROOT" "$SFIX" <<'PY'
-import json, re, subprocess, sys
+# A2 (found-items 2026-09-17): the CLI and MCP spellings of the "sidecar present but unreadable" baseline
+# marker diverged (git-HEAD (sidecar unreadable) vs git-HEAD (unreadable sidecar ignored)). Build a
+# throwaway repo with a pre-stamp v5 sidecar — qbaselineproducercheck.sh's own (F) technique, present on
+# disk but unrecognizable — so the VALUE probe below (attrparity above is deliberately name-only) can pin
+# both surfaces to the ONE documented spelling (verbs_quality.h's own legend).
+MFIX="$( mktemp -d )"; MFIX_CLEANUP="$MFIX"
+( cd "$MFIX" && git init -q . -b main >/dev/null 2>&1 \
+    && git config user.email fx@example.invalid && git config user.name fx \
+    && printf 'int f(){return 1;}\n' > a.cpp && git add -A && git commit -qm seed >/dev/null 2>&1 )
+"$BIN" "$MFIX" --quality-baseline >/dev/null 2>&1
+if [ -f "$MFIX/.ripwire_quality_baseline" ]; then
+    sed '1s/^# ripwire quality baseline v[0-9]* /# ripwire quality baseline v5 /' "$MFIX/.ripwire_quality_baseline" >"$MFIX/.rqb.new"
+    mv "$MFIX/.rqb.new" "$MFIX/.ripwire_quality_baseline"
+fi
+# The analyze twin arm needs a corpus BOTH windows show WHOLE: over the full repo each surface keeps its
+# own top-200 slice, so window drift (any commit that nudges one ranking) can drop the merged const/
+# non-const pair from one side alone — a false divergence with no contract changed. Ten rows, one
+# overloading pair, shown entirely by both dialects.
+AFX="$( mktemp -d )"; MFIX_CLEANUP="$MFIX_CLEANUP $AFX"   # #279 analyze-twin fixture; cleaned by the trap above
+cat > "$AFX/afx.hpp" <<'EOF'
+struct Box {
+    int* buf();
+    const int* buf() const;
+    int size();
+    void fill( int n );
+};
+inline int helper_add( int a, int b ) { return a + b; }
+inline int helper_sub( int a, int b ) { return a - b; }
+inline int helper_mul( int a, int b ) { return a * b; }
+EOF
+cat > "$AFX/afx.cpp" <<'EOF'
+#include "afx.hpp"
+int* Box::buf() { return nullptr; }
+const int* Box::buf() const { return nullptr; }
+int Box::size() { return 0; }
+void Box::fill( int ) {}
+int client() { Box b; b.fill( 1 ); return b.size() + helper_add( 1, 2 ); }
+EOF
+echo "mcpattrparitycheck: BIN=$BIN  CORPUS=$ROOT  REFFIX=$SFIX  MARKERFIX=$MFIX  ANFIX=$AFX"
 
-BIN, ROOT, SFIX = sys.argv[1], sys.argv[2], sys.argv[3]
+python3 - "$BIN" "$ROOT" "$SFIX" "$MFIX" "$AFX" <<'PY'
+import json, os, re, subprocess, sys
+
+BIN, ROOT, SFIX, MFIX, AFX = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+
 fails = 0
 def check( cond, msg ):
     global fails
@@ -74,6 +117,10 @@ def check( cond, msg ):
 
 # ── the three surfaces ────────────────────────────────────────────────────────────────────────────────
 def cliAt( corpus, args ):
+    # L1 (2026-09-19): the CLI default legend is compact; every twin here is the FULL posture (see M1 below), so the CLI
+    # operand asks for full too — unless the arm spells its own --legend=, or reads --json (no XML legend).
+    if not any( a.startswith( "--legend=" ) or a == "--json" for a in args ):
+        args = args + [ "--legend=full" ]
     return subprocess.run( [ BIN, corpus ] + args, capture_output = True, text = True ).stdout
 
 def cli( args ):
@@ -87,7 +134,9 @@ def cli( args ):
 # slice block below is the one that does, and it is where the flip itself is pinned CLI-to-MCP.
 LEGEND_FAMILY = { "analyze", "lego", "owners", "batch", "exemplar", "impact", "uses", "path_between",
                   "connect", "explore", "from_trace", "edit_check", "whereis", "stray_content", "flags",
-                  "doc_drift", "slice" }
+                  "doc_drift", "slice",
+                  # lane/t10-mcp-coverage: rank_by and affected both declare `legend` (mcprefusal.h)
+                  "rank_by", "affected" }
 
 def mcp( name, arguments, raw = False ):
     arguments = dict( arguments )
@@ -189,6 +238,25 @@ else:
     report( "quality_delta root", xmlRootAttrs( qdXml, "quality-delta" ) or set(),
             jsonTopKeys( qdMcp ), declaredLens( qdMcp ) )
 
+# A2 (found-items 2026-09-17): VALUE parity for the "sidecar present but unreadable" baseline marker.
+# attrparity above is deliberately NAME-only (a git stamp or a root path legitimately differs by value),
+# but this one string is a closed, documented vocabulary (verbs_quality.h's own legend) and CLI/MCP must
+# spell it identically — MFIX carries a pre-stamp v5 sidecar (present, unrecognizable) built above.
+markSide = os.path.join( MFIX, ".ripwire_quality_baseline" )
+if not os.path.isfile( markSide ):
+    check( False, "A2 fixture: no .ripwire_quality_baseline under MFIX — the marker-parity probe has nothing to corrupt" )
+else:
+    mkXml = cliAt( MFIX, [ "--quality-delta" ] )
+    mkMcp = mcp( "quality_delta", { "path": MFIX } )
+    mCli = re.search( r'\bbaseline="([^"]*)"', stripComments( mkXml ) )
+    try:    mMcpVal = json.loads( mkMcp ).get( "baseline" ) if not mkMcp.startswith( "__ERROR__" ) else None
+    except Exception: mMcpVal = None
+    check( bool( mCli ) and mCli.group( 1 ) == "git-HEAD (sidecar unreadable)",
+           "A2: CLI baseline= on a present-but-unreadable sidecar is \"git-HEAD (sidecar unreadable)\" (got %r)"
+           % ( mCli.group( 1 ) if mCli else None, ) )
+    check( mMcpVal == "git-HEAD (sidecar unreadable)",
+           "A2: MCP quality_delta baseline spells the same state identically to the CLI (got %r)" % ( mMcpVal, ) )
+
 # cochange — CLI XML root vs MCP JSON
 ccXml = cli( [ "--cochange=src/main.cpp" ] )
 ccMcp = mcp( "cochange", { "path": ROOT, "file": "src/main.cpp" } )
@@ -223,12 +291,81 @@ else:
 # analyze — the default CLI map's <s> rows vs MCP analyze's. This is the pair whose drop is DELIBERATE:
 # --stable omits the globally volatile k= so an unedited prefix stays byte-identical, and MCP serves the
 # stable order. The gate demands the declaration, not the attribute.
-mapXml = cli( [] )
-anMcp  = mcp( "analyze", { "path": ROOT } )
+#
+# The corpus is a FIXTURE, not $ROOT, on purpose: both surfaces serve a top-200 window, so comparing the
+# two windows over a 2,000-symbol tree grades which rows each window happened to keep, not whether the
+# dialects agree. An unrelated commit that shifts one ranking can drop the merged const/non-const pair
+# out of one window alone (the exact shape of the mcpattrparitycheck rc=1 that followed the --lsp hover
+# tiers — no contract changed, the window just moved). The fixture is ten rows: every surface shows the
+# whole corpus, so an attribute one dialect can carry and the other cannot is a real divergence again.
+mapXml = cliAt( AFX, [] )
+anMcp  = mcp( "analyze", { "path": AFX } )
 if anMcp.startswith( "__ERROR__" ):
     check( False, "analyze probe: " + anMcp[ :120 ] )
 else:
+    check( 'overloads="' in mapXml, "analyze fixture: the CLI map merges the const/non-const pair (the twin arm is not vacuous)" )
     report( "analyze rows", xmlRowAttrs( mapXml, "s" ), xmlRowAttrs( anMcp, "s" ), declaredLens( anMcp ) )
+
+# lane/t10-mcp-coverage: rank_by — the SAME <r> map shape as analyze (same serialize() call, same
+# statsFirstScreen=true MCP posture, same known divergence: the files=/symbols=/… stanza rides a LEADING
+# CLI comment and a TRAILING MCP one — see analyze's own comment above). The <s> row attribute SET is the
+# fact that must not move; the comment's POSITION is the declared, accepted difference.
+rbXml = cliAt( AFX, [ "--rank-by=authority" ] )
+rbMcp = mcp( "rank_by", { "path": AFX, "rank_by": "authority" } )
+if rbMcp.startswith( "__ERROR__" ):
+    check( False, "rank_by probe: " + rbMcp[ :120 ] )
+else:
+    check( 'rank_by="authority"' in rbXml, "rank_by fixture: the CLI map stamps rank_by=\"authority\" (the twin arm is not vacuous)" )
+    report( "rank_by rows", xmlRowAttrs( rbXml, "s" ), xmlRowAttrs( rbMcp, "s" ), declaredLens( rbMcp ) )
+    check( ( 'rank_by="authority"' in stripComments( rbMcp ) ), "rank_by root: MCP stamps the same rank_by=\"authority\" attribute the CLI does" )
+
+# lane/t10-mcp-coverage: affected — UNLIKE analyze/rank_by, this verb has NO posture difference at all
+# (testmap.h::writeAffectedReport is the literal same function both surfaces call), so the bar here is the
+# tighter one: byte-IDENTICAL once root= (which legitimately differs — "." on a relative CLI invocation vs
+# an absolute MCP `path`) is normalised away. Same technique the slice legend-posture block below uses.
+afXml = cliAt( ROOT, [ "--affected=src/graph.h" ] )
+afMcp = mcp( "affected", { "path": ROOT, "files": "src/graph.h" } )
+if afMcp.startswith( "__ERROR__" ):
+    check( False, "affected probe: " + afMcp[ :120 ] )
+else:
+    normAf = lambda t: re.sub( r' root="[^"]*"', ' root="R"', t ).strip()
+    check( normAf( afXml ) == normAf( afMcp ),
+           "affected: the MCP payload is byte-identical to the CLI's, modulo root= (%d vs %d B)"
+           % ( len( afXml ), len( afMcp ) ) )
+
+# ═══ REFUSAL parity: the new tools' bad-input messages name the same facts the CLI's do ═══════════════════
+print( "" )
+print( "=== REFUSAL: rank_by / affected refuse the CLI's own closed-set and two-reading facts ===" )
+# rank_by=churn / churn-decay are valid CLI values this tool REFUSES for now (no MainDispatch/Config over
+# MCP to mine git history through) — the refusal must NAME the value and the CLI escape hatch, never read
+# as an unknown-value typo (that message is a DIFFERENT sentence, asserted separately below).
+for mode in ( "churn", "churn-decay" ):
+    m = mcp( "rank_by", { "path": ROOT, "rank_by": mode } )
+    check( m.startswith( "__ERROR__" ) and mode in m and "CLI" in m,
+           "rank_by=%s: refused by name, pointing at the CLI (%s)" % ( mode, m[ :140 ] ) )
+badRb = mcp( "rank_by", { "path": ROOT, "rank_by": "nonsense" } )
+check( badRb.startswith( "__ERROR__" ) and "unknown value" in badRb and "nonsense" in badRb,
+       "rank_by=nonsense: refused as an unknown value, not silently read as pagerank (%s)" % badRb[ :140 ] )
+# TRAIN 10 (CodeRabbit 4056211646): ABSENT and PRESENT-BUT-EMPTY are two different requests. `rank_by:""` read
+# as "omitted" and answered pagerank at exit 0 (RED, measured: a 19,552 B map where a refusal belongs), while
+# the CLI's own `--rank-by=` refuses. Both halves are asserted, and the OMITTED case beside them — a fix that
+# took the default down with the empty value would pass a one-sided arm.
+emptyRb = mcp( "rank_by", { "path": ROOT, "rank_by": "" } )
+check( emptyRb.startswith( "__ERROR__" ) and "unknown value" in emptyRb,
+       "rank_by='' (present but empty): refused as an unknown value, not read as the omitted default (%s)" % emptyRb[ :140 ] )
+emptyCli = subprocess.run( [ BIN, ROOT, "--rank-by=" ], capture_output = True, text = True )
+check( emptyCli.returncode != 0 and "unknown value" in emptyCli.stderr,
+       "--rank-by= (CLI, empty value): refuses with the same reading its MCP twin now gives (%s)" % emptyCli.stderr.strip()[ :110 ] )
+check( mcp( "rank_by", { "path": ROOT } ) == mcp( "rank_by", { "path": ROOT, "rank_by": "pagerank" } ) != "__ERROR__",
+       "rank_by OMITTED still answers, byte-identically to rank_by='pagerank' — the empty-value refusal did not take the default with it" )
+# affected: an item matching neither an indexed path nor a symbol refuses with the same two-reading fact
+# the CLI's stderr states (verbs_change.h::runAffected) — echoed on both surfaces, never silently dropped.
+cliBad = subprocess.run( [ BIN, ROOT, "--affected=__definitely_not_indexed__" ], capture_output = True, text = True ).stderr
+mcpBad = mcp( "affected", { "path": ROOT, "files": "__definitely_not_indexed__" } )
+check( "matches no indexed file path" in cliBad and "__definitely_not_indexed__" in cliBad,
+       "affected (CLI): the bad-selector refusal names the fact and echoes the item (%s)" % ( "yes" if "matches no indexed file path" in cliBad else "NO" ) )
+check( mcpBad.startswith( "__ERROR__" ) and "matches no indexed file path" in mcpBad and "__definitely_not_indexed__" in mcpBad,
+       "affected (MCP): the same two-reading refusal, same echoed item (%s)" % mcpBad[ :160 ] )
 
 # ═══ CLI-vs-CLI dialects: the same property between a verb's own two spellings ══════════════════════════
 print( "" )

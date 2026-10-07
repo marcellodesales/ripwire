@@ -95,7 +95,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -279,7 +279,9 @@ int runDeepCase( void )
 }
 SRC
 
-panel(){ "$BIN" "$1" --quality-panel="$2" --limit=500 --no-cache 2>/dev/null; }
+# L1 (2026-09-19): the CLI default legend is compact and spells row shapes (<s p= n= fam= ...>) inside its comment; these arms
+# grep real <s> rows and read the FULL legend prose, so every panel asks for the full legend.
+panel(){ "$BIN" "$1" --quality-panel="$2" --limit=500 --no-cache --legend=full 2>/dev/null; }
 rootElem(){ grep -o '<quality_panel [^>]*>' "$1" | head -1; }
 rootAttr(){ rootElem "$1" | grep -o " $2=\"[^\"]*\"" | head -1 | sed "s/^ $2=\"//; s/\"$//"; }
 famSeq(){ grep -o '<s [^>]*>' "$1" | grep -o 'fam="[0-9]*"' | sed 's/[^0-9]//g'; }
@@ -324,7 +326,7 @@ case ",$strictEnabled," in
     *)              ok "(B) strict excludes historical" ;;
 esac
 case ",$strictEnabled," in
-    *,colocation,*) no "(B) strict COUNTS colocation. §9.9's ladder measured it at 0.732 mean consecutive / 0.222 endpoint Jaccard on the ctxpack ladder — WORSE than historical, and for the same mechanical reason: a fixed-size worst-40 cut over a ranking whose population moves. Assuming a new family inherited the others' stability instead of measuring it is exactly the error that finding exists to prevent." ;;
+    *,colocation,*) no "(B) strict COUNTS colocation. §9.9's ladder measured it at 0.732 mean consecutive / 0.222 endpoint Jaccard on the ripwire-ancestor ladder — WORSE than historical, and for the same mechanical reason: a fixed-size worst-40 cut over a ranking whose population moves. Assuming a new family inherited the others' stability instead of measuring it is exactly the error that finding exists to prevent." ;;
     *)              ok "(B) strict excludes colocation — the second exclusion, and it was found by running the ladder rather than assuming" ;;
 esac
 for p in default lenient; do
@@ -582,7 +584,8 @@ fi
 # Both legends carry the claim: the panel's own, and --ensemble's, which is where the four calibrated
 # families are described and where the same sentence used to stop at "git change frequency".
 legendOf(){ sed 's/-->/-->\n/g' "$1" | sed -n '1,/-->/p'; }   # the LEADING comment block only
-"$BIN" "$PANELC" --ensemble --no-cache >"$TMP/panelc.ensemble" 2>/dev/null
+# L1 (2026-09-19): (N2) reads the FULL --ensemble legend prose, so this run asks for the full legend.
+"$BIN" "$PANELC" --ensemble --no-cache --legend=full >"$TMP/panelc.ensemble" 2>/dev/null
 for pair in "quality-panel:$TMP/panelc.default" "ensemble:$TMP/panelc.ensemble"; do
     verb="${pair%%:*}"; doc="${pair#*:}"
     legendOf "$doc" >"$TMP/legend.$verb"

@@ -1,4 +1,7 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os::realpath — root identity
+
 
 // workspace.h — multi-root workspaces: N crawl roots → ONE merged symbol graph.
 //
@@ -47,7 +50,7 @@ namespace wsdetail
     inline std::string realOf( const std::string& p )
     {
         char buf[ PATH_MAX ];
-        return ::realpath( p.c_str(), buf ) ? std::string( buf ) : p;
+        return os::realpath( p.c_str(), buf ) ? std::string( buf ) : p;
     }
 
     // split a string on `delim` into its whole segments (no empties — a run of delimiters or a
@@ -56,22 +59,7 @@ namespace wsdetail
     // their own delimiter instead of hand-rolling the same loop (the shared primitive behind BOTH).
     inline std::vector<std::string_view> segmentsOf( std::string_view p, char delim = '/' )
     {
-        std::vector<std::string_view> segs;
-        std::size_t i = 0;
-        while( i < p.size() )
-        {
-            std::size_t j = p.find( delim, i );
-            if( j == std::string_view::npos )
-            {
-                j = p.size();
-            }
-            if( j > i )
-            {
-                segs.push_back( p.substr( i, j - i ) );
-            }
-            i = j + 1;
-        }
-        return segs;
+        return splitSegments( p, delim );   // arch.h — the shared primitive (resolve.h's workspace globs read it too)
     }
 
     // the k-segment suffix of `segs`, joined with '/'. k is clamped to segs.size().
@@ -116,7 +104,7 @@ inline bool buildWorkspaceRoots( const std::vector<std::string>& args, std::vect
         }
         if( dup )
         {
-            std::fprintf( stderr, "ripwire: duplicate root '%s' ignored (same directory already listed)\n", a.c_str() );
+            rw::emitTo( stderr, "ripwire: duplicate root '{}' ignored (same directory already listed)\n", a.c_str() );
             continue;
         }
         out.push_back( { a, real, std::string() } );
@@ -136,7 +124,7 @@ inline bool buildWorkspaceRoots( const std::vector<std::string>& args, std::vect
             if( inner.size() > outer.size() && inner.compare( 0, outer.size(), outer ) == 0
                 && inner[ outer.size() ] == '/' )
             {
-                std::fprintf( stderr, "ripwire: nested roots are not allowed: '%s' is inside '%s' — pass disjoint roots "
+                rw::emitTo( stderr, "ripwire: nested roots are not allowed: '{}' is inside '{}' — pass disjoint roots "
                                       "(to focus on a subtree, use --for / DIR-scoped verbs instead)\n",
                               out[j].arg.c_str(), out[i].arg.c_str() );
                 return false;
@@ -235,7 +223,16 @@ inline void mergeCrawlDisclosures( IngestResult& m, IngestResult& part, const Wo
     relabel( part.crawlSkips.unsupported, m.crawlSkips.unsupported );
     relabel( part.crawlSkips.ignored,        m.crawlSkips.ignored );          // §N6-C, per root, labeled like its siblings
     relabel( part.crawlSkips.ignoredDirRows, m.crawlSkips.ignoredDirRows );   // §N6-C
+    relabel( part.crawlSkips.nestRefused,    m.crawlSkips.nestRefused );      // the Kotlin nesting guard's refusals
+    relabel( part.crawlSkips.extractPartial, m.crawlSkips.extractPartial );   // files whose extraction came back partial
+    // §SEC1 — the crawl boundary is applied PER ROOT (a file is bounded by the root it was crawled under, not
+    // by the workspace's union), so its rows relabel and its count sums exactly like every sibling above. A
+    // link in root A pointing into root B is an escape from A; B's own copy is indexed under B, where it lives.
+    relabel( part.crawlSkips.escaped,        m.crawlSkips.escaped );
 
+    m.crawlSkips.escapedFiles     += part.crawlSkips.escapedFiles;
+    m.crawlSkips.nestRefusedFiles += part.crawlSkips.nestRefusedFiles;
+    m.crawlSkips.extractPartialFiles += part.crawlSkips.extractPartialFiles;
     m.crawlSkips.excludedFiles    += part.crawlSkips.excludedFiles;
     m.crawlSkips.unsupportedFiles += part.crawlSkips.unsupportedFiles;
     m.crawlSkips.excludedDirs     += part.crawlSkips.excludedDirs;
@@ -265,14 +262,46 @@ inline void mergeCrawlDisclosures( IngestResult& m, IngestResult& part, const Wo
     for( std::size_t i = 0; i < part.files.size(); ++i )
     {
         m.fileHealth.push_back( i < part.fileHealth.size() ? part.fileHealth[ i ] : FileHealth{} );
+        // #157: nestRefusedFile is EXACT and per-fileId like fileHealth, so it concatenates the same way —
+        // a part that never ran the parse pool contributes 0 ("not refused"), which is the honest reading
+        // for a root nothing measured, same as fileHealth's own default-row fallback above.
+        m.nestRefusedFile.push_back( i < part.nestRefusedFile.size() ? part.nestRefusedFile[ i ] : std::uint8_t( 0 ) );
     }
+}
+
+// #350: a memory-guard stop in ANY root makes the merged corpus partial. The first root to stop names the phase;
+// memory_parsed= counts the merged files that carry facts (a root whose parse finished contributes all of its own).
+inline MemoryStop mergeMemoryStops( const std::vector<IngestResult>& parts )
+{
+    MemoryStop merged;
+    bool       anyParseCut = false;
+    for( const IngestResult& p : parts )
+    {
+        anyParseCut = anyParseCut || p.memoryStop.parseCut;
+    }
+    for( const IngestResult& p : parts )
+    {
+        const MemoryStop& ps = p.memoryStop;
+        if( merged.phase == MemoryStop::Phase::None )
+        {
+            merged.phase = ps.phase;
+        }
+        merged.parseCut   = merged.parseCut || ps.parseCut;
+        merged.byPressure = merged.byPressure || ps.byPressure;
+        merged.limitBytes = std::max( merged.limitBytes, ps.limitBytes );
+        if( anyParseCut )
+        {
+            merged.parsedFiles += ps.parseCut ? ps.parsedFiles : static_cast<std::uint32_t>( p.files.size() );
+        }
+    }
+    return merged;
 }
 
 inline IngestResult mergeWorkspaceIngests( const std::vector<WorkspaceRoot>& roots,
                                            std::vector<IngestResult>&        parts )
 {
     IngestResult m;
-    VERIFY( roots.size() == parts.size() );
+    ASSUME( roots.size() == parts.size() );
     // §N6-C: seed the merged ignore mode from the FIRST part, not from IngestResult's own default. The
     // merge below keeps the WEAKEST mode across roots (mergeCrawlDisclosures), and a reduction seeded with
     // the "nothing was consulted" default would report exactly that for a workspace where every root's
@@ -293,6 +322,7 @@ inline IngestResult mergeWorkspaceIngests( const std::vector<WorkspaceRoot>& roo
                                               //   each root stat-gates against its own blob, so the sum is
                                               //   the honest "files re-extracted this pass" across roots.
     }
+    m.memoryStop = mergeMemoryStops( parts );   // #350
     m.files.reserve( totFiles );          m.realPaths.reserve( totFiles );   m.fileRoot.reserve( totFiles );
     m.symbols.reserve( totSyms );         m.references.reserve( totRefs );
     m.includes.reserve( totIncs );        m.bindings.reserve( totBinds );    m.bindingAliases.reserve( totFfis );
@@ -378,6 +408,11 @@ inline IngestResult mergeWorkspaceIngests( const std::vector<WorkspaceRoot>& roo
             s.id     += symOff;
             s.fileId += fileOff;
             m.symbols.push_back( std::move( s ) );
+        }
+        for( FnLocalScope f : p.fnLocalScopes )   // the function-local scope side table rides the same id offset
+        {
+            f.id += symOff;
+            m.fnLocalScopes.push_back( f );
         }
         const std::uint32_t fieldOff = std::uint32_t( m.fields.size() );   // member-variable round: the field side table merges alike
         for( Symbol& f : p.fields )

@@ -46,6 +46,9 @@
 #   (H) provenance   — a transitively-reached cell names the callee it came through (via=), a directly
 #                      touched one names its use site (at=); the two are never both present on one cell
 #   (I) honesty      — the root carries counts_floor="1" and the legend discloses the unsound cases
+#   (J) typing stubs — a `m.py` global restated in its `m.pyi` stub is ONE cell (it counted twice once langOfPath learned
+#                      `.pyi`); the same stub with no `m.py` beside it keeps its cell (a C extension's only declaration);
+#                      and the pair's row binds to m.py, not to the stub
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
@@ -56,7 +59,7 @@ FIXTURE="$TMP/fixture"
 MUTANT="$TMP/mutant"
 mkdir -p "$FIXTURE" "$MUTANT"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -248,7 +251,8 @@ PY
 [ $? -eq 0 ] || fail=1
 
 # ── (I cont.) the legend must NAME the unsound cases rather than let the reader assume soundness ───────
-legend="$( "$BIN" "$FIXTURE" --nonlocal-state --no-cache 2>/dev/null | head -c 4000 )"
+# L1 (2026-09-19): the CLI default legend is compact; (I) reads the FULL legend's prose, so it asks for it.
+legend="$( "$BIN" "$FIXTURE" --nonlocal-state --no-cache --legend=full 2>/dev/null | head -c 4000 )"
 missing=""
 for phrase in "indirect" "alias" "shadow"; do
     printf '%s' "$legend" | grep -qi -- "$phrase" || missing="$missing $phrase"
@@ -281,6 +285,32 @@ else
     no "(F) the flagless map is not additive-clean (differs across runs, or leaks direct_writes=)"
 fi
 
+# ── (J) a typing stub does not double-count its module's globals ───────────────────────────────────────
+STUBPAIR="$TMP/stubpair"; STUBONLY="$TMP/stubonly"
+mkdir -p "$STUBPAIR" "$STUBONLY"
+printf 'COUNT = 0\n\ndef bump():\n    global COUNT\n    COUNT = COUNT + 1\n\ndef peek():\n    return COUNT\n' > "$STUBPAIR/m.py"
+printf 'COUNT: int\n\ndef bump() -> None: ...\ndef peek() -> int: ...\n' > "$STUBPAIR/m.pyi"
+cp "$STUBPAIR/m.pyi" "$STUBONLY/m.pyi"
+pairOut="$( "$BIN" "$STUBPAIR" --nonlocal-state --no-cache 2>/dev/null )"
+onlyOut="$( "$BIN" "$STUBONLY" --nonlocal-state --no-cache 2>/dev/null )"
+pairCells="$( printf '%s' "$pairOut" | grep -o '<nonlocal_state [^>]*' | sed -n 's/.* cells="\([0-9]*\)".*/\1/p' )"
+onlyCells="$( printf '%s' "$onlyOut" | grep -o '<nonlocal_state [^>]*' | sed -n 's/.* cells="\([0-9]*\)".*/\1/p' )"
+if [ "$pairCells" = "1" ]; then
+    ok "(J) m.py + its m.pyi stub: COUNT is one cell (cells=\"1\")"
+else
+    no "(J) m.py + its m.pyi stub report cells=\"${pairCells:-unreadable}\" — the stub's restatement of COUNT is counted as a second cell"
+fi
+if [ "$onlyCells" = "1" ]; then
+    ok "(J) control: the same stub with no m.py beside it keeps its cell (cells=\"1\"), so the pair's 1 is a dedupe, not a stub blind spot"
+else
+    no "(J) control: a stub-only module reports cells=\"${onlyCells:-unreadable}\" — a stub with no source is the module's only declaration and must count"
+fi
+if printf '%s' "$pairOut" | grep -q '<cell n="COUNT" p="m.py:1"' && ! printf '%s' "$pairOut" | grep -q 'p="m.pyi'; then
+    ok "(J) the pair's cell rows bind to m.py:1 and never to the stub"
+else
+    no "(J) the pair's cell rows do not bind COUNT to m.py:1 alone: $( printf '%s' "$pairOut" | grep -o '<cell [^>]*' | head -3 | tr '\n' ' ' )"
+fi
+
 # ── well-formedness (G4): the report must pipe clean through an XML parser ────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
     if "$BIN" "$FIXTURE" --nonlocal-state --no-cache 2>/dev/null | xmllint --noout - 2>/dev/null; then
@@ -289,6 +319,28 @@ if command -v xmllint >/dev/null 2>&1; then
         no "(G4) the report does not parse as XML"
     fi
 fi
+
+# ── (K) cut-fix E: the 2048-cell ceiling is a COLLECTION cut (pageview.h rule 4) ─────────────────────────────
+# 2100 module globals written by one function: the cell universe saturates, so writes=/reads= are floors and rows
+# may exist that no page holds. RED on 9936ba4e: cells_capped="1" beside capped="0" (the complete-page reading).
+NL="$TMP/nlcap"; mkdir -p "$NL"
+python3 - "$NL" <<'PY'
+import os, sys
+n = 2100
+with open( os.path.join( sys.argv[1], "g.py" ), "w" ) as f:
+    f.write( "".join( "g%d = 0\n" % i for i in range( n ) ) )
+    f.write( "def setall():\n    global " + ", ".join( "g%d" % i for i in range( n ) ) + "\n" + "".join( "    g%d = %d\n" % ( i, i ) for i in range( n ) ) )
+PY
+NLR="$( cd "$NL" && "$BIN" . --nonlocal-state --no-cache 2>/dev/null | grep -o '<nonlocal_state [^>]*>' | head -1 )"
+case "$NLR" in
+    *'cells_capped="1"'*) ok "(K) presence guard: 2100 globals saturate the cell universe (cells_capped=\"1\")" ;;
+    *) no "(K) presence guard: the fixture did not saturate the cells: $NLR" ;;
+esac
+case "$NLR" in
+    *' capped="1"'*' counts_floor="1"'*) ok "(K) the collection cut forces capped=\"1\" and counts_floor=\"1\" on the root" ;;
+    *) no "(K) cells_capped=\"1\" rides a root that reads complete: $NLR" ;;
+esac
+if [ "$( printf '%s' "$NLR" | grep -o ' counts_floor="' | wc -l | tr -d ' ' )" = 1 ]; then ok "(K) counts_floor= appears once"; else no "(K) counts_floor= is repeated: $NLR"; fi
 
 [ "$fail" -eq 0 ] && echo "ALL PASS" || echo "nonlocalstatecheck: FAILURES ABOVE"
 exit "$fail"

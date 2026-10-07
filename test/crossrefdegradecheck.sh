@@ -41,7 +41,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -145,7 +145,9 @@ morecheck(){
     w add hits.c
     w commit -qm hits
 
-    "$BIN" "$W" --whereis=boundaryProbeSym >"$TMP/more.$hitcount.xml" 2>/dev/null
+    # L1 (2026-09-19): the CLI default legend is compact and spells `<hit ...>` inside its comment, which the tr split
+    # hands count_of as a row; these runs count real <hit> elements, so they ask for the full legend (rows identical).
+    "$BIN" "$W" --whereis=boundaryProbeSym --legend=full >"$TMP/more.$hitcount.xml" 2>/dev/null
     MX="$( cat "$TMP/more.$hitcount.xml" )"
     H="$( printf '%s' "$MX" | attr hits )"
     SHOWN="$( printf '%s' "$MX" | count_of hit )"
@@ -164,7 +166,7 @@ morecheck 61 "whereis <more> at the cap+1 boundary"
 morecheck 82 "whereis <more> in the general case"
 
 # --detail lifts the cap: every row present, and NO <more/> claiming a phantom drop
-"$BIN" "$TMP/w82" --whereis=boundaryProbeSym --detail=1 >"$TMP/more.detail.xml" 2>/dev/null
+"$BIN" "$TMP/w82" --whereis=boundaryProbeSym --detail=1 --legend=full >"$TMP/more.detail.xml" 2>/dev/null
 DX="$( cat "$TMP/more.detail.xml" )"
 D_SHOWN="$( printf '%s' "$DX" | count_of hit )"
 D_HITS="$(  printf '%s' "$DX" | attr hits )"
@@ -275,7 +277,7 @@ REFS_BEFORE="$( git -C "$C" for-each-ref --format='%(refname) %(objectname)' 2>/
 if command -v xmllint >/dev/null 2>&1; then
     g4=0
     for x in "$TMP"/*.xml; do xmllint --noout "$x" >/dev/null 2>&1 || { g4=1; echo "     bad: $x"; }; done
-    [ "$g4" = "0" ] && ok "G4: every emitted document is xmllint-clean" || no "G4: some emitted document is malformed"
+    if [ "$g4" = "0" ]; then ok "G4: every emitted document is xmllint-clean"; else no "G4: some emitted document is malformed"; fi
 fi
 
 [ "$fail" = "0" ] && echo "crossrefdegradecheck: ALL PASS" || echo "crossrefdegradecheck: FAILURES"

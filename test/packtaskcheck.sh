@@ -24,10 +24,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # make BIN absolute BEFORE we cd away
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -97,8 +98,21 @@ EOF
 runw(){ ( cd "$WORK" && "$BIN" . --no-cache "$@" 2>/dev/null ); }
 
 # discover the scoped canonical id EXACTLY as serialization spells it (id= is emitted only when scoped)
-PID="$( runw | grep -oE 'id="[^"]*BudgetPlanner::parseBudget"' | head -1 | sed -E 's/id="([^"]*)"/\1/' )"
-[ -n "$PID" ] && ok "discovered scoped canonical id: $PID" || no "could not discover BudgetPlanner::parseBudget id"
+# row 6 (2026-09-12): the <d> row prints the short id sc= beside its own p=; the canonical id composes as p::sc::n
+PID="$( runw | python3 -c '
+import re, sys
+doc, name, scope = sys.stdin.read(), sys.argv[1], ( sys.argv[2] if len( sys.argv ) > 2 else None )
+for f in re.finditer( r"<f p=\"([^\"]*)\"[^>]*>(.*?)</f>", doc, re.S ):
+    for row in re.finditer( r"<[sd]\b([^>]*)>", f.group( 2 ) ):
+        a = dict( re.findall( r"\s([\w:.-]+)=\"([^\"]*)\"", row.group( 1 ) ) )
+        if a.get( "n" ) == name and "sc" in a and ( scope is None or a[ "sc" ] == scope ):
+            print( f.group( 1 ) + "::" + a[ "sc" ] + "::" + a[ "n" ] ); sys.exit( 0 )
+for row in re.finditer( r"<d\b([^>]*)>", doc ):
+    a = dict( re.findall( r"\s([\w:.-]+)=\"([^\"]*)\"", row.group( 1 ) ) )
+    if a.get( "n" ) == name and "sc" in a and "p" in a and ( scope is None or a[ "sc" ] == scope ):
+        print( a[ "p" ] + "::" + a[ "sc" ] + "::" + a[ "n" ] ); sys.exit( 0 )
+' parseBudget BudgetPlanner )"
+if [ -n "$PID" ]; then ok "discovered scoped canonical id: $PID"; else no "could not discover BudgetPlanner::parseBudget id"; fi
 # D5: --note-add normalizes a target's path component to ROOT-RELATIVE on write (strips the crawl's leading
 # "./"), and --pack-task's notes section keys on that same normalized form — see notescheck.sh for the full
 # root-relative-notes gate.
@@ -108,11 +122,13 @@ runw --note-add="$PID: watch integer overflow when raw is INT_MAX" >/dev/null
 GIT_DATE="$( cd "$WORK" && git log -1 --format=%cs HEAD )"
 
 BUN="$TMP/bundle.xml"
-runw --pack-task="parse budget planner decoy" > "$BUN"
+# L1 (2026-09-19): the CLI default legend is compact — it spells <callers ...>/<sigs ...> inside its comment and omits the full
+# legend's per-section truncation prose; the bundle/tiny/lens arms read real sections and that prose, so they ask for the full legend.
+runw --pack-task="parse budget planner decoy" --legend=full > "$BUN"
 
 # section presence
 for tag in "<sigs" "<bodies " "<callers " "<notes " "<tests "; do
-    grep -qF -- "$tag" "$BUN" && ok "section present: ${tag}…" || no "section missing: ${tag}"
+    if grep -qF -- "$tag" "$BUN"; then ok "section present: ${tag}…"; else no "section missing: ${tag}"; fi
 done
 
 # section ORDER (fixed): ranking < bodies < callers < notes < tests, by first byte offset
@@ -175,7 +191,7 @@ grep -oE '<tests[^>]*>.*</tests>' "$BUN" | grep -qF 'test/test_budget.cpp' \
     && ok "section 5 (tests) surfaces the reaching test file" || no "tests section did not surface the reaching test"
 
 # xmllint on the fixture bundle
-xmllint --noout "$BUN" 2>/dev/null && ok "fixture bundle is xmllint-clean (G4)" || no "fixture bundle is not well-formed"
+if xmllint --noout "$BUN" 2>/dev/null; then ok "fixture bundle is xmllint-clean (G4)"; else no "fixture bundle is not well-formed"; fi
 
 # the header names every truncation (no silent caps): it must carry the per-section report line
 grep -q 'sections in FIXED order ranking > bodies > callers > notes > tests' "$BUN" \
@@ -186,7 +202,7 @@ grep -q 'sections in FIXED order ranking > bodies > callers > notes > tests' "$B
 D1="$( runw --pack-task="parse budget planner decoy" )"
 D2="$( runw --pack-task="parse budget planner decoy" )"
 D3="$( runw --pack-task="parse budget planner decoy" )"
-{ [ "$D1" = "$D2" ] && [ "$D2" = "$D3" ]; } && ok "bundle is deterministic (byte-identical ×3)" || no "bundle is non-deterministic"
+if { [ "$D1" = "$D2" ] && [ "$D2" = "$D3" ]; }; then ok "bundle is deterministic (byte-identical ×3)"; else no "bundle is non-deterministic"; fi
 
 # ── 3) TINY budget → ranking-only, <bodies> present with shown="0" (R9 fix, W3-S 2026-08-19) ───────────────
 # Before the fix, a budget too tight for the bodies section left bodiesStr empty and the WHOLE <bodies>
@@ -195,7 +211,7 @@ D3="$( runw --pack-task="parse budget planner decoy" )"
 # still degrade to fully absent (that is THEIR own, separately-scoped defect — not this item), so this arm
 # only tightens the <bodies> assertion, from "absent" to "present with shown=0/capped=1/the true total".
 TINY="$TMP/tiny.xml"
-"$BIN" "$ROOT/src" --no-cache --pack-task="serialize signatures budget" --token-budget=50 > "$TINY" 2>/dev/null
+"$BIN" "$ROOT/src" --no-cache --pack-task="serialize signatures budget" --token-budget=50 --legend=full > "$TINY" 2>/dev/null
 if grep -qF '<sigs' "$TINY" \
    && grep -qE '<bodies shown="0" total="[1-9][0-9]*" capped="1"></bodies>' "$TINY" \
    && ! grep -qF '<callers ' "$TINY" && ! grep -qF '<tests ' "$TINY" \
@@ -205,7 +221,7 @@ else
     no "tiny-budget degradation wrong (expected <sigs> + <bodies shown=\"0\" total=\"N\" capped=\"1\">)"
     head -c 400 "$TINY"; echo
 fi
-xmllint --noout "$TINY" 2>/dev/null && ok "tiny-budget bundle is xmllint-clean" || no "tiny-budget bundle is not well-formed"
+if xmllint --noout "$TINY" 2>/dev/null; then ok "tiny-budget bundle is xmllint-clean"; else no "tiny-budget bundle is not well-formed"; fi
 
 # ── 4) budget ceiling respected across several --token-budget values (real src/ tree, exercises trimming) ──
 # runRel (not "$ROOT/src"): see the W3-S item-6 note by ceiling_bytes()'s definition above.
@@ -224,8 +240,8 @@ done
 DEF="$TMP/def.xml"
 runRel --no-cache --pack-task="serialize signatures budget payload trim" > "$DEF" 2>/dev/null
 defbytes="$( wc -c < "$DEF" | tr -d ' ' )"; defceil="$( ceiling_bytes 6000 )"
-{ [ "$defbytes" -le "$defceil" ]; } && ok "default 6K-token budget within ceiling ($defbytes <= $defceil)" || no "default budget exceeded ceiling ($defbytes > $defceil)"
-xmllint --noout "$DEF" 2>/dev/null && ok "default bundle is xmllint-clean" || no "default bundle is not well-formed"
+if { [ "$defbytes" -le "$defceil" ]; }; then ok "default 6K-token budget within ceiling ($defbytes <= $defceil)"; else no "default budget exceeded ceiling ($defbytes > $defceil)"; fi
+if xmllint --noout "$DEF" 2>/dev/null; then ok "default bundle is xmllint-clean"; else no "default bundle is not well-formed"; fi
 
 # ── 5) --for is UNPERTURBED: pack-task's ranking is the SAME ranking --for emits (shared computeLensRanking) ─
 #
@@ -233,7 +249,7 @@ xmllint --noout "$DEF" 2>/dev/null && ok "default bundle is xmllint-clean" || no
 # grep with `2>/dev/null`, so it kept ONE bit — the extracted path — and threw away the exit code, stderr,
 # and the emitted bytes. CI reported exactly `for= pack=…/src/serialize.h` and nothing else, which is the
 # SAME observation for at least four different causes:
-#   (a) --for aborted (a sanitizer report / a VERIFY panic) and wrote nothing — rc and stderr both discarded;
+#   (a) --for aborted (a sanitizer report / an ASSUME panic) and wrote nothing — rc and stderr both discarded;
 #   (b) --for emitted an EMPTY payload, `<sigs capped="1"></sigs>` (serialize.h's ladder drops every <f>
 #       once sigsBudget clamps toward 1), which is a real product defect and a real thing to see;
 #   (c) the <sigs>/<f> shape changed and only the EXTRACTOR broke — a gate bug, not a product bug;
@@ -257,7 +273,7 @@ lens_evidence(){                               # the four-way discriminator, pri
     return 0
 }
 FOR_RC="$(  run_lens forlens  --for="$Q" )"
-PACK_RC="$( run_lens packlens --pack-task="$Q" )"
+PACK_RC="$( run_lens packlens --pack-task="$Q" --legend=full )"
 FOR_TOPF="$(  top_file "$TMP/forlens.xml" )"
 PACK_TOPF="$( top_file "$TMP/packlens.xml" )"
 if [ "$FOR_RC" -ne 0 ] || [ "$PACK_RC" -ne 0 ]; then
@@ -296,8 +312,8 @@ b1bytes="$( wc -c < "$B1" | tr -d ' ' )"; b2bytes="$( wc -c < "$B2" | tr -d ' ' 
 { [ "$b1bytes" -le "$b2bytes" ]; } \
     && ok "F4: --token-budget=1 ($b1bytes B) <= --token-budget=2 ($b2bytes B) — no 0-floor inversion" \
     || no "F4 REGRESSION: --token-budget=1 ($b1bytes B) > --token-budget=2 ($b2bytes B) — the 0-floor inversion is back"
-xmllint --noout "$B1" 2>/dev/null && ok "F4: --token-budget=1 bundle is xmllint-clean" || no "F4: --token-budget=1 bundle is not well-formed"
-xmllint --noout "$B2" 2>/dev/null && ok "F4: --token-budget=2 bundle is xmllint-clean" || no "F4: --token-budget=2 bundle is not well-formed"
+if xmllint --noout "$B1" 2>/dev/null; then ok "F4: --token-budget=1 bundle is xmllint-clean"; else no "F4: --token-budget=1 bundle is not well-formed"; fi
+if xmllint --noout "$B2" 2>/dev/null; then ok "F4: --token-budget=2 bundle is xmllint-clean"; else no "F4: --token-budget=2 bundle is not well-formed"; fi
 
 # ── 8) F5 — --token-budget beyond INT_MAX must not go negative / crash (UBSan aborts on the size_t->int
 #    narrowing this used to do; release wrapped negative and read as effectively unlimited). Sanity-only: the
@@ -311,7 +327,44 @@ HUGE_RC=$?
 grep -qE 'budget="-|target, ceiling -' "$HUGE" \
     && no "F5 REGRESSION: header carries a negative budget/ceiling value" \
     || ok "F5: header carries no negative budget/ceiling value"
-xmllint --noout "$HUGE" 2>/dev/null && ok "F5: --token-budget=3000000000 bundle is xmllint-clean" || no "F5: --token-budget=3000000000 bundle is not well-formed"
+if xmllint --noout "$HUGE" 2>/dev/null; then ok "F5: --token-budget=3000000000 bundle is xmllint-clean"; else no "F5: --token-budget=3000000000 bundle is not well-formed"; fi
+
+# ── RENDER: a section whose render FAILS is marked, named on the root, and never breaks the JSON ─────────────
+# packTaskRenderToString kept only Rendered::text, so a failed ranking/bodies render was an empty string: the XML
+# lost the section with a ledger saying "ranking: full", and the JSON wrote `"ranking":` with no value — not JSON
+# (CodeRabbit on #295). INFRA_FAULT_RENDER_EMIT_THROW=1 (infra/emit.h) makes every renderToString fail; it is
+# compiled out under NDEBUG together with the DISCLOSE trace, so the trace on stderr is the proof the switch is live.
+RFX="$TMP/renderfix"; mkdir -p "$RFX"
+printf 'int helper( int x )\n{\n    return x * 2;\n}\nint compute( int y )\n{\n    return helper( y ) + 1;\n}\n' > "$RFX/a.cpp"
+"$BIN" "$RFX" --pack-task="compute helper" --no-cache >"$TMP/rf_ok.xml" 2>/dev/null; rcOK=$?
+INFRA_FAULT_RENDER_EMIT_THROW=1 "$BIN" "$RFX" --pack-task="compute helper" --no-cache >"$TMP/rf.xml" 2>"$TMP/rf.err"; rcX=$?
+INFRA_FAULT_RENDER_EMIT_THROW=1 "$BIN" "$RFX" --pack-task="compute helper" --json --no-cache >"$TMP/rf.json" 2>/dev/null; rcJ=$?
+if [ "$rcOK" = 0 ] && grep -q '<sigs' "$TMP/rf_ok.xml" && ! grep -q 'render_failed' "$TMP/rf_ok.xml"; then
+    ok "RENDER control: an unfaulted bundle has its sections and no render_failed="
+else
+    no "RENDER control: the unfaulted bundle is not clean (exit $rcOK)"
+fi
+if grep -q 'emitter THREW' "$TMP/rf.err"; then
+    RFROOT="$( grep -o '<ctx [^>]*>' "$TMP/rf.xml" | head -1 )"
+    { [ "$rcX" = 0 ] && printf '%s' "$RFROOT" | grep -q 'render_failed="ranking,bodies' ; } \
+        && ok "RENDER: the root names the sections whose render failed ($( printf '%s' "$RFROOT" | grep -o 'render_failed="[^"]*"' ))" \
+        || no "RENDER: a failed section render left no render_failed= on the root (exit $rcX): $RFROOT"
+    grep -q '<sigs render_failed="1">' "$TMP/rf.xml" && grep -q '<bodies [^>]*render_failed="1"' "$TMP/rf.xml" \
+        && ok "RENDER: the ranking and bodies sections are present and marked render_failed=\"1\"" \
+        || no "RENDER: a failed section is absent or unmarked: $( grep -o '<sigs[^>]*>\|<bodies[^>]*>' "$TMP/rf.xml" | tr '\n' ' ' )"
+    if xmllint --noout "$TMP/rf.xml" 2>/dev/null; then
+        ok "RENDER: the faulted bundle is well-formed XML"
+    else
+        no "RENDER: the faulted bundle fails xmllint"
+    fi
+    if [ "$rcJ" = 0 ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("ranking",1) is None and d.get("bodies",1) is None and "ranking" in d.get("render_failed","") else 1)' "$TMP/rf.json" 2>/dev/null; then
+        ok "RENDER: --json stays valid JSON: ranking/bodies null, render_failed names them"
+    else
+        no "RENDER: --json under a failed render is not valid JSON or does not say so (exit $rcJ): $( head -c 300 "$TMP/rf.json" )"
+    fi
+else
+    printf '  INFO  RENDER: this binary compiles fault switches out (NDEBUG); the failed-render arm is proved on the plain-flavour leg\n'
+fi
 
 echo
 [ "$fail" = 0 ] && echo "ALL PASS" || { echo "SOME CHECKS FAILED"; exit 1; }

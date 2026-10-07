@@ -35,7 +35,7 @@ ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -50,9 +50,12 @@ NAME="pageRankDouble"                                          # name-exact: a s
 rw(){ "$BIN" src --no-cache "$@" 2>/dev/null; }
 bodycount(){ grep -o '<b t=' "$1" | wc -l | tr -d ' '; }
 
+# L1 (2026-09-19): the CLI default legend is compact; arm (3) reads the FULL legend's prose (concfull), and arm (6) greps
+# sigonly for bundle= which the compact legend spells inside its comment — both ask for the full legend.
 rw --for="$CONC"                  >"$TMP/conc"
+rw --for="$CONC" --legend=full    >"$TMP/concfull"
 rw --for="$CONC" --auto-bodies    >"$TMP/optout"
-rw --for="$CONC" --signatures-only >"$TMP/sigonly"
+rw --for="$CONC" --signatures-only --legend=full >"$TMP/sigonly"
 rw --for="$CONC" --no-route       >"$TMP/noroute"
 rw --for="$NAME"                  >"$TMP/name"
 
@@ -95,7 +98,7 @@ grep -q '<h [^>]*><calls total="[0-9]*"[^>]*><c n=' "$TMP/conc" \
 LEGEND="$( python3 -c 'import sys
 s=open(sys.argv[1],encoding="utf-8",errors="replace").read()
 a=s.find("<!--"); b=s.find("-->",a)
-sys.stdout.write(s[a+4:b] if a>=0 and b>=0 else "")' "$TMP/conc" )"
+sys.stdout.write(s[a+4:b] if a>=0 and b>=0 else "")' "$TMP/concfull" )"
 for A in 'bundle=' 'bodies=' 'reason=' 'hops' 'calls'; do
     case "$LEGEND" in
         *"$A"*) ok "(3) the legend defines/names '$A'" ;;

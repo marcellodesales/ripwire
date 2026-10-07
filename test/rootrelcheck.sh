@@ -51,7 +51,7 @@ CLEAN=""
 trap 'rm -rf "$TMP" ${CLEAN:+"$CLEAN"}' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -224,7 +224,7 @@ declare -a VERBS=(
     "comment-coherence|--comment-coherence"
     "nonlocal-state|--nonlocal-state"
     "naming-consistency|--naming-consistency"
-    "readability|--readability"
+    "biggest-first|--biggest-first"
     "dead-code|--dead-code"
     "field-affinity|--field-affinity"
     "deps|--deps"

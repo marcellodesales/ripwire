@@ -33,11 +33,12 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -210,8 +211,34 @@ grep -q rwGateVendorSymbol "$TMP/rooted" && ok "a root that is itself ignored is
     && ok '--skipped says ignore_mode="off" under --no-ignore' \
     || no '--no-ignore does not disclose ignore_mode="off"'
 
-# ── 12. the flag is in --help (the deckcheck allowlist row for --no-ignore retires with it).
-"$BIN" --help 2>&1 | grep -q -- '--no-ignore' && ok "--no-ignore is documented in --help" \
+# ── 12. CodeRabbit thread (src/ingest_crawl.h:1365): the gitignore probe's `git ls-files … -z` running
+#    but EXITING NON-ZERO (as opposed to git being altogether unrunnable, arm 12/§4 above, or a non-git
+#    root) used to return silently with no DISCLOSE at all — `available` was already false by default, so
+#    the fallback (a full walk, ignore_mode="unavailable") was always safe, but the degrade carried no
+#    record for the self-check ledger. A PATH shim makes `git ls-files … --ignored …` fail inside an
+#    otherwise-real git work tree (every OTHER git subcommand passes through), proving the crawl still
+#    falls back cleanly (same ignore_mode="unavailable" as arms 12/§4) rather than crashing or hanging on
+#    a probe that ran and refused.
+REALGIT="$( command -v git )"; SHIM="$TMP/gitshim"; mkdir -p "$SHIM"
+cat >"$SHIM/git" <<SHEOF
+#!/usr/bin/env bash
+case " \$* " in *" ls-files "*"--ignored"*) exit 1 ;; esac
+exec "$REALGIT" "\$@"
+SHEOF
+chmod +x "$SHIM/git"
+PATH="$SHIM:$PATH" "$BIN" "$TMP/repo" --skipped --no-cache >"$TMP/probefail.out" 2>"$TMP/probefail.err"; probefailRc=$?
+if [ "$probefailRc" -eq 0 ] && grep -q 'ignore_mode="unavailable"' "$TMP/probefail.out"; then
+    ok "gitignore probe: a git that runs but EXITS NON-ZERO still falls back cleanly (ignore_mode=\"unavailable\", exit 0)"
+else
+    no "gitignore probe: a failing (not missing) git broke the fallback (rc=$probefailRc): $( cat "$TMP/probefail.err" )"
+fi
+PATH="$SHIM:$PATH" "$BIN" "$TMP/repo" --top-k=400 --no-cache >"$TMP/probefail.map" 2>/dev/null
+grep -q "rwGateMainSymbol" "$TMP/probefail.map" \
+    && ok "gitignore probe failure still maps the tree in full (the safe fallback, not an empty map)" \
+    || no "gitignore probe failure produced an empty/short map instead of falling back to a full walk"
+
+# ── 13. the flag is in --help (the deckcheck allowlist row for --no-ignore retires with it).
+"$BIN" --help=all 2>&1 | grep -q -- '--no-ignore' && ok "--no-ignore is documented in --help" \
     || no "--no-ignore is missing from --help"
 
 [ "$fail" -eq 0 ] && { echo "gitignorecheck: PASS"; exit 0; }

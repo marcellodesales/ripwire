@@ -1,4 +1,8 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os — the edit lockfile (open/flock/close), the atomic write (open/write/fchmod/fsync/rename/unlink), realpath/getcwd
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
 
 // mcpedit.h — the shared symbol-addressed EDIT engine for CLI and MCP: replace_symbol_body /
 // insert_before_symbol / insert_after_symbol. The mcpedit namespace (resolve → per-file advisory
@@ -9,13 +13,15 @@
 
 #include "mcpindex.h"
 #include "editcheck.h"        // P9: the SAME four computations --edit-check renders as XML — folded into the receipt as JSON
-#include "testmap.h"          // P9: testsReachingFile + runFieldJsonDisclosed — the SAME rows --affected=FILE emits
+#include "testmap.h"          // P9: affectedAnswerForFile + testRowEvidence + runFieldJsonDisclosed — the SAME rows --affected=FILE emits
 #include "didyoumean.h"       // M9: boundedEditDistance / nearestIndexedFileClause — ONE near-miss policy for read and edit
 #include "selectorrefuse.h"   // atSeedFaultClause + indexHasFileMatching — the @FILE:LINE at-diagnosis, ONE set of fault sentences on every surface
 #include "infra/hashutil.h"   // sanitizer-clean modulo-2^64 FNV multiplication
 #include "infra/gitblob.h"    // E2: the receipt's blob_sha — the git id of the bytes it wrote
 #include "nextverb.h"         // E2: ONE next= on the receipt (nextFlag / nextFieldJson)
 #include "redact.h"           // R1 (V3): kRedactRules — the marker table the write gate's predicate is derived FROM
+#include "pathguard.h"        // A4-F14: rw::pathguard::isSymlink — THE symlink predicate, shared with the sidecar writers
+#include "memguard.h"         // #350: an edit refuses an index the memory guard cut (verbRefusalLine)
 
 #include <climits>            // PATH_MAX — the AbsHintFrame realpath/getcwd buffers (A2)
 
@@ -35,7 +41,7 @@ namespace rw
 //   • the file can't be re-read → refuse
 namespace mcpedit
 {
-    enum class Op { ReplaceBody, InsertBefore, InsertAfter };
+    enum class Op : std::uint8_t { ReplaceBody, InsertBefore, InsertAfter };
 
     // A1: the ONE wording for the binary-payload refusal, shared by the CLI arm (which names the flag),
     // the engine arm (which also covers MCP) and the edit-plan arm — three call sites, one sentence, so a
@@ -267,8 +273,8 @@ namespace mcpedit
                 return;
             }
             char buf[ PATH_MAX ];
-            hint = ::realpath( pathHint.c_str(), buf ) != nullptr ? std::string( buf ) : pathHint;
-            cwd  = ::getcwd( buf, sizeof( buf ) ) != nullptr ? std::string( buf ) : std::string();
+            hint = os::realpath( pathHint.c_str(), buf ) != nullptr ? std::string( buf ) : pathHint;
+            cwd  = os::getcwd( buf, sizeof( buf ) ) != nullptr ? std::string( buf ) : std::string();
         }
 
         bool matches( const IngestResult& ing, std::uint32_t fileId ) const
@@ -289,7 +295,7 @@ namespace mcpedit
     inline bool editHintMatches( const IngestResult& ing, std::uint32_t fileId,
                                  const std::string& pathHint, const AbsHintFrame& frame )
     {
-        return filePathContains( ing.files[ fileId ], pathHint ) || frame.matches( ing, fileId );
+        return filePathContainsRootRel( ing, fileId, pathHint ) || frame.matches( ing, fileId );
     }
 
     // A1 (secondary): "symbol 'X' not found under path 'F'" is a TRUE statement with a misleading cause when
@@ -628,10 +634,10 @@ namespace mcpedit
         std::uint64_t h = 1469598103934665603ULL;      // FNV-1a-64 of the target path → a stable per-file lock name
         for( char c : targetPath ) { h ^= static_cast<unsigned char>( c ); h = hashutil::fnv1aMultiply( h ); }
         char name[ 64 ];
-        std::snprintf( name, sizeof( name ), "ripwire-edit-%016llx.lock", (unsigned long long)h );
+        rw::formatTo( name, sizeof( name ), "ripwire-edit-{:016x}.lock", (unsigned long long)h );
         const std::string lockDir = quality::cacheDirLadder() + "/locks";
-        ::mkdir( lockDir.c_str(), 0700 );
-        ::chmod( lockDir.c_str(), 0700 );
+        os::mkdir( lockDir.c_str(), 0700 );
+        os::chmod( lockDir.c_str(), 0700 );
         return quality::resolveCacheBlobPath( lockDir, name );
     }
 
@@ -643,34 +649,50 @@ namespace mcpedit
     // HONEST LIMIT: this is ADVISORY — a non-cooperating external writer (an editor/formatter that doesn't take
     // this lock) is not serialized by it; that residual is handled by the re-check-before-rename in runEditVerb,
     // which shrinks (but cannot fully close) the external-writer window. Never blocks forever: LOCK_NB with a
-    // short bounded retry, then degrade to lock-free (the re-check still guards correctness). RAII: the fd is
+    // short bounded retry. CONTENDED past it (a live cooperating writer holds the lock) refuses the edit —
+    // proceeding would let that writer commit after this edit's rename and silently undo an edit reported as
+    // applied. A lockfile that cannot be opened, or a filesystem without flock, proves no live holder, and a
+    // refusal there would block every edit without serializing anything, so that degrade stays lock-free. RAII: the fd is
     // closed (releasing the flock) at scope exit, deterministically.
     struct EditLock
     {
-        int  fd     = -1;
-        bool locked = false;
+        int  fd        = -1;
+        bool locked    = false;
+        bool contended = false;   // every bounded attempt saw EWOULDBLOCK — another holder is live
 
         explicit EditLock( const std::string& targetPath )
         {
             const std::string lockPath = editLockPath( targetPath );
-            fd = ::open( lockPath.c_str(), O_RDWR | O_CREAT, 0644 );
-            if( fd < 0 ) { DEGRADED_PATH_ALERT( "edit lockfile open failed; proceeding lock-free (re-check still guards)" ); return; }
+            fd = os::open( lockPath.c_str(), O_RDWR | O_CREAT, 0644 );
+            if( fd < 0 )
+            {
+                DISCLOSE( Diagnostics::answerUnchanged, "the edit re-checks the file before its rename, which still refuses a stale write",
+                          "edit lockfile open failed; proceeding lock-free (re-check still guards)" );
+                return;
+            }
 
-            // ~200 ms bounded acquire: 20 tries × 10 ms. If a peer holds it longer, degrade rather than hang —
-            // the freshness re-check before rename is the correctness floor, the lock is only the fast path.
+            // ~200 ms bounded acquire: 20 tries × 10 ms. If a peer holds it longer, refuse rather than hang or
+            // proceed lock-free — the latter can lose a cooperating writer's committed update.
             for( int attempt = 0; attempt < 20; ++attempt )
             {
-                if( ::flock( fd, LOCK_EX | LOCK_NB ) == 0 ) { locked = true; break; }
+                if( os::flock( fd, LOCK_EX | LOCK_NB ) == 0 ) { locked = true; break; }
                 if( errno != EWOULDBLOCK )
                 {
                     break;
                 }
+                contended = attempt == 19;
                 struct timespec ts{ 0, 10 * 1000 * 1000 };   // 10 ms
-                ::nanosleep( &ts, nullptr );
+                os::nanosleep( &ts, nullptr );
             }
-            if( !locked )
+            // `contended` is disclosed to the caller in full via runEditVerb's -32603 message below — a real
+            // refusal, not a degrade, so it needs no debug-trace-only DISCLOSE of its own here (Diagnostics.h
+            // §4b: the one-argument form tells the release user nothing; the refusal already tells them
+            // everything). Only the still-degrading case keeps a DISCLOSE — the answerUnchanged form, since the
+            // re-check before the rename is what still guards the answer.
+            if( !contended && !locked )
             {
-                DEGRADED_PATH_ALERT( "edit lock contended past timeout; proceeding lock-free (re-check still guards)" );
+                DISCLOSE( Diagnostics::answerUnchanged, "the edit re-checks the file before its rename, which still refuses a stale write",
+                          "edit lock unsupported on this filesystem; proceeding lock-free (re-check still guards)" );
             }
         }
 
@@ -680,9 +702,9 @@ namespace mcpedit
             {
                 if( locked )
                 {
-                    ::flock( fd, LOCK_UN );
+                    os::flock( fd, LOCK_UN );
                 }
-                ::close( fd );
+                os::close( fd );
             }
         }
 
@@ -706,49 +728,44 @@ namespace mcpedit
     inline bool atomicWrite( const std::string& path, const std::string& bytes )
     {
         // capture the original's mode (if it exists) so we can restore it onto the fresh temp inode.
-        struct stat orig{};
-        const bool  haveOrig = ( ::stat( path.c_str(), &orig ) == 0 );
+        os::stat_t orig{};
+        const bool  haveOrig = ( os::stat( path.c_str(), &orig ) == 0 );
 
-        const std::string tmp = path + "." + std::to_string( ::getpid() ) + ".tmp";
-        const int fd = ::open( tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644 );
-        if( fd < 0 )
+        // The temp is created EXCLUSIVELY, without following a link, under an unpredictable name beside the
+        // target (rw::pathguard round 5): the create refuses an existing entry at the temp name, so this
+        // publish's write and fchmod land only on a file it just created. The RAII holder owns the temp — its
+        // destructor removes it on any early return below, so there is no manual unlink to forget — and
+        // commit() renames it into place. Same tmp+rename atomicity as before.
+        rw::pathguard::ExclTempFile temp = rw::pathguard::createExclTempFile( path + ".", ".tmp", 0644 );
+        if( !temp.ok() )
         {
             return false;
         }
+        const int fd = temp.fd();
 
-        // write the full buffer (a short write is a failure); a partial-write loop handles a signal-truncated write.
-        bool        wErr = false;
-        std::size_t off  = 0;
-        while( off < bytes.size() )
+        // write the full buffer (a short write is a failure); the shared loop handles a signal-truncated write.
+        if( !temp.write( bytes ) )
         {
-            const ssize_t n = ::write( fd, bytes.data() + off, bytes.size() - off );
-            if( n <= 0 ) { wErr = true; break; }
-            off += (std::size_t)n;
+            return false;   // temp removed by the holder's destructor
         }
 
         // A3-F7: restore the original mode bits onto the temp before the rename (preserve +x etc.). A new file
         // (no original) keeps the umask default. fchmod failure is non-fatal — degrade to the default mode.
-        if( !wErr && haveOrig )
+        if( haveOrig )
         {
-            if( ::fchmod( fd, orig.st_mode & 07777 ) != 0 )
+            if( os::fchmod( fd, orig.st_mode & 07777 ) != 0 )
             {
-                DEGRADED_PATH_ALERT( "atomicWrite: could not restore original file mode; wrote with default mode" );
+                DISCLOSE( "atomicWrite: could not restore original file mode; wrote with default mode" );
             }
         }
 
         // A3-F7: fsync the data to disk BEFORE the atomic rename so a crash can't leave a renamed-but-empty file.
-        if( !wErr && ::fsync( fd ) != 0 )
+        if( os::fsync( fd ) != 0 )
         {
-            DEGRADED_PATH_ALERT( "atomicWrite: fsync failed; proceeding (bytes may not be durable across a crash)" );
+            DISCLOSE( "atomicWrite: fsync failed; proceeding (bytes may not be durable across a crash)" );
         }
 
-        if( ::close( fd ) != 0 )
-        {
-            wErr = true;
-        }
-        if( wErr ) { ::unlink( tmp.c_str() ); return false; }
-        if( std::rename( tmp.c_str(), path.c_str() ) != 0 ) { ::unlink( tmp.c_str() ); return false; }
-        return true;
+        return temp.commit( path );   // closes the fd and renames; the destructor removes the temp on failure
     }
 
     struct EditTarget
@@ -855,7 +872,7 @@ namespace mcpedit
     //
     // Both halves are the STANDALONE verbs' own computations, called directly rather than re-derived:
     // editcheck.h's editCheckOverloadSet / editCheckContractVsHead / editCheckCallers / editCheckVerdict /
-    // editCheckCallSites are exactly what editCheckBundleText renders as XML, and testsReachingFile is what
+    // editCheckCallSites are exactly what editCheckBundleText renders as XML, and affectedAnswerForFile is what
     // runAffected walks. That is what lets test/receiptpostcheck.sh assert the receipt EQUALS a separate
     // --edit-check and a separate --affected: not a promise, a shared call.
 
@@ -965,7 +982,8 @@ namespace mcpedit
     {
         const std::vector<NodeId> overloadNodes = editCheckOverloadSet( ing, g, focus );
         const EditCheckContract   contract      = editCheckContractVsHead( ing, g, root, kDefaultMaxFileBytes, {}, focus, overloadNodes );
-        const auto [ callerIds, callerIncompatible ] = editCheckCallers( ing, g, overloadNodes, ing.symbols[ focus ].name );
+        EditCheckCalleeTest       callee( ing, ing.symbols[ focus ], overloadNodes );
+        const auto [ callerIds, callerIncompatible ] = editCheckCallers( ing, g, overloadNodes, callee );
         std::size_t incompatibleCount = 0;
         for( NodeId c : callerIds )
         {
@@ -973,7 +991,7 @@ namespace mcpedit
         }
         const EditCheckVerdict verdict = editCheckVerdict( contract, incompatibleCount );
         const std::vector<std::pair<NodeId, std::uint32_t>> callSites =
-            incompatibleCount > 0 ? editCheckCallSites( ing, ing.symbols[ focus ].name, callerIncompatible )
+            incompatibleCount > 0 ? editCheckCallSites( ing, callee, callerIncompatible )
                                   : std::vector<std::pair<NodeId, std::uint32_t>>{};
 
         std::string out = std::string( ",\"edit_check\":{\"status\":\"" ) + verdict.status
@@ -1011,28 +1029,49 @@ namespace mcpedit
         // graph_unresolved="2952" counts_floor="1">` says it is a floor off a name-based call graph. Same
         // helper, same JSON spelling every other folded surface uses: a disclosure survives into every
         // sibling surface or is DECLARED, and this one had been neither.
+        out += declinedCallsKeyJson( declinedCallsNaming( g, overloadNodes ) );   // the standalone root's declined_calls=, absent at zero
         out += graphCountFloorAttrJson( g );
         out += "}";
         (void) pathRel;
         return out;
     }
 
-    // `"tests_to_run":[{"p":…,"run":…|"run_unknown":true}]` — the SAME rows --affected=<that file> emits,
-    // through the SAME TestRunnerIndex and the SAME not-derivable disclosure the whole row family shares.
+    // `"tests_to_run":[{"p":…,<evidence>,"run":…|"run_unknown":true}]` — the SAME rows --affected=<that
+    // file> emits, through the SAME affectedAnswer, the SAME TestRunnerIndex and the SAME not-derivable
+    // disclosure the whole row family shares. <evidence> is testRowEvidence(Json): seed_kind/partner/hops,
+    // spelled as verbs_change.h spells them. The root carries "order" and "partners" beside "tests".
     inline std::string testsToRunReceiptJson( const IngestResult& ing, const Graph& g, const std::string& root, std::uint32_t fileId )
     {
-        const std::vector<std::uint32_t> testFiles = testsReachingFile( ing, g, fileId );
-        const TestRunnerIndex            runners( ing );
-        const auto                       jesc = []( std::string_view t ) { return mcpdetail::jsonEscape( std::string( t ) ); };
-        const std::string                prefix = rw::sarif::rootPrefixOf( root );
-        std::string                      out = ",\"tests_to_run\":[";
-        for( std::size_t i = 0; i < testFiles.size(); ++i )
+        // The SAME answer --affected=<this file> gives, through the SAME function — see
+        // testmap.h::affectedAnswerForFile for why this used to be a private walk and what that cost.
+        const AffectedAnswer  ans = rw::affectedAnswerForFile( ing, g, fileId );
+        const TestRunnerIndex runners( ing, root );
+        const auto            jesc   = []( std::string_view t ) { return mcpdetail::jsonEscape( std::string( t ) ); };
+        const std::string     prefix = rw::sarif::rootPrefixOf( root );
+        std::string           out    = ",\"tests_to_run\":[";
+        std::vector<rw::TestRowOut> rcRows;
+        rcRows.reserve( ans.rows.size() );
+        for( std::size_t i = 0; i < ans.rows.size(); ++i )
         {
-            if( i ) { out += ","; }
-            out += "{\"p\":\"" + mcpdetail::jsonEscape( std::string( rw::sarif::rootRelativeUri( ing.files[ testFiles[i] ], prefix ) ) ) + "\""
-                 + rw::runFieldJsonDisclosed( runners, testFiles[i], jesc ) + "}";
+            TestRow row = ans.rows[i];   // by value: see below
+            // A matched TEST file's changed= is spelled seed_kind="test" on --affected (verbs_change.h does
+            // exactly this), because "the argument matched it, run it" is a different fact from "you edited
+            // a file this test reaches". The receipt stands in for that verb, so it spells it the same way.
+            const bool seedTest = row.fileId < ans.isSeedTestFile.size() && ans.isSeedTestFile[ row.fileId ] != 0;
+            row.changed         = false;   // the IDENTICAL statement verbs_change.h uses, not a re-derivation
+            // The evidence rides the row, through the ONE builder --affected and --test-gate --json already
+            // use, so a receipt row can never say less than the verb it stands in for. A row that arrived on
+            // partner= or seed_kind= alone is a WEAKER claim than a graph-reached one, and dropping the
+            // attribute would serve it as though it were the same.
+            rcRows.push_back( { row.fileId, std::string( rw::sarif::rootRelativeUri( ing.files[ row.fileId ], prefix ) ),
+                                std::string( seedTest ? ",\"seed_kind\":\"test\"" : "" ) + rw::testRowEvidence( row, rw::EvDialect::Json ) } );
         }
+        out += rw::testRowsJoined( runners, rcRows, rw::TestRowShape{ rw::RowDialect::Json, "p" }, jesc, "," );   // E1: --affected's <g>, "p" an array
         out += "]";
+        // the root-level companions --affected carries beside its rows, so the two documents disclose the
+        // same facts about the same list
+        out += ",\"order\":\"evidence\",\"partners\":" + std::to_string( rw::testRowPartnerCount( ans.rows ) );
+        out += rw::runFirstField( ans.rows, ans.rows.size(), /*json=*/true );   // --affected's run_first=, same rule
         // F3: `"tests_to_run":[]` was an UNLABELLED ZERO. Its twin says "0 modelled tests, N shell gates the
         // call-graph walk cannot see, counts are floors"; the fold said `[]`, which a reader takes for
         // "nothing tests this" rather than "nothing that is a CALL EDGE tests this" (a shell harness runs the
@@ -1040,7 +1079,7 @@ namespace mcpedit
         // keys ride beside it — the same place --affected puts them relative to its own <test> rows, the same
         // counter (testmap.h::scriptGatesUnmodelledCount) and the same key names writeTestGateReportJson and
         // MCP situational_awareness already use. Never a second number.
-        out += ",\"tests\":" + std::to_string( testFiles.size() );
+        out += ",\"tests\":" + std::to_string( ans.rows.size() );
         out += ",\"script_gates_unmodelled\":" + std::to_string( scriptGatesUnmodelledCount( ing ) );
         out += graphCountFloorAttrJson( g );
         return out;
@@ -1105,7 +1144,17 @@ namespace mcpedit
             if( nextOut != nullptr ) { *nextOut = nextFlag( "--test-gate=", fileIdentity ); }
             return ",\"post_check_unavailable\":\"the edited file is not in the refreshed index\"";
         }
+        // Review of #219 (A3): every path this receipt hands back — "file", each tests_to_run[].run recipe and
+        // the stderr "next:" — is spelled RELATIVE to the crawl root, and the receipt named no root at all.
+        // An MCP client runs in its own working directory, so a relative command it cannot anchor is a
+        // command it cannot paste. The receipt's JSON siblings (--test-gate --json, situational_awareness)
+        // have carried "root" all along; this is the surface that least afforded to omit it. Single-root
+        // only, the same condition every other root= keeps. Gate: test/receiptpostcheck.sh (18).
         std::string out;
+        if( ing.realPaths.empty() && !root.empty() )
+        {
+            out += ",\"root\":\"" + mcpdetail::jsonEscape( root ) + "\"";
+        }
         if( focus == kNoNode )
         {
             // Honest, and it happens: a replace whose payload defines a DIFFERENT name leaves no definition
@@ -1123,9 +1172,10 @@ namespace mcpedit
         }
         if( nextOut != nullptr )
         {
-            const std::vector<std::uint32_t> testFiles = withTests ? testsReachingFile( ing, g, editedFile ) : std::vector<std::uint32_t>{};
+            // evidence order now, so next= suggests the changed/partner test ahead of a deeper graph hop
+            const std::uint32_t firstTest = withTests ? rw::firstTestFileForFile( ing, g, editedFile ) : rw::kNoFile;
             *nextOut = receiptNextFor( fileIdentity, symbolName, out,
-                                       testFiles.empty() ? std::string() : TestRunnerIndex( ing ).commandFor( testFiles[0] ) );
+                                       firstTest == rw::kNoFile ? std::string() : TestRunnerIndex( ing, root ).commandFor( firstTest ) );
         }
         return out;
     }
@@ -1154,6 +1204,14 @@ inline mcpedit::Outcome runEditVerb( const std::string& root, mcpedit::Op op, co
 
     const McpIndex&     ix  = getIndex( root );
     const IngestResult& ing = ix.ing;
+    // #350: a target resolved against a memory-guard partial index can be a false "not found", or a false "unique"
+    // when a same-named definition sits in a file the guard never parsed — refuse before anything is written
+    if( ing.memoryStop.isSet() )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = memguard::verbRefusalLine( ing.memoryStop, "an edit" );
+        return oc;
+    }
 
     // 1. resolve either a plain name or a grep-issued, freshness-pinned handle to exactly one definition.
     const mcpedit::EditTarget target = mcpedit::resolveTarget( ix, symbol, pathHint );
@@ -1186,10 +1244,19 @@ inline mcpedit::Outcome runEditVerb( const std::string& root, mcpedit::Op op, co
     // A4-F14: refuse to edit through a symlink. atomicWrite's temp-then-rename lands the new bytes at
     // `disk` by swapping the inode the LAST path component names — for a symlink that REPLACES the link
     // entry with a plain file, leaving the real target file completely untouched (a silent, data-losing
-    // surprise: the agent thinks it edited the target, but it edited nothing it can see). lstat (not stat)
-    // so we inspect the link itself rather than following it.
-    struct stat linkSt{};
-    if( ::lstat( disk.c_str(), &linkSt ) == 0 && S_ISLNK( linkSt.st_mode ) )
+    // surprise: the agent thinks it edited the target, but it edited nothing it can see).
+    //
+    // The DETECTION is rw::pathguard::isSymlink (lstat, not stat — inspect the link itself rather than
+    // following it); the MESSAGE stays here because this seam fails the OPPOSITE way round — rename replaces
+    // the link and spares the target, a sidecar's truncating open follows the link and destroys it.
+    //
+    // A CHECK IS THE RIGHT SHAPE *HERE*, and only here. The three sidecar writers used to ask this same
+    // question before their own open, which was check-then-open and raceable (CWE-367); their guard is now
+    // the open itself (O_NOFOLLOW, src/pathguard.h). This seam never opens `disk` at all — it refuses into a
+    // JSON-RPC error object and returns — so there is no second resolution for a replacement to land in
+    // front of, and nothing here to make atomic. atomicWrite's own publish then goes to a fresh temp path
+    // and a rename, which cannot follow a link into someone else's file. See src/pathguard.h.
+    if( rw::pathguard::isSymlink( disk ) )
     {
         oc.ok = false; oc.errCode = -32602;
         oc.message = "refusing to edit '" + path + "': it is a symlink, and editing through it would replace "
@@ -1200,9 +1267,18 @@ inline mcpedit::Outcome runEditVerb( const std::string& root, mcpedit::Op op, co
 
     // F1: hold a per-file advisory lock across the ENTIRE read→check→splice→rename below, so two cooperating
     //     ripwire MCP edit ops on one file serialize instead of racing (RAII: released at function return).
-    //     Degrades to lock-free on contention/failure — the re-check before the rename is the correctness floor.
+    //     Refuses when another holder keeps the lock past the bounded acquire — proceeding could let that
+    //     cooperating writer undo this edit after it reports applied. An unopenable lockfile or a filesystem
+    //     without flock degrades lock-free (no holder is provable); the re-check is the floor for both.
     //     Keyed by the REAL disk path so cross-process serialization lands on the actual file, not the label.
     const mcpedit::EditLock editLock( disk );
+    if( editLock.contended )
+    {
+        oc.ok = false; oc.errCode = -32603;
+        oc.message = "edit lock unavailable for '" + path + "'; another edit is in progress — retry after it is released; "
+                     "file left unchanged";
+        return oc;
+    }
 
     // 2. staleness: re-read the file NOW and verify its bytes still match what the index was built from.
     //    A mismatch means the span offsets below may address shifted bytes → refuse, tell the agent to
@@ -1294,7 +1370,7 @@ inline mcpedit::Outcome runEditVerb( const std::string& root, mcpedit::Op op, co
     // 5. force the cached index stale so the next verb rebuilds (belt-and-braces on top of the mtime watch),
     //    and report the applied span + the OLD index stamp with a note that it will refresh.
     char oldStamp[ 96 ];
-    std::snprintf( oldStamp, sizeof( oldStamp ), "[index: files=%zu symbols=%zu hash=%08x]",
+    rw::formatTo( oldStamp, sizeof( oldStamp ), "[index: files={} symbols={} hash={:08x}]",
                    ing.files.size(), ing.symbols.size(), (unsigned)( ix.contentHash & 0xFFFFFFFFu ) );
     invalidateMcpIndex();
 

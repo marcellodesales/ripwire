@@ -30,7 +30,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/queryfix"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -64,14 +64,14 @@ Pd="$( run --path=d1,hot )"
 
 # ── 4) --impact=d4 : the full upstream set {d3,d2,d1}, and NOTHING else ───────────────────────────────
 I4="$( run --impact=d4 )"
-I4NAMES="$( names "$I4" | sort | tr '\n' ',' )"
+I4NAMES="$( names "$I4" | LC_ALL=C sort | tr '\n' ',' )"
 { [ "$( attr "$I4" reaches )" = 3 ] && [ "$I4NAMES" = "d1,d2,d3," ]; } \
     && ok "--impact=d4: reaches=3, exactly {d1,d2,d3} (all upstream of the leaf)" \
     || no "--impact=d4 wrong (reaches=$( attr "$I4" reaches ) set=$I4NAMES)"
 
 # ── 5) --impact=hot : exactly the two callers ────────────────────────────────────────────────────────
 Ih="$( run --impact=hot )"
-IhNAMES="$( names "$Ih" | sort | tr '\n' ',' )"
+IhNAMES="$( names "$Ih" | LC_ALL=C sort | tr '\n' ',' )"
 { [ "$( attr "$Ih" reaches )" = 2 ] && [ "$IhNAMES" = "caller_a,caller_b," ]; } \
     && ok "--impact=hot: reaches=2, exactly {caller_a,caller_b}" \
     || no "--impact=hot wrong (reaches=$( attr "$Ih" reaches ) set=$IhNAMES)"
@@ -118,7 +118,7 @@ callees_d2="$( names "$( run --callees=d2 )" | sort | tr '\n' ',' )"
 if command -v xmllint >/dev/null 2>&1; then
     xw=0
     for out in "$P" "$I4" "$C2"; do printf '%s' "$out" | xmllint --noout - 2>/dev/null || xw=1; done
-    [ "$xw" = 0 ] && ok "xml well-formed (--path/--impact/--callees)" || no "xml malformed in one of --path/--impact/--callees"
+    if [ "$xw" = 0 ]; then ok "xml well-formed (--path/--impact/--callees)"; else no "xml malformed in one of --path/--impact/--callees"; fi
 else
     printf '  SKIP  xml well-formed (no xmllint)\n'
 fi

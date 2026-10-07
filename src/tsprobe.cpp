@@ -9,8 +9,10 @@
 
 #include "ingest.h"
 #include "model.h"
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
 
-#include "infra/Diagnostics.h"   // VERIFY — the enum-index bounds check
+
+#include "infra/Diagnostics.h"   // ASSUME — the enum-index bounds check
 
 #include <array>
 #include <cstddef>
@@ -32,28 +34,29 @@ namespace
 // serialize.h's calibration array can size on it (model.h documents why), and ingest never assigns it.
 inline constexpr const char* kLangName[] = {
     "cpp", "py", "ts", "go", "rust", "swift", "objc", "md", "js", "sh", "java", "rb", "?", "json", "cs", "c", "toml", "yaml",
-    "php", "lua", "ex", "dart",
+    "php", "lua", "ex", "dart", "kt", "gd",
 };
 
-static_assert( std::size( kLangName ) == std::size_t( rw::Lang::Dart ) + 1,
+static_assert( std::size( kLangName ) == rw::kLangCount,
                "kLangName drifted from the Lang enum — update both together" );
 
-// SymKind has no table here: rw::symTag() already IS the declarative one. Only its count is needed,
-// and it is derived the same way — `Other` is the last kind, so an appended kind resizes the counter.
-inline constexpr std::size_t kSymKindCount = std::size_t( rw::SymKind::Other ) + 1;
+// SymKind has no table here: rw::symTag() already IS the declarative one. Only its count is needed, and
+// model.h owns it — rw::kSymKindCount, proven at compile time to end at the LAST kind, so an appended kind
+// resizes the counter below instead of indexing it off its end.
+using rw::kSymKindCount;
 
 // A Lang / SymKind reaching these out of range means a symbol carries a value its own enum does not
-// name — a corrupt invariant, not a recoverable input, so VERIFY (free in release) and no fallback:
+// name — a corrupt invariant, not a recoverable input, so ASSUME (free in release) and no fallback:
 // the static_assert above already proves every in-range value has a row.
 std::size_t langIndex( rw::Lang l ) noexcept
 {
-    VERIFY( std::size_t( l ) < std::size( kLangName ) );
+    ASSUME( std::size_t( l ) < std::size( kLangName ) );
     return std::size_t( l );
 }
 
 std::size_t kindIndex( rw::SymKind k ) noexcept
 {
-    VERIFY( std::size_t( k ) < kSymKindCount );
+    ASSUME( std::size_t( k ) < kSymKindCount );
     return std::size_t( k );
 }
 
@@ -68,7 +71,7 @@ int main( int argc, char** argv )
 {
     if( argc < 2 )
     {
-        std::fprintf( stderr, "usage: %s <directory>\n", argv[ 0 ] );
+        rw::emitTo( stderr, "usage: {} <directory>\n", argv[ 0 ] );
         return 1;
     }
 
@@ -89,24 +92,24 @@ int main( int argc, char** argv )
         ++langCount[ langIndex( s.lang ) ];
     }
 
-    std::printf( "==== ripwire ingest probe ====\n" );
-    std::printf( "root:        %s\n", root );
-    std::printf( "files:       %zu\n", ir.files.size() );
-    std::printf( "symbols:     %zu\n", ir.symbols.size() );
-    std::printf( "references:  %zu\n", ir.references.size() );
+    rw::emitRaw( stdout, "==== ripwire ingest probe ====\n" );
+    rw::emitTo( stdout, "root:        {}\n", root );
+    rw::emitTo( stdout, "files:       {}\n", ir.files.size() );
+    rw::emitTo( stdout, "symbols:     {}\n", ir.symbols.size() );
+    rw::emitTo( stdout, "references:  {}\n", ir.references.size() );
 
     // every kind, zeros included — a kind the corpus does NOT have is evidence too, and there are only
     // eight of them. `sec` (markdown heading) and `other` used to be off the end of the printf.
-    std::printf( "\nsymbols by kind:\n " );
+    rw::emitRaw( stdout, "\nsymbols by kind:\n " );
     for( std::size_t kind = 0; kind < kSymKindCount; ++kind )
     {
-        std::printf( "  %s=%d", rw::symTag( static_cast<rw::SymKind>( kind ) ), kindCount[ kind ] );
+        rw::emitTo( stdout, "  {}={}", rw::symTag( static_cast<rw::SymKind>( kind ) ), kindCount[ kind ] );
     }
-    std::printf( "\n" );
+    rw::emitRaw( stdout, "\n" );
 
     // languages: only the ones that ACTUALLY appear — sixteen rows of mostly zeros is noise, and what
     // the probe is evidence FOR is which grammars extracted something.
-    std::printf( "\ndefs by language:\n " );
+    rw::emitRaw( stdout, "\ndefs by language:\n " );
     {
         int langsShown = 0;
         for( std::size_t lang = 0; lang < std::size( kLangName ); ++lang )
@@ -116,16 +119,16 @@ int main( int argc, char** argv )
                 continue;
             }
 
-            std::printf( "  %s=%d", kLangName[ lang ], langCount[ lang ] );
+            rw::emitTo( stdout, "  {}={}", kLangName[ lang ], langCount[ lang ] );
             ++langsShown;
         }
 
         if( langsShown == 0 )
         {
-            std::printf( "  (no defs)" );
+            rw::emitRaw( stdout, "  (no defs)" );
         }
     }
-    std::printf( "\n" );
+    rw::emitRaw( stdout, "\n" );
 
     // ---- references resolved vs file-scope (fromSymbol == kNoNode) ----
     {
@@ -137,7 +140,7 @@ int main( int argc, char** argv )
                 ++attributed;
             }
         }
-        std::printf( "\nreferences attributed to an enclosing symbol: %zu / %zu (rest are file-scope)\n",
+        rw::emitTo( stdout, "\nreferences attributed to an enclosing symbol: {} / {} (rest are file-scope)\n",
                      attributed, ir.references.size() );
     }
 
@@ -145,7 +148,9 @@ int main( int argc, char** argv )
     rw::HashMap<rw::NodeId, std::vector<const rw::Reference*>> bySym;
     for( const rw::Reference& r : ir.references )
     {
-        if( r.fromSymbol != rw::kNoNode )
+        // A value use (a function stored or passed) and a call THROUGH a value are not call references: this dump is
+        // the pre-resolution CALL list test/callformcheck.sh reads, so they stay out of it (src/valuerefs.h serves them).
+        if( r.fromSymbol != rw::kNoNode && r.role != rw::RefRole::Value && r.role != rw::RefRole::Through )
         {
             bySym[ r.fromSymbol ].push_back( &r );
         }
@@ -153,31 +158,31 @@ int main( int argc, char** argv )
 
     // ---- first ~40 symbols + their references ----
     const std::size_t showN = ir.symbols.size() < 40 ? ir.symbols.size() : 40;
-    std::printf( "\n---- first %zu symbols (name | kind | lang | file:line  -> references) ----\n", showN );
+    rw::emitTo( stdout, "\n---- first {} symbols (name | kind | lang | file:line  -> references) ----\n", showN );
 
     for( std::size_t i = 0; i < showN; ++i )
     {
         const rw::Symbol& s = ir.symbols[ i ];
         const char* file = ( s.fileId < ir.files.size() ) ? ir.files[ s.fileId ].c_str() : "?";
 
-        std::printf( "[%4u] %-28s %-7s %-4s  %s:%u\n",
+        rw::emitTo( stdout, "[{:>4}] {:<28} {:<7} {:<4}  {}:{}\n",
                      s.id, s.name.c_str(), rw::symTag( s.kind ), langName( s.lang ), file, s.line );
 
         auto it = bySym.find( s.id );
         if( it != bySym.end() )
         {
             int shown = 0;
-            std::printf( "        calls:" );
+            rw::emitRaw( stdout, "        calls:" );
             for( const rw::Reference* r : it->second )
             {
-                std::printf( " %s", r->calleeName.c_str() );
+                rw::emitTo( stdout, " {}", r->calleeName.c_str() );
                 if( ++shown >= 12 )
                 {
-                    std::printf( " ..." );
+                    rw::emitRaw( stdout, " ..." );
                     break;
                 }
             }
-            std::printf( "\n" );
+            rw::emitRaw( stdout, "\n" );
         }
     }
 

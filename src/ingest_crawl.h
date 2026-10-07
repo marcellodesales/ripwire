@@ -1,8 +1,13 @@
 #pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+
 #if !defined( RIPWIRE_INGEST_TU )
 #error "ingest_crawl.h is a SECTION of src/ingest.cpp's translation unit - include it only from ingest.cpp (see the ingest-family split note there)"
 #endif
 #include "infra/tablelookup.h"   // findByField — the same lookup wrap's agentTarget uses
+#include "infra/sortutil.h"      // svLess — string_view order without libstdc++'s length subtraction (#343)
+#include "memguard.h"            // #350: memguard::Watch — the crawl stops when the memory guard says so
 
 // ingest_crawl.h — crawl + parse setup, moved VERBATIM from ingest.cpp in the 2026-08-29 split: the
 // limits/skip config, the extension -> {lang, grammar, query} table (lookupLang), capture-role and
@@ -52,13 +57,43 @@ struct LangEntry
     std::string_view querySub;   // key into the configure-generated embedded tags.scm table
 };
 
+// The one extension whose parse is RESTRICTED to a sub-range of the file (its `---` frontmatter).
+// Named once so the table row and ingest_sidecap.h's restrictAstroToFrontmatter cannot drift apart.
+inline constexpr std::string_view kAstroExt = ".astro";
+
 // Order does not matter (linear scan); kept grouped by language for readability.
 // The extent is EXACT, not headroom: it was 32 with 32 rows, .toml made it 33, .pyi made it 34 and the
-// .yml/.yaml pair made it 36, and the .php/.phtml/.lua trio made it 40. Sizing it to the row count is what makes
+// .yml/.yaml pair made it 36, the .php/.phtml/.lua trio made it 40, the .ex/.exs pair made it 42, the
+// .rst/.adoc/.org/.mdx prose quartet made it 46, .dart made it 47, .kt made it 48, .hxx made it 49 and .gd made it 50. Sizing it to the row count is what
+// makes
 // `std::array<bool, kLangTable.size()> present` (the grammar-prewarm set,
 // below) exact too, and it turns "added a row and forgot the extent" into a compile error rather than a
 // silent drop.
-constexpr std::array<LangEntry, 43> kLangTable = {{
+//
+// THE PLAIN-TEXT PROSE FORMATS (.rst/.adoc/.org/.mdx), on the SAME grammar and the same walk as markdown.
+// docparse.h's kMarkdownGrammarExts is the NAME list every reader-facing prose lens consults; the
+// static_assert under this table ties the two together so neither can grow alone. Four SINGLE-PURPOSE
+// prose extensions — an extension that exists for nothing but documents — that the crawl indexed nowhere
+// before 2026-09-09, so a repository whose decision history lives in `docs/adr/*.rst` got "0 relevant of 0
+// document files" out of --recall.
+//
+// WHY THE MARKDOWN GRAMMAR AND NOT AN EXTRACTOR PER FORMAT. Measured, not assumed. reStructuredText's
+// title underlines (`=====`, `-----`) ARE setext headings, so the existing section tier tiles a real .rst
+// document with no new code at all and --recall serves the DECISION rather than the whole file. On a real
+// 292-file, 2.28 MB astropy `.rst` documentation tree, five pre-registered questions at three budgets:
+// heading-tiled answered 15/15 while the same prose with its setext underlines removed (the one-unit
+// control) answered 9/15, and tiled was CHEAPER at every budget (mean est_tokens 1299/2659/5379 against
+// 1436/2781/6041 at max-tokens 2000/4000/8000). An extractor per format would have bought that same
+// benefit for a docText copy of every byte, a second body-resolution rule and a fifth parser to keep
+// deterministic. `=` and `-` cover 1321 of that corpus's 1948 underlines (67.8%); `*`/`^`/`"`/`~`/`+`/`#`
+// titles are read as prose, which costs recall precision inside a file and nothing else.
+//
+// WHAT THIS HONESTLY DOES NOT DO, disclosed because --recall says `section-granular` only when it is true:
+// AsciiDoc's `== Section` and Org-mode's `* Heading` are NOT markdown headings (the former is a paragraph,
+// the latter a list item), so those files carry the file-level node alone and serve as ONE whole-file
+// unit. A heading detector per format is a later lane with its own measurement. `.mdx` is markdown with
+// JSX, which the block grammar already reads as html blocks (opaque). Gate: test/textdocscheck.sh.
+constexpr std::array<LangEntry, 51> kLangTable = {{
     { ".cpp",  Lang::Cpp,        &tree_sitter_cpp,        "cpp"        },
     { ".cc",   Lang::Cpp,        &tree_sitter_cpp,        "cpp"        },
     { ".cxx",  Lang::Cpp,        &tree_sitter_cpp,        "cpp"        },
@@ -114,15 +149,30 @@ constexpr std::array<LangEntry, 43> kLangTable = {{
     { ".h",    Lang::Cpp,        &tree_sitter_cpp,        "cpp"        },
     { ".hpp",  Lang::Cpp,        &tree_sitter_cpp,        "cpp"        },
     { ".hh",   Lang::Cpp,        &tree_sitter_cpp,        "cpp"        },
+    // A4 (found-items 2026-09-17): `.hxx` (a C++ header spelling, same status as `.hpp`/`.hh`) had no row
+    // here — every OTHER per-extension table in the tree (flipimpact.h's dead-code header set, layout.h's
+    // --layout scan, lintrules.h, quality.h's isHeaderPath/isTestScriptPath twin, resolve.h's include
+    // resolver, verbs_lint.h) already lists `.hxx` alongside `.h`/`.hpp`/`.hh`, so a repository that spells
+    // its headers `.hxx` was invisible to the crawl even though every downstream table was ready for it.
+    { ".hxx",  Lang::Cpp,        &tree_sitter_cpp,        "cpp"        },
     { ".c",    Lang::C,          &tree_sitter_c,          "c"          },   // plain C (L3) — was entirely invisible before this table gained its own row
     { ".py",   Lang::Python,     &tree_sitter_python,     "python"     },
     { ".pyi",  Lang::Python,     &tree_sitter_python,     "python"     },   // typing stub — often a library's ONLY Python-visible API (a Rust/C core's whole Python surface lives in one .pyi)
     { ".go",   Lang::Go,         &tree_sitter_go,         "go"         },
     { ".rs",   Lang::Rust,       &tree_sitter_rust,       "rust"       },
     { ".ts",   Lang::TypeScript, &tree_sitter_typescript, "typescript" },
-    { ".tsx",  Lang::TypeScript, &tree_sitter_tsx,        "typescript" },
+    // #285: .tsx gets its OWN querySub ("tsx", queries/tsx/tags.scm), not "typescript" — the tsx
+    // grammar is a superset of the plain one, but a query naming a JSX-only node type (added for
+    // JSX element call edges) fails to compile against the plain grammar WHOLESALE, which would have
+    // taken every .ts symbol/reference down with it. See queries/typescript/tags.scm's header.
+    { ".tsx",  Lang::TypeScript, &tree_sitter_tsx,        "tsx"        },
     { ".mts",  Lang::TypeScript, &tree_sitter_typescript, "typescript" },
     { ".cts",  Lang::TypeScript, &tree_sitter_typescript, "typescript" },
+    // Astro: the FRONTMATTER ONLY, via the one ts_parser_set_included_ranges call this build makes
+    // (ingest_sidecap.h). Rides Lang::TypeScript deliberately — langCompatible() admits only same-Lang
+    // pairs, so a Lang of its own would not resolve a frontmatter call into the .ts service it names,
+    // which is the entire point of issue #67. Same shape as .tsx/.mts above and .metal/.cu below.
+    { kAstroExt, Lang::TypeScript, &tree_sitter_typescript, "typescript" },
     { ".swift", Lang::Swift,     &tree_sitter_swift,      "swift"      },
     { ".m",    Lang::ObjC,       &tree_sitter_objc,       "objc"       },   // Objective-C
     { ".mm",   Lang::ObjC,       &tree_sitter_objc,       "objc"       },   // Objective-C++ (ObjC layer + C-style; C++ partial)
@@ -148,13 +198,105 @@ constexpr std::array<LangEntry, 43> kLangTable = {{
     { ".phtml", Lang::Php,       &tree_sitter_php,        "php"        },   // PHP template (markup + <?php ?> islands) — same grammar, same query
     { ".ex",   Lang::Elixir,     &tree_sitter_elixir,     "elixir"     },
     { ".exs",  Lang::Elixir,     &tree_sitter_elixir,     "elixir"     },
-    { ".dart", Lang::Dart,       &tree_sitter_dart,       "dart"       },   // Dart — classes/mixins/extensions/ctors/methods/imports/parts
+    { ".dart", Lang::Dart,       &tree_sitter_dart,       "dart"       },
     // Lua: no classes, no imports. The five function-definition spellings and the one call node are the
     // whole extractable structure (queries/lua/tags.scm states the metatable/dynamic-dispatch floor).
     { ".lua",  Lang::Lua,        &tree_sitter_lua,        "lua"        },   // Lua — function/method defs (5 shapes) + calls
+    // GDScript (.gd): Godot's language. A .gd FILE IS A CLASS BODY — `class_name` names it, top-level
+    // `func`/`var` are its members — which is why queries/gdscript/tags.scm captures file-scope defs as
+    // function/var rather than needing an enclosing class node. `.tscn`/`.tres`/`.gdshader` are NOT
+    // indexed: they are scene/resource/shader formats with their own grammars, and none is vendored here.
+    { ".gd",   Lang::GDScript,   &tree_sitter_gdscript,   "gdscript"   },   // GDScript — class/func/var/const/enum/signal defs + calls
+    // Kotlin: `.kts` (Gradle script DSL) is deliberately NOT a row here yet — its trailing-lambda
+    // density needs its own parse-quality probe before riding this grammar; `.kt` only for now.
+    { ".kt",   Lang::Kotlin,     &tree_sitter_kotlin,     "kotlin"     },   // Kotlin — classes/objects/interfaces/functions + calls; JVM-bridged to Java (graph.h langCompatible)
     { ".md",   Lang::Markdown,   &tree_sitter_markdown,   ""           },   // Markdown DOC tier — headings/sections via extractMarkdown()'s custom tree walk; NO tags.scm (query stays "")
-    { ".markdown", Lang::Markdown, &tree_sitter_markdown, ""           },   // sibling extension, same walk — scope disclosed: .md/.markdown only
+    { ".markdown", Lang::Markdown, &tree_sitter_markdown, ""           },   // sibling extension, same walk
+    { ".rst",  Lang::Markdown,   &tree_sitter_markdown,   ""           },   // reStructuredText — underlined titles tile as setext
+    { ".adoc", Lang::Markdown,   &tree_sitter_markdown,   ""           },   // AsciiDoc — whole-file unit (see above)
+    { ".org",  Lang::Markdown,   &tree_sitter_markdown,   ""           },   // Org-mode — whole-file unit (see above)
+    { ".mdx",  Lang::Markdown,   &tree_sitter_markdown,   ""           },   // MDX — markdown with JSX islands
 }};
+
+// SIBLING-COMPLETENESS GUARD (METHODOLOGY §3), at COMPILE time. docparse.h owns the NAME list every
+// reader-facing prose lens consults; this table owns the GRAMMAR rows. Adding a format to one and not the
+// other is exactly the defect this lane fixed — `.rst` counted as prose for ordering while the crawl
+// indexed it nowhere — so it is made impossible rather than merely documented.
+constexpr bool everyMarkdownGrammarExtHasARow() noexcept
+{
+    for( const std::string_view ext : docparse::kMarkdownGrammarExts )
+    {
+        // findIndexByField, not findByField: GCC rejects the pointer-vs-null compare of an array-derived
+        // address in constant evaluation under the sanitizer flags (#347); the index form is clean on
+        // every front end.
+        const std::size_t rowIdx = findIndexByField( kLangTable, &LangEntry::ext, ext );
+        if( rowIdx == std::size( kLangTable ) || kLangTable[rowIdx].lang != Lang::Markdown )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert( everyMarkdownGrammarExtHasARow(),
+               "every docparse::kMarkdownGrammarExts entry needs a kLangTable row on Lang::Markdown — "
+               "a prose format admitted by one and not the other is indexed nowhere while every lens calls it prose" );
+
+// SIBLING-COMPLETENESS GUARD #2, the same idea for the verb-time language classifier. lintrules.h's langOfPath buckets
+// an indexed file by language for --lint-rules, --deps/--arch, co-change's dep_capable=, --nonlocal-state and the lint
+// catalog, from its own kLintExtRows table. That table used to be "kept in sync by hand", and hand sync is how PR #233
+// lost its `.gd` row. This is the one translation unit that sees both tables, so the sync is asserted here:
+//   - every kLangTable row carries an extension and a grammar (a zero-filled tail row has neither);
+//   - a CODE row (model.h isCodeLang) is in kLintExtRows with the SAME Lang, and a data/doc row is not;
+//   - every kLintExtRows row names a kLangTable row with the same Lang (a lint row the crawl never admits is dead).
+// Each check returns the first offending ROW INDEX, and the table's size when clean. It never returns an extension
+// string: the first draft did, with "" for clean, and a zero-filled row's extension is also "", so the check passed
+// the very defect it exists for. The index is what the compiler's note prints ("'41 == 48'").
+constexpr std::size_t firstCrawlRowLangOfPathMisbuckets() noexcept
+{
+    for( std::size_t index = 0; index < kLangTable.size(); ++index )
+    {
+        const LangEntry&  row      = kLangTable[index];
+        const std::size_t lintIdx  = findIndexByField( kLintExtRows, &LintExtRow::ext, row.ext );   // index form: #347
+        const bool lintFound       = lintIdx != std::size( kLintExtRows );
+        const bool isMirrored      = lintFound && kLintExtRows[lintIdx].lang == row.lang;
+        // The grammar-pointer-vs-null clause is the ONE part of this guard GCC cannot constant-evaluate
+        // when the grammar TUs are ASan-instrumented ("'(tree_sitter_cpp == 0)' is not a constant
+        // expression", #347); clang accepts it under the same flags. The degrade is scoped to exactly
+        // that front end + flag pair — the "REAL but reduced" posture CMakeLists announces for the GCC
+        // sanitizer stack — and every other build asserts the grammar non-null in full.
+#if defined( __SANITIZE_ADDRESS__ ) && !defined( __clang__ )
+        const bool grammarNull = false;
+#else
+        const bool grammarNull = row.grammar == nullptr;
+#endif
+        if( row.ext.empty() || grammarNull || ( isCodeLang( row.lang ) ? !isMirrored : lintFound ) )
+        {
+            return index;
+        }
+    }
+    return kLangTable.size();
+}
+
+constexpr std::size_t firstLangOfPathRowTheCrawlNeverAdmits() noexcept
+{
+    for( std::size_t index = 0; index < std::size( kLintExtRows ); ++index )
+    {
+        const LintExtRow& row      = kLintExtRows[index];
+        const std::size_t crawlIdx = findIndexByField( kLangTable, &LangEntry::ext, row.ext );   // index form: #347
+        if( crawlIdx == std::size( kLangTable ) || kLangTable[crawlIdx].lang != row.lang )
+        {
+            return index;
+        }
+    }
+    return std::size( kLintExtRows );
+}
+
+static_assert( firstCrawlRowLangOfPathMisbuckets() == kLangTable.size(),
+               "a kLangTable row is empty, or a CODE row is missing from lintrules.h kLintExtRows (or names another Lang), "
+               "or a data/doc row is in it — langOfPath would call an indexed file the wrong language" );
+static_assert( firstLangOfPathRowTheCrawlNeverAdmits() == std::size( kLintExtRows ),
+               "a lintrules.h kLintExtRows row names an extension kLangTable does not admit under the same Lang" );
 
 const LangEntry* lookupLang( std::string_view ext ) noexcept
 {
@@ -180,8 +322,11 @@ std::string lowerExtensionOf( std::string_view path )
     return ext;
 }
 
-// ---- capture-name prefix -> role. @definition.* -> DEF, @reference.* -> REF. ----
-enum class CapRole : std::uint8_t { Ignore, NameOnly, Def, Ref };
+// ---- capture-name prefix -> role. @definition.* -> DEF, @reference.* -> REF, @import.* -> IMP. ----
+// `Import` is the shared import-capture vocabulary of #358: one `@import.path` per WRITTEN specifier,
+// declared in the grammar's own tags.scm and normalised by ONE specifier normaliser per DepDialect
+// (src/ingest_importcap.h), in place of the per-language extractors this replaces.
+enum class CapRole : std::uint8_t { Ignore, NameOnly, Def, Ref, Import };
 
 // Map the part AFTER "definition."/"reference." to a SymKind. Falls back to Other.
 SymKind defKind( std::string_view tail ) noexcept
@@ -263,6 +408,7 @@ CapRole roleOf( std::string_view cap, SymKind& kindOut ) noexcept
 {
     constexpr std::string_view kDef = "definition.";
     constexpr std::string_view kRef = "reference.";
+    constexpr std::string_view kImp = "import.";
 
     if( cap == "name" )
     {
@@ -277,6 +423,12 @@ CapRole roleOf( std::string_view cap, SymKind& kindOut ) noexcept
     if( cap.size() > kRef.size() && cap.substr( 0, kRef.size() ) == kRef )
     {
         return CapRole::Ref;
+    }
+    // @import.* is tested AFTER @reference.* on purpose: the two families must stay disjoint, and an
+    // earlier arm silently swallowing an import capture would look like a working query.
+    if( cap.size() > kImp.size() && cap.substr( 0, kImp.size() ) == kImp )
+    {
+        return CapRole::Import;
     }
 
     return CapRole::Ignore;   // @doc, @local.scope, etc.
@@ -417,30 +569,68 @@ bool isDenylistedName( std::string_view name ) noexcept
 // ERROR, so errBytes is a true byte measure of "what the parser could not interpret". MISSING nodes are
 // zero-width by construction (the parser inserted a token that was not there), so they contribute to
 // errNodes and nothing to errBytes — which is exactly why BOTH numbers are disclosed, not just a ratio.
+//
+// errNodes/errBytes ALSO count invalid UTF-8 byte sequences found in the leading whitespace-sample window
+// (one per bad sequence, since tree-sitter's error recovery does not reliably flag them as ERROR/MISSING —
+// a garbage byte run can parse as an unrecognized leaf with no error node at all).
 FileHealth measureFileHealth( TSNode root, std::string_view bytes )
 {
     FileHealth h;
     h.fileBytes = std::uint32_t( bytes.size() > 0xFFFFFFFFull ? 0xFFFFFFFFull : bytes.size() );
 
-    const std::size_t sample = bytes.size() < kHealthWsSampleBytes ? bytes.size() : kHealthWsSampleBytes;
-    std::uint32_t     ws     = 0;
-    for( std::size_t i = 0; i < sample; ++i )
+    // Walks the sample codepoint-by-codepoint (jsonesc::utf8SeqLen, already the shared UTF-8 validator
+    // for mcp.h/ccjson.h) rather than byte-by-byte: a whitespace byte is only meaningful outside a
+    // multi-byte sequence, and this lets the same pass also catch invalid UTF-8 — see below — for free.
+    // A bad sequence resyncs one byte at a time, same as any decoder recovering from garbage. Bad
+    // sequences are recorded as ascending START POSITIONS (the scan runs left to right), which is what
+    // lets the ERROR walk below dedup against them with std::lower_bound instead of a per-span scan.
+    const std::size_t         sample = bytes.size() < kHealthWsSampleBytes ? bytes.size() : kHealthWsSampleBytes;
+    std::uint32_t              ws    = 0;
+    std::vector<std::uint32_t> badUtf8Positions;
+    for( std::size_t i = 0; i < sample; )
     {
-        const unsigned char c = ( unsigned char ) bytes[ i ];
-        if( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' )
+        const int seqLen = jsonesc::utf8SeqLen( bytes.data(), i, bytes.size() );
+        if( seqLen == 0 )
         {
-            ++ws;
+            badUtf8Positions.push_back( std::uint32_t( i ) );
+            ++i;
+            continue;
         }
+        if( seqLen == 1 )
+        {
+            const unsigned char c = ( unsigned char ) bytes[ i ];
+            if( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' )
+            {
+                ++ws;
+            }
+        }
+        i += std::size_t( seqLen );
     }
     h.wsBytes = ws;
 
+    // Invalid UTF-8 in the leading sample is unparseable content by construction, but tree-sitter's own
+    // error recovery does not reliably surface it as an ERROR/MISSING node (a garbage byte run can be
+    // swallowed as an unrecognized leaf with no error flag at all — confirmed empirically on a random-byte
+    // .kt file: ts_node_has_error(root) came back false). Fold it into errNodes/errBytes rather than adding
+    // a parallel disclosure field: it is exactly what those two attributes already mean to a reader —
+    // "bytes this build could not interpret" — just found by a byte-level scan instead of a tree walk.
+    // A position that falls inside a top-most ERROR span below is the SAME problem tree-sitter already
+    // flagged there, and counting it twice would push err_ratio (errBytes/fileBytes) past its documented
+    // <=1.0 ceiling — so coverage is tallied WHILE walking and folded in ONCE, after, rather than adding
+    // every position up front and backing out duplicates mid-walk: `h` holds a correct value at every
+    // point in this function, never a transiently over-counted one a reader mid-function could observe.
     if( !ts_node_has_error( root ) )
     {
+        // no ERROR span for a bad sequence to overlap — every one found is a genuinely new finding
+        h.errNodes += std::uint32_t( badUtf8Positions.size() );
+        h.errBytes += std::uint32_t( badUtf8Positions.size() );
         return h;
     }
 
     std::vector<TSNode> stack;
+    ChildCursor         cursor( root );   // reused across nodes — this walk never recurses
     stack.push_back( root );
+    std::uint32_t coveredBadUtf8 = 0;   // badUtf8Positions entries already inside a counted top-most ERROR span
     while( !stack.empty() )
     {
         const TSNode n = stack.back();
@@ -451,6 +641,12 @@ FileHealth measureFileHealth( TSNode root, std::string_view bytes )
             const std::uint32_t lo = ts_node_start_byte( n );
             const std::uint32_t hi = ts_node_end_byte( n );
             h.errBytes += hi > lo ? hi - lo : 0u;
+            if( hi > lo && !badUtf8Positions.empty() )
+            {
+                const auto lo_it = std::lower_bound( badUtf8Positions.begin(), badUtf8Positions.end(), lo );
+                const auto hi_it = std::lower_bound( lo_it, badUtf8Positions.end(), hi );
+                coveredBadUtf8 += std::uint32_t( hi_it - lo_it );
+            }
             continue;   // top-most only — see the note above
         }
         if( ts_node_is_missing( n ) )
@@ -458,16 +654,24 @@ FileHealth measureFileHealth( TSNode root, std::string_view bytes )
             ++h.errNodes;
             continue;
         }
-        const std::uint32_t kids = ts_node_child_count( n );
-        for( std::uint32_t i = 0; i < kids; ++i )
+        // O(children), not O(children²). The root of a RECOVERED file is exactly where the width is
+        // largest and least controlled — one comment flood plus one unparseable token measured 56× the
+        // identical flood with no error in it before this became a cursor (test/childwalkscalecheck.sh,
+        // arm B4; the rule is on src/infra/tschildren.h). Filtered in place: `stack` is the work list,
+        // and only the children that carry an error belong on it.
+        forEachChild( n, cursor.cur, [ &stack ]( TSNode c )
         {
-            const TSNode c = ts_node_child( n, i );
             if( ts_node_has_error( c ) || ts_node_is_missing( c ) )
             {
                 stack.push_back( c );
             }
-        }
+            return true;
+        } );
     }
+    // Fold in only the bad-UTF-8 positions NOT already covered by a top-most ERROR span above.
+    const std::uint32_t uncoveredBadUtf8 = std::uint32_t( badUtf8Positions.size() ) - coveredBadUtf8;
+    h.errNodes += uncoveredBadUtf8;
+    h.errBytes += uncoveredBadUtf8;
     return h;
 }
 
@@ -643,6 +847,259 @@ bool mdNestsTooDeep( std::string_view bytes ) noexcept
     return false;
 }
 
+// ── the Kotlin string-template nesting prescan (kotlinStringsNestTooDeep) and its three lexical helpers ──────────────
+
+// The byte length of the character literal that starts at bytes[ i ] == '\'', or 0 when none does. The grammar's shape
+// is `'` (an escape, or ONE codepoint that is not a quote or a newline) `'`, and the parser's internal lexer takes it
+// whole, so a quote inside one (`'"'`) is never offered to the external scanner as a string start.
+inline std::size_t kotlinCharLiteralLength( std::string_view bytes, std::size_t i ) noexcept
+{
+    const auto byteAt = [ & ]( std::size_t k ) noexcept -> unsigned char { return k < bytes.size() ? static_cast<unsigned char>( bytes[ k ] ) : 0u; };
+    const unsigned char first  = byteAt( i + 1 );
+    std::size_t         length = 0;
+    if( first == '\\' )
+    {
+        length = ( byteAt( i + 2 ) == 'u' ) ? 8u : 4u;   // '\uXXXX' or a one-character escape
+    }
+    else if( first != 0u && first != '\'' && first != '\n' && first != '\r' )
+    {
+        std::size_t codepointBytes = 1;
+        if( ( first >> 5 ) == 0x6u )
+        {
+            codepointBytes = 2;
+        }
+        else if( ( first >> 4 ) == 0xEu )
+        {
+            codepointBytes = 3;
+        }
+        else if( ( first >> 3 ) == 0x1Eu )
+        {
+            codepointBytes = 4;
+        }
+        length = codepointBytes + 2u;
+    }
+    return ( length > 0 && byteAt( i + length - 1 ) == '\'' ) ? length : 0u;
+}
+
+// The index just past the `/* … */` comment whose `/*` starts at bytes[ i ], nesting exactly as the vendored scanner's
+// scan_multiline_comment does — including its reading of an unterminated comment, which runs to end of input.
+inline std::size_t kotlinBlockCommentEnd( std::string_view bytes, std::size_t i ) noexcept
+{
+    std::size_t k         = i + 2;
+    std::size_t depth     = 1;
+    bool        afterStar = false;
+    while( k < bytes.size() )
+    {
+        const char c = bytes[ k ];
+        ++k;
+        if( c == '*' )
+        {
+            afterStar = true;
+        }
+        else if( c == '/' && afterStar )
+        {
+            afterStar = false;
+            if( --depth == 0 )
+            {
+                return k;
+            }
+        }
+        else
+        {
+            afterStar = false;
+            if( c == '/' && k < bytes.size() && bytes[ k ] == '*' )
+            {
+                ++depth;
+                ++k;
+            }
+        }
+    }
+    return k;
+}
+
+// In Kotlin CODE: the index just past a token that is consumed WHOLE before the external scanner can see a quote inside
+// it — a `//` comment, a nested `/* */` comment, a character literal, a backtick identifier — or `i` itself when none
+// starts at bytes[ i ].
+inline std::size_t kotlinCodeTriviaEnd( std::string_view bytes, std::size_t i ) noexcept
+{
+    const std::size_t byteCount = bytes.size();
+    const char        c         = bytes[ i ];
+    const char        next      = ( i + 1 < byteCount ) ? bytes[ i + 1 ] : '\0';
+    if( c == '/' && next == '/' )
+    {
+        const std::size_t newline = bytes.find( '\n', i );
+        return ( newline == std::string_view::npos ) ? byteCount : newline;
+    }
+    if( c == '/' && next == '*' )
+    {
+        return kotlinBlockCommentEnd( bytes, i );
+    }
+    if( c == '\'' )
+    {
+        return i + kotlinCharLiteralLength( bytes, i );
+    }
+    if( c == '`' )
+    {
+        const std::size_t close = bytes.find_first_of( "`\r\n", i + 1 );
+        const bool        named = close != std::string_view::npos && bytes[ close ] == '`' && close > i + 1;
+        return named ? close + 1 : i;
+    }
+    return i;
+}
+
+enum class KotlinStringEvent : std::uint8_t { None, OpenInterpolation, CloseString };
+
+// One step of the vendored scanner's scan_string_content at bytes[ i ], inside an open string of the given shape: the
+// index after the bytes it consumes, and whether those bytes opened an interpolation or closed the string.
+//   `$`  a run of at least the string's `$` prefix followed by `{` opens an interpolation; any other run is content.
+//   `\`  skips the byte after it, and `\$` the byte after the `$` too: the scanner's loop falls through to its bottom
+//        advance, so `\$${` is content, never an interpolation. Before a quote the string's shape decides. In a
+//        single-quoted string `\$"` CLOSES it (upstream's own reading, mirrored because the stack follows it) and `\"` is
+//        content. In a triple-quoted string `\` is no escape before a quote, bare or as `\$` (vendored patch 002), so the
+//        quote is read again by the triple-quote close test.
+//   `"`  closes a single-quoted string; a run of three or more closes a triple-quoted one, and shorter runs are content.
+inline std::pair<std::size_t, KotlinStringEvent> kotlinStringStep( std::string_view bytes, std::size_t i, bool tripleQuoted,
+                                                                   std::size_t dollars ) noexcept
+{
+    const std::size_t byteCount = bytes.size();
+    const auto        byteAt    = [ & ]( std::size_t k ) noexcept -> char { return k < byteCount ? bytes[ k ] : '\0'; };
+    const auto        runOf     = [ & ]( char c ) noexcept
+    {
+        std::size_t run = 0;
+        while( i + run < byteCount && bytes[ i + run ] == c )
+        {
+            ++run;
+        }
+        return run;
+    };
+    switch( bytes[ i ] )
+    {
+        case '$':
+        {
+            const std::size_t run   = runOf( '$' );
+            const bool        opens = run >= dollars && byteAt( i + run ) == '{';
+            return { i + run + ( opens ? 1u : 0u ), opens ? KotlinStringEvent::OpenInterpolation : KotlinStringEvent::None };
+        }
+        case '\\':
+        {
+            const bool        escapesDollar = byteAt( i + 1 ) == '$';
+            const std::size_t quoteAt       = i + ( escapesDollar ? 2u : 1u );
+            if( tripleQuoted && byteAt( quoteAt ) == '"' )
+            {
+                return { quoteAt, KotlinStringEvent::None };   // the triple-quote close test reads this quote again
+            }
+            if( escapesDollar )
+            {
+                return { i + 3, byteAt( i + 2 ) == '"' ? KotlinStringEvent::CloseString : KotlinStringEvent::None };
+            }
+            return { i + 2, KotlinStringEvent::None };
+        }
+        case '"':
+        {
+            if( !tripleQuoted )
+            {
+                return { i + 1, KotlinStringEvent::CloseString };
+            }
+            const std::size_t run = runOf( '"' );
+            return { i + run, run >= 3 ? KotlinStringEvent::CloseString : KotlinStringEvent::None };
+        }
+        default:
+        {
+            return { i + 1, KotlinStringEvent::None };
+        }
+    }
+}
+
+// True when string-template nesting would take tree-sitter-kotlin's scanner string stack past kMaxKotlinStringNestDepth —
+// see that constant in ingest.h for the defect. Like the json/yaml/markdown prescans: one deterministic O(n) byte scan
+// BEFORE any parse, never a wall-clock timeout. Unlike them it is not a shape ESTIMATE, because the stack it bounds
+// changes in exactly two places — a string START pushes one entry and a string END pops one — so this scan MIRRORS the
+// vendored scanner's state machine (scan_string_start / scan_string_content; kotlinStringStep above carries the string
+// half). In code — top level, or inside an interpolation, which closes at the `}` balancing its `${` — a quote after an
+// optional `$` run is a string START, and kotlinCodeTriviaEnd skips what the parser's internal lexer takes whole first.
+// What a byte mirror cannot see is the parser's ERROR RECOVERY, which is why the ceiling sits 4x under the cliff rather
+// than at it, and why the vendored patch that turns the scanner's own abort() into a refused push is a second,
+// independent layer and not a formality.
+bool kotlinStringsNestTooDeep( std::string_view bytes ) noexcept
+{
+    struct NestFrame
+    {
+        bool        isString     = false;
+        bool        tripleQuoted = false;
+        std::size_t dollars      = 1;   // a string: how long a `$` run must be to open an interpolation inside it
+        std::size_t openBraces   = 0;   // an interpolation: `{` opened inside this `${ … }` and not yet closed
+    };
+    // String and interpolation frames strictly alternate above top-level code, so twice the ceiling bounds the stack —
+    // and the string push that would pass the ceiling IS the verdict, so it is reached before the array could fill.
+    std::array<NestFrame, 2u * kMaxKotlinStringNestDepth> frames {};
+    std::size_t       frameCount  = 0;
+    std::uint32_t     stringDepth = 0;
+    const std::size_t byteCount   = bytes.size();
+    std::size_t       i           = 0;
+    while( i < byteCount )
+    {
+        NestFrame* const top = ( frameCount > 0 ) ? &frames[ frameCount - 1 ] : nullptr;
+        if( top != nullptr && top->isString )
+        {
+            const auto [ next, event ] = kotlinStringStep( bytes, i, top->tripleQuoted, top->dollars );
+            i = next;
+            if( event == KotlinStringEvent::CloseString )
+            {
+                --frameCount;
+                --stringDepth;
+            }
+            else if( event == KotlinStringEvent::OpenInterpolation && frameCount < frames.size() )
+            {
+                frames[ frameCount ] = NestFrame{};
+                ++frameCount;
+            }
+            continue;
+        }
+        const std::size_t afterTrivia = kotlinCodeTriviaEnd( bytes, i );
+        if( afterTrivia != i )
+        {
+            i = afterTrivia;
+            continue;
+        }
+        std::size_t dollarRun = 0;
+        while( i + dollarRun < byteCount && bytes[ i + dollarRun ] == '$' )
+        {
+            ++dollarRun;
+        }
+        if( i + dollarRun < byteCount && bytes[ i + dollarRun ] == '"' )
+        {
+            if( stringDepth >= kMaxKotlinStringNestDepth || frameCount >= frames.size() )
+            {
+                return true;
+            }
+            const std::size_t quote  = i + dollarRun;
+            const bool        triple = quote + 2 < byteCount && bytes[ quote + 1 ] == '"' && bytes[ quote + 2 ] == '"';
+            frames[ frameCount ] = NestFrame{ true, triple, std::clamp<std::size_t>( dollarRun, 1u, 255u ), 0u };   // the scanner caps its prefix at 255
+            ++frameCount;
+            ++stringDepth;
+            i = quote + ( triple ? 3u : 1u );
+            continue;
+        }
+        if( top != nullptr && bytes[ i ] == '{' )
+        {
+            ++top->openBraces;
+        }
+        else if( top != nullptr && bytes[ i ] == '}' )
+        {
+            if( top->openBraces == 0 )
+            {
+                --frameCount;   // the brace that balances `${` closes the interpolation: back inside its string
+            }
+            else
+            {
+                --top->openBraces;
+            }
+        }
+        i += ( dollarRun > 0 ) ? dollarRun : 1u;
+    }
+    return false;
+}
+
 // A .h defaults to C++, but an Objective-C header (@interface/@protocol) must use the objc grammar or its
 // class/protocol structure is lost to the C++ parser. Cheap content peek (first 8 KB) for the distinctive
 // '@' declarations. @ is not valid C++ outside a string/comment — and "outside a string/comment" is load-
@@ -768,6 +1225,20 @@ void recordCrawlDrop( std::vector<SkippedFile>& rows, std::uint64_t& exactCount,
     rows.push_back( { path, ec ? 0ull : std::uint64_t( sz ), std::string( ext ) } );
 }
 
+// §SEC1 — a file the crawl REFUSED because its link left the root. Its own recorder rather than
+// recordCrawlDrop, and the difference is the point: recordCrawlDrop pays `entry.file_size()`, which FOLLOWS
+// the link and would therefore measure the very out-of-root file the refusal exists to leave unread. bytes=0
+// here is the NOT-MEASURED sentinel, not a claim of an empty file (see CrawlSkips::escaped in model.h).
+// The count is EXACT and always incremented; only the row is capped, exactly like every sibling class.
+void recordRootEscape( CrawlSkips& skips, const std::string& path, std::string_view ext )
+{
+    DISCLOSE( skips, CrawlSkips::DisclosureWhy::SymlinkEscapesRoot, "ingest: a symlink's target leaves the crawl root — file refused (see --skipped why=escaped-root)" );
+    if( skips.escaped.size() < kMaxSkipRowsPerClass )
+    {
+        skips.escaped.push_back( { path, 0ull, std::string( ext ) } );
+    }
+}
+
 // §L1: the crawl's two NON-SIZE drop tests, together, because they are one decision with one ordering
 // contract — is this file a crawl candidate at all, and if not, is its absence something the reader needs
 // told about? Returns true when the caller must skip the file (the drop, if reportable, is already
@@ -779,16 +1250,34 @@ void recordCrawlDrop( std::vector<SkippedFile>& rows, std::uint64_t& exactCount,
 // the user did NOT ask to hide (an --exclude'd .ml is requested absence, not a language this build cannot
 // read). Swap the two and both classes start lying.
 //
+// THE THIRD TEST, FOR ONE CLASS ONLY (§N6-C, closed 2026-09-09). The unsupported-ext population is not
+// merely reported — grep's aux scan (search.h grepCollectAux) READS it and SERVES its hits — so it must
+// hold only files the REPOSITORY did not ask to hide either, on exactly the rule it already applies to
+// --exclude. Before this test existed the crawl asked the ignore set only about files that survived
+// here, so a file that was both gitignored and of an unindexed extension was rowed as unsupported-ext:
+// measured, --regex='^#include' served four hits from a `.cpp.bak` beside its source that the
+// repository's own .gitignore names (rg does not open it), while unindexed_files_scanned= and
+// unsupported_ext= both counted it, so nothing disclosed that an ignored file had been read.
+// test/grepignorecheck.sh pins the fix. `ignored` is a LAZY predicate for the same reason fullPath is:
+// the lookup stringifies the path, so it is paid only once the two cheaper tests have already admitted
+// the file to this class — never for a binary asset or an --exclude'd file, and never for an indexable
+// file, which takes the crawl's own ignore test after this returns false. A file dropped here is in NO
+// class — neither this one nor ignored=, exactly as an --exclude'd unsupported-ext file is in neither
+// this one nor excluded=: ignored= describes only what would OTHERWISE HAVE BEEN INDEXED (the number the
+// map header's accounting invariant carries), and a language this build cannot read that the repository
+// hid is not a disclosure the reader is owed. --no-ignore makes the predicate false, so the escape hatch
+// restores the row and both counts with it.
+//
 // `fullPath` is the caller's LAZY path materializer, taken as a template parameter rather than a
 // std::string: a monorepo crawl walks far more non-source files than source ones, and stringifying every
 // one of them to record the handful that are reportable would be a real per-file cost for nothing.
-template< typename PathFn >
+template< typename PathFn, typename IgnoredFn >
 bool recordPreSizeDrop( CrawlSkips& skips, HashMap<std::string, std::uint64_t>& extTally,
-                        const std::string& ext, bool excluded, const fs::directory_entry& entry, PathFn&& fullPath )
+                        const std::string& ext, bool excluded, const fs::directory_entry& entry, PathFn&& fullPath, IgnoredFn&& ignored )
 {
     if( lookupLang( ext ) == nullptr && !docparse::isDocExtension( ext ) )
     {
-        if( !excluded && !isNonTextExtension( ext ) )
+        if( !excluded && !isNonTextExtension( ext ) && !ignored() )
         {
             ++extTally[ ext ];
             recordCrawlDrop( skips.unsupported, skips.unsupportedFiles, fullPath(), ext, entry );
@@ -831,6 +1320,18 @@ struct GitIgnoreSet
     bool                     rootIgnored = false; // git answered "./" — the ROOT is itself ignored (see IgnoreMode)
     std::vector<std::string> dirs;                // root-relative, NO trailing '/', sorted
     std::vector<std::string> files;               // root-relative, sorted
+    // The DISCLOSE sink for a probe git could not answer whole: `available` stays false, which --skipped prints as
+    // ignore_mode="unavailable" (and the crawl walks everything, never a partial ignore set).
+    enum class DisclosureWhy : std::uint8_t
+    {
+        GitNotRunnable,
+        ProbeOverCeiling,
+        ProbeFailed,   // git ran but exited non-zero (not a work tree, no git binary reachable via the shell, …)
+    };
+    void disclose( DisclosureWhy ) noexcept
+    {
+        available = false;
+    }
 };
 
 // A probe answer larger than this is refused whole rather than applied in part: a PARTIAL ignore set
@@ -849,14 +1350,14 @@ bool underGitRoot( const char* rootDir )
 {
     std::string dir = rootDir == nullptr ? std::string( "." ) : std::string( rootDir );
     char        resolved[ PATH_MAX ];
-    if( ::realpath( dir.c_str(), resolved ) != nullptr )
+    if( os::realpath( dir.c_str(), resolved ) != nullptr )
     {
         dir = resolved;
     }
     for( ;; )
     {
-        struct stat st;
-        if( ::stat( ( dir + "/.git" ).c_str(), &st ) == 0 )
+        os::stat_t st;
+        if( os::stat( ( dir + "/.git" ).c_str(), &st ) == 0 )
         {
             return true;
         }
@@ -876,12 +1377,12 @@ GitIgnoreSet collectGitIgnored( const char* rootDir )
     {
         return out;
     }
-    const std::string cmd = "git -C " + shSingleQuote( rootDir == nullptr ? std::string( "." ) : std::string( rootDir ) )
+    const std::string cmd = gitCmd( " -C " ) + shSingleQuote( rootDir == nullptr ? std::string( "." ) : std::string( rootDir ) )
                           + " -c core.quotepath=false ls-files --others --ignored --exclude-standard --directory -z 2>/dev/null";
-    std::FILE* pipe = ::popen( cmd.c_str(), "r" );
+    std::FILE* pipe = os::popen( cmd.c_str(), "r" );
     if( pipe == nullptr )
     {
-        DEGRADED_PATH_ALERT( "ingest: cannot run git for the ignore probe — full walk" );
+        DISCLOSE( out, GitIgnoreSet::DisclosureWhy::GitNotRunnable, "ingest: cannot run git for the ignore probe — full walk" );
         return out;
     }
     std::string buf;
@@ -896,14 +1397,19 @@ GitIgnoreSet collectGitIgnored( const char* rootDir )
         }
         buf.append( chunk, n );
     }
-    const int rc = ::pclose( pipe );
+    const int rc = os::pclose( pipe );
     if( rc != 0 )
     {
-        return out;   // not a git work tree, or no git binary — the DESIGNED degrade, silent by contract
+        // Not a git work tree, or no git binary — the DESIGNED degrade: the fallback (a full walk, no
+        // ignore-set pruning) is safe either way. `available` is already false here (its default), so this
+        // changes no output — it disclose()s the fact for the self-check ledger instead of leaving the
+        // degrade to a bare `return`, matching the GitNotRunnable/ProbeOverCeiling sites just above/below.
+        DISCLOSE( out, GitIgnoreSet::DisclosureWhy::ProbeFailed, "ingest: the git ignore probe exited non-zero — full walk" );
+        return out;
     }
     if( overflowed )
     {
-        DEGRADED_PATH_ALERT( "ingest: git ignore probe exceeded its byte ceiling — full walk" );
+        DISCLOSE( out, GitIgnoreSet::DisclosureWhy::ProbeOverCeiling, "ingest: git ignore probe exceeded its byte ceiling — full walk" );
         return out;
     }
 
@@ -953,13 +1459,23 @@ GitIgnoreSet collectGitIgnored( const char* rootDir )
 // extension classification and the --exclude match (the same reason recordPreSizeDrop's header gives for
 // its own two): `ignored` then only ever describes a file that would OTHERWISE HAVE BEEN INDEXED, which is
 // what lets the header's accounting invariant carry it — indexed= + oversize= + excluded= + ignored= = the
-// population the crawl enumerated — and keeps unsupported_ext=/unindexed= meaning exactly what they meant
-// before this lane. The DIRECTORY test runs after the built-in denylist for the mirror reason: ignoredDirs=
+// population the crawl enumerated. The ONE earlier consult is recordPreSizeDrop's unsupported-ext branch,
+// which asks the same predicate before it records a row and records NOTHING when the answer is yes: that
+// class is served by grep's aux scan, so unsupported_ext=/unindexed= describe the population grep actually
+// reads, and an ignored file of an unindexed extension is counted in neither class (its header has the
+// measured leak). The DIRECTORY test runs after the built-in denylist for the mirror reason: ignoredDirs=
 // then counts only the subtrees no rule this build already carried had pruned.
 bool pathInIgnoreSet( const std::vector<std::string>& sorted, std::string_view rel ) noexcept
 {
-    return std::binary_search( sorted.begin(), sorted.end(), rel,
-                               []( std::string_view a, std::string_view b ) noexcept { return a < b; } );
+    // lower_bound + the explicit found-check, not a binary_search one-liner: svLess because libstdc++'s
+    // string_view::_S_compare computes n1 - n2 in size_type and the wrap aborts the Linux G1 leg on the
+    // first prefix-equal, length-differing probe (#343 — `.git` against `.github/…`); the lower_bound
+    // shape because --quality-delta files a third `binary_search( …, svLess )` membership wrapper as a
+    // duplication clone of docparse's and externalnames' (measured: gating, tokens=35). Found ⟺ the
+    // first not-less element is not greater: svLess is the same total order operator< defines, so the
+    // vector sorted under operator< above stays sorted under this (infra/sortutil.h's contract).
+    const auto it = std::lower_bound( sorted.begin(), sorted.end(), rel, rw::sortutil::svLess );
+    return it != sorted.end() && !rw::sortutil::svLess( rel, *it );
 }
 
 // §N6-C — the probe AND the mode it implies, as one decision, so collectSources reads the answer instead
@@ -998,11 +1514,13 @@ void recordDirPrune( CrawlSkips& skips, bool excluded, bool ignoredDir, const fs
 // the DEFAULT map header, where an order that depended on hash iteration would be a determinism bug.
 void finalizeCrawlSkips( CrawlSkips& skips, const HashMap<std::string, std::uint64_t>& extTally )
 {
+    PROFILE_SCOPE_DESCRIBE( "ingest/crawl: finalize skip rows" );
     const auto byPath = []( const SkippedFile& a, const SkippedFile& b ) noexcept { return a.path < b.path; };
     std::sort( skips.excluded.begin(), skips.excluded.end(), byPath );
     std::sort( skips.unsupported.begin(), skips.unsupported.end(), byPath );
     std::sort( skips.ignored.begin(), skips.ignored.end(), byPath );               // §N6-C, same contract
     std::sort( skips.ignoredDirRows.begin(), skips.ignoredDirRows.end(), byPath ); // §N6-C, same contract
+    std::sort( skips.escaped.begin(), skips.escaped.end(), byPath );               // §SEC1, same contract
     skips.unindexedExts.reserve( extTally.size() );
     for( const auto& [ ext, count ] : extTally )
     {
@@ -1022,8 +1540,12 @@ struct CrawlResult
     CrawlSkips                   skips;
 };
 
+// #350: `memWatch` (null = unguarded) is consulted once per directory entry — memguard::Watch decides how rarely it
+// actually measures — and a stop ends the walk where it is. What was seen so far is sorted and returned exactly as a
+// finished walk's list is, so a partial corpus is still a deterministic one; ingest() discloses the stop.
 CrawlResult collectSources( const char* rootDir, const std::vector<std::string>& excludeSubstr,
-                            std::size_t maxFileBytes, std::string_view excludeLabel = {}, bool respectGitignore = true )
+                            std::size_t maxFileBytes, std::string_view excludeLabel = {}, bool respectGitignore = true,
+                            memguard::Watch* memWatch = nullptr )
 {
     std::vector<std::string>     out;
     std::vector<SkippedOversize> skipped;
@@ -1036,6 +1558,11 @@ CrawlResult collectSources( const char* rootDir, const std::vector<std::string>&
 
     std::error_code ec;
     fs::path root = fs::path( rootDir );
+
+    // §SEC1 — the boundary, canonicalized ONCE for the whole walk (ingest.h carries the rule and the reasons).
+    // Computed before the single-file branch because that branch is its own boundary: a user who names a file
+    // directly has selected it, and realpath'ing the root makes the file trivially inside itself.
+    const std::string rootReal = canonicalCrawlRoot( rootDir == nullptr ? std::string_view{} : std::string_view( rootDir ) );
 
     // If the root is a regular file, index just that one file instead of refusing.
     if( fs::is_regular_file( root, ec ) && !ec )
@@ -1072,169 +1599,208 @@ CrawlResult collectSources( const char* rootDir, const std::vector<std::string>&
     fs::recursive_directory_iterator it( root, opts, ec );
     if( ec )
     {
-        DEGRADED_PATH_ALERT( "ingest: cannot open root directory — empty result" );
+        DISCLOSE( "ingest: cannot open root directory — empty result" );
         return { std::move( out ), std::move( skipped ), std::move( skips ) };
     }
 
     const GitIgnoreSet ignoreSet = probeIgnoreSet( rootDir, respectGitignore, skips.ignoreMode );   // §N6-C
 
     const fs::recursive_directory_iterator end;
-    for( ; it != end; it.increment( ec ) )
     {
-        if( ec )
+        PROFILE_SCOPE_DESCRIBE( "ingest/crawl: directory walk (stat + classify)" );
+        std::uint64_t entryCount = 0;
+        for( ; it != end; it.increment( ec ) )
         {
-            ec.clear();
-            continue;
-        }
+            if( memWatch != nullptr && memWatch->crawlShouldStop( entryCount++ ) )
+            {
+                break;   // #350: the memory guard's crawl line — ingest() records the stop from the watch
+            }
+            if( ec )
+            {
+                ec.clear();
+                continue;
+            }
 
-        const fs::path& p = it->path();
-        std::string     full;
-        const auto fullPath = [ & ]() -> const std::string&
-        {
-            if( full.empty() )
+            const fs::path& p = it->path();
+            std::string     full;
+            const auto fullPath = [ & ]() -> const std::string&
             {
-                full = p.string();
-            }
-            return full;
-        };
-
-        // user --exclude substrings prune dirs and drop files (vendored/generated trees). Multi-root (A12):
-        // match against the LABELED spelling so one excludes list applies uniformly across roots.
-        bool excluded = false;
-        if( !excludeSubstr.empty() )
-        {
-            std::string labeledBuf;
-            std::string_view matchPath = fullPath();
-            if( !excludeLabel.empty() )
-            {
-                labeledBuf.assign( excludeLabel );
-                const std::string_view rel = relForHash( fullPath(), rootDir );
-                if( !rel.empty() ) { labeledBuf.push_back( '/' );  labeledBuf.append( rel ); }
-                matchPath = labeledBuf;
-            }
-            for( const std::string& ex : excludeSubstr )
-            {
-                if( !ex.empty() && matchPath.find( ex ) != std::string_view::npos ) { excluded = true; break; }
-            }
-        }
-
-        // prune noise/vendor/build subtrees entirely (a .gitignore-lite default denylist)
-        if( it->is_directory( ec ) )
-        {
-            // The denylist itself now lives in ingest.h (kCrawlSkipDirs / isSkippedCrawlDir) so darkflags.h's
-            // CMake walk prunes exactly the same subtrees — see the note there.
-            bool skip = excluded;
-            if( !skip )
-            {
-                skip = isSkippedCrawlDir( p.filename().string() );
-            }
-            // skip any dir that contains a CMakeCache.txt — it's a build output tree
-            if( !skip )
-            {
-                const fs::path cache_sentinel = p / "CMakeCache.txt";
-                if( fs::exists( cache_sentinel, ec ) )
+                if( full.empty() )
                 {
-                    skip = true;
+                    full = os::program_path( p );   // the logical path the model carries: '/' on every platform
+                }
+                return full;
+            };
+
+            // user --exclude substrings prune dirs and drop files (vendored/generated trees). #228/A1: match
+            // against the ROOT-RELATIVE spelling (relForHash), never the raw typed path — an absolute or
+            // trailing-slash root spelling must not let an --exclude substring hit the checkout location
+            // above the root (the same defect class rootRelPath fixes for the index-builder seams). Multi-root
+            // (A12): match against the LABELED spelling so one excludes list applies uniformly across roots.
+            bool excluded = false;
+            if( !excludeSubstr.empty() )
+            {
+                std::string             labeledBuf;
+                const std::string_view  rel       = relForHash( fullPath(), rootDir );
+                std::string_view        matchPath = rel;
+                if( !excludeLabel.empty() )
+                {
+                    labeledBuf.assign( excludeLabel );
+                    if( !rel.empty() ) { labeledBuf.push_back( '/' );  labeledBuf.append( rel ); }
+                    matchPath = labeledBuf;
+                }
+                for( const std::string& ex : excludeSubstr )
+                {
+                    if( !ex.empty() && matchPath.find( ex ) != std::string_view::npos ) { excluded = true; break; }
+                }
+            }
+
+            // prune noise/vendor/build subtrees entirely (a .gitignore-lite default denylist)
+            if( it->is_directory( ec ) )
+            {
+                // The denylist itself now lives in ingest.h (kCrawlSkipDirs / isSkippedCrawlDir) so darkflags.h's
+                // CMake walk prunes exactly the same subtrees — see the note there.
+                bool skip = excluded;
+                if( !skip )
+                {
+                    skip = isSkippedCrawlDir( p.filename().string() );
+                }
+                // skip any dir that contains a CMakeCache.txt — it's a build output tree
+                if( !skip )
+                {
+                    const fs::path cache_sentinel = p / "CMakeCache.txt";
+                    if( fs::exists( cache_sentinel, ec ) )
+                    {
+                        skip = true;
+                    }
+                    ec.clear();
+                }
+                // §N6-C: the ignore rule is tested LAST, so ignoredDirs= counts only the subtrees no rule this
+                // build already carried had pruned — every existing counter keeps the meaning it had, and the
+                // new one is exactly "what honouring .gitignore additionally removed".
+                bool ignoredDir = false;
+                if( !skip && ignoreSet.available )
+                {
+                    ignoredDir = pathInIgnoreSet( ignoreSet.dirs, relForHash( fullPath(), rootDir ) );
+                    skip       = ignoredDir;
+                }
+                if( skip )
+                {
+                    it.disable_recursion_pending();
+                    recordDirPrune( skips, excluded, ignoredDir, *it, fullPath );   // §L1/§N6-C: see its header
+                }
+                continue;
+            }
+
+            if( !it->is_regular_file( ec ) )
+            {
+                continue;
+            }
+
+            const std::string name = p.filename().string();
+            if( isDenylistedName( name ) )
+            {
+                continue;
+            }
+
+            // §SEC1 — THE CRAWL BOUNDARY, and it is tested BEFORE the extension is classified. Order is the
+            // contract here exactly as it is for the two drops below, but for a different reason: the
+            // unsupported-ext class is READ AND SERVED by grep's aux scan (search.h grepCollectAux), so a
+            // boundary test placed after the classification leaves a `.txt` link to an out-of-root file
+            // serving its bytes through --grep with every other arm of the fix green. Measured; it is arm 5
+            // of test/crawlescapecheck.sh. After isDenylistedName for the mirror reason the other tests sit
+            // where they do: this class then holds only files that would OTHERWISE HAVE BEEN READ.
+            //
+            // `is_symlink()` reads the cached readdir type, so the cost of this line on a symlink-free tree
+            // is a branch; only a symlink pays the realpath inside crawlPathStaysInRoot.
+            const bool isLink = it->is_symlink( ec );
+            ec.clear();
+            if( isLink && !crawlPathStaysInRoot( fullPath(), rootReal ) )
+            {
+                recordRootEscape( skips, fullPath(), lowerExtensionOf( name ) );
+                continue;
+            }
+
+            // extension must be a known source language OR a doc format (P1-B: notebooks/html/csv are collected
+            // like code so they get a fileId; they're skipped by the tree-sitter parse loop and handled in the
+            // doc post-pass instead). Use the filename here so rejected regular files do not pay to stringify the
+            // full path; materialize the full path only after the extension survives.
+            //
+            // §N6-C: the repository's own verdict on this file, ONE lazy predicate shared by the two sites that
+            // ask it — the lookup stringifies the path (relForHash over fullPath), so it is evaluated only where
+            // a class actually consults it, never for a binary asset or an --exclude'd file. False under
+            // --no-ignore, on a non-git root, and when git could not answer (ignoreSet.available).
+            const auto ignored = [ & ]() -> bool
+            {
+                return ignoreSet.available && pathInIgnoreSet( ignoreSet.files, relForHash( fullPath(), rootDir ) );
+            };
+
+            // §L1: the two NON-SIZE drops are classified and recorded together (recordPreSizeDrop) — see its
+            // header for why the tests must run in that order, why the unsupported-ext class alone consults the
+            // ignore verdict BEFORE it records a row, and why none of it is written inline here.
+            const std::string ext = lowerExtensionOf( name );
+            if( recordPreSizeDrop( skips, extTally, ext, excluded, *it, fullPath, ignored ) )
+            {
+                continue;
+            }
+
+            // §N6-C: AFTER the extension and the --exclude match — see pathInIgnoreSet's header for the ordering.
+            if( ignored() )
+            {
+                recordCrawlDrop( skips.ignored, skips.ignoredFiles, fullPath(), ext, *it );
+                continue;
+            }
+
+            const std::uintmax_t sz = it->file_size( ec );
+            if( ec || sz > maxFileBytes )
+            {
+                if( !ec && sz > maxFileBytes )
+                {
+                    // §P0.5d: a size drop is reportable, not invisible — path + size + the ceiling that dropped it
+                    skipped.push_back( { fullPath(), std::uint64_t( sz ), std::uint64_t( maxFileBytes ) } );
                 }
                 ec.clear();
+                continue;
             }
-            // §N6-C: the ignore rule is tested LAST, so ignoredDirs= counts only the subtrees no rule this
-            // build already carried had pruned — every existing counter keeps the meaning it had, and the
-            // new one is exactly "what honouring .gitignore additionally removed".
-            bool ignoredDir = false;
-            if( !skip && ignoreSet.available )
+
+            // JSON-lane ceiling (see kMaxJsonConfigBytes): big .json is data, not config — skip it before it
+            // mints a symbol-table explosion. Applies only to the .json extension; --max-file-size does not
+            // override it upward (config files this large do not exist; data files this large are the hazard).
+            //
+            // §B13.1: COUNTED, exactly like the generic size drop 8 lines above. Both are "an otherwise-indexable
+            // file the crawl dropped for exceeding a size ceiling", which is what skipped_oversize means, and the
+            // two are mutually exclusive BY CONSTRUCTION — the generic ceiling is tested first, so a .json over
+            // both ceilings is counted once, there — which is why one list serves both and no file is counted
+            // twice. Uncounted, this drop broke the header's own accounting invariant
+            // (files= + skipped_oversize= = the candidate population the crawl considered): on this repo the
+            // DEFAULT map reported files=866 with the attribute absent (implying 866) while --max-file-size=256K
+            // reported files=861 + skipped_oversize=8 = 869. Three files — the >256 KB .json under
+            // bench/locbench/ — vanished with no counter, no stderr and no legend clause, which is the exact
+            // class skipped_oversize exists to kill. The ceiling itself is deliberately NOT lifted here: it is a
+            // content-class guard (data vs config) that merely uses size as its proxy, so letting a SIZE flag
+            // override it would trade a disclosure defect for a corpus one.
+            if( sz > kMaxJsonConfigBytes && ext == ".json" )
             {
-                ignoredDir = pathInIgnoreSet( ignoreSet.dirs, relForHash( fullPath(), rootDir ) );
-                skip       = ignoredDir;
+                skipped.push_back( { fullPath(), std::uint64_t( sz ), std::uint64_t( kMaxJsonConfigBytes ) } );
+                continue;
             }
-            if( skip )
+
+            // YAML-lane ceiling (see kMaxYamlConfigBytes): the same hazard class as .json — a machine-written
+            // DATA population behind a config extension — at YAML's own measured calibration: 512 KB, because
+            // JSON's 256 KB would drop real hand-maintained config (NeMo's 293 KB cicd-main.yml). Counted in
+            // skipped_oversize exactly like its two siblings above, for the same accounting invariant.
+            if( sz > kMaxYamlConfigBytes && ( ext == ".yml" || ext == ".yaml" ) )
             {
-                it.disable_recursion_pending();
-                recordDirPrune( skips, excluded, ignoredDir, *it, fullPath );   // §L1/§N6-C: see its header
+                skipped.push_back( { fullPath(), std::uint64_t( sz ), std::uint64_t( kMaxYamlConfigBytes ) } );
+                continue;
             }
-            continue;
-        }
 
-        if( !it->is_regular_file( ec ) )
-        {
-            continue;
+            // binary sniff: the parse pool's looksBinary() already guards against binary content;
+            // removing the crawl-time sniff here avoids 3 syscalls × N files on every warm run
+            // (Win 3 from PERF.md). Any binary file that slips through produces zero defs/refs and
+            // is invisible in the ranked map; its phantom fileId has no downstream effect.
+            out.push_back( fullPath() );
         }
-
-        const std::string name = p.filename().string();
-        if( isDenylistedName( name ) )
-        {
-            continue;
-        }
-
-        // extension must be a known source language OR a doc format (P1-B: notebooks/html/csv are collected
-        // like code so they get a fileId; they're skipped by the tree-sitter parse loop and handled in the
-        // doc post-pass instead). Use the filename here so rejected regular files do not pay to stringify the
-        // full path; materialize the full path only after the extension survives.
-        //
-        // §L1: the two NON-SIZE drops are classified and recorded together (recordPreSizeDrop) — see its
-        // header for why the two tests must run in that order, and why they are not written inline here.
-        const std::string ext = lowerExtensionOf( name );
-        if( recordPreSizeDrop( skips, extTally, ext, excluded, *it, fullPath ) )
-        {
-            continue;
-        }
-
-        // §N6-C: AFTER the extension and the --exclude match — see pathInIgnoreSet's header for the ordering.
-        if( ignoreSet.available && pathInIgnoreSet( ignoreSet.files, relForHash( fullPath(), rootDir ) ) )
-        {
-            recordCrawlDrop( skips.ignored, skips.ignoredFiles, fullPath(), ext, *it );
-            continue;
-        }
-
-        const std::uintmax_t sz = it->file_size( ec );
-        if( ec || sz > maxFileBytes )
-        {
-            if( !ec && sz > maxFileBytes )
-            {
-                // §P0.5d: a size drop is reportable, not invisible — path + size + the ceiling that dropped it
-                skipped.push_back( { fullPath(), std::uint64_t( sz ), std::uint64_t( maxFileBytes ) } );
-            }
-            ec.clear();
-            continue;
-        }
-
-        // JSON-lane ceiling (see kMaxJsonConfigBytes): big .json is data, not config — skip it before it
-        // mints a symbol-table explosion. Applies only to the .json extension; --max-file-size does not
-        // override it upward (config files this large do not exist; data files this large are the hazard).
-        //
-        // §B13.1: COUNTED, exactly like the generic size drop 8 lines above. Both are "an otherwise-indexable
-        // file the crawl dropped for exceeding a size ceiling", which is what skipped_oversize means, and the
-        // two are mutually exclusive BY CONSTRUCTION — the generic ceiling is tested first, so a .json over
-        // both ceilings is counted once, there — which is why one list serves both and no file is counted
-        // twice. Uncounted, this drop broke the header's own accounting invariant
-        // (files= + skipped_oversize= = the candidate population the crawl considered): on this repo the
-        // DEFAULT map reported files=866 with the attribute absent (implying 866) while --max-file-size=256K
-        // reported files=861 + skipped_oversize=8 = 869. Three files — the >256 KB .json under
-        // bench/locbench/ — vanished with no counter, no stderr and no legend clause, which is the exact
-        // class skipped_oversize exists to kill. The ceiling itself is deliberately NOT lifted here: it is a
-        // content-class guard (data vs config) that merely uses size as its proxy, so letting a SIZE flag
-        // override it would trade a disclosure defect for a corpus one.
-        if( sz > kMaxJsonConfigBytes && ext == ".json" )
-        {
-            skipped.push_back( { fullPath(), std::uint64_t( sz ), std::uint64_t( kMaxJsonConfigBytes ) } );
-            continue;
-        }
-
-        // YAML-lane ceiling (see kMaxYamlConfigBytes): the same hazard class as .json — a machine-written
-        // DATA population behind a config extension — at YAML's own measured calibration: 512 KB, because
-        // JSON's 256 KB would drop real hand-maintained config (NeMo's 293 KB cicd-main.yml). Counted in
-        // skipped_oversize exactly like its two siblings above, for the same accounting invariant.
-        if( sz > kMaxYamlConfigBytes && ( ext == ".yml" || ext == ".yaml" ) )
-        {
-            skipped.push_back( { fullPath(), std::uint64_t( sz ), std::uint64_t( kMaxYamlConfigBytes ) } );
-            continue;
-        }
-
-        // binary sniff: the parse pool's looksBinary() already guards against binary content;
-        // removing the crawl-time sniff here avoids 3 syscalls × N files on every warm run
-        // (Win 3 from PERF.md). Any binary file that slips through produces zero defs/refs and
-        // is invisible in the ranked map; its phantom fileId has no downstream effect.
-        out.push_back( fullPath() );
     }
 
     // LOAD-BEARING: lexicographic (byte-order) sort fixes node-id assignment run-to-run.
@@ -1247,60 +1813,63 @@ CrawlResult collectSources( const char* rootDir, const std::vector<std::string>&
     return { std::move( out ), std::move( skipped ), std::move( skips ) };
 }
 
-// ---- read a file's bytes (returns false on open failure) ----
+// ---- read a file's bytes (false when it cannot be opened, sized or read in full) ----
+// Deliberately an out-parameter, unlike docparse::detail::readWholeFile: the parse pool and the AST-query pass
+// each hand in one worker-local buffer and reuse it for every file they read, so its capacity carries over.
+//
+// The stream is OWNED (rw::OwnedFile), so every return closes it. It used to be a raw FILE* closed inside
+// `( got == want ) && ( std::fclose( fp ) == 0 )`, which short-circuited past the close on every short read: a
+// file truncated between the size probe and the read leaked one descriptor per read, per re-ingest of a long-lived
+// server, until nothing more could be opened and every later file dropped out of the answer with exit 0.
 bool readFile( const std::string& path, std::string& out )
 {
     PROFILE_SCOPE_DESCRIBE( "ingest/readFile: fopen+read whole file" );
 
-    std::FILE* fp = std::fopen( path.c_str(), "rb" );
-    if( fp == nullptr )
+    OwnedFile fp = openOwnedFile( path.c_str(), "rb" );
+    if( !fp )
     {
         return false;
     }
 
-    if( std::fseek( fp, 0, SEEK_END ) != 0 )
+    if( std::fseek( fp.file, 0, SEEK_END ) != 0 )
     {
-        std::fclose( fp );
         return false;
     }
-    const long len = std::ftell( fp );
-    if( len < 0 )
+    const long len = std::ftell( fp.file );
+    if( len < 0 || std::fseek( fp.file, 0, SEEK_SET ) != 0 )
     {
-        std::fclose( fp );
-        return false;
-    }
-    if( std::fseek( fp, 0, SEEK_SET ) != 0 )
-    {
-        std::fclose( fp );
         return false;
     }
 
     out.resize( static_cast<std::size_t>( len ) );
     const std::size_t want = out.size();
-    const std::size_t got  = want == 0 ? 0 : std::fread( out.data(), 1, want, fp );
-    const bool ok = ( got == want ) && ( std::fclose( fp ) == 0 );
-    if( !ok )
+    const std::size_t got  = want == 0 ? 0 : std::fread( out.data(), 1, want, fp.file );
+    const bool        closedOk = fp.close();
+    if( got != want || !closedOk )
     {
         out.clear();
+        return false;
     }
-    return ok;
+    return true;
 }
 
+// The first `maxBytes` of a file, into `out` for the same reason as readFile: each prewarm hash worker reuses one
+// header-prefix buffer for every file it probes.
 bool readFilePrefix( const std::string& path, std::string& out, std::size_t maxBytes )
 {
     PROFILE_SCOPE_DESCRIBE( "ingest/readFilePrefix: fopen+read prefix" );
 
-    std::FILE* fp = std::fopen( path.c_str(), "rb" );
-    if( fp == nullptr )
+    OwnedFile fp = openOwnedFile( path.c_str(), "rb" );
+    if( !fp )
     {
         return false;
     }
 
     out.resize( maxBytes );
-    const std::size_t got = maxBytes == 0 ? 0 : std::fread( out.data(), 1, maxBytes, fp );
-    const bool readOk = got > 0 || std::feof( fp ) != 0;
-    const bool closeOk = std::fclose( fp ) == 0;
-    if( !readOk || !closeOk )
+    const std::size_t got      = maxBytes == 0 ? 0 : std::fread( out.data(), 1, maxBytes, fp.file );
+    const bool        readOk   = std::ferror( fp.file ) == 0 && ( got > 0 || std::feof( fp.file ) != 0 );
+    const bool        closedOk = fp.close();
+    if( !readOk || !closedOk )
     {
         out.clear();
         return false;
@@ -1336,21 +1905,17 @@ bool readFilePrefix( const std::string& path, std::string& out, std::size_t maxB
 struct StatInfo { long long mtimeNs; long long sizeBytes; long long ctimeNs; };   // all -1 if the path cannot be stat'd
 inline StatInfo statSizeTimes( const std::string& path ) noexcept
 {
-    struct stat st;
-    if( ::stat( path.c_str(), &st ) != 0 )
+    os::stat_t st;
+    if( os::stat( path.c_str(), &st ) != 0 )
     {
         return { -1, -1, -1 };
     }
-#if defined( __APPLE__ )
-    const long long m = (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
-    const long long c = (long long)st.st_ctimespec.tv_sec * 1000000000LL + st.st_ctimespec.tv_nsec;
-#elif defined( __linux__ )
-    const long long m = (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
-    const long long c = (long long)st.st_ctim.tv_sec * 1000000000LL + st.st_ctim.tv_nsec;
-#else
-    const long long m = (long long)st.st_mtime * 1000000000LL;   // whole-second fallback
-    const long long c = (long long)st.st_ctime * 1000000000LL;
-#endif
+    // saturatingNanoseconds (infra/statclock.h): a timestamp past 2262 overflowed the plain product — undefined
+    // behaviour in release and an abort under the sanitizer build, on any ext4/XFS/tmpfs file or tar restore
+    // carrying one. os::st_mtim/st_ctim already abstract the field name (Darwin st_mtimespec vs POSIX st_mtim,
+    // whole-second fallback elsewhere), so no platform switch is needed at this call site.
+    const long long m = saturatingNanoseconds( os::st_mtim( st ) );
+    const long long c = saturatingNanoseconds( os::st_ctim( st ) );
     return { m, (long long)st.st_size, c };
 }
 
@@ -1373,8 +1938,8 @@ enum class PathShape : std::uint8_t { Absent, RegularFile, Other };
 
 inline PathShape shapeOfPath( const std::string& path ) noexcept
 {
-    struct stat st;
-    const bool  isStatable = ::stat( path.c_str(), &st ) == 0;
+    os::stat_t st;
+    const bool  isStatable = os::stat( path.c_str(), &st ) == 0;
     return !isStatable ? PathShape::Absent : ( S_ISREG( st.st_mode ) ? PathShape::RegularFile : PathShape::Other );
 }
 
@@ -1386,7 +1951,8 @@ inline bool isReadableCacheBlob( const std::string& path ) noexcept
     const PathShape shape = shapeOfPath( path );
     if( shape == PathShape::Other )
     {
-        DEGRADED_PATH_ALERT( "ingest: cache path is not a regular file (directory/device/fifo) — cache treated as corrupt (full reparse)" );
+        DISCLOSE( Diagnostics::answerUnchanged, "a rejected cache is rebuilt from source: this run parses and answers byte-identically",
+                  "ingest: cache path is not a regular file (directory/device/fifo) — cache treated as corrupt (full reparse)" );
     }
     return shape == PathShape::RegularFile;
 }
@@ -1496,10 +2062,43 @@ TSQuery* compileQueryStandalone( const LangEntry& le )
     TSQuery*      q       = ts_query_new( le.grammar(), scm.data(), static_cast<std::uint32_t>( scm.size() ), &errOff, &errType );
     if( q == nullptr )
     {
-        std::fprintf( stderr, "[ripwire] tags.scm compile error for %s at byte %u (err %d) — skipping language\n",
+        rw::emitTo( stderr, "[ripwire] tags.scm compile error for {} at byte {} (err {}) — skipping language\n",
                       std::string( le.querySub ).c_str(), errOff, (int)errType );
     }
     return q;
+}
+
+// ---- the [grammar][field] TSFieldId table, filled ONCE per grammar (src/infra/fieldid.h) ----
+// Same shape and same invariant as the compiled-query cache above: written single-threaded before any
+// parse worker exists, read lock-free per AST node afterwards. It warms EVERY grammar the table can
+// name rather than the crawl's miss set, for two reasons. First, the miss set is empty on a fully-warm
+// run, and the AST walks that read this table are not: --slice, --lint and the preprocessor reader parse
+// outside the tags prewarm entirely. Second, the cost is a fixed few hundred microseconds — 23 grammars
+// x 41 field names, each one linear-scan resolved ONCE — against a per-AST-node saving, so paying it for
+// a grammar the run never uses is cheaper than reasoning about which runs need which.
+//
+// The function-local static is what makes it idempotent and thread-safe at the seam (ingest() can be
+// re-entered in a long-lived MCP server); rw::warmFieldIds itself is neither, which is why nothing else
+// may call it. Gate: test/fieldidcheck.sh arm E-warm.
+// A 65th extension row must be a compile error, not a run that silently keeps the by-name path: the row
+// count bounds the DISTINCT grammar count the loop below registers, so this assert bounds the registry.
+static_assert( kLangTable.size() <= kFieldIdCapacity,
+               "kLangTable has more rows than rw::kFieldIdCapacity — raise the capacity in src/infra/fieldid.h" );
+
+inline void warmFieldIdTable()
+{
+    static const bool warmed = []()
+    {
+        for( const LangEntry& le : kLangTable )
+        {
+            if( le.grammar != nullptr )
+            {
+                warmFieldIds( le.grammar() );      // nullptr-safe and idempotent; markdown rows have no grammar
+            }
+        }
+        return true;
+    }();
+    (void) warmed;
 }
 
 TSQuery* compiledQueryFor( const LangEntry& le )
@@ -1517,9 +2116,8 @@ TSQuery* compiledQueryFor( const LangEntry& le )
 
     // not prewarmed — a transient readFile failure can make the prewarm miss-detection skip a grammar the
     // pool later needs. Compiling here would WRITE the shared cache from a worker thread (data race on the
-    // non-thread-safe map). Degrade instead: skip the file (caller treats nullptr as "skip"); the normal
-    // prewarm path repopulates on the next run.
-    DEGRADED_PATH_ALERT( "ingest: tags query not prewarmed for a grammar — file skipped" );
+    // non-thread-safe map). Degrade instead: nullptr, which captureTagsFacts discloses into the file's
+    // ExtractShortfall (an extract-partial --skipped row, and no cache record, so the next run re-extracts).
     return nullptr;
 }
 }   // namespace — ingest_crawl.h section of ingest.cpp

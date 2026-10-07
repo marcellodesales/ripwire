@@ -50,7 +50,7 @@ FIX="$ROOT/test/yamlfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -68,7 +68,7 @@ echo "=== presence guards: the fixtures really contain what the arms below asser
 # finding nothing on both sides. Assert the probe target exists before asserting the property.
 WF="$FIX/workflow.yml"; MD="$FIX/multidoc.yml"; TK="$FIX/tasks.yaml"
 for f in "$WF" "$MD" "$TK"; do [ -f "$f" ] || { echo "fixture file $f missing"; exit 2; }; done
-guard(){ grep -qF -- "$2" "$1" && ok "fixture contains $3" || no "fixture LOST $3 — every arm below would pass by finding nothing"; }
+guard(){ if grep -qF -- "$2" "$1"; then ok "fixture contains $3"; else no "fixture LOST $3 — every arm below would pass by finding nothing"; fi; }
 guard "$WF" 'pipelinename:'        'a top-level key  pipelinename:'
 guard "$WF" 'branchfilter:'        'a depth-3 key  branchfilter:'
 guard "$WF" 'stepslist:'           'a depth-3 key owning a sequence  stepslist:'
@@ -95,18 +95,20 @@ echo
 echo "=== default map: exits 0, well-formed, clean stderr, edges=0 ==="
 # ═══════════════════════════════════════════════════════════════════════════
 MAP_OUT="$TMP/map.xml"
-$BIN "$FIX" --no-cache >"$MAP_OUT" 2>"$TMP/map.err"
+# L1 (2026-09-19): the CLI default legend is compact and spells a bare 'edges=' inside its comment, which the first-match
+# 'edges=[0-9]*' greps read instead of the header attribute; these runs ask for the full legend.
+$BIN "$FIX" --no-cache --legend=full >"$MAP_OUT" 2>"$TMP/map.err"
 MAP_EXIT=$?
-[ "$MAP_EXIT" -eq 0 ] && ok "default map: exits 0 on YAML fixture" || no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"
+if [ "$MAP_EXIT" -eq 0 ]; then ok "default map: exits 0 on YAML fixture"; else no "default map: exited $MAP_EXIT: $( cat "$TMP/map.err" )"; fi
 
-command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$MAP_OUT" && ok "default map: passes xmllint --noout" || no "default map: xmllint failed"; }
+command -v xmllint >/dev/null 2>&1 && { if xmllint --noout "$MAP_OUT"; then ok "default map: passes xmllint --noout"; else no "default map: xmllint failed"; fi; }
 
 # no degrade / ABI-mismatch warning must reach stderr on the clean fixtures
 [ -s "$TMP/map.err" ] && no "default map: unexpected stderr (ABI/degrade?): $( cat "$TMP/map.err" )" || ok "default map: clean stderr (no ABI mismatch / degrade)"
 
 # edges=0: YAML is data, no call graph
 EDGES="$( grep -o 'edges=[0-9]*' "$MAP_OUT" | head -1 )"
-[ "$EDGES" = "edges=0" ] && ok "default map: $EDGES (YAML is data — no call edges)" || no "default map: expected edges=0, got $EDGES"
+if [ "$EDGES" = "edges=0" ]; then ok "default map: $EDGES (YAML is data — no call edges)"; else no "default map: expected edges=0, got $EDGES"; fi
 
 # ─── parse per-file symbols once ────────────────────────────────────────────
 python3 - "$MAP_OUT" <<'PYEOF' >"$TMP/parsed.json"
@@ -234,11 +236,11 @@ cat > "$XL/app.js" <<'JSEOF'
 function serde() { return 1; }
 function main() { return serde(); }
 JSEOF
-XL_OUT="$( $BIN "$XL" --no-cache 2>/dev/null )"
+XL_OUT="$( $BIN "$XL" --no-cache --legend=full 2>/dev/null )"
 XL_EDGES="$( echo "$XL_OUT" | grep -o 'edges=[0-9]*' | head -1 )"
-[ "$XL_EDGES" = "edges=1" ] && ok "mixed YAML+JS: $XL_EDGES (only the JS-internal main->serde edge)" || no "mixed YAML+JS: expected edges=1, got $XL_EDGES"
+if [ "$XL_EDGES" = "edges=1" ]; then ok "mixed YAML+JS: $XL_EDGES (only the JS-internal main->serde edge)"; else no "mixed YAML+JS: expected edges=1, got $XL_EDGES"; fi
 # the YAML side must actually be in the map, or the isolation claim is vacuous
-echo "$XL_OUT" | grep -q 'deploy.yml' && ok "mixed YAML+JS: deploy.yml IS indexed (isolation arm is not vacuous)" || no "mixed YAML+JS: deploy.yml absent from the map"
+if echo "$XL_OUT" | grep -q 'deploy.yml'; then ok "mixed YAML+JS: deploy.yml IS indexed (isolation arm is not vacuous)"; else no "mixed YAML+JS: deploy.yml absent from the map"; fi
 XL_CR="$( $BIN "$XL" --callers=serde --no-cache 2>/dev/null )"
 echo "$XL_CR" | grep -q 'count="1"' && echo "$XL_CR" | grep -q 'app.js' \
     && ok "--callers=serde: count=1, from app.js (the YAML \`serde\` key is NOT a caller/target)" \
@@ -246,8 +248,8 @@ echo "$XL_CR" | grep -q 'count="1"' && echo "$XL_CR" | grep -q 'app.js' \
 
 # mutation: rename the JS call site → the ONLY edge must vanish (non-tautological)
 sed 's/return serde()/return serdeX()/' "$XL/app.js" >"$XL/app.js.tmp" && mv "$XL/app.js.tmp" "$XL/app.js"
-XL_MUT="$( $BIN "$XL" --no-cache 2>/dev/null | grep -o 'edges=[0-9]*' | head -1 )"
-[ "$XL_MUT" = "edges=0" ] && ok "mutation: renamed JS call site → edges=0 (the edge assertion is real)" || no "mutation: expected edges=0 after rename, got $XL_MUT"
+XL_MUT="$( $BIN "$XL" --no-cache --legend=full 2>/dev/null | grep -o 'edges=[0-9]*' | head -1 )"
+if [ "$XL_MUT" = "edges=0" ]; then ok "mutation: renamed JS call site → edges=0 (the edge assertion is real)"; else no "mutation: expected edges=0 after rename, got $XL_MUT"; fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo
@@ -278,7 +280,7 @@ with open(sys.argv[1], "w") as f:
 PYEOF
 $BIN "$DEEP" --no-cache >"$TMP/deep.xml" 2>"$TMP/deep.err"
 DEEP_EXIT=$?
-[ "$DEEP_EXIT" -eq 0 ] && ok "deep-indent: exits 0 (no SIGABRT — guard + patch both live)" || no "deep-indent: exited $DEEP_EXIT (the serialize() cliff?): $( cat "$TMP/deep.err" | head -3 )"
+if [ "$DEEP_EXIT" -eq 0 ]; then ok "deep-indent: exits 0 (no SIGABRT — guard + patch both live)"; else no "deep-indent: exited $DEEP_EXIT (the serialize() cliff?): $( cat "$TMP/deep.err" | head -3 )"; fi
 grep -q "yaml nesting" "$TMP/deep.err" \
     && ok "deep-indent: skipped with the one-line stderr note (house skip style)" \
     || no "deep-indent: no 'yaml nesting' skip note on stderr: $( cat "$TMP/deep.err" | head -3 )"
@@ -299,6 +301,75 @@ $BIN "$NORM" --no-cache >"$TMP/norm.xml" 2>"$TMP/norm.err"
 grep -q 'normalnest0' "$TMP/norm.xml" \
     && ok "guard calibration: a 12-level file is still indexed (its top-level key is a symbol)" \
     || no "guard calibration: a 12-level file was dropped — the depth guard over-fires"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== #157 FLIPPED (was KNOWN GAP, prompts/help-wanted/nesting-refusals-visible.md): the refused deep.yml is rowed cold AND warm, and --match refuses it consistently ==="
+# ═══════════════════════════════════════════════════════════════════════════
+# This block used to pin main's GAP (no row ever, warm run silent, --match parsed the refused file anyway) as
+# four KNOWN-GAP arms that passed on the bug. #157 closed it: refuseNesting (ingest_prewarm.h) itemizes every
+# nesting refusal — json/yaml/markdown/kotlin alike — into --skipped, forgetNestRefusalsForCache forgets the
+# refused file's cache record so a warm run re-refuses and re-rows it, and the structural-query walk
+# (astQueryGrouped, ingest_astquery.h) now checks the SAME per-file refusal (IngestResult::nestRefusedFile)
+# before parsing, so --match/--pattern/--lint can never return a hit from a file ingest refused.
+# NOTE on stderr: the warm run's "[ripwire] …: yaml nesting …" note REAPPEARS every warm run under this fix —
+# that is not a regression, it is forgetNestRefusalsForCache's documented cost (one re-scan per warm run of a
+# tree holding a refused file) and it is EXACTLY what Kotlin's own pre-existing guard already does (verified
+# against the unmodified base binary: Deep.kt's note reprints on every warm run there too). CONTRIBUTING's own
+# rule is to never assert DISCLOSE's stderr text as a disclosure — the --skipped ROW is the disclosure, and
+# that is what every arm below checks.
+KGY="$TMP/kgyaml"; mkdir -p "$KGY"
+cp "$DEEP/deep.yml" "$KGY/deep.yml"
+printf 'kgsiblingkey: 1\n' > "$KGY/sibling.yml"
+$BIN "$KGY" --cache="$TMP/kgyaml.cache" >"$TMP/kgy_cold.xml" 2>"$TMP/kgy_cold.err"; KGY_COLD_RC=$?
+$BIN "$KGY" --cache="$TMP/kgyaml.cache" >"$TMP/kgy_warm.xml" 2>"$TMP/kgy_warm.err"; KGY_WARM_RC=$?
+KGY_LIVE=0
+if [ "$KGY_COLD_RC" -eq 0 ] && [ "$KGY_WARM_RC" -eq 0 ] && grep -q 'deep.yml: yaml nesting' "$TMP/kgy_cold.err" \
+   && grep -q 'kgsiblingkey' "$TMP/kgy_warm.xml" && cmp -s "$TMP/kgy_cold.xml" "$TMP/kgy_warm.xml"; then
+    ok "(kg-yaml) presence: the cold run refuses deep.yml on stderr; the warm run serves the same map from the cache, sibling indexed"
+    KGY_LIVE=1
+else
+    no "(kg-yaml) presence: expected rc=0 twice, a cold refusal note for deep.yml and a warm map identical to the cold one (cold rc=$KGY_COLD_RC, warm rc=$KGY_WARM_RC) — the arms below would be vacuous: $( head -2 "$TMP/kgy_cold.err" )"
+fi
+if [ "$KGY_LIVE" -eq 1 ]; then
+    for mode in cold warm; do
+        if [ "$mode" = cold ]; then
+            $BIN "$KGY" --no-cache --skipped >"$TMP/kgy_sk_$mode.xml" 2>/dev/null; SK_RC=$?
+        else
+            $BIN "$KGY" --cache="$TMP/kgyaml.cache" --skipped >"$TMP/kgy_sk_$mode.xml" 2>/dev/null; SK_RC=$?
+        fi
+        DEEP_BYTES="$( wc -c < "$KGY/deep.yml" | tr -d ' ' )"
+        if [ "$SK_RC" -ne 0 ] || ! grep -q '<skipped indexed="2"' "$TMP/kgy_sk_$mode.xml"; then
+            no "(kg-yaml) $mode --skipped: exit $SK_RC or no <skipped indexed=\"2\"> report — the arm cannot observe the fix"
+        elif ! grep -qE "<f p=\"[^\"]*deep\\.yml\" why=\"nest-refused\" bytes=\"$DEEP_BYTES\" ext=\"\\.yml\"/>" "$TMP/kgy_sk_$mode.xml"; then
+            no "#157 REGRESSED: $mode --skipped has no exact nest-refused row for deep.yml (why=/bytes=$DEEP_BYTES/ext=.yml): $( grep -o '<f p="[^"]*deep[^/]*/>' "$TMP/kgy_sk_$mode.xml" )"
+        elif ! grep -q 'nest_refused="1"' "$TMP/kgy_sk_$mode.xml"; then
+            no "#157 REGRESSED: $mode --skipped header is missing nest_refused=\"1\": $( grep -o '<skipped [^>]*>' "$TMP/kgy_sk_$mode.xml" )"
+        elif ! grep -qF 'nest_refused= counts indexed files a pre-parse nesting guard' "$TMP/kgy_sk_$mode.xml"; then
+            no "#157 REGRESSED: $mode --skipped legend carries no nest_refused= clause"
+        else
+            ok "#157 FIXED: $mode --skipped rows deep.yml (why=\"nest-refused\" bytes=\"$DEEP_BYTES\" ext=\".yml\"), header nest_refused=\"1\", legend present — the file is no longer invisible"
+        fi
+        grep -qE '<f p="[^"]*sibling\.yml" why="nest-refused"' "$TMP/kgy_sk_$mode.xml" \
+            && no "#157 REGRESSED: $mode --skipped rows sibling.yml as nest-refused too — the guard is refusing the whole tree, not the one hostile file"
+    done
+fi
+# --match: evaluated on a clean exit only. A crashed run prints nothing, and "no hits in an empty document" would pass
+# for the very defect this arm exists to expose.
+$BIN "$KGY" --no-cache --match='(block_mapping_pair)' >"$TMP/kgy_match.xml" 2>"$TMP/kgy_match.err"; KGY_M_RC=$?
+if [ "$KGY_M_RC" -ne 0 ]; then
+    no "(kg-yaml) --match over the refused deep.yml exited $KGY_M_RC — a parse the guard exists to prevent went wrong (the vendored scanner patch is --match's only layer): $( head -2 "$TMP/kgy_match.err" )"
+elif ! grep -q 'deep.yml: yaml nesting' "$TMP/kgy_match.err"; then
+    no "(kg-yaml) --match: the same run's ingest did not refuse deep.yml — the arm cannot show the two paths agree"
+elif grep -q '<m p="deep\.yml:' "$TMP/kgy_match.xml"; then
+    no "#157 REGRESSED: --match returns hits INSIDE deep.yml in the same run whose ingest refused it — the bypass is back"
+elif ! grep -q 'nest_refused="1"' "$TMP/kgy_match.xml"; then
+    no "#157 REGRESSED: --match's answer does not disclose nest_refused=\"1\" over a tree holding one refused file: $( grep -o '<match [^>]*>' "$TMP/kgy_match.xml" )"
+elif ! grep -q '<m p="sibling\.yml:' "$TMP/kgy_match.xml"; then
+    no "#157 REGRESSED: --match found no hit in the sibling file either — the arm cannot tell refusal from a broken walk"
+else
+    ok "#157 FIXED: --match returns zero hits inside the refused deep.yml, discloses nest_refused=\"1\", and still scans sibling.yml"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo

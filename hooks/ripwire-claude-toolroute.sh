@@ -99,6 +99,19 @@ esac
 cwd="$( printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null )"
 session="$( printf '%s' "$input" | jq -r '.session_id // .conversation_id // empty' 2>/dev/null )"
 [ -n "$cwd" ] && [ -d "$cwd" ] || exit 0
+# #350: a home directory, a filesystem root or a system tree is nobody's project, whatever git says about it (a
+# dotfiles repository makes $HOME a work tree), so a background hook never crawls one: exit silently. The rule is the
+# binary's own (src/rootguard.h), not a second list here — run from that directory with no root, ripwire answers
+# "no project root" for exactly those directories and prints its plain usage anywhere else. One exec, no crawl.
+if ( cd "$cwd" 2>/dev/null && ripwire 2>&1 >/dev/null ) | grep -q 'no project root'; then
+    exit 0
+fi
+# The hook answers for the JSON cwd, so git's repository-selection variables inherited from the caller are
+# cleared first, as the two route hooks do (git's own list, plus GIT_DIR/GIT_WORK_TREE if git cannot print
+# it). With GIT_DIR exported, `git -C "$cwd" rev-parse --show-toplevel` prints a non-git cwd as its own top
+# level, and the ripwire calls below would read that repository's history instead of the cwd's.
+# shellcheck disable=SC2046 # word splitting is intended: one variable name per word
+unset $( git rev-parse --local-env-vars 2>/dev/null ) GIT_DIR GIT_WORK_TREE
 
 command=""
 pattern=""
@@ -399,13 +412,14 @@ fi
 #      never from repository content. Quoting is for DISPLAY only; nothing here is ever executed. ----
 runCmd=""
 case "$recommended" in
-    --grep)   runCmd="ripwire $cwd --grep=$grepPattern" ;;
-    --expand) runCmd="ripwire $cwd --expand=$resolvedSym" ;;
+    # A1-2 (2026-09-12): the XML verbs ask for the compact legend; --for keeps the full one (its compact legend is its own)
+    --grep)   runCmd="ripwire $cwd --grep=$grepPattern --legend=compact" ;;
+    --expand) runCmd="ripwire $cwd --expand=$resolvedSym --legend=compact" ;;
     --for)    runCmd="ripwire $cwd --for=\"$file_path\"" ;;
 esac
 [ -n "$runCmd" ] || exit 0
 
-context="$( printf '%s\n%s' 'Ripwire produced a confidence-gated CLI recommendation from the shape of this tool call, before it ran. Prefer it when it answers the need; continue with the original call when more evidence is still required.' "$runCmd" )"
+context="$( printf '%s\n%s' 'Ripwire produced a confidence-gated CLI recommendation from the shape of this tool call, before it ran. Prefer it when it answers the need (add --legend=full if a definition is unclear); continue with the original call when more evidence is still required.' "$runCmd" )"
 jq -cn --arg context "$context" \
     '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",additionalContext:$context}}' \
     2>/dev/null || exit 0

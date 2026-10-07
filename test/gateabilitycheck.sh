@@ -13,7 +13,7 @@
 # Repo-wide: drift = 2 (UNDATED) + 0 (DATED) + 1 (MIXED) = 3; dated = 0 + 2 + 1 = 3. gateability must list
 # exactly {MIXED.md: live=1, UNDATED.md: live=2} and compute projected_drift = drift(3) - (1+2) = 0 — i.e.
 # annotating BOTH listed docs would account for every currently-live row (the invariant writeDocDrift's own
-# VERIFY pins: liveTotal == res.drift). DATED.md and CLEAN.md must be ABSENT from the list.
+# ASSUME pins: liveTotal == res.drift). DATED.md and CLEAN.md must be ABSENT from the list.
 #
 # Also asserts: --gateability alone (no --doc-drift) refuses loudly (exit != 0, no XML on stdout); the
 # gateability block is present ONLY under the flag (bare --doc-drift omits it); xmllint-clean; determinism.
@@ -30,7 +30,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 CORPUS="$ROOT/test/gateabilityfix"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -39,7 +39,9 @@ no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 echo "gateabilitycheck: BIN=$BIN  CORPUS=$CORPUS"
 
 # ── plain --doc-drift: no gateability block at all, and the repo-wide tallies are what the fixture pins ──
-plain="$( "$BIN" "$CORPUS" --doc-drift --no-cache 2>/dev/null )"
+# L1 (2026-09-19): the CLI default is the compact posture, whose root leads with schema=; the tallies pin below
+# reads the full-posture `<doc-drift docs=` shape, so this run asks for --legend=full (rows identical).
+plain="$( "$BIN" "$CORPUS" --doc-drift --no-cache --legend=full 2>/dev/null )"
 case "$plain" in
     *'<gateability'*) no "bare --doc-drift emitted a <gateability> block — should require the flag" ;;
     *)                ok "bare --doc-drift: no <gateability> block" ;;
@@ -60,7 +62,7 @@ fi
 # ── --doc-drift --gateability: the block itself ────────────────────────────────────────────────────────
 full="$( "$BIN" "$CORPUS" --doc-drift --gateability --no-cache 2>/dev/null )"
 rc=$?
-[ "$rc" = "0" ] && ok "exits 0 (a report, not a gate)" || no "--doc-drift --gateability exited $rc, expected 0"
+if [ "$rc" = "0" ]; then ok "exits 0 (a report, not a gate)"; else no "--doc-drift --gateability exited $rc, expected 0"; fi
 
 block="$( printf '%s' "$full" | tr '<' '\n' | sed -n '/^gateability /,/^\/gateability/p' )"
 
@@ -95,7 +97,7 @@ strip_at(){ printf '%s' "$1" | sed -E 's/ at="[^"]*"//g'; }
 [ "$( strip_at "$full" )" = "$( strip_at "$full2" )" ] \
     && ok "determinism (byte-identical, modulo the at= working-tree stamp)" \
     || no "--doc-drift --gateability is non-deterministic"
-printf '%s' "$full" | xmllint --noout - >/dev/null 2>&1 && ok "xmllint clean" || no "xmllint FAILED"
+if printf '%s' "$full" | xmllint --noout - >/dev/null 2>&1; then ok "xmllint clean"; else no "xmllint FAILED"; fi
 
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "SOME FAILED"; fi
 exit "$fail"

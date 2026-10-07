@@ -30,7 +30,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 FIX="$ROOT/test/cyclecutfix"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -98,7 +98,8 @@ fi
 #        that --deps on test/fixture emits NO <cycles> block (nothing to be neutral about going wrong).
 FX="$ROOT/test/fixture"
 if [ -d "$FX" ]; then
-    FD="$( perl -e 'alarm 15; exec @ARGV' "$BIN" "$FX" --deps --no-cache 2>/dev/null )"
+    # L1 (2026-09-19): the CLI default legend is compact and names <cycles> inside its comment; this arm looks for a real block, so it asks for the full legend.
+    FD="$( perl -e 'alarm 15; exec @ARGV' "$BIN" "$FX" --deps --no-cache --legend=full 2>/dev/null )"
     if printf '%s' "$FD" | grep -q '<cycles>'; then
         no "test/fixture unexpectedly has a <cycles> block — golden-neutrality assumption invalid, recheck regression.sh golden"
     else

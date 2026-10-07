@@ -33,12 +33,13 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN (build first)"; exit 1; }
 
-"$BIN" "$ROOT" --quality-panel >"$TMP/panel.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; every arm here budgets and reads the FULL legend, so the runs ask for it.
+"$BIN" "$ROOT" --quality-panel --legend=full >"$TMP/panel.xml" 2>/dev/null
 grep -q '<quality_panel ' "$TMP/panel.xml" || { echo "no <quality_panel> in output — cannot measure"; exit 1; }
 
 # Split comment bytes from payload bytes (the audit's own method: comments vs rest).
@@ -88,10 +89,10 @@ done
 
 # The document must still be well-formed and deterministic after any legend change.
 if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$TMP/panel.xml" 2>/dev/null && ok "(d) panel is well-formed XML" || no "(d) panel fails xmllint"
+    if xmllint --noout "$TMP/panel.xml" 2>/dev/null; then ok "(d) panel is well-formed XML"; else no "(d) panel fails xmllint"; fi
 fi
-"$BIN" "$ROOT" --quality-panel >"$TMP/panel2.xml" 2>/dev/null
-diff -q "$TMP/panel.xml" "$TMP/panel2.xml" >/dev/null && ok "(d) panel deterministic (byte-identical twice)" || no "(d) panel differs across two runs"
+"$BIN" "$ROOT" --quality-panel --legend=full >"$TMP/panel2.xml" 2>/dev/null
+if diff -q "$TMP/panel.xml" "$TMP/panel2.xml" >/dev/null; then ok "(d) panel deterministic (byte-identical twice)"; else no "(d) panel differs across two runs"; fi
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit $fail

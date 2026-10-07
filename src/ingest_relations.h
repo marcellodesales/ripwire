@@ -45,6 +45,17 @@ inline bool isBaseTypeNode( const char* nt ) noexcept
     return false;
 }
 
+// The base-type test for one base-clause child, by language. Ruby names a base with its OWN node kinds, and only Ruby
+// does: `class Child < Parent` hands the `superclass` clause a (constant), `class Derived < Space::Base` a
+// (scope_resolution). They are asked under a language test here, rather than added as rows of isBaseTypeNode's shared
+// table, because both kind names are generic enough to occur in another grammar with another meaning, and that table is
+// consulted for every base clause in every language. `class Dynamic < Struct.new( :a )` hands over a (call) and is
+// correctly nothing — a computed superclass is not a name this tool can resolve. test/rubyinheritcheck.sh.
+inline bool isBaseTypeNodeIn( const char* nt, Lang lang ) noexcept
+{
+    return lang == Lang::Ruby ? ( kindIs( nt, "constant" ) || kindIs( nt, "scope_resolution" ) ) : isBaseTypeNode( nt );
+}
+
 // Emit one inherit RawRef (derived → base) for a base-type node. startByte sits inside the class header
 // (the type node's own start), so the byte-span enclosing attribution binds fromSymbol = the derived class.
 inline void emitBaseRef( TSNode typeNode, std::uint32_t fileId, Lang lang, std::string_view src, std::vector<RawRef>& refs )
@@ -95,7 +106,95 @@ bool macroBodyKeyword( std::string_view w ) noexcept
 // the `value:` (preproc_arg) child of a preproc_function_def / preproc_def; null node if absent.
 TSNode preprocValueNode( TSNode defineNode ) noexcept
 {
-    return ts_node_child_by_field_name( defineNode, "value", 5 );
+    return fieldChild( defineNode, NodeField::Value );
+}
+
+// ---- a NAME BOUND TO A FUNCTION LITERAL owns that literal's body ------------------------------------------
+// `const f = (x) => {…}`, `M.f = function(x) … end`, a class-body `f = lambda self, x: g(x)`: the tags query
+// captures the BINDING (lexical_declaration / assignment_statement / assignment / pair / field) as the
+// definition, and none of those nodes owns a `body:` field. Before this table the symbol read as bodyless
+// everywhere — sigEndByte == endByte, `--callees=f` answered bodyless_defs="1", and every quality verb that
+// skips bodyless symbols skipped it (measured on a TS agent repo: ~2,100 arrow-const functions, 63 measured).
+//
+// ONE table, not a branch per language (CONTRIBUTING "Adding a language: common stays common"): which
+// languages capture such bindings, which node kinds are function literals, which fields carry a bound value,
+// which positional lists carry one, and which wrappers sit between the binding and the literal. A language
+// joins by adding its literal kind (and, if its grammar spells the value differently, its field) — never code.
+// Languages that do NOT capture `name = <literal>` as a definition at all (Go `var f = func…`, Kotlin, Swift,
+// Dart, PHP, Ruby, C# lambdas) are a different gap — the definition is missing, not its body — and stay out.
+struct FnLiteralBindingTable
+{
+    std::array<Lang, 4>             langs;        // grammars whose tags.scm captures `name = <function literal>` as a def (TSX parses as TypeScript)
+    std::array<std::string_view, 4> literals;     // node kinds that ARE a function literal — each owns its params and a `body:` field
+    std::array<NodeField, 2>        valueFields;  // fields that carry the bound value: JS/TS declarator/pair/field `value:`, JS/Python assignment `right:`
+    std::array<std::string_view, 1> valueLists;   // positional value lists — Lua `a = v`: the list's FIRST `value:` is the bound value (tags.scm anchors it)
+    std::array<std::string_view, 3> wrappers;     // cast/paren wrappers between binding and literal: `((x) => …) as T` / `satisfies T`
+    std::array<NodeField, 1>        bareParam;    // a literal's lone parameter spelled WITHOUT a list — JS/TS `x => …` — counts as one
+};
+inline constexpr FnLiteralBindingTable kFnLiteralBinding = {
+    { Lang::JavaScript, Lang::TypeScript, Lang::Lua, Lang::Python },
+    { "arrow_function", "function_expression", "function_definition", "lambda" },
+    { NodeField::Value, NodeField::Right },
+    { "expression_list" },
+    { "parenthesized_expression", "as_expression", "satisfies_expression" },
+    { NodeField::Parameter },
+};
+
+// the value `binding` binds, through the wrappers: a value field, else the first `value:` of a positional value
+// list child. Null when the node binds nothing.
+inline TSNode fnLiteralBoundValue( TSNode binding ) noexcept
+{
+    TSNode value = {};
+    for( const NodeField f : kFnLiteralBinding.valueFields )
+    {
+        if( value = fieldChild( binding, f ); !ts_node_is_null( value ) )
+        {
+            break;
+        }
+    }
+    for( std::uint32_t i = 0, n = ts_node_named_child_count( binding ); ts_node_is_null( value ) && i < n && i < 4; ++i )
+    {
+        // i < 4: a value list is a direct child of the assignment, after the name list — never deep in a long child run
+        if( const TSNode c = ts_node_named_child( binding, i ); extent::inSet( kFnLiteralBinding.valueLists, std::string_view( ts_node_type( c ) ) ) )
+        {
+            value = fieldChild( c, NodeField::Value );
+        }
+    }
+    for( int guard = 0; !ts_node_is_null( value ) && guard < 4 && extent::inSet( kFnLiteralBinding.wrappers, std::string_view( ts_node_type( value ) ) ); ++guard )
+    {
+        value = ts_node_named_child( value, 0 );   // the wrapped expression is a wrapper's first named child; the type follows it
+    }
+    return value;
+}
+
+// The literal a definition's @name is bound to, and the node that binds it. Walks UP from the name — the
+// binding for THIS name, so `const a = () => 1, b = () => 2` hands each name its own literal — and stops at the
+// captured def node. Null literal when the language is not in the table or the name binds no function literal.
+struct FnLiteralBinding
+{
+    TSNode literal;
+    TSNode binding;
+};
+inline FnLiteralBinding fnLiteralBoundTo( TSNode roleNode, TSNode nameNode, Lang lang ) noexcept
+{
+    if( !extent::inSet( kFnLiteralBinding.langs, lang ) )
+    {
+        return {};
+    }
+    TSNode binding = ts_node_parent( nameNode );
+    for( int hop = 0; !ts_node_is_null( binding ) && hop < 6; ++hop )
+    {
+        if( const TSNode value = fnLiteralBoundValue( binding ); !ts_node_is_null( value ) && extent::inSet( kFnLiteralBinding.literals, std::string_view( ts_node_type( value ) ) ) )
+        {
+            return { value, binding };
+        }
+        if( ts_node_eq( binding, roleNode ) )
+        {
+            break;
+        }
+        binding = ts_node_parent( binding );
+    }
+    return {};
 }
 
 // the def's body node: the `body:` field for every function/class grammar, and — macro-edges round — a
@@ -103,14 +202,82 @@ TSNode preprocValueNode( TSNode defineNode ) noexcept
 // real signature/body split (sigEnd = replacement start), which is ALSO what makes graph.h's decl/def
 // collapse treat an indexed macro as a DEFINITION (hasBody: endByte > sigEndByte) instead of a shadowable
 // forward decl. Kept out of captureTagsFacts (the file's densest dispatch point) behind one call.
-TSNode defBodyNodeOf( TSNode roleNode, SymKind kind ) noexcept
+//
+// A function/method whose def node owns no body and whose name is bound to a function literal
+// (kFnLiteralBinding) takes the LITERAL's body, and `literal` names it so params/cx/nest read from the
+// function itself rather than from the declaration around it (a typed const's annotation carries its own
+// formal_parameters ahead of the arrow); null for every other def. `span` narrows to the one binding when the def node binds several
+// names (`const a = …, b = …;`, a Lua table of function fields) so each name's calls attribute to it alone;
+// a def node that binds one name keeps its own span, byte-for-byte.
+struct DefBodyNodes
 {
-    TSNode body = ts_node_child_by_field_name( roleNode, "body", 4 );
+    TSNode body;      // null: a declaration
+    TSNode literal;   // the function literal the name is bound to — metrics read from it; null: not literal-bound
+    TSNode span;      // the node the symbol's byte/row span covers
+};
+inline DefBodyNodes defBodyNodeOf( TSNode roleNode, TSNode nameNode, SymKind kind, Lang lang ) noexcept
+{
+    TSNode body = fieldChild( roleNode, NodeField::Body );
     if( ts_node_is_null( body ) && kind == SymKind::Macro )
     {
-        body = ts_node_child_by_field_name( roleNode, "value", 5 );
+        body = fieldChild( roleNode, NodeField::Value );
     }
-    return body;
+    if( !ts_node_is_null( body ) || ( kind != SymKind::Function && kind != SymKind::Method ) )
+    {
+        return { body, {}, roleNode };
+    }
+    const auto [ literal, binding ] = fnLiteralBoundTo( roleNode, nameNode, lang );
+    if( ts_node_is_null( literal ) )
+    {
+        return { body, {}, roleNode };
+    }
+    const bool oneOfSeveral = !ts_node_eq( binding, roleNode ) && ts_node_named_child_count( roleNode ) > 1
+                              && ts_node_eq( ts_node_parent( binding ), roleNode );
+    return { fieldChild( literal, NodeField::Body ), literal, oneOfSeveral ? binding : roleNode };
+}
+
+// a def's parameter count, read from `metricNode` (the literal for a literal-bound name): its parameter list's
+// count, or one for a literal whose lone parameter has no list (`x => …`), which countParams cannot see.
+inline std::uint16_t paramCountOf( TSNode metricNode, bool literalBound )   // NOT noexcept — countParams allocates
+{
+    const std::uint16_t listed = countParams( metricNode );
+    if( listed != 0 || !literalBound )
+    {
+        return listed;
+    }
+    for( const NodeField f : kFnLiteralBinding.bareParam )
+    {
+        if( !ts_node_is_null( fieldChild( metricNode, f ) ) )
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// DART's body is a SIBLING, not a field and not a child. tree-sitter-dart emits `function_body` next to
+// `function_signature` / `method_signature`, so defBodyNodeOf finds nothing, the shared ancestor climb in
+// captureTagsFacts finds nothing either, and the definition's span stops at the signature's closing paren —
+// after which every call in the body attributes to the nearest ENCLOSING symbol. Measured on test/dartfix
+// before this existed: `square` landed on the class `Calculator` rather than the method `accumulate`, and
+// the three top-level edges were lost outright, 5 edges where 8 are expected. Scanning FORWARD to the next
+// NAMED sibling is what keeps an abstract member honest: `void f();` has no function_body, the scan stops at
+// the next declaration, the body stays null and the symbol stays a declaration. Same reason as
+// defBodyNodeOf's: one call at the dispatch point instead of a loop inside it. Gate: test/dartcheck.sh.
+TSNode dartFollowingBody( TSNode defNode ) noexcept
+{
+    for( TSNode sib = ts_node_next_sibling( defNode ); !ts_node_is_null( sib ); sib = ts_node_next_sibling( sib ) )
+    {
+        if( kindIs( ts_node_type( sib ), "function_body" ) )
+        {
+            return sib;
+        }
+        if( ts_node_is_named( sib ) )
+        {
+            break;   // the signature/body pair ended
+        }
+    }
+    return {};
 }
 
 bool preprocFunctionDefHasBody( TSNode defineNode, std::string_view src ) noexcept
@@ -142,7 +309,7 @@ void captureMacroBodyCalls( TSNode defineNode, std::uint32_t fileId, Lang lang, 
     // function-like `#define` only: object-like preproc_def is not a call-edge participant, and the
     // non-C-family @definition.macro capture (Rust macro_definition) has no preproc replacement to scan.
     // Checked HERE so the captureTagsFacts call site stays a single kind test.
-    if( std::strcmp( ts_node_type( defineNode ), "preproc_function_def" ) != 0 )
+    if( !kindIs( ts_node_type( defineNode ), "preproc_function_def" ) )
     {
         return;
     }
@@ -161,7 +328,7 @@ void captureMacroBodyCalls( TSNode defineNode, std::uint32_t fileId, Lang lang, 
     // the macro's own name (self-reference never expands) + its parameter names (a param used call-shaped
     // is the ARGUMENT's business, not a body call — `#define CALL(f) f()` has no resolvable callee here).
     std::string macroName;
-    if( const TSNode nameNode = ts_node_child_by_field_name( defineNode, "name", 4 ); !ts_node_is_null( nameNode ) )
+    if( const TSNode nameNode = fieldChild( defineNode, NodeField::Name ); !ts_node_is_null( nameNode ) )
     {
         const uint32_t na = ts_node_start_byte( nameNode );
         const uint32_t nb = ts_node_end_byte( nameNode );
@@ -171,13 +338,15 @@ void captureMacroBodyCalls( TSNode defineNode, std::uint32_t fileId, Lang lang, 
         }
     }
     std::vector<std::string> params;
-    if( const TSNode paramsNode = ts_node_child_by_field_name( defineNode, "parameters", 10 ); !ts_node_is_null( paramsNode ) )
+    if( const TSNode paramsNode = fieldChild( defineNode, NodeField::Parameters ); !ts_node_is_null( paramsNode ) )
     {
-        const uint32_t pc = ts_node_child_count( paramsNode );
-        for( uint32_t i = 0; i < pc; ++i )
+        // O(children): a preproc_params list holds every block comment written between its names — extras
+        // land in the child array (src/infra/tschildren.h); 16 000 of them measured 60x the identical flood
+        // outside the #define (test/childwalkscalecheck.sh, arm B13).
+        ChildCursor cursor( paramsNode );
+        forEachChild( paramsNode, cursor.cur, [ & ]( TSNode ch )
         {
-            const TSNode ch = ts_node_child( paramsNode, i );
-            if( std::strcmp( ts_node_type( ch ), "identifier" ) == 0 )
+            if( kindIs( ts_node_type( ch ), "identifier" ) )
             {
                 const uint32_t pa = ts_node_start_byte( ch );
                 const uint32_t pb = ts_node_end_byte( ch );
@@ -186,7 +355,8 @@ void captureMacroBodyCalls( TSNode defineNode, std::uint32_t fileId, Lang lang, 
                     params.emplace_back( src.substr( pa, pb - pa ) );
                 }
             }
-        }
+            return true;
+        } );
     }
     const auto isParam = [ & ]( std::string_view w ) noexcept
     {
@@ -269,7 +439,11 @@ void captureMacroBodyCalls( TSNode defineNode, std::uint32_t fileId, Lang lang, 
 // Capture base classes for the inheritance/Lego view: walk a class node's base clause and emit an
 // inherit RawRef per base (derived → base). startByte sits inside the class header, so the enclosing
 // attribution assigns fromSymbol = the derived class. Explicit-syntax langs: C++/TS/JS/Java/Python/Swift/
-// C#/PHP. Lua is deliberately absent and it is a DISCLOSED non-goal, not an omission: Lua inheritance IS
+// C#/PHP/Kotlin/Ruby. Ruby reuses the `superclass` clause name Java's extends clause already has, and
+// names its base with (constant)/(scope_resolution) — see isBaseTypeNodeIn. A Ruby MIXIN
+// (`include M` / `extend M` / `prepend M`) is NOT captured here, for the same reason the PHP note below
+// gives: it is a call in the class BODY, not a clause. Ruby's ancestor chain does hold included modules,
+// so that is a stated residue (test/rubyinheritcheck.sh floor (b)), not a claim it is not inheritance. Lua is deliberately absent and it is a DISCLOSED non-goal, not an omission: Lua inheritance IS
 // `setmetatable( Derived, { __index = Base } )`, an ordinary runtime call over an ordinary table, so there
 // is no syntax to read and a Lua corpus correctly reports no inheritance edges at all.
 //
@@ -288,53 +462,69 @@ void captureMacroBodyCalls( TSNode defineNode, std::uint32_t fileId, Lang lang, 
 //               Java super_interfaces → type_list → type_identifier
 //               C# base_list → primary_constructor_base_type → (its `type` field child) — a record's
 //               base with constructor args (`record Foo(int X) : Base(X)`)
+//               Kotlin delegation_specifier → constructor_invocation → user_type (`class Foo : Bar(args)`);
+//               a bare interface (`class Foo : Baz`, no call) hits DIRECT instead — user_type sits right
+//               under delegation_specifier with no constructor_invocation wrapper.
 // So after matching a clause we scan its children for type nodes AND recurse one level into any wrapper
 // child, collecting type nodes at both depths (Rust is a separate pass — impl Trait for T is a sibling).
 void captureBases( TSNode classNode, std::uint32_t fileId, Lang lang, std::string_view src, std::vector<RawRef>& refs )
 {
-    const uint32_t cc = ts_node_child_count( classNode );
-    for( uint32_t i = 0; i < cc; ++i )
+    // O(children) at all three levels. These child lists LOOK grammar-bounded — a class node's clauses, a
+    // clause's base types — and the earlier class-3 reasoning said so, but EXTRAS refute it: a comment run
+    // between two base types is spliced straight into the clause's own child array (src/infra/tschildren.h),
+    // and 16 000 of them measured 118× the same file with the flood outside the clause
+    // (test/childwalkscalecheck.sh, arm B10). Each level owns its cursor — the loops nest.
+    ChildCursor classCursor( classNode );
+    forEachChild( classNode, classCursor.cur, [ & ]( TSNode clause )
     {
-        const TSNode clause = ts_node_child( classNode, i );
-        const char*  ct     = ts_node_type( clause );
-        const bool   isClause =    std::strcmp( ct, "base_class_clause" ) == 0     // C++    : public Base
-                                || std::strcmp( ct, "class_heritage" ) == 0        // TS/JS  extends / implements (wraps clauses)
-                                || std::strcmp( ct, "superclasses" ) == 0          // Python class X(Base):   (field)
-                                || std::strcmp( ct, "argument_list" ) == 0         // Python bases
-                                || std::strcmp( ct, "superclass" ) == 0            // Java   extends Base
-                                || std::strcmp( ct, "super_interfaces" ) == 0      // Java   implements I, J   (wraps type_list)
-                                || std::strcmp( ct, "inheritance_specifier" ) == 0 // Swift  : Protocol
-                                || std::strcmp( ct, "base_list" ) == 0             // C#     : Base, IBar
-                                || std::strcmp( ct, "base_clause" ) == 0           // PHP    extends Base
-                                || std::strcmp( ct, "class_interface_clause" ) == 0; // PHP  implements I, J
+        const char* ct = ts_node_type( clause );
+        const bool   isClause =    kindIs( ct, "base_class_clause" )     // C++    : public Base
+                                || kindIs( ct, "class_heritage" )        // TS/JS  extends / implements (wraps clauses)
+                                || kindIs( ct, "superclasses" )          // Python class X(Base):   (field)
+                                || kindIs( ct, "argument_list" )         // Python bases
+                                || kindIs( ct, "superclass" )            // Java   extends Base
+                                || kindIs( ct, "super_interfaces" )      // Java   implements I, J   (wraps type_list)
+                                || kindIs( ct, "inheritance_specifier" ) // Swift  : Protocol
+                                || kindIs( ct, "base_list" )             // C#     : Base, IBar
+                                || kindIs( ct, "base_clause" )           // PHP    extends Base
+                                || kindIs( ct, "class_interface_clause" ) // PHP  implements I, J
+                                || kindIs( ct, "delegation_specifier" ); // Kotlin : Base(), Interface (one per base)
         if( !isClause )
         {
-            continue;
+            return true;
         }
 
-        const uint32_t bc = ts_node_child_count( clause );
-        for( uint32_t j = 0; j < bc; ++j )
+        ChildCursor clauseCursor( clause );
+        forEachChild( clause, clauseCursor.cur, [ & ]( TSNode bn )
         {
-            const TSNode bn = ts_node_child( clause, j );
-            const char*  bt = ts_node_type( bn );
-            if( isBaseTypeNode( bt ) )                 // DIRECT: type node right under the clause
+            const char* bt = ts_node_type( bn );
+            if( isBaseTypeNodeIn( bt, lang ) )         // DIRECT: type node right under the clause
             {
                 emitBaseRef( bn, fileId, lang, src, refs );
-                continue;
+                return true;
+            }
+            // Ruby has no wrapper: its `superclass` clause holds ONE expression, and anything but a constant is
+            // COMPUTED (`class Dynamic < Struct.new( :a )`). Descending into that (call) lands on its receiver
+            // `Struct` and minted an edge to it — the receiver is not the base (test/rubyinheritcheck.sh floor (a)).
+            if( lang == Lang::Ruby )
+            {
+                return true;
             }
             // WRAPPED: descend ONE level into a wrapper (extends_clause / implements_clause / type_list)
             // and emit each type node it holds. One level is enough for every measured grammar shape.
-            const uint32_t wc = ts_node_child_count( bn );
-            for( uint32_t w = 0; w < wc; ++w )
+            ChildCursor wrapCursor( bn );
+            forEachChild( bn, wrapCursor.cur, [ & ]( TSNode wn )
             {
-                const TSNode wn = ts_node_child( bn, w );
                 if( isBaseTypeNode( ts_node_type( wn ) ) )
                 {
                     emitBaseRef( wn, fileId, lang, src, refs );
                 }
-            }
-        }
-    }
+                return true;
+            } );
+            return true;
+        } );
+        return true;
+    } );
 }
 
 // Rust inheritance capture (separate pass — different shape). `impl Trait for T { … }` is a top-level
@@ -358,12 +548,12 @@ struct RustImplCtx
 void rustImplVisitNode( RustImplCtx& cx, TSNode node, const char* t )
 {
     FUSEPROBE_BUMP( kRustImpls );
-    if( std::strcmp( t, "impl_item" ) != 0 )
+    if( !kindIs( t, "impl_item" ) )
     {
         return;
     }
-    const TSNode traitNode = ts_node_child_by_field_name( node, "trait", 5 );
-    const TSNode typeNode  = ts_node_child_by_field_name( node, "type",  4 );
+    const TSNode traitNode = fieldChild( node, NodeField::Trait );
+    const TSNode typeNode  = fieldChild( node, NodeField::Type );
     if( ts_node_is_null( traitNode ) || ts_node_is_null( typeNode ) )
     {
         return;
@@ -386,6 +576,198 @@ void rustImplVisitNode( RustImplCtx& cx, TSNode node, const char* t )
     }
 }
 
+// the namespace a member's type was written in — `std` for `std::string name_;` — or "" for an unqualified type, a
+// global `::Foo` and a class-template scope (`Outer<int>::Inner`, no namespace). captureFields reads only the two-
+// segment spelling (a type_identifier directly under the qualified_identifier), so this is ONE segment; a class scope
+// `Outer::Inner` parses the same way and records `Outer`. Its readers act on `std` alone (resolve.h fieldTypeWrittenInStd):
+// no in-repo class IS a std:: type, so Rule 2b records no type for the field and the HAS-A edges draw none (kParserVer 99).
+inline std::string_view writtenTypeNamespace( TSNode typeNode, std::string_view src ) noexcept
+{
+    if( !kindIs( ts_node_type( typeNode ), "qualified_identifier" ) )
+    {
+        return {};
+    }
+    const TSNode scope = fieldChild( typeNode, NodeField::Scope );
+    return ( !ts_node_is_null( scope ) && kindIs( ts_node_type( scope ), "namespace_identifier" ) ) ? nodeTextOf( scope, src ) : std::string_view{};
+}
+
+// the class NAME a type specifier denotes by itself — its final segment with template arguments dropped: `IRBuilder<F, I>`
+// and `llvm::IRBuilder<F>` → IRBuilder, `ir::QBase` → QBase, `struct Node` → Node. "" for every specifier that names no class
+// on its own: a primitive, `auto`, `decltype( … )`, a dependent `typename T::X`, an enum, an anonymous struct.
+inline std::string_view aliasTargetName( TSNode spec, std::string_view src ) noexcept
+{
+    for( int guard = 0; guard < 16 && !ts_node_is_null( spec ); ++guard )
+    {
+        const char* kind = ts_node_type( spec );
+        if( kindIs( kind, "type_identifier" ) )
+        {
+            return nodeTextOf( spec, src );
+        }
+        if( !kindIs( kind, "qualified_identifier" ) && !kindIs( kind, "template_type" )
+            && !kindIs( kind, "struct_specifier" ) && !kindIs( kind, "class_specifier" ) && !kindIs( kind, "union_specifier" ) )
+        {
+            return {};
+        }
+        spec = fieldChild( spec, NodeField::Name );
+    }
+    return {};
+}
+
+// captureTypeAlias's arm on the shared side stream (ingest_sidecap.h streamSideCaptures). Records collect in `out` and join `refs`
+// after the walk, so during it `refs` keeps at most one writer per file (EMISSION ORDER there: value-uses on C++).
+struct TypeAliasCtx
+{
+    std::uint32_t       fileId = 0;
+    Lang                lang {};
+    std::string_view    src;
+    std::vector<RawRef> out;
+};
+
+// the {type specifier, alias name} a PLAIN alias node declares; a null specifier when the node is no alias of a class itself. A
+// typedef's names are its plain declarators — it can declare several (`typedef Foo A, *PA;` aliases Foo as A only) — so its name
+// node is null and captureTypeAlias walks them.
+inline std::pair<TSNode, TSNode> aliasSpecifierAndName( TSNode n, const char* t ) noexcept
+{
+    if( kindIs( t, "type_definition" ) )
+    {
+        return { fieldChild( n, NodeField::Type ), TSNode{} };
+    }
+    if( !kindIs( t, "alias_declaration" ) )
+    {
+        return {};
+    }
+    const TSNode descriptor = fieldChild( n, NodeField::Type );
+    if( ts_node_is_null( descriptor ) || !ts_node_is_null( fieldChild( descriptor, NodeField::Declarator ) ) )
+    {
+        return {};   // `using P = Foo*;` / `using F = void( int );` — not the class itself
+    }
+    return { fieldChild( descriptor, NodeField::Type ), fieldChild( n, NodeField::Name ) };
+}
+
+// true ⇒ `n` sits in a function body or a lambda — or deeper than the side stream's own cap, where its enclosure is unknown
+inline bool insideFunctionBody( TSNode n ) noexcept
+{
+    TSNode parent = ts_node_parent( n );
+    for( int depth = 0; !ts_node_is_null( parent ); ++depth, parent = ts_node_parent( parent ) )
+    {
+        const char* pt = ts_node_type( parent );
+        if( depth >= 256 || kindIs( pt, "compound_statement" ) || kindIs( pt, "function_definition" ) || kindIs( pt, "lambda_expression" ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// one alias record: `aliasNode` names `target`, the class `spec` spells (see captureTypeAlias for the record's fields)
+inline void emitTypeAlias( TypeAliasCtx& cx, TSNode aliasNode, TSNode spec, std::string_view target )
+{
+    const std::string_view alias = nodeTextOf( aliasNode, cx.src );
+    if( alias.empty() || alias == target )
+    {
+        return;   // a self-alias (`typedef struct Node Node;`) adds nothing to walk
+    }
+    RawRef r;
+    r.fileId     = cx.fileId;
+    r.startByte  = ts_node_start_byte( aliasNode );
+    r.line       = ts_node_start_point( aliasNode ).row + 1;
+    r.lang       = cx.lang;
+    r.isCompose  = true;
+    r.composeRel = "alias";
+    r.name       = target;
+    r.recvVar    = alias;
+    r.qualifier  = writtenTypeNamespace( spec, cx.src );
+    cx.out.push_back( std::move( r ) );
+}
+
+// C/C++/ObjC TYPE ALIAS → the class it names, for the resolver's inheritance NAME graph (resolve.h addTypeAliasBases). An alias
+// declares no class, so a base walk keyed by class names dead-ended at one: `class CGBuilderTy : public CGBuilderBaseTy` with
+// `typedef llvm::IRBuilder<F, I> CGBuilderBaseTy;` stopped at CGBuilderBaseTy, and a member `CGBuilderTy Builder;` never reached
+// IRBuilderBase::CreateCall (test/fieldnarrowcheck.sh arm t). Rides the compose record shape — cached field for field, so the blob
+// format is unchanged — marked composeRel "alias" with an EMPTY fieldName, the one shape no member record has: `recvVar` = the
+// alias, `name` = the target's class name, `qualifier` = the namespace the target was written in (a `std` target is refused by
+// its reader). Only a PLAIN alias of a named class records: a pointer/reference/array/function declarator, a target that names no
+// class (aliasTargetName), a self-alias and an alias local to a function body (it types no member, and the name graph has no
+// scopes to keep it local) record nothing.
+inline void captureTypeAlias( TypeAliasCtx& cx, TSNode n, const char* t )
+{
+    const auto [ spec, nameNode ] = aliasSpecifierAndName( n, t );
+    const std::string_view target = aliasTargetName( spec, cx.src );
+    if( target.empty() || insideFunctionBody( n ) )
+    {
+        return;
+    }
+    if( !ts_node_is_null( nameNode ) )
+    {
+        if( kindIs( ts_node_type( nameNode ), "type_identifier" ) )
+        {
+            emitTypeAlias( cx, nameNode, spec, target );
+        }
+        return;
+    }
+    ChildCursor cursor( n );
+    forEachChild( n, cursor.cur, [ & ]( TSNode c )
+    {
+        const char* field = ts_tree_cursor_current_field_name( &cursor.cur );
+        if( field != nullptr && kindIs( field, "declarator" ) && kindIs( ts_node_type( c ), "type_identifier" ) )
+        {
+            emitTypeAlias( cx, c, spec, target );
+        }
+        return true;
+    } );
+}
+
+// The std smart pointers whose `->` reaches their FIRST template argument. No other template is read through: an in-repo
+// Holder<T> or util::Box<T> may overload `->` onto anything, std::weak_ptr has no `->`, and std::auto_ptr left in C++17.
+inline constexpr std::array<std::string_view, 2> kStdSmartPointers{ "unique_ptr", "shared_ptr" };
+
+// The pointee of a member type written `std::unique_ptr<T>` / `std::shared_ptr<T>`, spelled the way a compose ref spells a type:
+// T's final segment and the namespace T was written in (`std` for `std::unique_ptr<std::string>`, which the readers refuse like
+// any std type). An empty name for every other type — including a global `::std::…`, which the two-segment capture does not read
+// (see writtenTypeNamespace) — and when T is not a plain type: `Widget`, `const gfx::Widget` and `Gen<int>` are; `Widget[]` (it
+// has no `->`), `int`, an expression, a comment and a qualified template are not.
+struct WrittenPointee
+{
+    std::string_view name;
+    std::string_view qualifier;
+};
+
+inline WrittenPointee stdSmartPointee( TSNode typeNode, std::string_view src ) noexcept
+{
+    const TSNode tmpl = writtenTypeNamespace( typeNode, src ) == "std" ? fieldChild( typeNode, NodeField::Name ) : TSNode{};
+    if( ts_node_is_null( tmpl ) || !kindIs( ts_node_type( tmpl ), "template_type" ) )
+    {
+        return {};
+    }
+    const std::string_view tmplName = nodeFieldText( tmpl, NodeField::Name, src );
+    if( std::find( kStdSmartPointers.begin(), kStdSmartPointers.end(), tmplName ) == kStdSmartPointers.end() )
+    {
+        return {};
+    }
+    const TSNode args  = fieldChild( tmpl, NodeField::Arguments );
+    const TSNode first = ( ts_node_is_null( args ) || ts_node_named_child_count( args ) == 0 ) ? TSNode{} : ts_node_named_child( args, 0 );
+    if( ts_node_is_null( first ) || !kindIs( ts_node_type( first ), "type_descriptor" ) || !ts_node_is_null( fieldChild( first, NodeField::Declarator ) ) )
+    {
+        return {};
+    }
+    const TSNode      type = fieldChild( first, NodeField::Type );
+    const char* const kind = ts_node_is_null( type ) ? "" : ts_node_type( type );
+    if( kindIs( kind, "type_identifier" ) )
+    {
+        return { nodeTextOf( type, src ), {} };
+    }
+    if( kindIs( kind, "template_type" ) )
+    {
+        return { nodeFieldText( type, NodeField::Name, src ), {} };
+    }
+    const TSNode name = kindIs( kind, "qualified_identifier" ) ? fieldChild( type, NodeField::Name ) : TSNode{};
+    if( !ts_node_is_null( name ) && kindIs( ts_node_type( name ), "type_identifier" ) )
+    {
+        return { nodeTextOf( name, src ), writtenTypeNamespace( type, src ) };
+    }
+    return {};
+}
+
 // S5-E HAS-A composition edges: walk a class/struct node's field_declaration_list and emit a
 // compose RawRef for each typed member variable whose type name matches a known class/struct name.
 // Two sub-relations:
@@ -393,6 +775,10 @@ void rustImplVisitNode( RustImplCtx& cx, TSNode node, const char* t )
 //   "uses"    — the member is a REFERENCE or POINTER (SoundEngine& m_sound; Foo* p;) — injected dep.
 // These edges carry isCompose=true and are NEVER inserted into the call graph CSR; they live only in
 // Graph::composeEdges for the <compose> block in --for and --around. C++ only (priority per PLAN).
+// The name is the type's final segment and the qualifier the NAMESPACE it was written in (writtenTypeNamespace):
+// the same (name, immediate qualifier) pair a call ref carries, so `std::string name_;` is `string` in `std`. A std smart
+// pointer records its POINTEE with viaArrow set: `std::unique_ptr<Widget> w_;` is `Widget`, which `w_->m()` reaches and
+// `w_.m()` does not (kParserVer 113). Every other qualified template (`std::vector<Widget> v_;`) still records nothing.
 void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::string_view src, std::vector<RawRef>& refs )
 {
     if( lang != Lang::Cpp )
@@ -409,7 +795,7 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
         const char* ct = ts_node_type( child );
 
         // C++ class body is under field_declaration_list
-        if( std::strcmp( ct, "field_declaration_list" ) != 0 )
+        if( !kindIs( ct, "field_declaration_list" ) )
         {
             continue;
         }
@@ -417,7 +803,7 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
         collectChildren( child, cursor.cur, fieldKids );
         for( const TSNode fdecl : fieldKids )
         {
-            if( std::strcmp( ts_node_type( fdecl ), "field_declaration" ) != 0 )
+            if( !kindIs( ts_node_type( fdecl ), "field_declaration" ) )
             {
                 continue;
             }
@@ -426,7 +812,7 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
             //   type_identifier — a plain class name (SpherePool)
             //   type_descriptor — a reference/pointer type containing a type_identifier
             // We consider type_identifier directly under type= as the declared type.
-            const TSNode typeNode = ts_node_child_by_field_name( fdecl, "type", 4 );
+            const TSNode typeNode = fieldChild( fdecl, NodeField::Type );
             if( ts_node_is_null( typeNode ) )
             {
                 continue;
@@ -435,10 +821,11 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
             const char* tnType = ts_node_type( typeNode );
 
             // Determine the type name and whether this is a reference/pointer (uses) or value (creates).
-            std::string typeName;
-            bool isRefOrPtr = false;   // reference (&) or pointer (*) → "uses"; else "creates"
+            std::string    typeName;
+            bool           isRefOrPtr = false;   // reference (&) or pointer (*) → "uses"; else "creates"
+            WrittenPointee pointee;              // `std::unique_ptr<Widget>` / `std::shared_ptr<Widget>`: Widget
 
-            if( std::strcmp( tnType, "type_identifier" ) == 0 )
+            if( kindIs( tnType, "type_identifier" ) )
             {
                 // `SpherePool m_pool;` — plain value member
                 const uint32_t ta = ts_node_start_byte( typeNode ), tb = ts_node_end_byte( typeNode );
@@ -449,8 +836,8 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
                 typeName = std::string( src.substr( ta, tb - ta ) );
                 isRefOrPtr = false;
             }
-            else if(    std::strcmp( tnType, "reference_declarator" ) == 0
-                     || std::strcmp( tnType, "pointer_declarator" ) == 0 )
+            else if(    kindIs( tnType, "reference_declarator" )
+                     || kindIs( tnType, "pointer_declarator" ) )
             {
                 // The grammar sometimes puts a reference/pointer declarator AT the type level when there
                 // is no explicit separate type node. Look for an identifier child.
@@ -458,21 +845,30 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
                 // This branch covers unusual parses; the main path is via the declarator below.
                 continue;
             }
+            else if( pointee = stdSmartPointee( typeNode, src ); !pointee.name.empty() )
+            {
+                // `std::unique_ptr<Widget> w_;` records Widget, reached through `->` alone (arm p). Not the other std templates:
+                // recording `std::vector<Widget> v_;` as a std type would only tombstone same-named classes' same-named members,
+                // and on rocksdb and llvm-project that lost six correct narrows and refused no wrong one (2026-09-17).
+                typeName = std::string( pointee.name );
+            }
             else
             {
                 // Not a plain type_identifier type — could be template, qualified, etc.
                 // Walk the type node's children looking for the innermost type_identifier.
+                // O(children): a qualified_identifier `ns /*…*/ ::T` owns every comment between its tokens —
+                // 16 000 of them measured 16x the identical flood after the field (childwalkscalecheck B14).
+                // `cursor` is free here: the enclosing loops walk materialised vectors, not the cursor.
                 bool found = false;
-                const uint32_t tc2 = ts_node_child_count( typeNode );
-                for( uint32_t k = 0; k < tc2 && !found; ++k )
+                forEachChild( typeNode, cursor.cur, [ & ]( TSNode tc3 )
                 {
-                    const TSNode tc3 = ts_node_child( typeNode, k );
-                    if( std::strcmp( ts_node_type( tc3 ), "type_identifier" ) == 0 )
+                    if( kindIs( ts_node_type( tc3 ), "type_identifier" ) )
                     {
                         const uint32_t ta = ts_node_start_byte( tc3 ), tb = ts_node_end_byte( tc3 );
                         if( ta < tb && tb <= src.size() ) { typeName = std::string( src.substr( ta, tb - ta ) ); found = true; }
                     }
-                }
+                    return !found;
+                } );
                 if( !found )
                 {
                     continue;
@@ -491,7 +887,7 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
             //   field_identifier                       — plain value field: `SpherePool m_pool;`
             //   reference_declarator > field_identifier — reference field: `SoundEngine& m_sound;`
             //   pointer_declarator   > field_identifier — pointer field:   `Foo* m_foo;`
-            const TSNode decl = ts_node_child_by_field_name( fdecl, "declarator", 10 );
+            const TSNode decl = fieldChild( fdecl, NodeField::Declarator );
             if( ts_node_is_null( decl ) )
             {
                 continue;
@@ -502,7 +898,7 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
             std::string fieldName;
             bool        declIsRefOrPtr = false;
 
-            if( std::strcmp( dt, "field_identifier" ) == 0 )
+            if( kindIs( dt, "field_identifier" ) )
             {
                 // plain value member
                 const uint32_t da = ts_node_start_byte( decl ), db = ts_node_end_byte( decl );
@@ -513,20 +909,24 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
                 fieldName = std::string( src.substr( da, db - da ) );
                 declIsRefOrPtr = false;
             }
-            else if( std::strcmp( dt, "reference_declarator" ) == 0 || std::strcmp( dt, "pointer_declarator" ) == 0 )
+            else if( !pointee.name.empty() && kindIs( dt, "pointer_declarator" ) )
+            {
+                continue;   // `std::unique_ptr<Widget>* p_;` — `p_->` reaches the smart pointer, not Widget
+            }
+            else if( kindIs( dt, "reference_declarator" ) || kindIs( dt, "pointer_declarator" ) )
             {
                 declIsRefOrPtr = true;
-                // Walk the declarator's children to find the field_identifier
-                const uint32_t dc = ts_node_child_count( decl );
-                for( uint32_t k = 0; k < dc; ++k )
+                // Walk the declarator's children to find the field_identifier — O(children): `T & /*…*/ m` puts
+                // the comments in the reference_declarator (14x at 16 000, childwalkscalecheck B15)
+                forEachChild( decl, cursor.cur, [ & ]( TSNode dchild )
                 {
-                    const TSNode dchild = ts_node_child( decl, k );
-                    if( std::strcmp( ts_node_type( dchild ), "field_identifier" ) == 0 )
+                    if( kindIs( ts_node_type( dchild ), "field_identifier" ) )
                     {
                         const uint32_t da = ts_node_start_byte( dchild ), db = ts_node_end_byte( dchild );
-                        if( da < db && db <= src.size() ) { fieldName = std::string( src.substr( da, db - da ) ); break; }
+                        if( da < db && db <= src.size() ) { fieldName = std::string( src.substr( da, db - da ) ); return false; }
                     }
-                }
+                    return true;
+                } );
             }
             else
             {
@@ -547,8 +947,14 @@ void captureFields( TSNode classNode, std::uint32_t fileId, Lang lang, std::stri
             r.lang       = lang;
             r.isCompose  = true;
             r.name       = typeName;        // the member-type name (SpherePool, SoundEngine, ...)
+            r.qualifier  = writtenTypeNamespace( typeNode, src );   // `std` for `std::string name_;`, "" unqualified
             r.fieldName  = std::move( fieldName );
             r.composeRel = ( isRefOrPtr || declIsRefOrPtr ) ? "uses" : "creates";
+            if( !pointee.name.empty() )
+            {
+                r.qualifier = std::string( pointee.qualifier );   // the POINTEE's namespace: `std` for `std::unique_ptr<std::string>`
+                r.viaArrow  = true;
+            }
             refs.push_back( std::move( r ) );
         }
     }
@@ -590,10 +996,11 @@ inline std::string importSpecifierText( TSNode node, std::string_view src )
     }
     std::string_view s = src.substr( a, b - a );
 
-    // TS/JS specifier is a `string` node whose text includes the quote delimiters; strip exactly one pair.
-    if( std::strcmp( ts_node_type( node ), "string" ) == 0 && s.size() >= 2 && ( s.front() == '\'' || s.front() == '"' ) && s.back() == s.front() )
+    // TS/JS specifier is a `string` node whose text includes the quote delimiters; strip exactly one pair
+    // (pattern::stripQuotePair — the one quote-strip this and jsrunner.h's node:test check both apply).
+    if( kindIs( ts_node_type( node ), "string" ) )
     {
-        s = s.substr( 1, s.size() - 2 );
+        s = pattern::stripQuotePair( s );
     }
 
     return std::string( s );
@@ -616,26 +1023,15 @@ inline std::string importSpecifierText( TSNode node, std::string_view src )
 // for the first one.
 inline std::string csharpUsingTarget( TSNode usingNode, std::string_view src )
 {
-    if( const TSNode aliasType = ts_node_child_by_field_name( usingNode, "type", 4 ); !ts_node_is_null( aliasType ) )
+    if( const TSNode aliasType = fieldChild( usingNode, NodeField::Type ); !ts_node_is_null( aliasType ) )
     {
         return importSpecifierText( aliasType, src );
     }
 
-    const uint32_t cc = ts_node_child_count( usingNode );
-    for( uint32_t k = 0; k < cc; ++k )
-    {
-        const TSNode c = ts_node_child( usingNode, k );
-        if( !ts_node_is_named( c ) )
-        {
-            continue;
-        }
-        const char* ct = ts_node_type( c );
-        if( std::strcmp( ct, "qualified_name" ) == 0 || std::strcmp( ct, "identifier" ) == 0 || std::strcmp( ct, "generic_name" ) == 0 || std::strcmp( ct, "alias_qualified_name" ) == 0 )
-        {
-            return importSpecifierText( c, src );
-        }
-    }
-    return {};
+    // O(children): `using /*…*/ System.Text;` puts the comments in the using_directive itself — 16 000 of
+    // them measured 36x the identical flood inside a method body (test/childwalkscalecheck.sh, arm B16)
+    const TSNode c = firstChildOfKind( usingNode, /*namedOnly=*/true, { "qualified_name", "identifier", "generic_name", "alias_qualified_name" } );
+    return ts_node_is_null( c ) ? std::string {} : importSpecifierText( c, src );
 }
 
 // csharpUsingTarget's PHP sibling: the written specifier of a `use` statement. Node shapes read off
@@ -658,39 +1054,39 @@ inline std::string csharpUsingTarget( TSNode usingNode, std::string_view src )
 // is top-level and unaffected). Both are misses, never wrong answers.
 inline std::string phpUseTarget( TSNode useNode, std::string_view src )
 {
-    const uint32_t cc = ts_node_child_count( useNode );
-    for( uint32_t k = 0; k < cc; ++k )
+    // O(children) at both levels: `use /*…*/ Foo\Bar;` floods the namespace_use_declaration (54x at 16 000,
+    // test/childwalkscalecheck.sh arm B17), and the same comments inside a `{A, B}` group would flood the
+    // clause. Two cursors, because the clause walk runs while the declaration walk is mid-iteration.
+    std::string target;
+    ChildCursor clauses( useNode );
+    ChildCursor names( useNode );
+    forEachNamedChild( useNode, clauses.cur, [ & ]( TSNode c )
     {
-        const TSNode c = ts_node_child( useNode, k );
-        if( !ts_node_is_named( c ) )
-        {
-            continue;
-        }
         const char* ct = ts_node_type( c );
-        if( std::strcmp( ct, "namespace_name" ) == 0 )      // the `use Foo\{A, B}` group prefix
+        if( kindIs( ct, "namespace_name" ) )      // the `use Foo\{A, B}` group prefix
         {
-            return importSpecifierText( c, src );
+            target = importSpecifierText( c, src );
+            return false;
         }
-        if( std::strcmp( ct, "namespace_use_clause" ) != 0 )
+        if( !kindIs( ct, "namespace_use_clause" ) )
         {
-            continue;
+            return true;
         }
-        const uint32_t gc = ts_node_child_count( c );
-        for( uint32_t j = 0; j < gc; ++j )
+        bool hit = false;
+        forEachNamedChild( c, names.cur, [ & ]( TSNode g )
         {
-            const TSNode g = ts_node_child( c, j );
-            if( !ts_node_is_named( g ) )
-            {
-                continue;
-            }
             const char* gt = ts_node_type( g );
-            if( std::strcmp( gt, "qualified_name" ) == 0 || std::strcmp( gt, "name" ) == 0 )
+            if( kindIs( gt, "qualified_name" ) || kindIs( gt, "name" ) )
             {
-                return importSpecifierText( g, src );
+                target = importSpecifierText( g, src );
+                hit    = true;
+                return false;
             }
-        }
-    }
-    return {};
+            return true;
+        } );
+        return !hit;
+    } );
+    return target;
 }
 
 // TS/JS `require("./x")` and dynamic `import("./x")` → the written specifier, or empty when this call
@@ -709,28 +1105,22 @@ inline std::string phpUseTarget( TSNode useNode, std::string_view src )
 //     unresolvable include: a floor, never a wrong answer.
 inline std::string jsModuleLoadTarget( TSNode n, std::string_view src )
 {
-    const std::string_view callee = nodeFieldText( n, "function", 8, src );
+    const std::string_view callee = nodeFieldText( n, NodeField::Function, src );
     if( callee != "require" && callee != "import" )
     {
         return {};
     }
-    const TSNode ar = ts_node_child_by_field_name( n, "arguments", 9 );
+    const TSNode ar = fieldChild( n, NodeField::Arguments );
     if( ts_node_is_null( ar ) )
     {
         return {};
     }
 
-    TSNode   only  = { };
-    uint32_t named = 0;
-    for( uint32_t k = 0, cc = ts_node_child_count( ar ); k < cc; ++k )
-    {
-        if( const TSNode c = ts_node_child( ar, k );  ts_node_is_named( c ) )
-        {
-            only = c;
-            ++named;
-        }
-    }
-    if( named != 1 || std::strcmp( ts_node_type( only ), "string" ) != 0 )
+    TSNode      only  = { };
+    uint32_t    named = 0;
+    ChildCursor cursor( ar );   // O(children): `require( /*…*/ 'x' )` — 54x at 16 000 (childwalkscalecheck B18)
+    forEachNamedChild( ar, cursor.cur, [ & ]( TSNode c ) { only = c; ++named; return true; } );
+    if( named != 1 || !kindIs( ts_node_type( only ), "string" ) )
     {
         return {};
     }
@@ -739,13 +1129,17 @@ inline std::string jsModuleLoadTarget( TSNode n, std::string_view src )
 
 // The bare header path inside a C-family include spelling: `"dir/x.h"` / `<dir/x.h>` → `dir/x.h`, with
 // isAngleOut set from the delimiter BEFORE it is stripped (angle = external ⇒ path-precise resolution
-// leaves it unresolved). Shared by the two C-family spellings so they can never drift apart:
+// leaves it unresolved). ONE function for both spellings, so they can never drift apart:
 //   * `#include` — preproc_include's `path` field, which is EXACTLY the delimited token;
 //   * `#import`  — preproc_call's `argument` field, a preproc_arg that runs to end-of-line and so can
 //     carry a trailing comment (`#import "Volumetrics.h"   // vol_skyColor`, real, MeshRenderer.metal).
 // Hence the CLOSING delimiter, not the end of the spelling, ends the path. A spelling with no recognised
 // opening delimiter (a macro include, `#include HEADER_MACRO`) is returned verbatim in quote-form — the
 // pre-existing behaviour, preserved byte-for-byte. Allocates a std::string → not noexcept.
+//
+// #358: this is now the DepDialect::CFamily normaliser's own body (src/ingest_importcap.h), reached from
+// one `@import.path` capture instead of two per-language extractors. It stays HERE rather than moving,
+// because this file is the section that owns the spelling vocabulary and it is the one reader left.
 std::string includePathOf( std::string_view spelling, bool& isAngleOut )
 {
     if( spelling.size() < 2 || ( spelling.front() != '"' && spelling.front() != '<' ) )
@@ -761,34 +1155,6 @@ std::string includePathOf( std::string_view spelling, bool& isAngleOut )
         return std::string( spelling.substr( 1 ) );   // unterminated — degrade to "everything after the opener"
     }
     return std::string( spelling.substr( 1, end - 1 ) );
-}
-
-// C/C++/ObjC `#include "x.h"` / `<x.h>` → the bare path, isAngle set from the delimiter. Its own
-// function for the same reason csharpUsingTarget, phpUseTarget and jsModuleLoadTarget are: one AST shape
-// per language keeps directiveTargetOf's grain at one branch per grammar spelling, instead of one branch
-// plus its own null-and-bounds ladder. Empty when the node carries no readable path field.
-inline std::string preprocIncludeTarget( TSNode n, std::string_view src, bool& isAngleOut )
-{
-    const std::string_view spelling = nodeFieldText( n, "path", 4, src );
-    return spelling.empty() ? std::string{} : includePathOf( spelling, isAngleOut );
-}
-
-// The `#import "x.h"` spelling under the C/C++ grammar. `#import` is `#include` + include-once, so it
-// MUST yield the same Include edge — this is the edge that connects a `.metal` shader to the FX headers
-// it pulls in (10 of the 45 shaders in the measured reference tree use it). Under the objc grammar it
-// already parses as preproc_include; under the C/C++ grammar there is no #import rule, so it lands as the
-// generic preproc_call: directive:(preproc_directive) `#import`, argument:(preproc_arg) `"x.h"` / `<x.h>`.
-// EVERY other preproc_call (`#pragma`, `#error`, `#warning`, an unknown directive) is not a physical
-// dependency — the directive-text check is what keeps them out, so this never widens the include graph
-// beyond #import.
-inline std::string preprocImportTarget( TSNode n, std::string_view src, bool& isAngleOut )
-{
-    if( nodeFieldText( n, "directive", 9, src ) != "#import" )
-    {
-        return {};
-    }
-    const std::string_view spelling = nodeFieldText( n, "argument", 8, src );   // preproc_arg: runs to end-of-line
-    return spelling.empty() ? std::string{} : includePathOf( spelling, isAngleOut );   // the closing delimiter ends the path
 }
 
 // ─── kParserVer 81: the four languages that had no directive branch at all ───────────────────────────
@@ -812,8 +1178,6 @@ inline std::string preprocImportTarget( TSNode n, std::string_view src, bool& is
 // Elixir call's `arguments` child is one shape and it already has one reader, and a second private copy
 // here is exactly the duplication --quality-delta flags. Same TU, same anonymous namespace.
 TSNode elixirArguments( TSNode node ) noexcept;
-std::string dartDirectiveTarget( TSNode node, std::string_view src );
-std::vector<std::string> dartConditionalTargets( TSNode node, std::string_view src );
 
 // The literal text a shell word/string argument names, or empty when the argument is not a literal at
 // all. `word` is an unquoted argument (`source ./lib.sh`), `string`/`raw_string` a quoted one; a
@@ -829,11 +1193,11 @@ inline std::string bashWordText( TSNode arg, std::string_view src )
         return {};
     }
     const char* t = ts_node_type( arg );
-    if( std::strcmp( t, "word" ) == 0 || std::strcmp( t, "concatenation" ) == 0 )
+    if( kindIs( t, "word" ) || kindIs( t, "concatenation" ) )
     {
         return std::string( nodeTextOf( arg, src ) );
     }
-    if( std::strcmp( t, "string" ) == 0 || std::strcmp( t, "raw_string" ) == 0 )
+    if( kindIs( t, "string" ) || kindIs( t, "raw_string" ) )
     {
         std::string_view s = nodeTextOf( arg, src );
         if( s.size() >= 2 && ( s.front() == '"' || s.front() == '\'' ) && s.back() == s.front() )
@@ -854,12 +1218,12 @@ inline std::string bashWordText( TSNode arg, std::string_view src )
 // positional parameters to the sourced script, they are not further files.
 inline std::string bashSourceTarget( TSNode n, std::string_view src )
 {
-    const std::string_view name = nodeFieldText( n, "name", 4, src );
+    const std::string_view name = nodeFieldText( n, NodeField::Name, src );
     if( name != "source" && name != "." )
     {
         return {};
     }
-    return bashWordText( ts_node_child_by_field_name( n, "argument", 8 ), src );
+    return bashWordText( fieldChild( n, NodeField::Argument ), src );
 }
 
 // The first STRING-literal argument of a call-shaped node, read through the grammar: `arguments`/
@@ -868,14 +1232,16 @@ inline std::string bashSourceTarget( TSNode n, std::string_view src )
 // Lua and Ruby, whose argument nodes differ only in name.
 inline std::string stringLiteralText( TSNode str, std::string_view src )
 {
-    if( ts_node_is_null( str ) || std::strcmp( ts_node_type( str ), "string" ) != 0 )
+    if( ts_node_is_null( str ) || !kindIs( ts_node_type( str ), "string" ) )
     {
         return {};   // `require(mod)`, `require("a" .. b)`, `require "#{x}"` — no single literal to read
     }
+    // Indexed on purpose: a string's children come from the external scanner, which owns every byte between
+    // the delimiters, so no comment token is ever lexed into this list (src/infra/tschildren.h's one-line test).
     for( std::uint32_t i = 0; i < ts_node_named_child_count( str ); ++i )
     {
         const TSNode kid = ts_node_named_child( str, i );
-        if( std::strcmp( ts_node_type( kid ), "string_content" ) == 0 )
+        if( kindIs( ts_node_type( kid ), "string_content" ) )
         {
             return std::string( nodeTextOf( kid, src ) );
         }
@@ -897,19 +1263,19 @@ inline std::string firstStringArgText( TSNode args, std::string_view src )
 // is somebody's own method, not the loader.
 inline std::string luaRequireTarget( TSNode n, std::string_view src )
 {
-    const TSNode name = ts_node_child_by_field_name( n, "name", 4 );
-    if( ts_node_is_null( name ) || std::strcmp( ts_node_type( name ), "identifier" ) != 0 || nodeTextOf( name, src ) != "require" )
+    const TSNode name = fieldChild( n, NodeField::Name );
+    if( ts_node_is_null( name ) || !kindIs( ts_node_type( name ), "identifier" ) || nodeTextOf( name, src ) != "require" )
     {
         return {};
     }
-    return firstStringArgText( ts_node_child_by_field_name( n, "arguments", 9 ), src );
+    return firstStringArgText( fieldChild( n, NodeField::Arguments ), src );
 }
 
 // Ruby `require_relative "x"` / `require "lib/x"` / `load "x.rb"` — a `call` whose `method:` is one of
 // the three Kernel loaders and which has NO receiver (`foo.require` is somebody's own method; the bare
 // spelling is the only one that is provably Kernel's). `autoload :Foo, "lib/x"` was a disclosed floor here
 // through kParserVer 81 (its path is argument TWO); rubyAutoloadTarget below lifts it, and the constant
-// spellings — superclass, include/extend/prepend, path-less `autoload :Foo` — live in rubyConstantDirective
+// spellings — superclass, include/extend/prepend, path-less `autoload :Foo` — live in rubyNamedDirective
 // and rubyMixinTargets, resolved by index rather than by path (Include::isSymbolic).
 //
 // The two resolution rules are encoded in the target the way Python's already are — by a LEADING DOT,
@@ -921,12 +1287,12 @@ inline std::string luaRequireTarget( TSNode n, std::string_view src )
 // mis-resolve: unique-or-degrade means a wrong file-relative guess simply finds nothing.
 inline std::string rubyRequireTarget( TSNode n, std::string_view src )
 {
-    if( !ts_node_is_null( ts_node_child_by_field_name( n, "receiver", 8 ) ) )
+    if( !ts_node_is_null( fieldChild( n, NodeField::Receiver ) ) )
     {
         return {};
     }
-    const TSNode method = ts_node_child_by_field_name( n, "method", 6 );
-    if( ts_node_is_null( method ) || std::strcmp( ts_node_type( method ), "identifier" ) != 0 )
+    const TSNode method = fieldChild( n, NodeField::Method );
+    if( ts_node_is_null( method ) || !kindIs( ts_node_type( method ), "identifier" ) )
     {
         return {};
     }
@@ -935,7 +1301,7 @@ inline std::string rubyRequireTarget( TSNode n, std::string_view src )
     {
         return {};
     }
-    std::string spec = firstStringArgText( ts_node_child_by_field_name( n, "arguments", 9 ), src );
+    std::string spec = firstStringArgText( fieldChild( n, NodeField::Arguments ), src );
     if( spec.empty() )
     {
         return {};
@@ -966,26 +1332,31 @@ inline std::string rubyRequireTarget( TSNode n, std::string_view src )
 // and it is how Ruby spells a constant whose whole definition is its existence — so it defines. Recorded on the ConstOpen captureIncludes emits; read by resolve.h::buildRubyConstantIndex (test/rubyconstcheck.sh, namespace arms).
 inline bool rubyNamespaceOnly( TSNode defNode ) noexcept
 {
-    const TSNode body = ts_node_child_by_field_name( defNode, "body", 4 );
+    const TSNode body = fieldChild( defNode, NodeField::Body );
     if( ts_node_is_null( body ) )
     {
         return false;   // an empty open defines its constant
     }
-    bool nestedOpen = false;
-    const std::uint32_t n = ts_node_named_child_count( body );
-    for( std::uint32_t i = 0; i < n; ++i )
+    // O(children): the scan already skips `comment` by kind, which is the author knowing they land in this
+    // list — 16 000 of them measured 58x the identical flood after the class (childwalkscalecheck B19)
+    bool        nestedOpen = false;
+    bool        ownBody    = false;
+    ChildCursor cursor( body );
+    forEachNamedChild( body, cursor.cur, [ & ]( TSNode c )
     {
-        const char* ct = ts_node_type( ts_node_named_child( body, i ) );
-        if( std::strcmp( ct, "class" ) == 0 || std::strcmp( ct, "module" ) == 0 )
+        const char* ct = ts_node_type( c );
+        if( kindIs( ct, "class" ) || kindIs( ct, "module" ) )
         {
             nestedOpen = true;
         }
-        else if( std::strcmp( ct, "comment" ) != 0 )
+        else if( !kindIs( ct, "comment" ) )
         {
-            return false;   // a method, a call, a constant, `class << self` — a body of its own
+            ownBody = true;   // a method, a call, a constant, `class << self` — a body of its own
+            return false;
         }
-    }
-    return nestedOpen;
+        return true;
+    } );
+    return !ownBody && nestedOpen;
 }
 
 // The text of a constant-shaped node — `constant` (`Base`) or `scope_resolution` (`A::B`, `::Top`) — or
@@ -997,7 +1368,7 @@ inline std::string rubyConstantText( TSNode n, std::string_view src )
         return {};
     }
     const char* t = ts_node_type( n );
-    if( std::strcmp( t, "constant" ) != 0 && std::strcmp( t, "scope_resolution" ) != 0 )
+    if( !kindIs( t, "constant" ) && !kindIs( t, "scope_resolution" ) )
     {
         return {};
     }
@@ -1024,13 +1395,13 @@ inline std::string rubySuperclassTarget( TSNode superclassNode, std::string_view
 inline std::string rubyAutoloadTarget( TSNode n, std::string_view src, bool& symbolic )
 {
     symbolic = false;
-    const TSNode args = ts_node_child_by_field_name( n, "arguments", 9 );
+    const TSNode args = fieldChild( n, NodeField::Arguments );
     if( ts_node_is_null( args ) || ts_node_named_child_count( args ) == 0 )
     {
         return {};
     }
     const TSNode sym = ts_node_named_child( args, 0 );
-    if( std::strcmp( ts_node_type( sym ), "simple_symbol" ) != 0 )
+    if( !kindIs( ts_node_type( sym ), "simple_symbol" ) )
     {
         return {};
     }
@@ -1051,25 +1422,45 @@ inline std::string rubyAutoloadTarget( TSNode n, std::string_view src, bool& sym
     return std::string( txt );
 }
 
-// The receiver-less `call` node's method name when it is one of the constant-shaped directives, else empty.
-// `autoload` and the three mixin verbs; `obj.include X` is somebody's own method and reads as nothing.
-inline std::string_view rubyConstantDirective( TSNode n, std::string_view src )
+// If the node's field child is of node kind `kind`, its text; else empty. The field-child-of-one-kind-and-give-
+// me-its-text shape recurs across grammars: fieldIdentifierText below is its `identifier` case, and
+// ingest_binds.h's rubyFinalConstant its `constant` case. The kind stays a literal, so kindIs keeps its
+// compile-time length.
+template< std::size_t N >
+inline std::string_view fieldChildTextOfKind( TSNode n, NodeField field, const char ( &kind )[N], std::string_view src ) noexcept
 {
-    if( !ts_node_is_null( ts_node_child_by_field_name( n, "receiver", 8 ) ) )
+    const TSNode c = fieldChild( n, field );
+    return !ts_node_is_null( c ) && kindIs( ts_node_type( c ), kind ) ? nodeTextOf( c, src ) : std::string_view {};
+}
+
+// If the node's field child is a bare identifier, its text; else empty (elixirTarget, elixirDirectiveTarget,
+// elixirAliasGroup, and the Ruby readers below all open with it).
+inline std::string_view fieldIdentifierText( TSNode n, NodeField field, std::string_view src ) noexcept
+{
+    return fieldChildTextOfKind( n, field, "identifier", src );
+}
+
+// The two Ruby named-directive verb sets. `attributes` (plural) has no runtime meaning in base Rails
+// (measured: NoMethodError at class level) — captured for third-party DSLs that define it; the
+// disclosure lives in the CHANGELOG and the tags.scm header.
+inline constexpr std::array<std::string_view, 4> kRubyConstantDirectives = { "include", "extend", "prepend", "autoload" };
+inline constexpr std::array<std::string_view, 5> kRubyAttrFamilyNames    = { "attribute", "attributes", "attr_reader", "attr_writer", "attr_accessor" };
+// `module_function` is NOT a visibility wrapper here: `module_function attr_accessor :x` raises in either position
+// (measured, Ruby 4.0.7: NoMethodError in a class, which undefines module_function; TypeError in a module, which
+// refuses the [:x, :x=] array attr_accessor returns), so no running program spells it and it defines nothing.
+inline constexpr std::array<std::string_view, 3> kRubyVisibilityNames    = { "private", "protected", "public" };
+
+// A receiver-less `call` node's method-name TEXT when it is one of `names`, else empty — the shared reader of
+// the Ruby named directives (`obj.include X` / `obj.attr_writer :x` are somebody's own methods and read as
+// nothing; empty is the "not a directive" signal for every caller).
+inline std::string_view rubyNamedDirective( TSNode n, std::string_view src, std::span<const std::string_view> names )
+{
+    if( !ts_node_is_null( fieldChild( n, NodeField::Receiver ) ) )
     {
         return {};
     }
-    const TSNode method = ts_node_child_by_field_name( n, "method", 6 );
-    if( ts_node_is_null( method ) || std::strcmp( ts_node_type( method ), "identifier" ) != 0 )
-    {
-        return {};
-    }
-    const std::string_view m = nodeTextOf( method, src );
-    if( m == "include" || m == "extend" || m == "prepend" || m == "autoload" )
-    {
-        return m;
-    }
-    return {};
+    const std::string_view m = fieldIdentifierText( n, NodeField::Method, src );
+    return std::find( names.begin(), names.end(), m ) != names.end() ? m : std::string_view{};
 }
 
 // `include A, B` / `extend M` / `prepend P` — ONE directive naming N constants and therefore N Include
@@ -1078,25 +1469,89 @@ inline std::string_view rubyConstantDirective( TSNode n, std::string_view src )
 inline std::vector<std::string> rubyMixinTargets( TSNode n, std::string_view src )
 {
     std::vector<std::string> out;
-    const std::string_view   m = rubyConstantDirective( n, src );
+    const std::string_view   m = rubyNamedDirective( n, src, kRubyConstantDirectives );
     if( m.empty() || m == "autoload" )
     {
         return out;
     }
-    const TSNode args = ts_node_child_by_field_name( n, "arguments", 9 );
+    const TSNode args = fieldChild( n, NodeField::Arguments );
     if( ts_node_is_null( args ) )
     {
         return out;
     }
-    const std::uint32_t count = ts_node_named_child_count( args );
-    for( std::uint32_t i = 0; i < count; ++i )
+    ChildCursor cursor( args );   // O(children): `include A, # … B` — 58x at 16 000 (childwalkscalecheck B20)
+    forEachNamedChild( args, cursor.cur, [ & ]( TSNode a )
     {
-        if( std::string c = rubyConstantText( ts_node_named_child( args, i ), src ); !c.empty() )
+        if( std::string c = rubyConstantText( a, src ); !c.empty() )
         {
             out.push_back( std::move( c ) );
         }
-    }
+        return true;
+    } );
     return out;
+}
+
+// Is this macro call at class-DSL position — a class/module/`class << self` body, optionally through the
+// macro call's OWN do/{ } block wrapper or an INLINE VISIBILITY wrapper? In tree-sitter-ruby 0.23.1 the call's
+// do/{ } block is a FIELD (`(call … block: (do_block (body_statement …)))`; `{ }` interposes `block_body`
+// between the field and its statements), so the call itself sits directly at the class body — the fixture
+// passes through the plain body_statement ascent and the `ownBlockWrapper` branch below is a conservatively-
+// unreachable guard against a future grammar that reintroduces a wrapping `block` node. An INLINE visibility
+// wrapper — `private attr_reader :x` (Ruby 3, RuboCop's Style/AccessModifierDeclarations: inline) — parses as
+// the family call being the SOLE argument of a receiverless private/protected/public call:
+// the visibility call's own parent chain must ALSO pass this gate (its argument is evaluated first — the
+// macro runs and the method IS defined — then visibility applies). A method body, a lambda, or a block
+// nested under anything else is not: a method body runs at call time, and a file top level
+// (`attr_accessor :x` outside any class — defines on Object) is walked to nothing. A `begin`/modifier-`if`-
+// guarded macro call and the do-block bodies of `included`/`class_methods`/`Struct.new`/`Class.new`/
+// `Module.new` or a non-modifier `if … then … end` are disclosed floors (not unwrapped).
+inline bool rubyAttrAtClassBodyLevel( TSNode n, std::string_view src ) noexcept
+{
+    TSNode cur = n;
+    for( int guard = 0; guard < 4; ++guard )   // visibility wrapper + block wrapper + body_statement is the deepest real chain
+    {
+        const TSNode p = ts_node_parent( cur );
+        if( ts_node_is_null( p ) )
+        {
+            return false;
+        }
+        const char* const pt = ts_node_type( p );
+        if( kindIs( pt, "class" ) || kindIs( pt, "module" ) )
+        {
+            return true;
+        }
+        if( kindIs( pt, "singleton_class" ) )
+        {
+            // `class << self` opens the ENCLOSING class's singleton, so its accessors are that class's and scope to
+            // it. `class << Registry` opens ANOTHER object's singleton: its accessors are not the enclosing class's,
+            // and rubyEnclosingScopeOf would name the enclosing class, so they define nothing (a disclosed floor).
+            const TSNode value = fieldChild( p, NodeField::Value );
+            return !ts_node_is_null( value ) && kindIs( ts_node_type( value ), "self" );
+        }
+        if( kindIs( pt, "argument_list" ) )
+        {
+            // Inline visibility: the sole argument of a receiverless visibility call, and the VISIBILITY
+            // call's own parent chain must pass the same gate (next hop(s)) — this is what keeps
+            // `def m; private attr_reader :x; end` out (`private` inside a method body fails the ascent).
+            const TSNode outer = ts_node_parent( p );
+            if( !ts_node_is_null( outer ) && kindIs( ts_node_type( outer ), "call" )
+                && !rubyNamedDirective( outer, src, kRubyVisibilityNames ).empty()
+                && ts_node_named_child_count( p ) == 1 && ts_node_eq( ts_node_named_child( p, 0 ), cur ) )
+            {
+                cur = outer;   // one more ascent; the visibility call's own parent decides
+                continue;
+            }
+            return false;
+        }
+        const bool ownBlockWrapper = kindIs( pt, "block" ) && ts_node_eq( ts_node_named_child( p, 0 ), cur );
+        const bool statementList   = kindIs( pt, "body_statement" );   // class bodies wrap multi-statement lists; the next hop decides
+        if( !ownBlockWrapper && !statementList )
+        {
+            return false;
+        }
+        cur = p;
+    }
+    return false;
 }
 
 // A CONSTANT CHAIN: `Name`, `A::B::C`, `::A::B` — every segment a constant, the head a constant or absent (`::A`).
@@ -1104,28 +1559,41 @@ inline std::vector<std::string> rubyMixinTargets( TSNode n, std::string_view src
 // restricts to constants (a class name, a superclass, a mixin argument); a RECEIVER is not such a position —
 // `repo::Finder.call` and `self.class::Foo.bar` are scope_resolutions whose head is an identifier or a call,
 // and naming them as constants would invent a dependency on nothing. Empty when any segment is not a constant.
+//
+// A LOOP, not a recursion (parser version 86). `A::B::C` parses left-nested — scope_resolution(scope:
+// scope_resolution(scope: A, name: B), name: C) — so the chain's depth is its segment count, and a recursive
+// check spent one native frame per segment: a 5000-segment receiver overflowed a parse worker's stack (SIGBUS,
+// measured on macOS) and took the whole run with it, before the depth-bounded walk in captureIncludes ever saw
+// the node. The gate builds a 150 000-segment chain and expects one directive.
 inline bool rubyIsConstantChain( TSNode n ) noexcept
 {
-    if( ts_node_is_null( n ) )
+    for( ;; )
     {
-        return false;
+        if( ts_node_is_null( n ) )
+        {
+            return false;
+        }
+        const char* t = ts_node_type( n );
+        if( kindIs( t, "constant" ) )
+        {
+            return true;
+        }
+        if( !kindIs( t, "scope_resolution" ) )
+        {
+            return false;
+        }
+        const TSNode name  = fieldChild( n, NodeField::Name );
+        const TSNode scope = fieldChild( n, NodeField::Scope );
+        if( ts_node_is_null( name ) || !kindIs( ts_node_type( name ), "constant" ) )
+        {
+            return false;
+        }
+        if( ts_node_is_null( scope ) )
+        {
+            return true;   // null scope = the absolute `::A` form: the chain's head
+        }
+        n = scope;   // one segment inward; the loop is the recursion, minus the frame
     }
-    const char* t = ts_node_type( n );
-    if( std::strcmp( t, "constant" ) == 0 )
-    {
-        return true;
-    }
-    if( std::strcmp( t, "scope_resolution" ) != 0 )
-    {
-        return false;
-    }
-    const TSNode name  = ts_node_child_by_field_name( n, "name", 4 );
-    const TSNode scope = ts_node_child_by_field_name( n, "scope", 5 );
-    if( ts_node_is_null( name ) || std::strcmp( ts_node_type( name ), "constant" ) != 0 )
-    {
-        return false;
-    }
-    return ts_node_is_null( scope ) || rubyIsConstantChain( scope );   // null scope = the absolute `::A` form
 }
 
 // Parser version 83 (test/rubyrecvcheck.sh): a CONSTANT RECEIVER — `User.find`, `App::Mailer.deliver`,
@@ -1133,15 +1601,80 @@ inline bool rubyIsConstantChain( TSNode n ) noexcept
 // reference. The target is the receiver chain AS WRITTEN (`::Time` and `Time` are two spellings, two
 // directives); a receiver that is not a constant chain — an identifier, `self.class`, an ivar, `repo::Finder`
 // — yields nothing. A constant used as an ARGUMENT (`raise Errors::Boom`, `validates_with Foo`) or as a
-// rescue class is NOT a receiver: a disclosed floor of this round, stated in the gate's header.
+// rescue class is NOT a receiver: that was round two's disclosed floor, and parser version 93 lifted it —
+// rubyArgumentTargets / rubyRescueTargets below, test/rubyargcheck.sh.
 inline std::string rubyReceiverTarget( TSNode n, std::string_view src )
 {
-    const TSNode recv = ts_node_child_by_field_name( n, "receiver", 8 );
+    const TSNode recv = fieldChild( n, NodeField::Receiver );
     if( !rubyIsConstantChain( recv ) )
     {
         return {};
     }
     return std::string( nodeTextOf( recv, src ) );
+}
+
+// Parser version 93 (test/rubyargcheck.sh): a CONSTANT ARGUMENT — `raise Errors::Boom`, `validates_with Validator`,
+// `delegate :x, to: Helper`, `obj.is_a?(User)`, `super(Validator)`, `yield User` — is evaluated when the call runs,
+// and evaluating a constant is what makes the autoloader load its file: the same dependency a receiver is, in the
+// OTHER position Ruby evaluates constants in. The `argument_list` is the grammar's one node for the arguments of a
+// `call` (parenthesised or not), a `super` and a `yield`, so one read of that node covers all three. Read: every
+// DIRECT named child that is a constant chain (the same rubyIsConstantChain test a receiver passes — `repo::Finder`
+// is nothing here too), and the VALUE of a keyword `pair` written directly in the list. NOT read, the disclosed
+// floor of this round and pinned by the gate to yield nothing: a hash literal inside the parens, a splat, and every
+// constant in a value position that is not an argument (`when X`, `[X]`, `Y = X`, `"#{X}"`, `X || Z`) — each an
+// evaluation Ruby performs that a later round may read. The argument list of `include`/`extend`/`prepend`/
+// `autoload` belongs to round one (rubyMixinTargets, rubyAutoloadTarget): reading it here as well would double
+// every mixin in the corpus, so a list whose call is one of those directives is skipped whole.
+inline std::vector<std::string> rubyArgumentTargets( TSNode argList, std::string_view src )
+{
+    std::vector<std::string> out;
+    const TSNode parent = ts_node_parent( argList );
+    if( !ts_node_is_null( parent ) && kindIs( ts_node_type( parent ), "call" ) && !rubyNamedDirective( parent, src, kRubyConstantDirectives ).empty() )
+    {
+        return out;
+    }
+    ChildCursor cursor( argList );   // O(children): a 16 000-argument list is one cursor pass, never an indexed scan
+    forEachNamedChild( argList, cursor.cur, [ & ]( TSNode a )
+    {
+        const TSNode c = kindIs( ts_node_type( a ), "pair" ) ? fieldChild( a, NodeField::Value ) : a;
+        if( rubyIsConstantChain( c ) )
+        {
+            out.emplace_back( nodeTextOf( c, src ) );
+        }
+        return true;
+    } );
+    return out;
+}
+
+// Parser version 93: a RESCUE CLASS — every constant chain in a `rescue` clause's exception list (`rescue A, B => e`);
+// a bare `rescue => e` names no class and yields nothing, and so does an identifier there (`rescue klass`). Ruby
+// evaluates the exception list only when an exception is being MATCHED against the clause, never when the clause is
+// loaded (`class X; begin; 1; rescue Nope; end; end` is silent; the same begin with a `raise` inside names Nope in a
+// NameError — measured on ruby 4.0.6), so captureIncludes marks the directive LAZY whatever encloses it: a class-body
+// rescue is a use, not a load-time dependency. The `exceptions` node is a named child, not a field, so it is found
+// by kind rather than through NodeField — one child per clause, the search stops at it.
+inline std::vector<std::string> rubyRescueTargets( TSNode rescueNode, std::string_view src )
+{
+    std::vector<std::string> out;
+    ChildCursor cursor( rescueNode );
+    forEachNamedChild( rescueNode, cursor.cur, [ & ]( TSNode child )
+    {
+        if( !kindIs( ts_node_type( child ), "exceptions" ) )
+        {
+            return true;
+        }
+        ChildCursor inner( child );   // a second cursor: the outer one is mid-walk on rescueNode and cannot be reused (tschildren.h)
+        forEachNamedChild( child, inner.cur, [ & ]( TSNode e )
+        {
+            if( rubyIsConstantChain( e ) )
+            {
+                out.emplace_back( nodeTextOf( e, src ) );
+            }
+            return true;
+        } );
+        return false;
+    } );
+    return out;
 }
 
 // Elixir `alias`/`import`/`require`/`use` — a `call` whose `target:` is one of the four directive
@@ -1160,12 +1693,7 @@ inline std::string rubyReceiverTarget( TSNode n, std::string_view src )
 // the name alias does NOT narrow call resolution, exactly as that query's own comment already says.
 inline std::string elixirDirectiveTarget( TSNode n, std::string_view src )
 {
-    const TSNode target = ts_node_child_by_field_name( n, "target", 6 );
-    if( ts_node_is_null( target ) || std::strcmp( ts_node_type( target ), "identifier" ) != 0 )
-    {
-        return {};
-    }
-    const std::string_view kw = nodeTextOf( target, src );
+    const std::string_view kw = fieldIdentifierText( n, NodeField::Target, src );
     if( kw != "alias" && kw != "import" && kw != "require" && kw != "use" )
     {
         return {};
@@ -1176,7 +1704,7 @@ inline std::string elixirDirectiveTarget( TSNode n, std::string_view src )
         return {};
     }
     const TSNode first = ts_node_named_child( args, 0 );
-    if( ts_node_is_null( first ) || std::strcmp( ts_node_type( first ), "alias" ) != 0 )
+    if( ts_node_is_null( first ) || !kindIs( ts_node_type( first ), "alias" ) )
     {
         return {};   // a `dot` brace group is emitted by elixirAliasGroup; anything else is not a module name
     }
@@ -1189,12 +1717,7 @@ inline std::string elixirDirectiveTarget( TSNode n, std::string_view src )
 inline std::vector<std::string> elixirAliasGroup( TSNode n, std::string_view src )
 {
     std::vector<std::string> out;
-    const TSNode target = ts_node_child_by_field_name( n, "target", 6 );
-    if( ts_node_is_null( target ) || std::strcmp( ts_node_type( target ), "identifier" ) != 0 )
-    {
-        return out;
-    }
-    const std::string_view kw = nodeTextOf( target, src );
+    const std::string_view kw = fieldIdentifierText( n, NodeField::Target, src );
     if( kw != "alias" && kw != "import" && kw != "require" && kw != "use" )
     {
         return out;
@@ -1205,32 +1728,31 @@ inline std::vector<std::string> elixirAliasGroup( TSNode n, std::string_view src
         return out;
     }
     const TSNode first = ts_node_named_child( args, 0 );
-    if( ts_node_is_null( first ) || std::strcmp( ts_node_type( first ), "dot" ) != 0 )
+    if( ts_node_is_null( first ) || !kindIs( ts_node_type( first ), "dot" ) )
     {
         return out;
     }
-    const TSNode left  = ts_node_child_by_field_name( first, "left", 4 );
-    const TSNode right = ts_node_child_by_field_name( first, "right", 5 );
+    const TSNode left  = fieldChild( first, NodeField::Left );
+    const TSNode right = fieldChild( first, NodeField::Right );
     if( ts_node_is_null( left ) || ts_node_is_null( right )
-        || std::strcmp( ts_node_type( left ), "alias" ) != 0 || std::strcmp( ts_node_type( right ), "tuple" ) != 0 )
+        || !kindIs( ts_node_type( left ), "alias" ) || !kindIs( ts_node_type( right ), "tuple" ) )
     {
         return out;
     }
     const std::string_view prefix = nodeTextOf( left, src );
-    for( std::uint32_t i = 0; i < ts_node_named_child_count( right ); ++i )
+    ChildCursor            cursor( right );   // O(children): `{A, # … B}` — 86x at 16 000 (childwalkscalecheck B21)
+    forEachNamedChild( right, cursor.cur, [ & ]( TSNode member )
     {
-        const TSNode member = ts_node_named_child( right, i );
-        if( std::strcmp( ts_node_type( member ), "alias" ) != 0 )
+        if( kindIs( ts_node_type( member ), "alias" ) )
         {
-            continue;
+            const std::string_view name = nodeTextOf( member, src );
+            if( !prefix.empty() && !name.empty() )
+            {
+                out.emplace_back( std::string( prefix ) + "." + std::string( name ) );
+            }
         }
-        const std::string_view name = nodeTextOf( member, src );
-        if( prefix.empty() || name.empty() )
-        {
-            continue;
-        }
-        out.emplace_back( std::string( prefix ) + "." + std::string( name ) );
-    }
+        return true;
+    } );
     return out;
 }
 
@@ -1382,10 +1904,12 @@ inline constexpr std::array<std::string_view, 6> kElixirImportContainers = {
     "call", "do_block", "stab_clause", "body", "arguments", "keywords"
 };
 
-// DART. `import`/`export` directives sit under an `import_or_export` wrapper whose child names the real
-// directive (`library_import` / `library_export`), so the walk needs exactly that one container to stand on
-// the URI-bearing node. `part` and `part of` are root children directly and need no container entry.
-inline constexpr std::array<std::string_view, 1> kDartImportContainers = { "import_or_export" };
+// KOTLIN. Unlike every other language in this table, an `import` is not a general statement that CAN
+// appear inside a function/class body — the language itself only allows it at file top level, before
+// any other declaration. Empirically confirmed (not assumed from the grammar): every import_header in
+// two real corpora (Nanidroid, the socialite sample app), across single- and multi-import files, has
+// the SAME two-deep parent chain with no variation — `import_list -> source_file`. One entry.
+inline constexpr std::array<std::string_view, 1> kKotlinImportContainers = { "import_list" };
 
 // The FUNCTION-BODY node kinds — read off real parses, not predicted. Entering ANY one of these means
 // everything inside it is written INSIDE a function's body, so a require()/import() found there only runs
@@ -1404,6 +1928,8 @@ inline constexpr std::array<std::string_view, 6> kJsFunctionContainers = {
 // own closure grammar. A receiver at class-body or file level runs at load and is not lazy. A `do`-block passed
 // to a class-level macro (`included do`, `after_commit do`) is lazy under this rule even when the callee runs it
 // at load: the tool cannot see the callee, and a block is a closure the callee may or may not run.
+// A RESCUE class (parser version 93, rubyRescueTargets) is lazy without any of these around it: Ruby evaluates a
+// rescue clause's exception list only while matching an exception, so the closure that defers it is the clause.
 inline constexpr std::array<std::string_view, 5> kRubyClosureContainers = {
     "method", "singleton_method", "lambda", "block", "do_block"
 };
@@ -1486,7 +2012,7 @@ inline constexpr std::array<LangImportContainers, 9> kImportContainersByLang = {
     { Lang::Bash,       kBashImportContainers   },
     { Lang::Lua,        kLuaImportContainers    },
     { Lang::Elixir,     kElixirImportContainers },
-    { Lang::Dart,       kDartImportContainers   }
+    { Lang::Kotlin,     kKotlinImportContainers }
 } };
 
 inline bool isImportContainer( Lang lang, const char* type ) noexcept
@@ -1520,88 +2046,101 @@ constexpr std::uint16_t kMaxImportContainerDepth = 256;
 // at all. Split out of captureIncludes so the walk that FINDS directives and the per-grammar table that
 // READS them stay separately readable — the walk is one shape, this is one branch per grammar spelling.
 //
-// Node types confirmed per grammar: C++ preproc_include (path field, "" local vs <> external); C++
-// preproc_call with directive `#import` (the C/C++ grammar has no #import rule — the objc grammar does,
-// and yields preproc_include there); Python import_statement/import_from_statement; Go/Swift
+// Node types confirmed per grammar: Python import_statement/import_from_statement; Go/Swift
 // import_declaration; Rust use_declaration + mod_item; C# using_directive; TS/JS call_expression for the
-// CommonJS `require("./x")` and dynamic `import("./x")` spellings. LEVER-B B0: non-C imports capture the
+// CommonJS `require("./x")` and dynamic `import("./x")` spellings; plus the kParserVer-81 four (bash
+// `command`, lua `function_call`, ruby `call`, elixir `call`). LEVER-B B0: non-C imports capture the
 // CLEAN written specifier via grammar child fields (module path / quoted specifier / use argument), not a
 // sliced clause — the sound resolver input.
+//
+// #358: the C-family rows are GONE from this list. C++ preproc_include (path field, "" local vs <>
+// external) and C++ preproc_call with directive `#import` are captured as `@import.path` by the grammar's
+// own query and read by the DepDialect::CFamily normaliser (src/ingest_importcap.h), so this function is
+// never asked about a C-family node. What is left is every language whose extraction needs the walk's own
+// frame state — which is also the list of languages that have NOT moved over yet.
 //
 // `lang` exists for exactly one branch: `call_expression` is a node type in most of our grammars, and a
 // C++ or Rust function that happens to be named `require` must never manufacture a dependency edge. The
 // language gate makes that impossible by construction rather than by relying on where the walk goes.
 //
-// `isAngle` is C/C++/ObjC only: `<x.h>` (external) vs `"x.h"` (quote), returned alongside the target so
-// path-precise resolution can leave angle includes unresolved. `isLazy` is TS/JS only (kParserVer 72):
-// true when `insideFn` says this call sits inside a function-body container — see kJsFunctionContainers
-// and captureIncludes' `insideFn` propagation below. Allocates a std::string → not noexcept.
-// `isSymbolic` (parser version 82, Ruby only): the target is a CONSTANT resolved through the corpus's own
-// class/module index, never a path — see model.h Include::isSymbolic.
-struct DirectiveTarget { std::string target; bool isAngle; bool isLazy; bool isSymbolic; bool isReceiver; };
+// `isLazy` (kParserVer 72, TS/JS; Ruby since parser version 82/83): true when `insideFn` says this call sits
+// inside a closure container — see kJsFunctionContainers, the Ruby closure kinds, and captureIncludes'
+// `insideFn` propagation below — or when the directive is a Ruby `autoload`. Allocates a std::string →
+// not noexcept. `isSymbolic` (parser version 82, Ruby only): the target is a CONSTANT resolved through the
+// corpus's own class/module index, never a path — see model.h Include::isSymbolic.
+//
+// There is deliberately NO `isAngle` here any more. It was C-family-only (`<x.h>` vs `"x.h"`), the two arms
+// that set it are the ones #358 deleted, and the CFamily normaliser writes Include::isAngle straight onto
+// the record it builds (src/ingest_importcap.h). A field no path can set is a lie in the type, so it is
+// gone rather than documented as always-false.
+struct DirectiveTarget { std::string target; bool isLazy; bool isSymbolic; bool isReceiver; };
 
 // `insideFn` exists for exactly the same one branch `lang` does: whether the call_expression being read
 // sits inside a TS/JS function body, per captureIncludes' walk — meaningless (and ignored) everywhere else.
 DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src, Lang lang, bool insideFn )
 {
     std::string target;
-    bool        isAngle    = false;
     bool        isLazy     = false;
     bool        isSymbolic = false;
     bool        isReceiver = false;
 
-    if( std::strcmp( t, "preproc_include" ) == 0 )                       // C++/C/ObjC: exact file path
-    {
-        target = preprocIncludeTarget( n, src, isAngle );
-    }
-    else if( std::strcmp( t, "preproc_call" ) == 0 )                     // C++-grammar `#import "x.h"` (ObjC/Metal spelling)
-    {
-        target = preprocImportTarget( n, src, isAngle );
-    }
-    else if( std::strcmp( t, "import_statement" ) == 0 )                 // Python `import a` / TS `import … from 'x'`
+    if( kindIs( t, "import_statement" ) )                 // Python `import a` / TS `import … from 'x'`
     {
         // Prefer the grammar's specifier field over slicing the whole statement (LEVER-B B0: the resolver
         // needs the REAL written specifier, not the clause). Empirically confirmed node shapes:
         //   Python: import_statement name:(dotted_name|aliased_import)  → the dotted module `pkg.mod`.
         //   TS/JS:  import_statement source:(string)                    → the quoted specifier `'./x'`.
-        // ts_node_child_by_field_name returns null for the language that lacks the field, so a single
+        // A grammar that lacks the field resolves it to id 0, and fieldChild returns null for it, so a single
         // capture covers both grammars without a per-language branch.
-        if( const TSNode src_ = ts_node_child_by_field_name( n, "source", 6 );  !ts_node_is_null( src_ ) )
+        if( const TSNode src_ = fieldChild( n, NodeField::Source );  !ts_node_is_null( src_ ) )
         {
             target = importSpecifierText( src_, src );                    // TS/JS: strip the surrounding quotes
         }
-        else if( const TSNode nm = ts_node_child_by_field_name( n, "name", 4 );  !ts_node_is_null( nm ) )
+        else if( const TSNode nm = fieldChild( n, NodeField::Name );  !ts_node_is_null( nm ) )
         {
             target = importSpecifierText( nm, src );                      // Python: the dotted module head
         }
     }
-    else if( std::strcmp( t, "import_from_statement" ) == 0 )            // Python `from pkg.mod import Z`
+    else if( kindIs( t, "export_statement" ) && ( lang == Lang::TypeScript || lang == Lang::JavaScript ) )
+    {
+        // kParserVer 124 (#220 part 2): a RE-EXPORT — `export { x } from './y'`, `export * from './y'`,
+        // `export * as ns from './y'`, `export type { T } from './y'` — loads its module exactly as an import does,
+        // and a barrel file is made of nothing else, so an import graph without them misses every cycle through a
+        // barrel. The grammar gives the specifier the same `source:` field import_statement has; every other
+        // export_statement (`export function …`, `export { x }`, `export default …`) has none and reads empty, and
+        // the walk still descends into it (it is a kJsImportContainers entry) for the requires inside.
+        if( const TSNode src_ = fieldChild( n, NodeField::Source );  !ts_node_is_null( src_ ) )
+        {
+            target = importSpecifierText( src_, src );
+        }
+    }
+    else if( kindIs( t, "import_from_statement" ) )            // Python `from pkg.mod import Z`
     {
         // module_name:(dotted_name)  → `pkg.mod`;  module_name:(relative_import)  → `.rel` / `..up` (leading
         // dots preserved so the resolver can resolve relative-to-file). The imported-names clause is dropped.
-        if( const TSNode mn = ts_node_child_by_field_name( n, "module_name", 11 );  !ts_node_is_null( mn ) )
+        if( const TSNode mn = fieldChild( n, NodeField::ModuleName );  !ts_node_is_null( mn ) )
         {
             target = importSpecifierText( mn, src );
         }
     }
-    else if( std::strcmp( t, "call_expression" ) == 0
+    else if( kindIs( t, "call_expression" )
              && ( lang == Lang::TypeScript || lang == Lang::JavaScript ) )   // TS/JS `require("./x")` / `import("./x")`
     {
         target = jsModuleLoadTarget( n, src );
         isLazy = insideFn && !target.empty();   // kParserVer 72: a hit found inside a function body is LAZY
     }
-    else if( std::strcmp( t, "command" ) == 0 && lang == Lang::Bash )              // Bash `source x.sh` / `. x.sh`
+    else if( kindIs( t, "command" ) && lang == Lang::Bash )              // Bash `source x.sh` / `. x.sh`
     {
         target = bashSourceTarget( n, src );
     }
-    else if( std::strcmp( t, "function_call" ) == 0 && lang == Lang::Lua )         // Lua `require "a.b"`
+    else if( kindIs( t, "function_call" ) && lang == Lang::Lua )         // Lua `require "a.b"`
     {
         target = luaRequireTarget( n, src );
     }
-    else if( std::strcmp( t, "call" ) == 0 && lang == Lang::Ruby )                 // Ruby `require_relative "x"` / `require "x"` / `load "x"`
+    else if( kindIs( t, "call" ) && lang == Lang::Ruby )                 // Ruby `require_relative "x"` / `require "x"` / `load "x"`
     {
         target = rubyRequireTarget( n, src );
-        if( target.empty() && rubyConstantDirective( n, src ) == "autoload" )    // parser version 82: `autoload :Name[, "path"]`
+        if( target.empty() && rubyNamedDirective( n, src, kRubyConstantDirectives ) == "autoload" )   // parser version 82: `autoload :Name[, "path"]`
         {
             target = rubyAutoloadTarget( n, src, isSymbolic );
             isLazy = !target.empty();   // an autoload is lazy by definition — the file loads on first use
@@ -1615,12 +2154,12 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
         }
         // include/extend/prepend name N constants and are emitted by captureIncludes through rubyMixinTargets.
     }
-    else if( std::strcmp( t, "superclass" ) == 0 && lang == Lang::Ruby )           // Ruby `class X < Base` (parser version 82)
+    else if( kindIs( t, "superclass" ) && lang == Lang::Ruby )           // Ruby `class X < Base` (parser version 82)
     {
         target     = rubySuperclassTarget( n, src );
         isSymbolic = !target.empty();
     }
-    else if( std::strcmp( t, "call" ) == 0 && lang == Lang::Elixir )               // Elixir `alias`/`import`/`require`/`use`
+    else if( kindIs( t, "call" ) && lang == Lang::Elixir )               // Elixir `alias`/`import`/`require`/`use`
     {
         // `call` is the node type of EVERY Elixir expression including `defmodule`, so the four-keyword
         // gate inside elixirDirectiveTarget is the whole guard — the same posture as the TS/JS
@@ -1628,29 +2167,39 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
         // by captureIncludes through elixirAliasGroup, one Include per member.
         target = elixirDirectiveTarget( n, src );
     }
-    else if( lang == Lang::Dart
-             && ( std::strcmp( t, "library_import" ) == 0 || std::strcmp( t, "library_export" ) == 0
-                  || std::strcmp( t, "part_directive" ) == 0 || std::strcmp( t, "part_of_directive" ) == 0 ) )
+    else if( kindIs( t, "import_header" ) && lang == Lang::Kotlin )   // Kotlin `import a.b.C` / `import a.b.*`
     {
-        target = dartDirectiveTarget( n, src );
+        // No `source:`/`name:` field (this grammar exposes none on import_header — verified against
+        // node-types.json, same reason kotlinEnclosingScopeOf walks positionally): find the flat
+        // `identifier` child and take its WHOLE span, mirroring Python's dotted-module-head branch
+        // above. That span already covers every dotted segment (`kotlin.math.max`), including the
+        // wildcard case (`import a.b.*` has `identifier`="a.b" plus a separate wildcard_import
+        // sibling this branch does not need to read) and the aliased case (`import a.b.C as D` has
+        // `identifier`="a.b.C" plus a separate import_alias sibling naming "D" — the alias is not
+        // resolved here, matching every other language's import branch above: none of them resolve
+        // a rename either, they all just name the imported target).
+        if( const TSNode id = firstChildOfType( n, "identifier" );  !ts_node_is_null( id ) )
+        {
+            target = importSpecifierText( id, src );
+        }
     }
-    else if( std::strcmp( t, "use_declaration" ) == 0 )                  // Rust `use crate::a::b;`
+    else if( kindIs( t, "use_declaration" ) )                  // Rust `use crate::a::b;`
     {
         // argument:(scoped_identifier|scoped_use_list|identifier|…)  → `crate::a::b`. A brace group
         // `crate::{a, b}` is kept verbatim; the resolver degrades on it (no unique single-file hit).
-        if( const TSNode arg = ts_node_child_by_field_name( n, "argument", 8 );  !ts_node_is_null( arg ) )
+        if( const TSNode arg = fieldChild( n, NodeField::Argument );  !ts_node_is_null( arg ) )
         {
             target = importSpecifierText( arg, src );
         }
     }
-    else if( std::strcmp( t, "mod_item" ) == 0 )                        // Rust `mod x;` (module-file declaration)
+    else if( kindIs( t, "mod_item" ) )                        // Rust `mod x;` (module-file declaration)
     {
         // A body-LESS `mod x;` declares module `x` in a sibling file (`x.rs` or `x/mod.rs`); a `mod x { … }`
         // with a body is INLINE (no file) → skip it. Prefix `mod:` so the Rust resolver applies the
         // module-file rule, distinct from a bare `use x;`. name:(identifier) → `x`.
-        if( ts_node_is_null( ts_node_child_by_field_name( n, "body", 4 ) ) )
+        if( ts_node_is_null( fieldChild( n, NodeField::Body ) ) )
         {
-            if( const TSNode nm = ts_node_child_by_field_name( n, "name", 4 );  !ts_node_is_null( nm ) )
+            if( const TSNode nm = fieldChild( n, NodeField::Name );  !ts_node_is_null( nm ) )
             {
                 if( std::string bare = importSpecifierText( nm, src );  !bare.empty() )
                 {
@@ -1659,7 +2208,7 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
             }
         }
     }
-    else if(    std::strcmp( t, "import_declaration" ) == 0 )            // Go / Swift — captured but NOT precise-resolved
+    else if(    kindIs( t, "import_declaration" ) )            // Go / Swift — captured but NOT precise-resolved
     {
         // Go (needs go.mod module-root) and Swift (whole-module, no path) are DEFERRED — the precise
         // resolver leaves them unresolved. Keep the best-effort target for --uses / --deps back-compat.
@@ -1679,11 +2228,11 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
             }
         }
     }
-    else if( std::strcmp( t, "using_directive" ) == 0 )
+    else if( kindIs( t, "using_directive" ) )
     { // C# `using Foo.Bar;` / `using static Foo;` / `using X = Foo.Bar;`
         target = csharpUsingTarget( n, src );                            // see csharpUsingTarget for the shape rationale
     }
-    else if( std::strcmp( t, "namespace_use_declaration" ) == 0 )
+    else if( kindIs( t, "namespace_use_declaration" ) )
     { // PHP `use Foo\Bar;` / `use Foo\Bar as Baz;` / `use function Foo\bar;` / `use Foo\{A, B};`
         // Captured for --uses / --deps visibility, NEVER precise-resolved: PHP has no entry in
         // resolve.h's includeLangOf table, so it falls through to IncludeLang::Other exactly as Java and
@@ -1692,7 +2241,7 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
         // read), so there is no sound string→fileId rule to write, and a wrong narrow is worse than none.
         target = phpUseTarget( n, src );                                 // see phpUseTarget for the shape rationale
     }
-    return { std::move( target ), isAngle, isLazy, isSymbolic, isReceiver };
+    return { std::move( target ), isLazy, isSymbolic, isReceiver };
 }
 
 // Capture #include / import directives (physical dependencies) by walking the file's top-level nodes —
@@ -1721,49 +2270,52 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
 // emitBindings attributes kNoNode); spans {0,0}. Pure-syntactic, deterministic, source order.
 inline void capturePythonImportBinds( TSNode stmt, const char* t, std::uint32_t fileId, std::string_view src, std::vector<RawBind>& binds )
 {
-    const bool isFrom = ( std::strcmp( t, "import_from_statement" ) == 0 );
-    if( !isFrom && std::strcmp( t, "import_statement" ) != 0 )
+    const bool isFrom = ( kindIs( t, "import_from_statement" ) );
+    if( !isFrom && !kindIs( t, "import_statement" ) )
     {
         return;
     }
     std::string target;
     if( isFrom )
     {
-        const TSNode mn = ts_node_child_by_field_name( stmt, "module_name", 11 );
+        const TSNode mn = fieldChild( stmt, NodeField::ModuleName );
         if( ts_node_is_null( mn ) )
         {
             return;
         }
         target = importSpecifierText( mn, src );
     }
-    const TSNode        moduleNode = isFrom ? ts_node_child_by_field_name( stmt, "module_name", 11 ) : TSNode{};
-    const std::uint32_t n          = ts_node_child_count( stmt );
-    for( std::uint32_t i = 0; i < n; ++i )
+    const TSNode        moduleNode = isFrom ? fieldChild( stmt, NodeField::ModuleName ) : TSNode{};
+    // One import statement's clause list: the count comes from the input (`from m import ( a, b, … )`),
+    // and a comment between two clauses is a further child, so the indexed form was O(children²) here too.
+    // No scaling arm exists for it (an import flood is not a shape any corpus produces) — this is the
+    // pure-iteration conversion, covered by the byte-identical arms (test/childwalkscalecheck.sh).
+    ChildCursor cursor( stmt );
+    forEachChild( stmt, cursor.cur, [ & ]( TSNode kid )
     {
-        const TSNode kid = ts_node_child( stmt, i );
         if( ts_node_is_null( kid ) )
         {
-            continue;
+            return true;
         }
         const char* kt = ts_node_type( kid );
         if( isFrom && ts_node_eq( kid, moduleNode ) )
         {
-            continue;   // the module_name child of a from-import is not a bound name; only the `name:` clauses are
+            return true;   // the module_name child of a from-import is not a bound name; only the `name:` clauses are
         }
         std::string_view bound;
         std::string      clauseTarget;
-        if( std::strcmp( kt, "aliased_import" ) == 0 )
+        if( kindIs( kt, "aliased_import" ) )
         {
-            const TSNode alias = ts_node_child_by_field_name( kid, "alias", 5 );
-            const TSNode nm    = ts_node_child_by_field_name( kid, "name", 4 );
+            const TSNode alias = fieldChild( kid, NodeField::Alias );
+            const TSNode nm    = fieldChild( kid, NodeField::Name );
             if( ts_node_is_null( alias ) || ts_node_is_null( nm ) )
             {
-                continue;
+                return true;
             }
             bound        = pattern::nodeText( alias, src );
             clauseTarget = isFrom ? target : importSpecifierText( nm, src );
         }
-        else if( std::strcmp( kt, "dotted_name" ) == 0 )
+        else if( kindIs( kt, "dotted_name" ) )
         {
             const std::string_view whole = pattern::nodeText( kid, src );
             if( isFrom )
@@ -1780,11 +2332,11 @@ inline void capturePythonImportBinds( TSNode stmt, const char* t, std::uint32_t 
         }
         else
         {
-            continue;   // keywords, punctuation, wildcard_import
+            return true;   // keywords, punctuation, wildcard_import
         }
         if( bound.empty() || clauseTarget.empty() )
         {
-            continue;
+            return true;
         }
         RawBind b;
         b.fileId    = fileId;
@@ -1793,12 +2345,43 @@ inline void capturePythonImportBinds( TSNode stmt, const char* t, std::uint32_t 
         b.kind      = LocalBindKind::Import;
         b.var.assign( bound );
         b.typeName  = std::move( clauseTarget );
+        // issue #287 (kParserVer 115): `importedName` is otherwise unused by a Python Import bind (no
+        // reader keys on it before this — checked), so it carries ONE bit here: "module" iff `bound` names
+        // the MODULE itself (`import a.b` / `import a.b as c`, isFrom==false) — the shape a receiver-alias
+        // narrow may trust to mean "this variable's namespace IS the module's". Left empty for `from m
+        // import x [as y]` (isFrom==true): there `bound` names a MEMBER of m (a function, class, ufunc
+        // instance, …), and `bound.anything()` is a call on THAT member, not on m's namespace — numpy's
+        // `from numpy.core.numeric import greater_equal` then `greater_equal.outer(...)` is exactly this:
+        // `.outer` is a ufunc method, not numeric.py's free `outer`, and conflating the two shapes narrowed
+        // the alias-receiver rule onto it (caught on the numpy corpus before this marker existed).
+        b.importedName = isFrom ? std::string {} : "module";
         binds.push_back( std::move( b ) );
-    }
+        return true;
+    } );
 }
 
+// The DISCLOSE sink every extraction pass shares for ONE file: a pass that could not extract all of the file's facts
+// (a nesting bound it will not descend past, a tags query that is not available) says so here, and the parse worker
+// turns a short file into its --skipped row (why="extract-partial") and keeps its facts out of the cache, so a warm run
+// re-extracts rather than reusing a partial answer as a whole one.
+struct ExtractShortfall
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        TagsQueryUnavailable,     // the grammar's tags query was not prewarmed: no definition was extracted
+        ElixirScopeTooDeep,       // an Elixir module/alias chain past the resolver's depth bound: scope or name lost
+        ImportNestingTooDeep,     // imports nested past kMaxImportContainerDepth containers: the deeper ones not captured
+        AstroFrontmatterUnterminated,   // an .astro opened a `---` fence and never closed it: its frontmatter is not extracted
+    };
+    bool isShort = false;
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        isShort = true;
+    }
+};
+
 void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_view src, std::vector<Include>& incs, std::vector<RawRef>& refs,
-                      std::vector<RawBind>& binds, std::vector<ConstOpen>& constOpens )
+                      std::vector<RawBind>& binds, std::vector<ConstOpen>& constOpens, ExtractShortfall& shortfall )
 {
     ChildCursor         cursor( root );
     std::vector<TSNode> kids;
@@ -1830,7 +2413,7 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
     {
         stack.push_back( { kids[i - 1], 0, false, kNoOpenIdx } );   // nothing is inside a function or an open at the file root
     }
-    HashMap<std::string, char> seenReceivers;   // (openIdx '\x1f' written) → seen; per file, receivers only
+    HashMap<std::string, std::uint32_t> seenConstUses;   // (openIdx '\x1f' written) → index in incs; per file, constant USES only
 
     while( !stack.empty() )
     {
@@ -1846,16 +2429,16 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
         // `mod x { … }` is a container whose body holds `use`s. A walk that treated container-ness as a
         // reason to skip the read would silently drop every Rust module-file declaration in the corpus.
         // For every other container the read simply returns empty, so one uniform order covers all of them.
-        auto [ target, isAngle, isLazy, isSymbolic, isReceiver ] = directiveTargetOf( n, t, src, lang, frame.insideFn );
+        auto [ target, isLazy, isSymbolic, isReceiver ] = directiveTargetOf( n, t, src, lang, frame.insideFn );
 
         // parser version 82: every Ruby class/module OPEN is recorded for resolve.h's constant index — the span
         // (nesting by containment), the own-body bit, the name as written (model.h ConstOpen). `class`/`module`
         // are containers, so the walk already stands on every open it needs to record; a `class << self` is a
         // singleton_class, not an open of a constant, and is not here.
         std::uint32_t childOpenIdx = frame.openIdx;
-        if( lang == Lang::Ruby && ( std::strcmp( t, "class" ) == 0 || std::strcmp( t, "module" ) == 0 ) )
+        if( lang == Lang::Ruby && ( kindIs( t, "class" ) || kindIs( t, "module" ) ) )
         {
-            if( const TSNode nm = ts_node_child_by_field_name( n, "name", 4 ); !ts_node_is_null( nm ) )
+            if( const TSNode nm = fieldChild( n, NodeField::Name ); !ts_node_is_null( nm ) )
             {
                 if( std::string written = rubyConstantText( nm, src ); !written.empty() )
                 {
@@ -1878,7 +2461,8 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
             // descent reaches every arm of a chain — no separate alternative-following pass.
             if( frame.depth >= kMaxImportContainerDepth )
             {
-                DEGRADED_PATH_ALERT( "ingest: import-container nesting past the depth bound — deeper imports not captured" );
+                DISCLOSE( shortfall, ExtractShortfall::DisclosureWhy::ImportNestingTooDeep,
+                          "ingest: import-container nesting past the depth bound — deeper imports not captured" );
             }
             else
             {
@@ -1901,7 +2485,7 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
         // rather than the straight-line block it used to be for exactly one reason: an Elixir
         // `alias MyApp.{Bar, Baz}` is ONE directive node naming N modules, so N records come off it and
         // the second one cannot be written by falling through this code once.
-        const auto emitDirective = [ & ]( std::string tgt, bool symbolic )
+        const auto emitDirective = [ & ]( std::string tgt, bool symbolic, bool lazy, bool valueUse )
         {
             // import-role use-site ref: name = the importable final segment (skip when the target has no
             // identifier head, e.g. a relative `../x` whose head strips to empty → nothing to resolve).
@@ -1920,59 +2504,88 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
             // The site byte. A Ruby `superclass` carries its CLASS's own start byte: the superclass expression is
             // evaluated in the ENCLOSING scope (Ruby has not opened the class yet), and resolve.h's containment
             // is strict at the start, so that byte reads as outside the class — the nesting Ruby actually uses.
-            const bool          superclassSite = ( lang == Lang::Ruby && std::strcmp( t, "superclass" ) == 0 );
+            const bool          superclassSite = ( lang == Lang::Ruby && kindIs( t, "superclass" ) );
             const std::uint32_t siteByte       = superclassSite ? ts_node_start_byte( ts_node_parent( n ) ) : ts_node_start_byte( n );
-            incs.push_back( { fileId, isAngle, isLazy, symbolic, siteByte, std::move( tgt ) } );
+            incs.push_back( { fileId, /*isAngle*/ false, lazy, symbolic, siteByte, valueUse, std::move( tgt ) } );
+        };
+        // The constant-USE dedupe (parser version 83 for receivers; arguments and rescue classes joined at 93). Key =
+        // innermost open + the name as written; the FIRST occurrence in source order carries the byte. The lazy bit is
+        // the AND over every occurrence (parser version 86): a receiver inside a method written ABOVE the same receiver
+        // at class-body level used to leave the directive lazy, and resolve.h's pair rule — one load-time directive
+        // makes the pair load-time — then never saw the load-time site, so the structure lost a real dependency and
+        // the answer depended on statement order. A later load-time site clears the retained record's bit — and since
+        // 93 the site may be of a different KIND: a `rescue Errors::Bust` (always lazy) above an `Errors::Bust.new` at
+        // class-body level is one load-time directive. Declarative directives never come through here: each
+        // `include`/`< Base`/`autoload` IS a statement, one record per occurrence.
+        // `valueUse` (Include::isValueUse) is the AND over occurrences too, in the other direction: a record stays
+        // import evidence for the call narrow only while EVERY occurrence is a receiver; one argument or rescue
+        // site beside a receiver of the same name leaves the receiver's evidence standing (the bit clears), and a
+        // value-only record never gains it.
+        const auto emitConstUse = [ & ]( std::string tgt, bool lazy, bool valueUse )
+        {
+            std::string key = std::to_string( frame.openIdx );
+            key += '\x1f';
+            key += tgt;
+            if( auto [ it, fresh ] = seenConstUses.try_emplace( std::move( key ), 0u ); fresh )
+            {
+                emitDirective( std::move( tgt ), true, lazy, valueUse );
+                it->second = static_cast<std::uint32_t>( incs.size() - 1 );
+            }
+            else
+            {
+                if( !lazy )
+                {
+                    incs[ it->second ].isLazy = false;
+                }
+                if( !valueUse )
+                {
+                    incs[ it->second ].isValueUse = false;
+                }
+            }
         };
 
         if( !target.empty() && isReceiver )
         {
-            // The receiver dedupe (parser version 83). Key = innermost open + the name as written; the FIRST
-            // occurrence in source order wins and carries the byte, and with it the lazy bit. Declarative
-            // directives never come through here: each `include`/`< Base`/`autoload` IS a statement of its own.
-            std::string key = std::to_string( frame.openIdx );
-            key += '\x1f';
-            key += target;
-            if( seenReceivers.try_emplace( std::move( key ), 1 ).second )
-            {
-                emitDirective( std::move( target ), isSymbolic );
-            }
+            emitConstUse( std::move( target ), isLazy, false );
         }
         else if( !target.empty() )
         {
-            emitDirective( std::move( target ), isSymbolic );
+            emitDirective( std::move( target ), isSymbolic, isLazy, false );
         }
-        else if( lang == Lang::Ruby && std::strcmp( t, "call" ) == 0 )
+        else if( lang == Lang::Ruby && kindIs( t, "call" ) )
         {
             // `include A, B` / `extend M` / `prepend P` (parser version 82): N constants off one directive node, in
             // SOURCE order, each a symbolic Include — the Ruby twin of the Elixir alias group below.
             for( std::string& member : rubyMixinTargets( n, src ) )
             {
-                emitDirective( std::move( member ), true );
+                emitDirective( std::move( member ), true, isLazy, false );
             }
         }
-        else if( lang == Lang::Elixir && std::strcmp( t, "call" ) == 0 )
+        else if( lang == Lang::Ruby && kindIs( t, "argument_list" ) )
+        {
+            // Parser version 93: the constant ARGUMENTS of a call / super / yield — lazy exactly when a receiver on
+            // this frame would be (inside a kRubyClosureContainers kind), load-time at class-body or file level.
+            for( std::string& constant : rubyArgumentTargets( n, src ) )
+            {
+                emitConstUse( std::move( constant ), frame.insideFn, true );
+            }
+        }
+        else if( lang == Lang::Ruby && kindIs( t, "rescue" ) )
+        {
+            // Parser version 93: the RESCUE classes — lazy whatever the frame says (see rubyRescueTargets).
+            for( std::string& constant : rubyRescueTargets( n, src ) )
+            {
+                emitConstUse( std::move( constant ), true, true );
+            }
+        }
+        else if( lang == Lang::Elixir && kindIs( t, "call" ) )
         {
             // The multi-alias group. Members come out in SOURCE order (elixirAliasGroup walks the tuple's
             // named children left to right), so `incs` stays source-ordered and the determinism contract
             // holds exactly as it does for the single-target path.
             for( std::string& member : elixirAliasGroup( n, src ) )
             {
-                emitDirective( std::move( member ), false );
-            }
-        }
-        if( lang == Lang::Dart && ( std::strcmp( t, "library_import" ) == 0 || std::strcmp( t, "library_export" ) == 0 ) )
-        {
-            // Dart conditional imports/exports (`import "stub.dart" if (...) "io.dart";`) name several
-            // possible files. With no build environment in evidence the honest posture matches preprocessor
-            // branches: union over the stated URIs, each shown as its own Include row, and precise resolution
-            // still applies unique-or-degrade per target.
-            for( std::string& member : dartConditionalTargets( n, src ) )
-            {
-                if( member != target )
-                {
-                    emitDirective( std::move( member ), false );
-                }
+                emitDirective( std::move( member ), false, isLazy, false );
             }
         }
     }

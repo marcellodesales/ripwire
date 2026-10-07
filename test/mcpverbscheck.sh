@@ -9,7 +9,7 @@
 #   3. tools/call for  {path, task} → assert non-empty text result containing <sigs>
 #   4. tools/call owners {path}     → assert valid owners XML (uses a synthetic git repo)
 #   5. Determinism: call sequences 3 and 4 each run twice and produce byte-identical output.
-#   6. L4: tools/list shows 31 verbs (`pack_task` dispatch-only, not separately advertised);
+#   6. L4: tools/list shows 33 verbs (`pack_task` dispatch-only, not separately advertised);
 #      `explore` round-trips a pack-task-shaped bundle and is byte-identical to `pack_task`;
 #      `from_trace` maps a fixture trace onto zoomfix's appMain; `edit_check` returns the
 #      contract shape and refuses an unknown symbol; each of explore/pack_task/from_trace/
@@ -35,13 +35,14 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 CORPUS="$ROOT/test/zoomfix"
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -270,7 +271,7 @@ print("OK" if code == -32602 else "GOT:" + str(code))
 echo
 echo "=== 6. L4 — explore/pack_task/from_trace/edit_check (B11 verb parity) ==="
 
-# ── tools/list shows 31 verbs, including the L4 three and the field-notes four ───────────────
+# ── tools/list shows 33 verbs, including the L4 three and the field-notes four ───────────────
 LIST_OUT2="$( mcp_call \
     '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -1 )"
@@ -291,16 +292,88 @@ L4_WHEREIS="$( l4_field '"whereis" in names' )"
 L4_STRAY="$(   l4_field '"stray_content" in names' )"
 L4_FLAGS="$(   l4_field '"flags" in names' )"
 L4_DDRIFT="$( l4_field '"doc_drift" in names' )"
-[ "$L4_COUNT" = "31" ]     && ok "tools/list shows exactly 31 verbs" || no "tools/list shows $L4_COUNT verbs, expected 31"
-[ "$L4_DDRIFT" = "True" ]  && ok "tools/list includes 'doc_drift'"     || no "tools/list is missing 'doc_drift'"
-[ "$L4_WHEREIS" = "True" ] && ok "tools/list includes 'whereis'"       || no "tools/list is missing 'whereis'"
-[ "$L4_STRAY" = "True" ]   && ok "tools/list includes 'stray_content'" || no "tools/list is missing 'stray_content'"
-[ "$L4_FLAGS" = "True" ]   && ok "tools/list includes 'flags'"         || no "tools/list is missing 'flags'"
-[ "$L4_EXPLORE" = "True" ] && ok "tools/list includes 'explore'"    || no "tools/list is missing 'explore'"
-[ "$L4_TRACE" = "True" ]   && ok "tools/list includes 'from_trace'" || no "tools/list is missing 'from_trace'"
-[ "$L4_EDITCHK" = "True" ] && ok "tools/list includes 'edit_check'" || no "tools/list is missing 'edit_check'"
+if [ "$L4_COUNT" = "33" ]; then ok "tools/list shows exactly 33 verbs"; else no "tools/list shows $L4_COUNT verbs, expected 33"; fi
+if [ "$L4_DDRIFT" = "True" ]; then ok "tools/list includes 'doc_drift'"; else no "tools/list is missing 'doc_drift'"; fi
+if [ "$L4_WHEREIS" = "True" ]; then ok "tools/list includes 'whereis'"; else no "tools/list is missing 'whereis'"; fi
+if [ "$L4_STRAY" = "True" ]; then ok "tools/list includes 'stray_content'"; else no "tools/list is missing 'stray_content'"; fi
+if [ "$L4_FLAGS" = "True" ]; then ok "tools/list includes 'flags'"; else no "tools/list is missing 'flags'"; fi
+if [ "$L4_EXPLORE" = "True" ]; then ok "tools/list includes 'explore'"; else no "tools/list is missing 'explore'"; fi
+if [ "$L4_TRACE" = "True" ]; then ok "tools/list includes 'from_trace'"; else no "tools/list is missing 'from_trace'"; fi
+if [ "$L4_EDITCHK" = "True" ]; then ok "tools/list includes 'edit_check'"; else no "tools/list is missing 'edit_check'"; fi
 [ "$L4_PACKTASK" = "False" ] && ok "'pack_task' is NOT separately advertised in tools/list (dispatch-only alias)" \
                               || no "'pack_task' unexpectedly appears in tools/list"
+
+# ── (6b) THE EXACT ADVERTISED ROSTER — a constant-count swap must not slip a verb in ─────────────
+# WHY THIS ARM. The L4_COUNT==31 assertion above fails closed on a verb ADDED; the per-name checks pin
+# the L4/field-notes verbs individually. Neither catches a RENAME or SWAP that keeps the count at 31 and
+# touches a verb no arm names (analyze, grep, the edit trio, …) — CONTRIBUTING §2 shape 7 ("true but
+# narrower"): "same count + these names present" is strictly weaker than "the roster is EXACTLY this set".
+# A verb that reaches a subprocess (a hypothetical run_trace MCP twin of the CLI-only --run-trace) could
+# replace an unnamed read verb at count 31 with every arm above still green. Pinning the FULL sorted
+# roster reddens on ANY add/remove/rename until a human updates this list — the point being that a new
+# MCP verb, above all one that reaches an exec, is signed for, never a silent drift.
+# The set is the ADVERTISED roster (kMcpVerbTable, mcp.h); pack_task stays out (dispatch-only alias,
+# already asserted absent above). Sorted so the diff reads name-by-name.
+EXPECTED_VERBS="affected
+analyze
+batch
+cochange
+connect
+doc_drift
+edit_check
+exemplar
+explore
+fetch_body
+find_referencing_symbols
+find_symbol
+flags
+for
+from_trace
+grep
+impact
+insert_after_symbol
+insert_before_symbol
+lego
+memory_recall
+mentions
+owners
+path_between
+quality_baseline
+quality_delta
+rank_by
+replace_symbol_body
+situational_awareness
+slice
+stray_content
+uses
+whereis"
+
+LIVE_VERBS_SORTED="$( l4_field 'chr(10).join(sorted(names))' )"
+EXPECTED_SORTED="$( printf '%s\n' "$EXPECTED_VERBS" | sort )"
+
+if [ "$LIVE_VERBS_SORTED" = "$EXPECTED_SORTED" ]; then
+    ok "(6b) advertised roster matches the pinned set exactly ($L4_COUNT verbs; no unpinned add/rename/swap)"
+else
+    no "(6b) advertised roster DRIFTED from the pinned set — a verb was added, removed, or renamed; review it (a subprocess-reaching verb must never join silently), then update EXPECTED_VERBS consciously:"
+    diff <(printf '%s\n' "$EXPECTED_SORTED") <(printf '%s\n' "$LIVE_VERBS_SORTED") | sed 's/^/      /'
+fi
+
+# ── (6c) LIVENESS of (6b) + the named shell-exec tripwire (CONTRIBUTING §2: prove the arm can fail) ─
+# (6b) is only as live as its ability to SEE a new verb. Prove it on a mutated copy of the live list:
+# inject a synthetic run_trace and assert the SAME comparison reddens. Guards shape 3 (empty==empty) if
+# a future edit ever broke the extraction. Computed here, run every time — never a fixture of the server.
+MUT_LIVE="$( printf '%s\nrun_trace\n' "$LIVE_VERBS_SORTED" | sort )"
+if [ "$MUT_LIVE" != "$EXPECTED_SORTED" ]; then
+    ok "(6c) mutation control: a synthetic 'run_trace' verb is correctly seen as roster drift"
+else
+    no "(6c) mutation control VACUOUS: injecting 'run_trace' did not disturb the comparison — (6b) cannot fail"
+fi
+# The invariant, named for the reader who greps for it: no shell/exec-shaped verb is advertised.
+if printf '%s\n' "$LIVE_VERBS_SORTED" | grep -qxE 'run_trace|run|shell|exec'; then
+    no "(6c) an MCP verb named like a shell/exec entry point is advertised — --run-trace must stay CLI-only (runtracecheck.sh)"
+else
+    ok "(6c) no shell/exec-shaped verb advertised (MCP surface reaches no subprocess exec; --run-trace stays CLI-only)"
+fi
 
 # ── explore round-trip: a pack-task-shaped bundle (same shape as CLI --pack-task) ────────────────
 EXPLORE_MSGS=(
@@ -687,6 +760,75 @@ EOF
 fi
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
+echo "=== 8. cut-fix E — MCP owners/mentions disclose their surface-only default cut ==="
+# `owners` (40 <f> rows) and `mentions` (100 files) are capped on this surface alone — the CLI twins print every row —
+# and both cut with discloseCap=false, so a cut answer said nothing. RED on 9936ba4e (no shown=/capped= on the cut);
+# GREEN: the cut carries shown=/capped="1"/total=/next_offset=, offset= continues it, an uncut answer adds no bytes.
+CR="$TMP/cutrepo"; mkdir -p "$CR/docs"
+git -C "$CR" init -q
+for i in $( seq -w 1 45 ); do printf 'int cutfn%s( int x ) { return x + 1; }\n' "$i" >"$CR/f$i.c"; done
+for i in $( seq -w 1 105 ); do printf '# note %s\n\nSee `cutfn01` here.\n' "$i" >"$CR/docs/n$i.md"; done
+printf '# solo\n\nOnly `cutfn02` is named here.\n' >"$CR/docs/solo.md"   # the uncut mentions answer has one real row
+( cd "$CR" && git add -A && GIT_AUTHOR_NAME=A GIT_AUTHOR_EMAIL=a@x.com GIT_COMMITTER_NAME=A GIT_COMMITTER_EMAIL=a@x.com \
+    GIT_AUTHOR_DATE=2026-06-01T12:00:00 GIT_COMMITTER_DATE=2026-06-01T12:00:00 git commit -q -m one )
+for i in $( seq -w 1 45 ); do printf '// b\n' >>"$CR/f$i.c"; done
+( cd "$CR" && git add -A && GIT_AUTHOR_NAME=B GIT_AUTHOR_EMAIL=b@x.com GIT_COMMITTER_NAME=B GIT_COMMITTER_EMAIL=b@x.com \
+    GIT_AUTHOR_DATE=2026-06-02T12:00:00 GIT_COMMITTER_DATE=2026-06-02T12:00:00 git commit -q -m two )
+cut_text(){ mcp_call '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"'"$1"'","arguments":'"$2"'}}' | tail -1 \
+    | python3 -c 'import sys, json; r = json.load(sys.stdin); print(r["result"]["content"][0]["text"] if "result" in r else "__ERROR__")'; }
+OW="$( cut_text owners '{"path":"'"$CR"'"}' )"
+OWROOT="$( printf '%s' "$OW" | grep -o '<owners [^>]*>' | head -1 )"
+case "$OWROOT" in
+    *' shown="40" capped="1" total="45" has_more="1" next_offset="40"'*) ok "owners: the 40-row cut discloses shown=40 capped=1 total=45 next_offset=40" ;;
+    *) no "owners: the 40-row cut is silent: $OWROOT" ;;
+esac
+OW2="$( cut_text owners '{"path":"'"$CR"'","offset":40}' )"
+OW2N="$( printf '%s' "$OW2" | grep -o '<f p="' | wc -l | tr -d ' ' )"
+if [ "$OW2N" = 5 ]; then ok "owners: offset=40 serves the other 5 rows"; else no "owners: offset=40 served $OW2N rows (want 5)"; fi
+# The uncut arms first prove the answer IS the expected one: an error (cut_text prints __ERROR__) or an empty answer
+# also lacks shown=, so "no shown=" alone would pass on a verb that failed.
+OW3="$( cut_text owners '{"path":"'"$CR"'","symbol":"cutfn01"}' )"
+OW3ROOT="$( printf '%s' "$OW3" | grep -o '<owners [^>]*>' | head -1 )"
+OW3ROWS="$( printf '%s' "$OW3" | grep -o '<f p="[^"]*"' | tr '\n' ' ' )"
+if [ -z "$OW3ROOT" ] || [ "$OW3ROWS" != '<f p="f01.c" ' ]; then
+    no "owners: the uncut answer is not the one f01.c row: root [$OW3ROOT] rows [$OW3ROWS] ($( printf '%s' "$OW3" | head -c 120 ))"
+elif printf '%s' "$OW3ROOT" | grep -q ' shown='; then
+    no "owners: an uncut answer gained shown="
+else
+    ok "owners: an uncut answer (the one f01.c row) is unchanged (no shown=)"
+fi
+MN="$( cut_text mentions '{"path":"'"$CR"'","symbol":"cutfn01"}' )"
+printf '%s' "$MN" | python3 -c '
+import sys, json
+d = json.loads( sys.stdin.read() )
+ok = d.get( "shown" ) == 100 and d.get( "capped" ) is True and d.get( "total" ) == 105 and d.get( "next_offset" ) == 100 and len( d[ "files" ] ) == 100
+sys.exit( 0 if ok else 1 )' && ok "mentions: the 100-file cut discloses shown=100 capped=true total=105 next_offset=100" \
+    || no "mentions: the 100-file cut is silent: $( printf '%s' "$MN" | head -c 200 )"
+MN2="$( cut_text mentions '{"path":"'"$CR"'","symbol":"cutfn01","offset":100}' )"
+if printf '%s' "$MN2" | python3 -c 'import sys, json; sys.exit( 0 if len( json.loads( sys.stdin.read() )[ "files" ] ) == 5 else 1 )'; then
+    ok "mentions: offset=100 serves the other 5 files"
+else
+    no "mentions: offset=100 did not serve the other 5 files"
+fi
+MN3="$( cut_text mentions '{"path":"'"$CR"'","symbol":"cutfn02"}' )"
+if MN3V="$( printf '%s' "$MN3" | python3 -c '
+import sys, json
+try:
+    d = json.loads( sys.stdin.read() )
+except ValueError:
+    print( "not JSON (an MCP error reads __ERROR__)" ); sys.exit( 1 )
+files = [ f.get( "file" ) for f in d.get( "files", [] ) ]
+if d.get( "symbol" ) != "cutfn02" or files != [ "docs/solo.md" ]:
+    print( "want the one docs/solo.md row, got symbol=%r files=%r" % ( d.get( "symbol" ), files ) ); sys.exit( 1 )
+if "shown" in d:
+    print( "an uncut answer gained \"shown\"" ); sys.exit( 1 )
+print( "the one docs/solo.md row, no \"shown\"" )' )"; then
+    ok "mentions: an uncut answer is unchanged: $MN3V"
+else
+    no "mentions: uncut answer: $MN3V"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "ALL PASS"

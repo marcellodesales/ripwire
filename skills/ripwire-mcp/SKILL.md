@@ -14,7 +14,8 @@ allowed-tools: Bash, Read
 Trigger: "wire ripwire into my agent", "set up the ripwire MCP server", or "which ripwire MCP verb
 answers this?".
 
-**The 31 verbs, at a glance**: 16 read verbs (`analyze`, `for`, `find_symbol`,
+**The 33 verbs, at a glance**: 17 read verbs (`analyze`, `rank_by` — the same map, ranked by
+authority/hub/rrf instead of plain PageRank — `for`, `find_symbol`,
 `find_referencing_symbols`, `grep`, `cochange`, `memory_recall`, `situational_awareness`, `mentions`,
 `owners`, `lego`, `batch` — N read sub-queries in ONE call — `fetch_body`, and `flags` — what is BUILT but
 DARK here: every compile / CMake `option()` / `getenv` gate with its default and the size of the code it
@@ -22,8 +23,9 @@ guards, the answer to "why don't I see feature X?", and `doc_drift` — which of
 are now FALSE: dead `file:line` anchors, deleted symbols, `= N` constants and `[N]` extents the code has
 since changed; call it before trusting a design doc or audit you did not just write, and `slice` — per-line
 def-use rows of ONE variable inside ONE definition, `flow=back|fwd|both` for the transitive data-flow
-slice, `@FILE:LINE` seeds by location and pre-picks the variable the seed line names) + 12 flagship-reflex verbs
-(`exemplar`, `quality_delta`, `quality_baseline`, `impact`, `uses`, `path_between`, `connect` — the
+slice, `@FILE:LINE` seeds by location and pre-picks the variable the seed line names) + 13 flagship-reflex verbs
+(`exemplar`, `quality_delta`, `quality_baseline`, `impact`, `uses`, `affected` — which tests transitively
+reach a changed file/symbol, the pre-PR "what do I run?" reflex — `path_between`, `connect` — the
 minimal joining subgraph over N task symbols — the L4 one-call/B11-parity trio `explore`, `from_trace`,
 `edit_check` — so an MCP-only agent gets the same write & done reflexes as the CLI — and the CROSS-BRANCH
 pair `whereis` / `stray_content`, which answer "where does this content live?" across every branch: the
@@ -35,8 +37,8 @@ edit verbs (`replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol`
 via `fetch_body`); the edit verbs enforce a safety contract (staleness refusal, ambiguity refusal, atomic
 writes) detailed below and in full in [`mcp-reference.md`](mcp-reference.md).
 
-The server exposes **31 MCP verbs**: 16 read verbs (incl. `fetch_body`/`flags`/`slice`), 12 flagship-reflex
-verbs (`connect`/`explore`/`from_trace`/`edit_check` and the cross-branch pair `whereis`/`stray_content`) and
+The server exposes **33 MCP verbs**: 17 read verbs (incl. `rank_by`/`fetch_body`/`flags`/`slice`), 13 flagship-reflex
+verbs (`affected`/`connect`/`explore`/`from_trace`/`edit_check` and the cross-branch pair `whereis`/`stray_content`) and
 3 edit verbs — `ripwire wrap codex --force` prints the live count.
 
 ## Wiring — `ripwire wrap <agent>` prints the recipe
@@ -64,6 +66,14 @@ Codex hook roles, and the configured `mcp_servers.ripwire` command plus `--mcp` 
 the exact installer/wrap repair command. The report deliberately emits no config contents or full shell
 commands, so it is safe to paste for diagnosis; `--agent=codex` alone refuses because it modifies doctor.
 
+### "no project root" / "memory limit reached" / `_memory_stop`
+
+`$HOME`, `/` and system directories are never a project root over MCP — not as the launch directory and not as
+`path=`: pass the project directory itself (a server started as `ripwire ~ --mcp` still answers about `~`). A tool call refused with "memory limit reached", or an answer carrying `_memory_stop`
+in its envelope, means the memory guard cut or refused the work on a tree too large for the machine: point
+`path=` at a smaller root, or raise the limit with `--max-memory=<N>[K|M|G]` (or `RIPWIRE_MAX_MEMORY`) on the
+server's command line. The default (65% of RAM) is silent on real projects.
+
 ## The read verbs + fetch_body (and when each beats the CLI form)
 
 Every verb takes `path` (the repo root; `memory_recall` takes the docs/memory dir). For a split
@@ -90,13 +100,13 @@ enclosing-chain report) and `@FILE:LINE` in any SYM selector; contract gate: `te
 | Verb | CLI twin | Ask it for |
 |---|---|---|
 | `analyze` | `ripwire <dir>` | the ranked XML map |
-| `for` (`task`) | `--for=TASK` | the task lens: signatures + cx/in metrics framed for reuse. **Auto-routes** the ranker — pass a symbol NAME verbatim as `task` to get name-exact retrieval (recall@1 ~99%); a conceptual phrase uses subtoken+body. Header prints `[routed: …]`. |
+| `for` (`task`) | `--for=TASK` | the task lens: signatures + cx/in metrics framed for reuse. **Auto-routes** the ranker — pass a symbol NAME verbatim as `task` to get name-exact retrieval (recall@1 ~99%); a conceptual phrase uses subtoken+body. Root carries `route=` as a code (`name-exact(X)` / `subtoken+body[:broad\|:declined]`). |
 | `find_symbol` (`symbol`) | `--callers` + `--callees` | locate a symbol with its callers AND callees in one call — each symbol carries a `handle` |
 | `find_referencing_symbols` (`symbol`) | `--callers=SYM` | just who references/calls it — also handle-bearing |
 | `grep` (`pattern`) | `--grep=STR` | parallel literal scan + enclosing symbol + matched line |
 | `cochange` (`file`) | `--cochange=FILE` | the lockstep git partners of one file |
 | `memory_recall` (`task`, `top_k` + `budget_tokens` optional) | `--recall=TASK [--top-k=N] [--max-tokens=N]` | full bodies of the few relevant docs/memory notes, bounded by the SAME default 8000-token body ceiling as the CLI (the header discloses `max_tokens=` and every cut). `budget_tokens` raises the ceiling explicitly when you want everything; `top_k` (default 8) shapes how many docs |
-| `situational_awareness` (`diff`/`files` optional) | `--situ` | blast radius, tests_to_run, forgotten co-change partners (the Shotgun Surgery check), hotspot alert — as JSON; defaults to `git diff HEAD` |
+| `situational_awareness` (`diff`/`files` optional) | `--situ` | blast radius, tests_to_run, forgotten co-change partners (the Shotgun Surgery check), hotspot alert — as JSON; defaults to `git diff HEAD`. In `tests_to_run`, `situational_awareness` uses `test`; `explore` and edit receipts use `p`. The field is a path string OR an **array** of paths beside `n` — several runner-less tests sharing their attributes, served as one row — and every row carries `run` or `run_unknown: true` |
 | `mentions` (`symbol`) | `--mentions=SYM` | which markdown plans/designs discuss a symbol |
 | `owners` (`symbol` optional) | `--owners[=SYM]` | bus-factor: recency-weighted author ownership |
 | `lego` (`type`) | `--lego=TYPE` | an interface's method contract + every implementor (own-language) |
@@ -147,6 +157,17 @@ edit verbs are refused over remote unless you pass `--allow-remote-edits` (which
 Full flag/env reference, the `curl` recipe, and each refusal's exact wire behavior →
 [`mcp-reference.md`](mcp-reference.md#remote-transport).
 
+## Editor transport: `--lsp` (navigation LSP server) — read-only, Phase 1
+
+`--mcp` answers agents and `--listen` serves a team; `--lsp` answers **editors**: a read-only,
+navigation-focused LSP 3.x server over stdio — lifecycle (`initialize`/`shutdown`/`exit`) plus
+`definition`, `references`, `documentSymbol` (member variables merged into the outline), workspace
+symbol, and `hover`. Same warm index as `--mcp` — no second parser, no second process. Saved-state
+answers only: an unsaved buffer is absent from the index, not mispositioned, and every count is a
+floor, not a total (the hover text says so in place, since JSON-RPC results have no metadata channel).
+UTF-8 positions; refuses to combine with `--mcp`/`--listen` — one protocol per stdin. The PoC plan and
+its locked decisions live in `docs/LSP.md`.
+
 ## The lazy-body posture: names/signatures by default, bodies by handle on request
 
 `find_symbol` and `find_referencing_symbols` attach a stable `handle` to every symbol object they return
@@ -166,6 +187,16 @@ the kit-style default-lean posture (measured ~90% cut on comparable extract-symb
 - **Handles are content-addressed, not pinned literals**: both halves are derived hashes, so a handle you
   copied out of a prior session or a doc is almost certainly stale — call `find_symbol`/
   `find_referencing_symbols` fresh each session and read the `handle` it hands back.
+
+## The per-session legend: read `ripwire://legend-dict` once
+
+Every answer defines its own attributes until the session reads the MCP resource `ripwire://legend-dict`
+(`initialize` names it). After that read, the verbs that take `legend` (and `for`) answer rows first and
+end with `<about … legend="ref" dict= dictv=/>`, which carries the root attributes; a definition arrives once
+per session, in a comment after the rows of the first answer that needs it. Lost the definitions (a
+compacted context)? Read `ripwire://legend-dict/full` for all of them, or print them with
+`ripwire --legend-dict`. `legend:"compact"` on one call keeps that answer's legend inline. The HTTP
+transport (`--listen`) keeps every legend inline.
 
 ## The 3 MCP edit verbs — the warm-server counterpart to the preferred CLI
 

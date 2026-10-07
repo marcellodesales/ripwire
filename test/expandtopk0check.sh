@@ -29,7 +29,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 FIX="$ROOT/test/expandtopk0fix"
 MODEFIX="$ROOT/test/expandmodefix"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ]     || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -126,14 +126,23 @@ fi
 #        (reason="file 48222B &lt; bundle 1054283B", mode="whole-file"); GREEN once the estimator is
 #        guarded exactly like its two siblings at the ceiling verdict and the topK>0 emission gate
 #        (`mapTopK > 0 ? measureEmittedMapBytes(...) : 0`).
-"$BIN" "$ROOT" --expand=endsWithView --no-cache >"$TMP/real_default.xml" 2>"$TMP/real_default.err"
-"$BIN" "$ROOT" --expand=endsWithView --no-cache --top-k=0 >"$TMP/real_tk0.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact. (G-b)'s identity — reason='s bundle price IS the served byte count —
+# is priced by chooseExpandServe in the FULL dialect (expandmodecheck (4) states why); under the compact default the
+# reason= numbers stay the full-dialect candidate prices, a found item in the L1 lane report. Both runs ask for full.
+# PROBE MOVED 2026-09-30 (train 22): src/darkflags.h grew past the 64 KiB pack budget (66,556 B, the --flags
+# JavaScript/TypeScript env reader), so --expand=endsWithView now serves bundle for a different reason ("whole-file
+# 66556B over pack-budget 65536B") and never prices the bundle against the file — the comparison this arm exists for.
+# The probe is now lspPercentDecode (src/lsp.h, ~50 KB, one definition): a small body in a real file under the budget,
+# the same shape darkflags.h had when V1 was found. Pick another such symbol if lsp.h crosses the budget too.
+PROBE=lspPercentDecode
+"$BIN" "$ROOT" --expand=$PROBE --no-cache --legend=full >"$TMP/real_default.xml" 2>"$TMP/real_default.err"
+"$BIN" "$ROOT" --expand=$PROBE --no-cache --top-k=0 --legend=full >"$TMP/real_tk0.xml" 2>/dev/null
 realTk0Bytes=$( wc -c < "$TMP/real_tk0.xml" | tr -d ' ' )
 
 if grep -q 'mode="whole-file"' "$TMP/real_default.xml"; then
-    no "(G) default --expand=endsWithView on the real repo wrongly served whole-file: $( grep -oE '<ctx[^>]*>' "$TMP/real_default.xml" )"
+    no "(G) default --expand=$PROBE on the real repo wrongly served whole-file: $( grep -oE '<ctx[^>]*>' "$TMP/real_default.xml" )"
 else
-    ok "(G) default --expand=endsWithView on the real repo correctly stays in bundle mode"
+    ok "(G) default --expand=$PROBE on the real repo correctly stays in bundle mode"
 fi
 
 # (G-a) the SERVED BODY (everything but the <ctx ...> opening tag's own mode=/reason= decoration, which
@@ -145,15 +154,27 @@ diff -q "$TMP/real_default_body.xml" "$TMP/real_tk0_body.xml" >/dev/null \
     && ok "(G-a) default's served body is byte-identical to explicit --top-k=0's" \
     || no "(G-a) default's served body diverges from explicit --top-k=0's — the estimator or the emitter disagree on what mapTopK==0 means"
 
-# (G-b) when topk_default="0" is in effect and a reason= fires, the bundle byte count it PRICES must be
-#       the REAL served size (== the --top-k=0 byte count), never a phantom map-inclusive estimate. This
-#       is the precise, load-bearing number the V1 defect corrupted.
+# (G-b) when topk_default="0" is in effect and a reason= fires, the bundle byte count it PRICES must be the
+#       REAL served size, never a phantom map-inclusive estimate. This is the precise, load-bearing number
+#       the V1 defect corrupted.
+#
+#       WHAT THE COMPARISON IS, and why it moved (CodeRabbit, PR #215). It used to read the priced number
+#       against EXPLICIT --top-k=0's byte count. Those two documents carry the same payload but not the same
+#       root: the auto form is decorated with topk_default= and the mode=/reason= disclosure, the explicit
+#       override is deliberately undecorated ((G-a) strips the opener for exactly that reason). The old
+#       equality held only because the price omitted that decoration too — two omissions cancelling, which is
+#       how the file candidate came to be compared against the bundle on different accounting in the first
+#       place. Both candidates are now priced as the complete document they would serve, so the identity is
+#       the stronger and more direct one: the priced bundle IS the bundle document. The anti-phantom property
+#       the arm exists for is unweakened — (G-a) already proves this document's payload is byte-identical to
+#       explicit --top-k=0's, and a phantom whole-repo map would blow the identity here by ~1 MB.
 pricedBundle=$( grep -oE 'reason="bundle [0-9]+B' "$TMP/real_default.xml" | grep -oE '[0-9]+' )
+realDefaultBytes=$( wc -c < "$TMP/real_default.xml" | tr -d ' ' )
 if [ -n "$pricedBundle" ]; then
-    if [ "$pricedBundle" = "$realTk0Bytes" ]; then
-        ok "(G-b) reason= prices the bundle at exactly the --top-k=0 byte count (${pricedBundle}B) — no phantom map"
+    if [ "$pricedBundle" = "$realDefaultBytes" ]; then
+        ok "(G-b) reason= prices the bundle at exactly the bytes it serves (${pricedBundle}B; explicit --top-k=0 serves the same payload under an undecorated root, ${realTk0Bytes}B) — no phantom map"
     else
-        no "(G-b) reason= priced the bundle at ${pricedBundle}B but --top-k=0 actually serves ${realTk0Bytes}B — the reason= string still prices a map that mapTopK==0 will never emit"
+        no "(G-b) reason= priced the bundle at ${pricedBundle}B but the document it served is ${realDefaultBytes}B — the whole-file candidate is being compared against a bundle price that is not the bundle document"
     fi
 else
     no "(G-b) no reason=\"bundle NNNB ...\" clause found on the real-repo default root — unexpected mode, see (G) above: $( grep -oE '<ctx[^>]*>' "$TMP/real_default.xml" )"
@@ -162,7 +183,7 @@ fi
 # ── (F) well-formedness + determinism ─────────────────────────────────────────────────────────────────
 if command -v xmllint >/dev/null 2>&1; then
     for f in uniq dup5 dup tk5 tk0 big real_default real_tk0; do
-        xmllint --noout "$TMP/$f.xml" 2>/dev/null && ok "(F) $f.xml well-formed" || no "(F) $f.xml fails xmllint"
+        if xmllint --noout "$TMP/$f.xml" 2>/dev/null; then ok "(F) $f.xml well-formed"; else no "(F) $f.xml fails xmllint"; fi
     done
 else
     printf '  SKIP  xmllint not installed\n'

@@ -29,11 +29,12 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/statcompat.sh"
 BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -46,39 +47,29 @@ CORPUS="$ROOT/test/fixture"
 XDG="$TMP/xdg"; mkdir -p "$XDG"
 CACHEDIR="$XDG/ripwire"
 
-# L3 (Linux probe): portable stat reader(s). GNU coreutils and BSD/macOS disagree on both the flag and the
-# format directives, and the `stat -f FMT ... || stat -c FMT ...` fallback this gate used is a TRAP. On GNU,
-# `-f` means FILESYSTEM status and takes NO format argument, so FMT is parsed as a second FILE: measured on
-# coreutils 9.11, `stat -f %i FILE` PRINTS a six-line filesystem block for FILE on stdout and exits 1. The
-# `||` arm then appends the right number under six lines of junk -- so a string compare fails, a numeric
-# compare dies with "integer expression expected", and a `|| echo MISSING` variant reports MISSING forever
-# (a gate that then passes by comparing nothing to nothing). Detect the flavour ONCE, use one form.
-if stat --version >/dev/null 2>&1; then inode_of(){ stat -c %i "$1" 2>/dev/null; }   # GNU coreutils
-else                                    inode_of(){ stat -f %i "$1" 2>/dev/null; }   # BSD / macOS
-fi
 # glob helper: echo the single matching class file (or empty). Y4: shard-aware lookup — a blob may
 # live flat under $CACHEDIR or under $CACHEDIR/<xx>/ (2-hex-char shard), so search both via find -maxdepth 2.
-richfile(){ find "$CACHEDIR" -maxdepth 2 -type f -name 'ripwire-*-rich.bin' 2>/dev/null | head -1; }
-leanfile(){ find "$CACHEDIR" -maxdepth 2 -type f -name 'ripwire-*-lean.bin' 2>/dev/null | head -1; }
+richfile(){ find "$CACHEDIR" -maxdepth 2 -type f -name 'ripwire-*-rich*.bin' 2>/dev/null | head -1; }
+leanfile(){ find "$CACHEDIR" -maxdepth 2 -type f -name 'ripwire-*-lean*.bin' 2>/dev/null | head -1; }
 
 run(){ env -u TMPDIR XDG_CACHE_HOME="$XDG" "$BIN" "$CORPUS" "$@"; }
 
 # ── (a) structural no-thrash: rich → lean → rich ─────────────────────────────────────────────────
 run --for="distance between two points" >/dev/null 2>/dev/null   # rich (cold) — writes the rich class file
 RF="$( richfile )"
-[ -n "$RF" ] && ok "rich verb creates a -rich.bin auto-cache" || no "no -rich.bin created by a rich verb"
+if [ -n "$RF" ]; then ok "rich verb creates a -rich.bin auto-cache"; else no "no -rich.bin created by a rich verb"; fi
 RI1="$( [ -n "$RF" ] && inode_of "$RF" )"
 
 run >/dev/null 2>/dev/null                                        # lean (cold) — writes the lean class file
 LF="$( leanfile )"
-[ -n "$LF" ] && ok "lean verb creates a SEPARATE -lean.bin auto-cache" || no "no -lean.bin created by a lean verb"
+if [ -n "$LF" ]; then ok "lean verb creates a SEPARATE -lean.bin auto-cache"; else no "no -lean.bin created by a lean verb"; fi
 
 # both class files coexist → proves the split (old single-file scheme could only ever have ONE file)
 # Y4: shard-aware lookup — count matching blobs in either layout. Narrowed to the -rich.bin/-lean.bin
 # CLASS files specifically (not the bare 'ripwire-*.bin' wildcard): Y2's qchurn family now also writes a
 # ripwire-qchurn-*.bin blob during the --for pass, which the old broad wildcard would incorrectly count
 # toward "class cache files" — the gate's stated intent here is exactly 2 class files (rich + lean).
-NFILES="$( find "$CACHEDIR" -maxdepth 2 -type f \( -name 'ripwire-*-rich.bin' -o -name 'ripwire-*-lean.bin' \) 2>/dev/null | wc -l | tr -d ' ' )"
+NFILES="$( find "$CACHEDIR" -maxdepth 2 -type f \( -name 'ripwire-*-rich*.bin' -o -name 'ripwire-*-lean*.bin' \) 2>/dev/null | wc -l | tr -d ' ' )"
 [ "$NFILES" = "2" ] && ok "rich + lean caches coexist (exactly 2 class files — split confirmed)" \
     || no "expected exactly 2 class cache files after rich→lean, found $NFILES"
 

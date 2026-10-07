@@ -54,7 +54,7 @@ BIN="${1:-${RIPWIRE_BIN:-$ROOT/build/ripwire}}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow a repo-relative RIPWIRE_BIN
 TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first (cmake --build build -j)"; exit 2; }
@@ -99,6 +99,33 @@ PY
 "$BIN" docdemotefix --for="$BUGQ" --no-route --format=candidates --no-cache >"$TMP/noroute.xml" 2>/dev/null
 "$BIN" docdemotefix --for="$BUGQ"     --no-cache >"$TMP/bugfor.xml"    2>/dev/null
 "$BIN" docdemotefix --for="$TRACEQ"   --no-cache >"$TMP/tracefor.xml"  2>/dev/null
+# RE-PIN 2026-09-13 (merge of lane/sc-legend and lane/for-widen): docdemotegolden_for.xml RE-MEASURED on the
+# MERGED tree at 5,809 B (est_tokens "2328"), from 5,887 on for-widen's tree and 5,425 on sc-legend's. Neither
+# lane's own number is the merged one, so this is measured, not summed. Three identified changes, and the golden
+# carries all three:
+#   sc-legend (PR #215, row 6)  the scoped <d> rows carry sc= instead of the path-repeating id= (this is the
+#       SHRINK: 78 B off the rows here); route= is a code, not prose; and the callee rows of one calls block
+#       merge, which adds its own reading to the legend.
+#   sc-legend (PR #215, 2026-09-13)  the sc= composition rule (29 B) and the route= code's reading (54 B) join
+#       the default dialect's legend -- the second present-only, and this conceptual query's root carries route=,
+#       so it appears.
+#   for-widen (L-W)  the query is a THIN answer under the present-only rule (coverage="36"), so the root carries
+#       coverage= with its legend clause and the r=1 row's next= names the file-grain page instead of the body.
+# Verified before re-pinning, against BOTH sides' goldens: the legend comment differs from for-widen's by exactly
+# two insertions (the two clauses above, and the merged-callee reading) and by nothing else; the rows differ from
+# sc-legend's by exactly the r=1 next=. No ranking, demotion or route byte moved, and arm (f)'s own demotion
+# assertions still hold. The noroute golden is the control on the present-only rule: with no route= there is no
+# route clause, and (h) proves it -- it is byte-identical on the merged tree at 9,409 B.
+# RE-PIN 2026-09-10 (cap-disclosure lane, fix 2): docdemotegolden_for.xml 5505 -> 5517 B (est_tokens
+# "2202" -> "2207") and docdemotegolden_noroute.xml 9556 -> 9568 B (est_tokens "3386" -> "3391"). ONE
+# identified change, +12 B on each = FOUR three-byte U+2026 markers: cleanSig's 240-byte cap
+# (kMaxSig, src/serialize.h) used to break a signature mid-token with NO marker at all, and now ends it
+# through truncateUtf8WithEllipsis like the tool's three other signature cuts. This fixture is where it
+# shows: a markdown section's "signature" is prose, so four of these rows were over the cap and had been
+# truncated invisibly for the life of the golden. Verified before re-pinning: with est_tokens= normalised
+# and the four new ellipses deleted, live and previous goldens are byte-identical on BOTH fixtures — no
+# ranking, demotion, route or budget byte moved, and neither root is capped, so budget_bytes= (the same
+# lane's fix 3) is absent from both. Gate: capdisclosurecheck arms B1/B2/B3.
 # RE-PIN 2026-09-07 (head-to-head vs Graft, lane 2): both goldens +33 B, the tail legend clause only — the
 # file-grain tail now excludes the files of the sigs rows actually SHOWN instead of the whole 40-candidate
 # surface, and the clause defining the tail says so. Verified before re-pinning: with every comment and
@@ -126,8 +153,9 @@ PY
 # Verified before re-pinning: with est_tokens= and that one clause normalized out, old and new documents are
 # byte-identical — no ranking, demotion or route byte moved (gate: estchargecheck #15 d; same re-pin as
 # anchorcheck/routecheck the same day).
-"$BIN" docdemotefix --for="$CONCEPTQ" --no-cache >"$TMP/concept.xml"   2>/dev/null
-"$BIN" docdemotefix --for="$BUGQ" --no-route --no-cache >"$TMP/noroutefor.xml" 2>/dev/null
+# L1 (2026-09-19): the CLI default legend is compact; (f)/(h) compare against goldens recorded from the full default, so they ask for it.
+"$BIN" docdemotefix --for="$CONCEPTQ" --no-cache --legend=full >"$TMP/concept.xml"   2>/dev/null
+"$BIN" docdemotefix --for="$BUGQ" --no-route --no-cache --legend=full >"$TMP/noroutefor.xml" 2>/dev/null
 "$BIN" docdemotefix --recall="$BUGQ" --no-cache >"$TMP/recall.xml" 2>/dev/null
 
 # ── (a) presence guard — the documents this gate reasons about exist in the index ────────────────────────

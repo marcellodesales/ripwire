@@ -34,10 +34,11 @@
 
 set -u
 ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
 BIN="${RIPWIRE_BIN:-$ROOT/build/ripwire}"
 [ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
 fail=0
-ok(){ printf '  PASS  %s\n' "$*"; }
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
 no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
 
 [ -x "$BIN" ] || { echo "no ripwire binary at $BIN — build first"; exit 2; }
@@ -110,7 +111,39 @@ for fx in fixture ffifix hostilefix; do cp -R "$ROOT/test/$fx" "$TMP/$fx"; done
 REPO_Q=( "rank graph teleport" "compact legend rewrite" "edit receipt post-check" "substitution meter hook"
          "pagerank power iteration" "tree-sitter ingest cache" "merge scout conflict" "quality delta acks"
          "MCP manifest tools list" "test gate affected tests" )
-REPO_BASE=( 9981 9961 9784 9968 9362 9949 9909 9745 9613 9806 )
+# q5 RE-PINNED 2026-09-10 (cap follow-up integration), the OTHER NINE DELIBERATELY LEFT at their @8eb669ff bases.
+# q5 crossed 4% by +106 B of Lane B1 disclosure on a query where the doc-mention cap fires (attributed: the
+# 633a1d23 binary on this same tree gives 9,649 B, this binary 9,755 B), so its base follows the output change.
+# q3/q9 sit at +3.6% from corpus growth alone with NO tool change behind it — that drift is the evidence that
+# arm (3) measures the live repository and needs a frozen fixture; re-basing them would erase the evidence and
+# leave the problem. Expect them to trip on ordinary growth; when they do, the fix is the fixture, not a re-pin.
+# RE-PINNED AGAIN 2026-09-13 (lane for-widen, owner decision 22:55: coverage= is PRESENT-ONLY, thin answers only): all ten
+# repo answers are CONFIDENT on this tree, so they carry no coverage= and no clause and read within a few bytes of the base
+# build again (q2 +16 B, q7 +1 B: the r=1 row's next= spelling; q10 9861 on the tree as it stands, its head having moved
+# on this lane's own source text). The nine fixture bundles below: the seven THIN ones keep the gauge (+312..+364 B), the
+# two confident ones (ffifix/geometry, hostilefix/call) read exactly the base.
+# RE-PINNED 2026-09-12 (lane for-widen, L-W): all ten bases follow an OUTPUT change, the q5 precedent above. Measured on this
+# tree (the lane's own new source, src/forpage.h, is part of the corpus — q10's head moved +241 B on that text alone) with
+# the lane's base build (1cf3086e): 10134 10013 10080 10102 9470 9397 10008 10070 9966 10139 — q1..q4/q7..q10 had already
+# drifted +2.5%..+3.7% on corpus growth alone (the frozen-fixture note above still stands); with the lane's build:
+# 10463 10337 10409 10431 9799 9726 10337 10399 10294 10468, i.e. +324..+329 B on every query = the coverage= root fact,
+# its legend clause (kForCoverageLegend, forpage.h) and the r=1 row's widening next= on a thin answer. Nothing else moved
+# (routecheck/anchorcheck's goldens re-pinned the same day with every other byte proven identical).
+# q5 RE-PINNED 2026-09-13 (merge of lane/sc-legend and lane/for-widen), the q5 precedent above, third time on the same
+# query: 9,470 -> 9,880 B (+4.33%). ATTRIBUTED FOUR WAYS, which is what the precedent requires — main tree / main binary
+# 9,464 B, LANE tree / main binary 9,470 B (so corpus drift is +6 B, not the cause), main tree / lane binary 9,875 B,
+# lane tree / lane binary 9,880 B: the whole +410 B is the TOOL, and it is +410 B of ANSWER. Main serves this query
+# shown="20" of 40 ranked rows; this build serves shown="25". The sc= rows are ~20 B shorter than the id= rows they
+# replace, so the byte-shaped <sigs> section fits five more signature rows, and the legend that grew 154 B (the sc=
+# rule, the route= code's reading and the merged-callee reading) is paid for several times over in rows. The other
+# nine stay at their for-widen bases: -1.11%, +0.36%, -0.45%, +1.54%, +0.02%, +1.66%, +0.18%, -0.56%, +2.30%.
+REPO_BASE=( 10134 10029 10080 10102 9880 9397 10009 10070 9966 10379 )
+# q10 RE-PINNED 2026-09-19 (lane/r1-for-sections-stub, L2 round-1 lever B1): 9861 -> 10379 B (+5.25%), an
+# OUTPUT change, the q5 precedent's pattern. This query's ranked head reaches an interface with
+# implementors — the ONLY one of the ten reference queries that does — so it is the one query in this
+# fixed set whose --for answer now carries the present-only kForSectionStubLegend clause (serialize.h)
+# beside its collapsed <lego> stub. The other nine are unaffected (unchanged bytes on this same binary,
+# confirming the clause really is present-only, not a fixed per-call cost).
 
 # ── (1)+(2) rank order + p= on every row, four dialects ───────────────────────────────────────────────────
 order_fail=0
@@ -140,7 +173,7 @@ FX_Q=( "geometry area of a shape" "call a native function from python" "parse th
 
 # ── (3) byte growth ≤ 4% against the registered sizes ─────────────────────────────────────────────────────
 growth_fail=0
-echo "  ledger: the ten reference queries (this repo, full legend) — base bytes @8eb669ff → now, shown=/total="
+echo "  ledger: the ten reference queries (this repo, full legend) — base bytes @8eb669ff (q5 @cap-followup-2026-09-10) → now, shown=/total="
 i=0
 for q in "${REPO_Q[@]}"; do
     base="${REPO_BASE[$i]}"; i=$(( i + 1 ))
@@ -154,15 +187,23 @@ for q in "${REPO_Q[@]}"; do
     fi
 done
 # nine fixture bundles measured on the pre-fix binary (git-less copies; d5ac29a7)
-FX_BASE="fixture|geometry area of a shape|2895
-fixture|call a native function from python|3067
-fixture|parse the config and load it|3277
-ffifix|geometry area of a shape|2050
-ffifix|call a native function from python|3068
-ffifix|parse the config and load it|3506
-hostilefix|geometry area of a shape|2775
-hostilefix|call a native function from python|2074
-hostilefix|parse the config and load it|2928"
+# RE-PINNED 2026-09-12 (lane for-widen, L-W), the nine fixture bundles, same output change as the ten repo queries above:
+# measured base build (1cf3086e) → this build: fixture/geometry 2950 → 3299, fixture/call 3126 → 3490, fixture/parse 3349 → 3691, ffifix/geometry 2082 → 2082, ffifix/call 3116 → 3468, ffifix/parse 3525 → 3877, hostilefix/geometry 2834 → 3146, hostilefix/call 2106 → 2106, hostilefix/parse 3002 → 3360 — the coverage= root fact, its clause and the widening next= on a thin answer; on a 2–3.5 KB bundle that is 12–20%,
+# which is why the 4% band cannot absorb a root-fact addition on these and the bases follow it (the q5 precedent).
+# fixture/geometry RE-PINNED 2026-09-16 (#228, test/rootspellingcheck.sh), the q5 precedent, attributed three ways on a
+# git-less copy crawled as this arm crawls it (root typed `fixture`): base build 3,366 B; base build crawled as `.`
+# 3,488 B (+6 B is `root="."` against `root="fixture"`, so 3,494 B); this build 3,494 B. The typed root `fixture` matched
+# pathTierOf's `fixture/` segment, so every file of the tree was tiered test/bench and its notes.md headings could not
+# carry a doc mention; read root-relative they do (doc_mentions="1", r=3/r=4 swap). The other eight bases do not move.
+FX_BASE="fixture|geometry area of a shape|3494
+fixture|call a native function from python|3510
+fixture|parse the config and load it|3711
+ffifix|geometry area of a shape|2082
+ffifix|call a native function from python|3488
+ffifix|parse the config and load it|3897
+hostilefix|geometry area of a shape|3166
+hostilefix|call a native function from python|2106
+hostilefix|parse the config and load it|3380"
 echo "  ledger: nine fixture bundles — base bytes @d5ac29a7 → now"
 while IFS='|' read -r fx q base; do
     now="$( cd "$TMP" && "$BIN" "$fx" --for="$q" 2>/dev/null | wc -c | tr -d ' ' )"
@@ -244,7 +285,7 @@ if not any( "off-by-one lives here" in n.get( "text", "" ) for r in rows for n i
 print( "OK" )
 ' "$NORM_FILE" )" && ok "(4) JSON: the file note is the carrier row's file_notes array; the symbol note stays in notes" \
      || { no "(4) JSON file note: $v"; printf '%s\n' "$NOTE_JSON" | head -c 900; echo; }
-    printf '%s' "$NOTE_FOR" | xmllint --noout - 2>/dev/null && ok "(4) --for with notes is xmllint-clean" || no "(4) --for with notes is not well-formed"
+    if printf '%s' "$NOTE_FOR" | xmllint --noout - 2>/dev/null; then ok "(4) --for with notes is xmllint-clean"; else no "(4) --for with notes is not well-formed"; fi
 fi
 
 # ── (5) mutation control: the checker rejects the pre-fix shapes ──────────────────────────────────────────
@@ -253,25 +294,124 @@ PREFIX_JSON='{"sigs":[{"p":"src/a.h","symbols":[{"l":1,"n":"x","r":2,"sig":"int 
 FLAT_XML='<ctx><sigs><d l="9" n="y" p="src/a.h" r="1">int y()</d><d l="1" n="x" p="src/a.h" r="2">int x()</d><d l="3" n="z" p="src/b.h" r="3">int z()</d></sigs></ctx>'
 if printf '%s' "$PREFIX_XML" | check xml >/dev/null; then no "(5) the checker ACCEPTED a file-grouped XML bundle — no teeth"; else ok "(5) mutation control: the checker rejects the pre-fix file-grouped XML shape"; fi
 if printf '%s' "$PREFIX_JSON" | check json >/dev/null; then no "(5) the checker ACCEPTED a file-grouped JSON bundle — no teeth"; else ok "(5) mutation control: the checker rejects the pre-fix file-grouped JSON shape"; fi
-printf '%s' "$FLAT_XML" | check xml >/dev/null && ok "(5) …and accepts a flat rank-ordered bundle with p= on every row" || no "(5) the checker rejects the target shape"
+if printf '%s' "$FLAT_XML" | check xml >/dev/null; then ok "(5) …and accepts a flat rank-ordered bundle with p= on every row"; else no "(5) the checker rejects the target shape"; fi
 
 # ── (6) shown= consistency, determinism, well-formedness ─────────────────────────────────────────────────
 A="$( "$BIN" . --for="rank graph teleport" 2>/dev/null )"
 B="$( "$BIN" . --for="rank graph teleport" 2>/dev/null )"
-[ "$A" = "$B" ] && ok "(6) two runs byte-identical" || no "(6) --for is not deterministic"
+if [ "$A" = "$B" ]; then ok "(6) two runs byte-identical"; else no "(6) --for is not deterministic"; fi
 shown="$( printf '%s' "$A" | grep -o '<sigs[^>]*>' | head -1 | grep -o 'shown="[0-9]*"' | tr -dc '0-9' )"
 drows="$( printf '%s' "$A" | python3 -c 'import re,sys; s=sys.stdin.read(); m=re.search(r"<sigs[^>]*>(.*?)</sigs>",s,re.S); print(len(re.findall(r"<d ",m.group(1))) if m else -1)' )"
 if [ -n "$shown" ]; then
-    [ "$shown" = "$drows" ] && ok "(6) shown=\"$shown\" equals the $drows <d> rows printed" || no "(6) shown=\"$shown\" but $drows <d> rows printed"
+    if [ "$shown" = "$drows" ]; then ok "(6) shown=\"$shown\" equals the $drows <d> rows printed"; else no "(6) shown=\"$shown\" but $drows <d> rows printed"; fi
 else
     ok "(6) <sigs> is uncapped on this query (shown= absent by contract)"
 fi
 if command -v xmllint >/dev/null 2>&1; then
-    printf '%s' "$A" | xmllint --noout - 2>/dev/null && ok "(6) full bundle is well-formed" || no "(6) full bundle is not well-formed"
-    "$BIN" . --for="rank graph teleport" --legend=compact 2>/dev/null | xmllint --noout - 2>/dev/null && ok "(6) compact bundle is well-formed" || no "(6) compact bundle is not well-formed"
+    if printf '%s' "$A" | xmllint --noout - 2>/dev/null; then ok "(6) full bundle is well-formed"; else no "(6) full bundle is not well-formed"; fi
+    if "$BIN" . --for="rank graph teleport" --legend=compact 2>/dev/null | xmllint --noout - 2>/dev/null; then ok "(6) compact bundle is well-formed"; else no "(6) compact bundle is not well-formed"; fi
 else
     printf '  SKIP  xmllint (not installed)\n'
 fi
+
+# ── (7) the row gate cuts RANK FIRST, and the cut is counted (cut-fix lane A, 2026-09-23) ─────────────────────
+# The --pack-budget-bytes gate ran inside the FILE-MAJOR collection walk (files by best rank, rows in source order), so
+# it cut in reading order: on this repo at 64 B the old binary served r=7 and r=20 (the rank-1 row's file's first rows in
+# SOURCE order) under a bare <sigs>, and at 2000 B r= 1 2 5 6 7 9 19 20 23 27 — interior gaps, no shown=/total=. RED on
+# origin/main 60b65f02 for every sub-arm below; the invariant is corpus-independent: the served rows are exactly r=1..S,
+# and the tag says shown="S" total="T" capped="1" with T the rows handed to the gate. Both dialects.
+gate_xml(){ python3 -c '
+import re, sys
+s = sys.stdin.read()
+m = re.search( r"<sigs([^>]*)>(.*?)</sigs>", s, re.S )
+if not m: print( "FAIL no <sigs>" ); sys.exit( 1 )
+seq = [ int( x ) for x in re.findall( r"<d [^>]*\br=\"([0-9]+)\"", m.group( 2 ) ) ]
+if len( seq ) < int( sys.argv[ 1 ] ): print( "FAIL %d served rows, want at least %s: an empty head is 1..0 and would pass the order test" % ( len( seq ), sys.argv[ 1 ] ) ); sys.exit( 1 )
+sh = re.search( r"shown=\"([0-9]+)\"", m.group( 1 ) ); tt = re.search( r"total=\"([0-9]+)\"", m.group( 1 ) )
+if seq != list( range( 1, len( seq ) + 1 ) ): print( "FAIL served r= is not the rank head 1..S: %s" % seq ); sys.exit( 1 )
+if not ( sh and tt and "capped=\"1\"" in m.group( 1 ) ): print( "FAIL the gate cut is undisclosed: <sigs%s>" % m.group( 1 ) ); sys.exit( 1 )
+if int( sh.group( 1 ) ) != len( seq ) or int( tt.group( 1 ) ) <= len( seq ): print( "FAIL shown=/total= do not count the cut: <sigs%s> with %d rows" % ( m.group( 1 ), len( seq ) ) ); sys.exit( 1 )
+print( "OK r=1..%d of total=%s" % ( len( seq ), tt.group( 1 ) ) )' "${1:-0}"; }
+gate_json(){ python3 -c '
+import json, sys
+d = json.load( sys.stdin )
+seq = [ r[ "r" ] for r in d[ "sigs" ] ]
+if len( seq ) < int( sys.argv[ 1 ] ): print( "FAIL %d served rows, want at least %s: an empty head is 1..0 and would pass the order test" % ( len( seq ), sys.argv[ 1 ] ) ); sys.exit( 1 )
+if seq != list( range( 1, len( seq ) + 1 ) ): print( "FAIL served r is not the rank head 1..S: %s" % seq ); sys.exit( 1 )
+if d.get( "capped" ) is not True or d.get( "sigs_shown" ) != len( seq ) or not d.get( "sigs_total", 0 ) > len( seq ):
+    print( "FAIL the gate cut is undisclosed: capped=%r sigs_shown=%r sigs_total=%r rows=%d" % ( d.get( "capped" ), d.get( "sigs_shown" ), d.get( "sigs_total" ), len( seq ) ) ); sys.exit( 1 )
+print( "OK r=1..%d of sigs_total=%d" % ( len( seq ), d[ "sigs_total" ] ) )' "${1:-0}"; }
+# A floor on the served rows: at 2000 B this query serves 8 today (measured at a2faa525), so a regression that dropped
+# every row while still saying capped="1" total>0 must fail (an empty head is 1..0, so the order test alone passes it).
+# 64 B serves 1 today, and the floor holds there too: gateSigRowsRankFirst (src/serialize.h, which packSignatures calls)
+# tests `used >= budgetBytes` before each row with `used` starting at 0, so the first row is admitted at any budget by
+# construction. The floor is 1, not 8, so a legitimate byte change to the rows does not trip it.
+for pb in 64 2000; do
+    minrows=1
+    if v="$( "$BIN" src --for="rank graph teleport" --pack-budget-bytes=$pb --no-cache 2>/dev/null | gate_xml $minrows )"; then
+        ok "(7) --pack-budget-bytes=$pb XML: $v"
+    else
+        no "(7) --pack-budget-bytes=$pb XML: $v"
+    fi
+    if v="$( "$BIN" src --for="rank graph teleport" --pack-budget-bytes=$pb --json --no-cache 2>/dev/null | gate_json $minrows )"; then
+        ok "(7) --pack-budget-bytes=$pb JSON: $v"
+    else
+        no "(7) --pack-budget-bytes=$pb JSON: $v"
+    fi
+done
+
+# ── (8) docs_dropped= discloses the rank tier's doc removal; shrunk-not-dropped is named (cut-fix lane A) ─────────
+# The tier removes the doc of every row past r=24 ALWAYS (not budget-driven), and the ladder's steps B/D remove more on a
+# capped block; both used to leave no trace. Fixture: 40 matching C++ functions over two files, EVERY one with a doc
+# comment, small enough that the default bundle is uncapped — so exactly the 16 rows past r=24 print no <doc>. RED on
+# 60b65f02 (no docs_dropped=, no clause). Then the ladder's first capped state (shrink, no drop) is found by walking
+# --token-budget down, and must say shown == total with the shrunk clause. In every state, docs_dropped= must equal the
+# shown rows printing no <doc> (every fixture row has one), and the JSON twin must carry the same count.
+mkdir -p "$TMP/fxdocs"
+python3 - "$TMP/fxdocs" <<'PY'
+import sys
+for f in range( 2 ):
+    with open( "%s/part%d.cpp" % ( sys.argv[1], f ), "w" ) as o:
+        for i in range( 20 ):
+            n = f * 20 + i + 1
+            o.write( "// widget helper %d computes a widget\nint widgetHelper%d( int x ) { return x + %d; }\n\n" % ( n, n, n ) )
+PY
+docs_arm(){ python3 -c '
+import re, sys
+s = sys.stdin.read()
+m = re.search( r"<sigs([^>]*)>(.*?)</sigs>", s, re.S )
+if not m: print( "FAIL no <sigs>" ); sys.exit( 1 )
+rows = re.findall( r"<d [^>]*\br=\"([0-9]+)\"[^>]*>(.*?)</d>", m.group( 2 ), re.S )
+nodoc = [ int( r ) for r, inner in rows if "<doc>" not in inner ]
+dd = re.search( r"docs_dropped=\"([0-9]+)\"", m.group( 1 ) )
+got = int( dd.group( 1 ) ) if dd else 0
+if got != len( nodoc ) or got == 0: print( "FAIL docs_dropped=%d but %d shown rows print no <doc> (r=%s)" % ( got, len( nodoc ), nodoc ) ); sys.exit( 1 )
+if "[docs_dropped=N:" not in s[ : s.find( "<sigs" ) ]: print( "FAIL docs_dropped= rides with no legend clause ahead of <sigs>" ); sys.exit( 1 )
+sh = re.search( r"shown=\"([0-9]+)\"", m.group( 1 ) ); tt = re.search( r"total=\"([0-9]+)\"", m.group( 1 ) )
+shrunk = bool( sh and tt and sh.group( 1 ) == tt.group( 1 ) )
+if shrunk != ( "[sigs capped=1 with shown=total:" in s ): print( "FAIL the shrunk clause rides %s a shown==total cap" % ( "without" if shrunk else "beside no" ) ); sys.exit( 1 )
+print( "OK docs_dropped=%d rows=%d %s" % ( got, len( rows ), "<sigs%s>" % m.group( 1 ) ) )'; }
+if v="$( cd "$TMP" && "$BIN" fxdocs --for="widget helper" --no-cache 2>/dev/null | docs_arm )"; then
+    case "$v" in
+        *'docs_dropped=16 rows=40 <sigs docs_dropped="16">'*) ok "(8) uncapped: the r>24 tier is disclosed: $v" ;;
+        *) no "(8) uncapped fixture: want docs_dropped=16 of 40 on an uncapped tag, got: $v" ;;
+    esac
+else
+    no "(8) uncapped fixture: $v"
+fi
+jd="$( cd "$TMP" && "$BIN" fxdocs --for="widget helper" --json --no-cache 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("docs_dropped"), sum(1 for r in d["sigs"] if "doc" not in r))' )"
+if [ "$jd" = "16 16" ]; then ok "(8) JSON twin: docs_dropped=16 = the rows with no doc key"; else no "(8) JSON twin: docs_dropped/no-doc rows = '$jd' (want '16 16')"; fi
+first_capped=""
+for tb in 3400 3200 3000 2800 2600 2400 2200 2000; do
+    out="$( cd "$TMP" && "$BIN" fxdocs --for="widget helper" --no-cache --token-budget=$tb 2>/dev/null )"
+    v="$( printf '%s' "$out" | docs_arm )" || { no "(8) --token-budget=$tb: $v"; continue; }
+    if [ -z "$first_capped" ] && printf '%s' "$v" | grep -q 'capped="1"'; then first_capped="$tb $v"; fi
+done
+case "$first_capped" in
+    *'shown="40" total="40" capped="1"'*) ok "(8) the ladder's first capped state is shrunk-not-dropped and says so: --token-budget=$first_capped" ;;
+    "") no "(8) no --token-budget in 3400..2000 capped the fixture — the shrunk arm measured nothing" ;;
+    *) no "(8) first capped state is not shrunk-not-dropped: $first_capped" ;;
+esac
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
 exit "$fail"
